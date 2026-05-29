@@ -172,6 +172,16 @@ Use these entry points:
 - `/gsd-execute-phase` for planned phase work
 
 Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
+
+### Branching & PR workflow (required)
+
+`main` is protected — never commit or push directly to it. Every unit of work goes on its own branch and reaches `main` only through a reviewed PR:
+
+- **Phases** — `/gsd-execute-phase` auto-creates a branch (`git.branching_strategy: phase` → `gsd/phase-{phase}-{slug}`). Open a PR from that branch back to `main` when the phase verifies.
+- **Quick tasks** — `/gsd-quick` branches via `gsd/quick-{slug}`; PR back to `main`.
+- **Debug sessions / ad-hoc fixes / chores** — create a descriptive branch first (e.g. `debug/{slug}`, `fix/{slug}`, `chore/{slug}`), then PR back to `main`.
+
+Run the full CI gate locally before pushing (`uv run nox -s gate` — runs ruff check + ruff format --check + mypy + pytest over the whole repo, not a scoped path). Track any deferred/declined items as GitHub issues, the single source of truth for outstanding work.
 <!-- GSD:workflow-end -->
 
 
