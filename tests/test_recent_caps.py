@@ -139,11 +139,11 @@ async def test_recent_languages_filter_and_limit_clamp(
     resp = await client.get("/recent", params={"languages": "en", "limit": "9999"})
     assert resp.status_code == 200
     assert route.called
-    sent = route.calls.last.request.url
+    sent = str(route.calls.last.request.url)
     # languages=en → translatedLanguage[]=en upstream.
-    assert "translatedLanguage%5B%5D=en" in str(sent) or "translatedLanguage[]=en" in str(sent)
+    assert "translatedLanguage%5B%5D=en" in sent or "translatedLanguage[]=en" in sent
     # limit clamped to <=100 (RCNT-01 DoS guard T-02-06).
-    assert "limit=100" in str(sent)
+    assert "limit=100" in sent
 
 
 @respx.mock
