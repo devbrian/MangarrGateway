@@ -12,6 +12,7 @@ served read-through the 12h caps cache.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 import httpx
 import pytest
@@ -158,6 +159,30 @@ async def test_recent_sorts_by_instant_across_mixed_offsets(
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_recent_truncates_merged_to_limit(client: httpx.AsyncClient) -> None:
+    # T-02-06 (#2): the merged feed is truncated to the requested limit, even when
+    # the upstream returns more rows than requested.
+    manga_id = str(uuid.uuid4())
+    chapters = [
+        _chapter(
+            chapter=str(i),
+            chapter_id=str(uuid.uuid4()),
+            manga_id=manga_id,
+            published=f"2026-05-2{i}T00:00:00+00:00",
+        )
+        for i in range(3)
+    ]
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        return_value=httpx.Response(200, json=_recent_payload(chapters))
+    )
+
+    resp = await client.get("/recent", params={"limit": "2"})
+    assert resp.status_code == 200
+    assert len(resp.json()["releases"]) == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_recent_languages_filter_and_limit_clamp(
     client: httpx.AsyncClient,
 ) -> None:
@@ -214,9 +239,11 @@ async def test_recent_since_filters_older_items(client: httpx.AsyncClient) -> No
     resp = await client.get("/recent", params={"since": since})
     assert resp.status_code == 200
     releases = resp.json()["releases"]
-    # RCNT-02: only items newer than `since` survive.
+    # RCNT-02: only items newer than `since` survive — compare instants, not ISO
+    # strings (lexical compare misorders mixed Z/+00:00 offsets).
+    since_dt = datetime.fromisoformat(since)
     for rel in releases:
-        assert rel["publishDate"] > since
+        assert datetime.fromisoformat(rel["publishDate"]) > since_dt
     assert all(r["publishDate"] != "2026-05-10T00:00:00+00:00" for r in releases)
     # Either upstream publishAtSince was sent OR the client-side filter applied.
     sent = str(route.calls.last.request.url)

@@ -82,6 +82,7 @@ def register_error_handlers(app: FastAPI) -> None:
             return JSONResponse(
                 status_code=400,
                 content=_error("bad_request", "Malformed request"),
+                headers=getattr(exc, "headers", None),
             )
         return JSONResponse(
             status_code=exc.status_code,

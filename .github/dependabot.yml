@@ -1,0 +1,11 @@
+# Keep the SHA-pinned GitHub Actions current. Dependabot opens weekly PRs that bump
+# the pinned commit hashes (and surfaces the Node 20 -> 24 action deprecation), so the
+# supply-chain pin in ci.yml does not go stale without manual tracking.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"

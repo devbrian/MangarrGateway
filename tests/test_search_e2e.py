@@ -370,6 +370,68 @@ async def test_search_no_query_no_id_returns_400(client: httpx.AsyncClient) -> N
     assert resp.json()["error"]["code"] == "bad_request"
 
 
+@pytest.mark.asyncio
+async def test_search_empty_id_value_returns_400(client: httpx.AsyncClient) -> None:
+    # SRCH-05: an id key present but empty/whitespace is NOT usable input → 400.
+    resp = await client.post(
+        "/search", json={"type": "manga", "ids": {"mangadexId": "   "}}
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "bad_request"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_truncates_to_limit(client: httpx.AsyncClient) -> None:
+    # T-02-04 / WR-03: the merged result is bounded by the requested limit even when
+    # the upstream feed returns more rows.
+    manga_id = str(uuid.uuid4())
+    chapters = [
+        {
+            "id": str(uuid.uuid4()),
+            "type": "chapter",
+            "attributes": {
+                "volume": None,
+                "chapter": str(i),
+                "title": None,
+                "translatedLanguage": "en",
+                "externalUrl": None,
+                "isUnavailable": False,
+                "publishAt": "2026-05-29T13:57:18+00:00",
+                "readableAt": "2026-05-29T13:57:18+00:00",
+                "pages": 2,
+            },
+            "relationships": [
+                {"id": "grp", "type": "scanlation_group", "attributes": {"name": "G"}},
+                {"id": manga_id, "type": "manga", "attributes": {"title": {"en": "X"}}},
+            ],
+        }
+        for i in range(5)
+    ]
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": "ok",
+                "response": "collection",
+                "data": chapters,
+                "total": len(chapters),
+                "limit": 100,
+                "offset": 0,
+            },
+        )
+    )
+
+    resp = await client.post(
+        "/search", json={"type": "chapter", "query": "X", "limit": 2}
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["releases"]) == 2  # merged total truncated to limit
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_search_minted_handle_resolves_in_store(
@@ -386,6 +448,7 @@ async def test_search_minted_handle_resolves_in_store(
     resp = await client.post(
         "/search", json={"type": "chapter", "query": "Solo Leveling"}
     )
+    assert resp.status_code == 200
     handle = resp.json()["releases"][0]["downloadHandle"]
     store = app.state.handle_store
     record = store.resolve(handle)

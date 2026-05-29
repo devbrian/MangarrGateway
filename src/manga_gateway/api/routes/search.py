@@ -50,7 +50,18 @@ USABLE_ID_KEYS = {"mangadexId", "anilistId", "malId"}
 def _has_usable_search_input(req: SearchRequest) -> bool:
     if req.query and req.query.strip():
         return True
-    return bool(req.ids) and any(k in (req.ids or {}) for k in USABLE_ID_KEYS)
+    if not req.ids:
+        return False
+    # A usable id key must carry a non-empty value — mere presence of an empty,
+    # whitespace, or None id does NOT bypass the SRCH-05 guard (D-23).
+    for key in USABLE_ID_KEYS:
+        value = req.ids.get(key)
+        if isinstance(value, str):
+            if value.strip():
+                return True
+        elif value is not None:
+            return True
+    return False
 
 
 def _select_sources(
@@ -99,6 +110,10 @@ async def search(
         return await src.search(req, ctx)
 
     releases, warning_tuples = await fan_out(sources, _run_one)
+    # T-02-04: bound the total releases/handles a single search can mint. A title
+    # search fans across multiple candidate manga, so per-source/per-manga paging
+    # alone does not cap the merged total — truncate to the requested limit.
+    releases = releases[: req.limit]
     warnings = [
         SourceWarning(source_key=key, code=code, message=message)
         for key, code, message in warning_tuples

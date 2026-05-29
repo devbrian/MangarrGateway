@@ -154,6 +154,9 @@ async def get_recent(
 
     # RCNT-01: merge newest-first by publishDate across all sources (datetime-parsed).
     releases.sort(key=lambda rel: _parse_ts(rel.publish_date), reverse=True)
+    # T-02-06: enforce the overall limit on the MERGED list — per-source paging caps
+    # each source, but the merged feed across sources must not exceed the requested max.
+    releases = releases[:clamped_limit]
 
     warnings = [
         SourceWarning(source_key=key, code=code, message=message)
