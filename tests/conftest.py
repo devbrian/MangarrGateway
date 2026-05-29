@@ -33,11 +33,17 @@ def app() -> FastAPI:
 
 @pytest_asyncio.fixture
 async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
-    """In-process httpx client over ASGITransport (no bound port)."""
+    """In-process httpx client over ASGITransport (no bound port).
+
+    httpx ASGITransport does not emit the ASGI lifespan scope, so we drive the
+    app's lifespan explicitly — this builds the R1 singleton seams on
+    ``app.state`` that seam-reading routes (Plan 02's /caps, /status) rely on.
+    """
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url=BASE_URL,
-        headers={"X-Api-Key": TEST_API_KEY},
-    ) as ac:
-        yield ac
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=BASE_URL,
+            headers={"X-Api-Key": TEST_API_KEY},
+        ) as ac:
+            yield ac
