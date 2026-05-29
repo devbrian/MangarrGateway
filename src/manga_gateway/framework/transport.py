@@ -7,12 +7,25 @@ subclasses. Nothing fetches in Phase 1 — this only establishes the seam.
 
 from __future__ import annotations
 
+import importlib.util
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import httpx
 
 if TYPE_CHECKING:
     from ..config import Settings
+
+# Honest, non-spoofed UA (MangaDex requires a descriptive UA — RESEARCH MangaDex
+# Contract; SRC-05). One place the outbound identity lives.
+_USER_AGENT = "MangaGateway/1.0"
+
+# Per-host connection limits — the ONE place they live (SRC-04). Sources never
+# construct their own client, so this bounds outbound concurrency process-wide.
+_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+
+# HTTP/2 needs the optional ``h2`` package; enable only when present so the gateway
+# runs with the locked dependency set (falls back to HTTP/1.1 transparently).
+_HTTP2 = importlib.util.find_spec("h2") is not None
 
 
 @runtime_checkable
@@ -37,9 +50,13 @@ class HttpxTransport:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        # One shared client. HTTP/2 + per-host limits land with the first
-        # source (Phase 2); proxies/mounts inject here in v2 (SRC-04).
-        self._client = httpx.AsyncClient()
+        # One shared client. Non-spoofed UA + per-host limits live HERE (SRC-04/SRC-05);
+        # HTTP/2 when ``h2`` is available; proxies/mounts inject here in v2 (PROXY-01).
+        self._client = httpx.AsyncClient(
+            headers={"User-Agent": _USER_AGENT},
+            http2=_HTTP2,
+            limits=_LIMITS,
+        )
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         return await self._client.request(method, url, **kwargs)

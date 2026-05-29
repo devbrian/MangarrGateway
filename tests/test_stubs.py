@@ -1,10 +1,14 @@
-"""Shape assertions for the Phase-1 read stubs ``GET /caps`` + ``GET /status``.
+"""Shape assertions for ``GET /caps`` + ``GET /status``.
 
 These complement the schemathesis contract harness (``test_contract.py``) with
 explicit, human-readable shape checks: camelCase field names on the wire, the
-empty-but-valid ``sources: []`` invariant (D-05 — NO invented source data), the
 ``downloadFormats`` enum subset, and the PLAT-04 caps-cache read-through (same
 object served on a second request).
+
+Phase 2 (Plan 02-02) flips the former Phase-1 ``sources: []`` invariant (D-05): the
+caps document now advertises the live per-source ``SourceCap`` list from the registry
+(CAPS-02/03). The detailed MangaDex SourceCap content is asserted in
+``test_recent_caps.py``; here we only assert the registry-driven shape.
 """
 
 from __future__ import annotations
@@ -16,8 +20,8 @@ _DOWNLOAD_FORMAT_ENUM = {"cbz", "cbt", "folder"}
 
 
 @pytest.mark.asyncio
-async def test_caps_shape_and_empty_sources(client: httpx.AsyncClient) -> None:
-    """GET /caps returns camelCase fields, empty-but-valid sources, valid formats."""
+async def test_caps_shape_and_registry_sources(client: httpx.AsyncClient) -> None:
+    """GET /caps returns camelCase fields, registry-driven sources, valid formats."""
     resp = await client.get("/caps")
     assert resp.status_code == 200
     body = resp.json()
@@ -28,8 +32,10 @@ async def test_caps_shape_and_empty_sources(client: httpx.AsyncClient) -> None:
     assert body["supportedSearchParams"]  # non-empty list of str
     assert all(isinstance(p, str) for p in body["supportedSearchParams"])
 
-    # D-05: sources stays [] — no invented SourceCap data this phase.
-    assert body["sources"] == []
+    # Phase 2: sources is registry-driven (CAPS-02/03) — at least the MangaDex source.
+    assert isinstance(body["sources"], list)
+    assert body["sources"]  # non-empty: the live registered sources
+    assert all("key" in src for src in body["sources"])
 
     # limits.{defaultPageSize, maxPageSize} are ints.
     assert isinstance(body["limits"]["defaultPageSize"], int)

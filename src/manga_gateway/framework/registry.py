@@ -29,6 +29,10 @@ class SourceRegistry:
     def get(self, key: str) -> type[Any] | None:
         return self._sources.get(key)
 
+    def keys(self) -> list[str]:
+        """Return all registered source keys (omit a ``sources`` filter = all)."""
+        return list(self._sources.keys())
+
     def caps(self) -> list[Any]:
         """Return per-source capabilities. Phase 1: ``[]`` (no sources)."""
         return [cls.source_cap() for cls in self._sources.values()]
