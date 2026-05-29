@@ -57,8 +57,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ``None``, Task 3 wires this to ``load_settings()``.
     """
     if settings is None:
-        # Task 3 wires this to load_settings() (TOML load + auto-key persist).
-        raise ValueError("settings must be provided (load_settings lands in Task 3)")
+        from .config import load_settings  # noqa: PLC0415
+
+        settings = load_settings()
 
     app = FastAPI(
         title="Mangarr Manga-Gateway API",

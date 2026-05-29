@@ -1,31 +1,74 @@
-"""Application settings + key provisioning.
+"""Application settings + API-key provisioning.
 
 TOML is the source of truth (D-10); env vars override ONLY ops knobs
 (host/port/output_root) (D-11). The API key is auto-generated-and-persisted on
 first start and is NEVER supplied via the environment (D-01).
 
-NOTE: the full TOML load + key-generation persistence (``load_settings``) is
-finalized in Plan 01-01 Task 3. Task 1 only needs the ``Settings`` shape so the
-contract test can construct ``create_app(Settings(api_key=...))`` (D-03).
+Env-exclusion mechanism for ``api_key`` (Open Question 2 / Pitfall 4):
+``load_settings`` constructs ``Settings(api_key=<from TOML>, ...)`` passing the
+key as an explicit init keyword. In pydantic-settings, init keywords take
+precedence over the environment source, so ``GATEWAY_API_KEY`` can never set the
+effective key. The ``alias`` on ``api_key`` further decouples it from the
+``GATEWAY_`` env prefix. A regression test asserts the env value is ignored.
 """
 
 from __future__ import annotations
 
+import logging
+import secrets
+import tomllib
+from pathlib import Path
+
+import tomli_w
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_log = logging.getLogger("manga_gateway")
+
+_KEY_BYTES = 32  # secrets.token_urlsafe(32) -> >= 43 url-safe chars
 
 
 class Settings(BaseSettings):
     """Gateway runtime settings.
 
-    ``api_key`` is intentionally provisioned from the TOML file / explicit
-    construction only — it is excluded from the env mapping in
-    ``load_settings`` so ``GATEWAY_API_KEY`` is never honored (D-01).
+    ``host``/``port``/``output_root`` are env-overridable ops knobs (D-11).
+    ``api_key`` is provisioned from the TOML file / explicit construction only
+    (D-01): its alias keeps it off the ``GATEWAY_`` env mapping, and
+    ``load_settings`` always passes it explicitly.
     """
 
-    model_config = SettingsConfigDict(env_prefix="GATEWAY_")
+    model_config = SettingsConfigDict(env_prefix="GATEWAY_", extra="ignore")
 
     host: str = "127.0.0.1"  # AUTH-02: localhost bind by default
     port: int = 9191
     url_base: str = ""  # PLAT-01: UrlBase reverse-proxy prefix; "" = none
     output_root: str = "/data/manga"  # D-11: gateway-determined default
-    api_key: str
+    # alias decouples the key from the GATEWAY_ env prefix (D-01).
+    api_key: str = Field(alias="api_key")
+
+
+def load_settings(path: Path = Path("config.toml")) -> Settings:
+    """Load settings from TOML, generating + persisting the key on first run.
+
+    Args:
+        path: TOML config path (source of truth, D-10).
+
+    Returns:
+        Fully-provisioned ``Settings``. The ``api_key`` always comes from the
+        TOML data, never from the environment (D-01/D-11).
+    """
+    data: dict[str, object] = {}
+    if path.exists():
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+
+    api_key = data.get("api_key")
+    if not api_key or not isinstance(api_key, str):
+        api_key = secrets.token_urlsafe(_KEY_BYTES)  # D-01 generate
+        data["api_key"] = api_key
+        # stdlib tomllib is read-only — tomli_w writes the key back (D-10).
+        path.write_text(tomli_w.dumps(data), encoding="utf-8")
+        _log.info("Generated API key: %s", api_key)  # log exactly once (D-01)
+
+    # api_key passed explicitly (beats env); host/port/output_root come from
+    # env overrides via pydantic-settings (D-11). GATEWAY_API_KEY is ignored.
+    return Settings(api_key=api_key)

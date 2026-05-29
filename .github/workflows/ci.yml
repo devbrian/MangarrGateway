@@ -1,0 +1,17 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  gate:
+    # Linux runner: uvloop is active here (absent on the Windows dev host).
+    # The contract test binds no port (in-process ASGITransport), so the loop
+    # implementation is irrelevant to it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.12
+      - run: uv sync --dev
+      # The SAME command runnable locally (D-12).
+      - run: uv run nox -s gate
