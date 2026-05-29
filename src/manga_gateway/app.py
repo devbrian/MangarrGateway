@@ -26,7 +26,9 @@ from .framework.ratelimit import RateLimiter
 from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
 from .framework.transport import HttpxTransport
+from .handles.store import HandleStore
 from .security import require_api_key
+from .sources import register_builtin_sources
 
 # 12h caps TTL (PLAT-04).
 _CAPS_TTL_SECONDS = 43_200
@@ -41,8 +43,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session = SessionManager(transport)  # R1 shared session
     app.state.solver = NoopSolver()  # BOT-01 default
     app.state.ratelimiter = RateLimiter()  # rate-limit seam
-    app.state.registry = SourceRegistry()  # SRC-01, empty in Phase 1
+    registry = SourceRegistry()  # SRC-01
+    register_builtin_sources(registry)  # register MangaDex into THIS instance
+    app.state.registry = registry
     app.state.caps_cache = TTLCache(maxsize=1, ttl=_CAPS_TTL_SECONDS)  # PLAT-04
+    app.state.handle_store = HandleStore()  # opaque downloadHandle store (HDL-01/02)
     try:
         yield
     finally:

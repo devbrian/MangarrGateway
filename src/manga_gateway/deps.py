@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from .framework.registry import SourceRegistry
     from .framework.session import SessionManager
     from .framework.transport import Transport
+    from .handles.store import HandleStore
 
 
 def get_settings(request: Request) -> Settings:
@@ -54,3 +55,8 @@ def get_registry(request: Request) -> SourceRegistry:
 def get_caps_cache(request: Request) -> TTLCache[str, object]:
     cache: TTLCache[str, object] = request.app.state.caps_cache
     return cache
+
+
+def get_handle_store(request: Request) -> HandleStore:
+    store: HandleStore = request.app.state.handle_store
+    return store

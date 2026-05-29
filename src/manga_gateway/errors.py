@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 ErrorCode = Literal[
     "auth", "rate_limited", "source_unavailable", "bad_request", "internal"
@@ -68,6 +69,24 @@ def register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=400,
             content=_error("bad_request", "Malformed request"),
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exc(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # A 400 from a body-parse failure (FastAPI raises a 400 HTTPException, not a
+        # RequestValidationError, when the body is undecodable) must still serialize
+        # the contract Error envelope (CTRT-01 / T-02-05) — never Starlette's bare
+        # {"detail": ...}. Other statuses (e.g. 404) keep the default JSON detail
+        # shape so a genuine 404 stays a normal 404 (Pitfall 5).
+        if exc.status_code == 400:
+            return JSONResponse(
+                status_code=400,
+                content=_error("bad_request", "Malformed request"),
+            )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=getattr(exc, "headers", None),
         )
 
     @app.exception_handler(RateLimited)

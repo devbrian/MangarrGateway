@@ -20,6 +20,7 @@ from .errors import SourceError
 if TYPE_CHECKING:
     from aiolimiter import AsyncLimiter
 
+    from ..handles.store import HandleStore
     from .ratelimit import RateLimiter
     from .session import SessionManager
 
@@ -37,6 +38,7 @@ class SourceContext:
         rate_limit_per_minute: int,
         session: SessionManager,
         ratelimiter: RateLimiter,
+        handle_store: HandleStore,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -44,7 +46,13 @@ class SourceContext:
         self._limiter: AsyncLimiter = ratelimiter.for_source(
             source_key, rate_limit_per_minute
         )
+        self._handle_store = handle_store
         self._warnings: list[tuple[str, str]] = []
+
+    @property
+    def handle_store(self) -> HandleStore:
+        """The app-scoped handle store a source mints into (HDL-01)."""
+        return self._handle_store
 
     @property
     def warnings(self) -> list[tuple[str, str]]:
