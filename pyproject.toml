@@ -1,0 +1,57 @@
+[project]
+name = "manga-gateway"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiolimiter==1.2.1",
+    "cachetools==7.1.4",
+    "fastapi==0.136.3",
+    "httpx==0.28.1",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.1",
+    "tomli-w==1.2.0",
+    "uvicorn[standard]==0.48.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy==2.1.0",
+    "nox>=2026.4.10",
+    "pytest-asyncio==1.4.0",
+    "respx==0.23.1",
+    "ruff==0.15.15",
+    "schemathesis==4.20.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manga_gateway"]
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+# F=pyflakes, E=pycodestyle, I=isort, UP=pyupgrade, B=bugbear,
+# ASYNC=flake8-async (catches blocking calls on the event loop).
+select = ["F", "E", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["manga_gateway"]
+
+[[tool.mypy.overrides]]
+# schemathesis ships partial stubs; relax strictness for the contract harness.
+module = ["tests.test_contract"]
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
