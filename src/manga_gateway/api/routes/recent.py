@@ -117,9 +117,7 @@ async def get_recent(
     handle_store: Annotated[HandleStore, Depends(get_handle_store)],
     sources: Annotated[str | None, Query(description="CSV of source keys")] = None,
     languages: Annotated[str | None, Query(description="CSV of BCP-47 codes")] = None,
-    limit: Annotated[
-        str | None, Query(description="Max items; clamped <=100")
-    ] = None,
+    limit: Annotated[str | None, Query(description="Max items; clamped <=100")] = None,
     since: Annotated[
         str | None, Query(description="Return items newer than this")
     ] = None,

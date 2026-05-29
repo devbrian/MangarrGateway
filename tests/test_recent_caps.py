@@ -263,9 +263,7 @@ async def test_caps_advertises_live_mangadex_source(client: httpx.AsyncClient) -
 
 
 @pytest.mark.asyncio
-async def test_caps_served_read_through_cache(
-    client: httpx.AsyncClient, app
-) -> None:
+async def test_caps_served_read_through_cache(client: httpx.AsyncClient, app) -> None:
     # First call populates the 12h caps cache; second returns the same cached object.
     first = await client.get("/caps")
     assert first.status_code == 200

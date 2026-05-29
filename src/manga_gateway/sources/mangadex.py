@@ -174,9 +174,7 @@ class MangaDexSource(Source):
         volume = self._parse_int(attrs.get("volume"))
         language = attrs.get("translatedLanguage") or "en"
         page_count = self._parse_int(attrs.get("pages"))
-        publish_date = (
-            attrs.get("readableAt") or attrs.get("publishAt") or ""
-        )
+        publish_date = attrs.get("readableAt") or attrs.get("publishAt") or ""
 
         manga_title = self._manga_title(chapter, language)
         group = self._relationship_name(chapter, "scanlation_group")
@@ -189,9 +187,7 @@ class MangaDexSource(Source):
             group=group,
         )
         # D-21: chapter UUID guarantees per-upload uniqueness across groups.
-        guid = (
-            f"mangadex:{manga_id}:ch-{raw_chapter or '?'}:{language}:{chapter_id}"
-        )
+        guid = f"mangadex:{manga_id}:ch-{raw_chapter or '?'}:{language}:{chapter_id}"
 
         handle = ctx.handle_store.mint(
             ResolutionRecord(

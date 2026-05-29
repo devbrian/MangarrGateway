@@ -182,9 +182,7 @@ class _SequenceTransport:
         self._responses = responses
         self.calls = 0
 
-    async def request(
-        self, method: str, url: str, **kwargs: object
-    ) -> httpx.Response:
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
         self.calls += 1
         return self._responses.pop(0)
 
@@ -315,7 +313,9 @@ async def test_search_title_returns_releases(client: httpx.AsyncClient) -> None:
         return_value=httpx.Response(200, json=_chapter_feed_payload(manga_id))
     )
 
-    resp = await client.post("/search", json={"type": "chapter", "query": "Solo Leveling"})
+    resp = await client.post(
+        "/search", json={"type": "chapter", "query": "Solo Leveling"}
+    )
     assert resp.status_code == 200
     body = resp.json()
     releases = body["releases"]
@@ -383,7 +383,9 @@ async def test_search_minted_handle_resolves_in_store(
         return_value=httpx.Response(200, json=_chapter_feed_payload(manga_id))
     )
 
-    resp = await client.post("/search", json={"type": "chapter", "query": "Solo Leveling"})
+    resp = await client.post(
+        "/search", json={"type": "chapter", "query": "Solo Leveling"}
+    )
     handle = resp.json()["releases"][0]["downloadHandle"]
     store = app.state.handle_store
     record = store.resolve(handle)
