@@ -1,0 +1,90 @@
+"""Shape assertions for the Phase-1 read stubs ``GET /caps`` + ``GET /status``.
+
+These complement the schemathesis contract harness (``test_contract.py``) with
+explicit, human-readable shape checks: camelCase field names on the wire, the
+empty-but-valid ``sources: []`` invariant (D-05 — NO invented source data), the
+``downloadFormats`` enum subset, and the PLAT-04 caps-cache read-through (same
+object served on a second request).
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+
+_DOWNLOAD_FORMAT_ENUM = {"cbz", "cbt", "folder"}
+
+
+@pytest.mark.asyncio
+async def test_caps_shape_and_empty_sources(client: httpx.AsyncClient) -> None:
+    """GET /caps returns camelCase fields, empty-but-valid sources, valid formats."""
+    resp = await client.get("/caps")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # camelCase on the wire (response_model_by_alias=True).
+    assert isinstance(body["gatewayVersion"], str) and body["gatewayVersion"]
+    assert isinstance(body["supportedSearchParams"], list)
+    assert body["supportedSearchParams"]  # non-empty list of str
+    assert all(isinstance(p, str) for p in body["supportedSearchParams"])
+
+    # D-05: sources stays [] — no invented SourceCap data this phase.
+    assert body["sources"] == []
+
+    # limits.{defaultPageSize, maxPageSize} are ints.
+    assert isinstance(body["limits"]["defaultPageSize"], int)
+    assert isinstance(body["limits"]["maxPageSize"], int)
+
+    # downloadFormats subset of the contract enum.
+    assert set(body["downloadFormats"]) <= _DOWNLOAD_FORMAT_ENUM
+    assert body["downloadFormats"]
+
+
+@pytest.mark.asyncio
+async def test_caps_served_from_cache(client: httpx.AsyncClient) -> None:
+    """PLAT-04: /caps is served read-through the 12h caps TTLCache.
+
+    The lifespan-built cache persists across requests within the same app, so the
+    second request returns the same cached document the first one populated.
+    """
+    first = await client.get("/caps")
+    second = await client.get("/caps")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json() == second.json()
+
+
+@pytest.mark.asyncio
+async def test_caps_cache_object_identity(app, client: httpx.AsyncClient) -> None:  # type: ignore[no-untyped-def]
+    """PLAT-04: the cache holds the SAME Capabilities object across requests."""
+    from manga_gateway.api.routes.caps import _CAPS_KEY
+    from manga_gateway.models.caps import Capabilities
+
+    await client.get("/caps")
+    cached_first = app.state.caps_cache.get(_CAPS_KEY)
+    assert isinstance(cached_first, Capabilities)
+
+    await client.get("/caps")
+    cached_second = app.state.caps_cache.get(_CAPS_KEY)
+    # Identity: the read-through did not rebuild the document.
+    assert cached_first is cached_second
+
+
+@pytest.mark.asyncio
+async def test_status_shape(client: httpx.AsyncClient) -> None:
+    """GET /status returns the contract-shaped StatusResponse with camelCase fields."""
+    resp = await client.get("/status")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # isLocalhost is true under the default 127.0.0.1 test bind (AUTH-02).
+    assert body["isLocalhost"] is True
+    assert isinstance(body["outputRootFolders"], list)
+    assert all(isinstance(f, str) for f in body["outputRootFolders"])
+    assert isinstance(body["version"], str) and body["version"]
+    assert body["removesCompletedDownloads"] is False
+
+    caps = body["capabilities"]
+    assert isinstance(caps["pause"], bool)
+    assert isinstance(caps["outputFormats"], list)
+    assert isinstance(caps["maxConcurrentChapters"], int)

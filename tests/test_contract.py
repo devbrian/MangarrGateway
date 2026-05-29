@@ -40,7 +40,8 @@ from .conftest import BASE_URL, TEST_API_KEY
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "manga-gateway.openapi.yaml"
 
 # Implemented operations this plan exercises (D-06). Grows as endpoints land.
-IMPLEMENTED_OPERATIONS = ["getVersion"]
+# Plan 01-02 adds getStatus + getCaps; /search, /recent, /downloads* stay excluded.
+IMPLEMENTED_OPERATIONS = ["getVersion", "getStatus", "getCaps"]
 
 # Response-conformance checks: stable from endpoint #1.
 CONTRACT_CHECKS = [
