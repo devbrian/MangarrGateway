@@ -87,7 +87,9 @@ def load_settings(path: Path = Path("config.toml")) -> Settings:
             except OSError:
                 pass
             raise
-        _log.info("Generated API key: %s", api_key)  # log exactly once (D-01)
+        # Log the generation event ONCE (D-01) — never the secret itself; the
+        # operator reads the key from the persisted TOML at `path` (CodeRabbit).
+        _log.info("Generated a new API key and persisted it to %s", path)
 
     # api_key passed explicitly (beats env); host/port/output_root come from
     # env overrides via pydantic-settings (D-11). GATEWAY_API_KEY is ignored.

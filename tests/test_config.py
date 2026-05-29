@@ -43,13 +43,21 @@ def test_logs_key_once_at_generation(
     cfg = tmp_path / "config.toml"
     with caplog.at_level("INFO", logger="manga_gateway"):
         settings = load_settings(cfg)
-    generation_logs = [r for r in caplog.records if settings.api_key in r.getMessage()]
+    # Assert a generation EVENT was logged once — never the secret value itself
+    # (logging the raw key would be a credential leak; CodeRabbit).
+    generation_logs = [
+        r for r in caplog.records if "Generated a new API key" in r.getMessage()
+    ]
     assert len(generation_logs) == 1
-    # A second load must NOT log the key again.
+    # The raw key must NOT appear in any log message.
+    assert not [r for r in caplog.records if settings.api_key in r.getMessage()]
+    # A second load (key already present) must NOT log a generation event again.
     caplog.clear()
     with caplog.at_level("INFO", logger="manga_gateway"):
         load_settings(cfg)
-    assert not [r for r in caplog.records if settings.api_key in r.getMessage()]
+    assert not [
+        r for r in caplog.records if "Generated a new API key" in r.getMessage()
+    ]
 
 
 def test_env_api_key_is_ignored(

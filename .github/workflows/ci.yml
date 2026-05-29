@@ -2,6 +2,10 @@ name: ci
 
 on: [push, pull_request]
 
+# Least-privilege default token (CodeRabbit/zizmor: excessive-permissions).
+permissions:
+  contents: read
+
 jobs:
   gate:
     # Linux runner: uvloop is active here (absent on the Windows dev host).
@@ -9,8 +13,12 @@ jobs:
     # implementation is irrelevant to it.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      # Actions pinned to full commit SHAs (supply-chain hardening); trailing
+      # comment records the human-readable tag.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false # don't leak the token into the checkout
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.12
       - run: uv sync --dev
       # The SAME command runnable locally (D-12).
