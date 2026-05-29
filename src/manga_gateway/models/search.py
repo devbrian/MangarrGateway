@@ -16,7 +16,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, field_serializer
 
 from .common import ApiModel
 
@@ -59,6 +59,14 @@ class Release(ApiModel):
     page_count: int | None = Field(default=None, alias="pageCount")
     size_bytes: int = Field(default=0, alias="sizeBytes")
     ids: dict[str, Any] | None = None
+
+    @field_serializer("chapter_number", when_used="json")
+    def _serialize_chapter_number(self, value: Decimal | None) -> float | None:
+        """Emit a JSON ``number`` on the wire (contract ``type: number``) while the
+        in-memory model keeps the lossless ``Decimal`` (SRCH-06). ``float`` of a
+        <=3-place decimal round-trips exactly to the required precision.
+        """
+        return float(value) if value is not None else None
 
 
 class SourceWarning(ApiModel):
