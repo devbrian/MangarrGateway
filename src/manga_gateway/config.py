@@ -15,7 +15,9 @@ effective key. The ``alias`` on ``api_key`` further decouples it from the
 from __future__ import annotations
 
 import logging
+import os
 import secrets
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -66,7 +68,25 @@ def load_settings(path: Path = Path("config.toml")) -> Settings:
         api_key = secrets.token_urlsafe(_KEY_BYTES)  # D-01 generate
         data["api_key"] = api_key
         # stdlib tomllib is read-only — tomli_w writes the key back (D-10).
-        path.write_text(tomli_w.dumps(data), encoding="utf-8")
+        # Atomic + owner-only write of the sole plaintext secret (WR-03/WR-04):
+        # mkstemp creates the temp file 0o600 in the same dir, os.replace() makes
+        # the swap atomic so a crash mid-write can't truncate the only key copy.
+        # On Windows the 0o600 bits are best-effort (largely ignored); effective
+        # on the Linux prod target.
+        rendered = tomli_w.dumps(data)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent or "."), prefix=f"{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(rendered)
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         _log.info("Generated API key: %s", api_key)  # log exactly once (D-01)
 
     # api_key passed explicitly (beats env); host/port/output_root come from

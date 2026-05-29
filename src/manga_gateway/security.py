@@ -28,5 +28,11 @@ async def require_api_key(
     """Reject the request unless a valid key is supplied (header or query)."""
     supplied = header_key or query_key
     expected: str = request.app.state.settings.api_key
-    if not supplied or not secrets.compare_digest(supplied, expected):
+    # Compare on UTF-8 bytes (CR-01): secrets.compare_digest raises TypeError on
+    # a non-ASCII str, and HTTP header values arrive latin-1-decoded, so any byte
+    # 0x80-0xFF in X-Api-Key/?apikey= would otherwise crash auth to 500 instead of
+    # the contract 401. Encoding both operands accepts any input and rejects it.
+    if not supplied or not secrets.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise AuthError

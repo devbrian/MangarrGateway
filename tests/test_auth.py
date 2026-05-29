@@ -58,6 +58,24 @@ async def test_wrong_key_returns_401_auth(app: FastAPI) -> None:
     assert resp.json()["error"]["code"] == "auth"
 
 
+async def test_non_ascii_key_returns_401_not_500(app: FastAPI) -> None:
+    """A non-ASCII key is rejected as 401, never crashed to 500 (CR-01).
+
+    HTTP header values arrive latin-1-decoded, so a byte 0x80-0xFF yields a
+    non-ASCII str. secrets.compare_digest raises TypeError on a non-ASCII str;
+    encoding both operands to UTF-8 bytes first keeps the auth path returning
+    the contract 401 instead of falling through to the catch-all 500.
+
+    The key is sent as raw bytes: httpx encodes outgoing header values as ASCII
+    and would reject a non-ASCII str, but the byte 0xFF on the wire is exactly
+    what the ASGI layer decodes to the non-ASCII str that hits compare_digest.
+    """
+    async with _client(app) as ac:
+        resp = await ac.get("/version", headers={"X-Api-Key": b"\xff-not-the-key"})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "auth"
+
+
 async def test_singleton_seams_built_once(app: FastAPI) -> None:
     """The same seam object is reused across two requests (R1/PLAT-02).
 
