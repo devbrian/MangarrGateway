@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 from ..framework.base import Source
+from ..framework.errors import SourceError
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -104,6 +105,45 @@ class MangaDexSource(Source):
             if rel is not None:
                 releases.append(rel)
         return releases
+
+    # ───────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
+
+    async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
+        """Resolve a FRESH at-home manifest into ordered page URLs (PKG-01/R6).
+
+        Calls ``GET {base_url}/at-home/server/{chapter_id}`` (shares the 300/min
+        api.mangadex.org limiter via ``get_json``), then constructs
+        ``{baseUrl}/data/{hash}/{filename}`` for each entry of ``chapter.data``: the
+        full-quality array, already in reading order (Pitfall 5). The ``baseUrl`` is
+        read fresh per call and NEVER stored (~15-min TTL, D-17/D-32). The ``/report``
+        endpoint is intentionally NOT called in v1 (D-32/D-32a).
+        """
+        data = await ctx.get_json(f"{self.base_url}/at-home/server/{chapter_id}")
+        base_url = data.get("baseUrl")  # FRESH ~15-min TTL: NEVER store (D-17/D-32)
+        chapter = data.get("chapter")
+        chapter_hash = chapter.get("hash") if isinstance(chapter, dict) else None
+        filenames = chapter.get("data") if isinstance(chapter, dict) else None
+        # Guard a malformed at-home response (WR-06): a typed SourceError surfaces as a
+        # contract warning instead of a raw KeyError/TypeError leaking from the source.
+        # Every filename must be a non-empty string, else a bad entry yields an invalid
+        # page URL that only fails much later during image fetch (CR).
+        if (
+            not base_url
+            or not chapter_hash
+            or not isinstance(filenames, list)
+            or not all(isinstance(name, str) and name for name in filenames)
+        ):
+            raise SourceError("source_unavailable", "malformed at-home manifest")
+        # full-quality, in reading order (not dataSaver)
+        return [f"{base_url}/data/{chapter_hash}/{name}" for name in filenames]
+
+    async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
+        """Fetch one page image's raw bytes via the shared session (PKG-02).
+
+        Delegates to ``ctx.get_bytes``: bounded by the per-job semaphore (Plan 03),
+        NOT the per-source limiter (image host is not API-rate-limited; D-31).
+        """
+        return await ctx.get_bytes(url)
 
     # ─────────────────────────── MangaDex fetch helpers ──────────────────────────
 

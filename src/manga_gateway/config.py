@@ -45,6 +45,16 @@ class Settings(BaseSettings):
     port: int = 9191
     url_base: str = ""  # PLAT-01: UrlBase reverse-proxy prefix; "" = none
     output_root: str = "/data/manga"  # D-11: gateway-determined default
+    # Download-surface concurrency + persistence knobs — env-overridable ops knobs
+    # (D-11), same treatment as host/port/output_root (NOT the api_key exclusion).
+    # ge=1: a non-positive bound would break semaphore creation / job scheduling.
+    max_concurrent_chapters: int = Field(
+        default=3, ge=1
+    )  # D-30: global job bound, reported by /status
+    image_fetch_concurrency: int = Field(
+        default=6, ge=1
+    )  # D-31: per-job image-fetch bound
+    db_path: str = "gateway.db"  # RESEARCH Open Q2: aiosqlite job store path
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
 

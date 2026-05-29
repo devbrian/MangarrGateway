@@ -1,0 +1,267 @@
+"""aiosqlite raw-SQL ``JobStore`` — durable job persistence (PLAT-03, D-27/28).
+
+A single :class:`aiosqlite.Connection` owned by the lifespan backs the ``jobs``
+table. The mechanic differs from :mod:`manga_gateway.handles.store` (SQLite vs
+in-memory ``TTLCache``) but the SHAPE is the same: one class owning one backing
+store, narrow methods, docstring citing D-numbers.
+
+Two structural guarantees:
+
+* **One LIVE job per ``releaseHandle`` (D-27)** — a PARTIAL unique index on
+  ``release_handle`` restricted to live statuses. A duplicate live insert raises
+  ``aiosqlite.IntegrityError``; once a job reaches a TERMINAL status the handle is
+  freed so the release can be re-grabbed (DELETE/failure path).
+* **Restart rehydration (PLAT-03/D-28)** — :meth:`rehydrate` flips every job left
+  in a live status by an unclean shutdown to ``failed`` ("interrupted by restart")
+  and projects all rows; TERMINAL jobs survive untouched.
+
+NO at-home ``baseUrl``/cookie column exists (HDL-01/D-17) — volatile tokens are
+never persisted. Writes are serialized behind a single ``asyncio.Lock`` and run
+under WAL (Pitfall 7); aiosqlite is async-native so every call is awaited (no
+``to_thread``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+
+import aiosqlite
+
+from .model import _LIVE_STATUSES, Job, JobStatus
+
+# One live job per handle (D-27): the index applies ONLY while a job is live, so a
+# handle becomes re-grabbable once its job is completed/failed. Built from the
+# single source of truth in model.py so the index, find_live, and rehydrate agree.
+_LIVE_SET_SQL = "(" + ",".join(f"'{s}'" for s in _LIVE_STATUSES) + ")"
+
+_CREATE_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id           TEXT PRIMARY KEY,
+  release_handle   TEXT NOT NULL,
+  source_key       TEXT NOT NULL,
+  title            TEXT NOT NULL,
+  status           TEXT NOT NULL,
+  manga_id         INTEGER,
+  output_format    TEXT NOT NULL,
+  chapter_id       TEXT,
+  language         TEXT,
+  total_pages      INTEGER,
+  downloaded_pages INTEGER,
+  total_bytes      INTEGER NOT NULL DEFAULT 0,
+  remaining_bytes  INTEGER NOT NULL DEFAULT 0,
+  output_path      TEXT,
+  message          TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL,
+  completed_at     TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_jobs_live_handle
+  ON jobs(release_handle)
+  WHERE status IN {_LIVE_SET_SQL};
+"""
+
+_COLUMNS = (
+    "job_id",
+    "release_handle",
+    "source_key",
+    "title",
+    "status",
+    "manga_id",
+    "output_format",
+    "chapter_id",
+    "language",
+    "total_pages",
+    "downloaded_pages",
+    "total_bytes",
+    "remaining_bytes",
+    "output_path",
+    "message",
+    "created_at",
+    "updated_at",
+    "completed_at",
+)
+
+_INSERT_SQL = (
+    f"INSERT INTO jobs ({', '.join(_COLUMNS)}) "
+    f"VALUES ({', '.join('?' for _ in _COLUMNS)})"
+)
+
+_UPDATE_SQL = (
+    "UPDATE jobs SET "
+    + ", ".join(f"{c} = ?" for c in _COLUMNS if c != "job_id")
+    + " WHERE job_id = ?"
+)
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _row_to_job(row: aiosqlite.Row) -> Job:
+    return Job(
+        job_id=row["job_id"],
+        release_handle=row["release_handle"],
+        source_key=row["source_key"],
+        title=row["title"],
+        status=JobStatus(row["status"]),
+        manga_id=row["manga_id"],
+        output_format=row["output_format"],
+        chapter_id=row["chapter_id"],
+        language=row["language"],
+        total_pages=row["total_pages"],
+        downloaded_pages=row["downloaded_pages"],
+        total_bytes=row["total_bytes"],
+        remaining_bytes=row["remaining_bytes"],
+        output_path=row["output_path"],
+        message=row["message"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _job_values(job: Job) -> tuple[object, ...]:
+    return (
+        job.job_id,
+        job.release_handle,
+        job.source_key,
+        job.title,
+        job.status.value,
+        job.manga_id,
+        job.output_format,
+        job.chapter_id,
+        job.language,
+        job.total_pages,
+        job.downloaded_pages,
+        job.total_bytes,
+        job.remaining_bytes,
+        job.output_path,
+        job.message,
+        job.created_at,
+        job.updated_at,
+        job.completed_at,
+    )
+
+
+class JobStore:
+    """Owns one ``aiosqlite.Connection`` for the ``jobs`` table (PLAT-03).
+
+    Construct via :func:`open_store` (which creates the schema). All writes go
+    through a single :class:`asyncio.Lock` so the shared connection never sees
+    concurrent statements (Pitfall 7); reads share the same connection.
+    """
+
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        self._conn = conn
+        self._write_lock = asyncio.Lock()
+
+    async def insert(self, job: Job) -> None:
+        """Persist a new job. Raises ``aiosqlite.IntegrityError`` on a duplicate
+        live ``release_handle`` (the partial unique index, D-27).
+        """
+        async with self._write_lock:
+            await self._conn.execute(_INSERT_SQL, _job_values(job))
+            await self._conn.commit()
+
+    async def update(self, job: Job) -> None:
+        """Write-through a status/progress transition (called BEFORE the in-memory
+        projection mutates, RESEARCH Pattern 2). Stamps ``updated_at``.
+        """
+        job.updated_at = _now_iso()
+        values = _job_values(job)
+        # _UPDATE_SQL sets every column except job_id, then matches on job_id.
+        params = (*values[1:], job.job_id)
+        async with self._write_lock:
+            cur = await self._conn.execute(_UPDATE_SQL, params)
+            # Fail fast on a zero-row update: an unknown/deleted job_id must not be
+            # treated as a durable transition, or in-memory and SQLite state would
+            # desync across restart (CR).
+            if cur.rowcount != 1:
+                raise KeyError(f"job not found: {job.job_id}")
+            await self._conn.commit()
+
+    async def get(self, job_id: str) -> Job | None:
+        """Return the job by id, or ``None`` if unknown."""
+        async with self._conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_job(row) if row is not None else None
+
+    async def find_live_by_handle(self, release_handle: str) -> Job | None:
+        """Return the single LIVE job for ``release_handle``, or ``None`` (D-27)."""
+        async with self._conn.execute(
+            f"SELECT * FROM jobs WHERE release_handle = ? "
+            f"AND status IN {_LIVE_SET_SQL}",
+            (release_handle,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_job(row) if row is not None else None
+
+    async def find_latest_by_handle(self, release_handle: str) -> Job | None:
+        """Return the most-recently-updated job for ``release_handle`` (D-27).
+
+        Used by the idempotency-by-existence check: after no LIVE job is found, the
+        manager inspects the latest job for this handle and, if it is ``completed``
+        with its output file still on disk, returns its id (single os.stat per submit,
+        DL-05). Ordered by ``updated_at`` descending, then ``rowid`` descending as a
+        deterministic tiebreak so same-timestamp rows resolve consistently (WR-01:
+        freshest insert wins).
+        """
+        async with self._conn.execute(
+            "SELECT * FROM jobs WHERE release_handle = ? "
+            "ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            (release_handle,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_job(row) if row is not None else None
+
+    async def delete(self, job_id: str) -> None:
+        """Remove a job row (DELETE /downloads path — frees the handle, D-27)."""
+        async with self._write_lock:
+            await self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            await self._conn.commit()
+
+    async def all(self) -> list[Job]:
+        """Project every persisted job (queue + history read model, DL-05)."""
+        async with self._conn.execute("SELECT * FROM jobs") as cur:
+            rows = await cur.fetchall()
+        return [_row_to_job(r) for r in rows]
+
+    async def rehydrate(self) -> list[Job]:
+        """Restart recovery (PLAT-03/D-28): flip live jobs to ``failed``, project all.
+
+        Every job left in a live status by an unclean shutdown is marked
+        ``failed`` with message ``"interrupted by restart"``; terminal jobs
+        (completed/failed) are untouched and survive the restart. Returns all
+        rows projected for rehydrating the in-memory queue.
+        """
+        async with self._write_lock:
+            await self._conn.execute(
+                f"UPDATE jobs SET status = 'failed', "
+                f"message = 'interrupted by restart', updated_at = ? "
+                f"WHERE status IN {_LIVE_SET_SQL}",
+                (_now_iso(),),
+            )
+            await self._conn.commit()
+        return await self.all()
+
+    async def close(self) -> None:
+        """Close the backing connection (lifespan teardown)."""
+        await self._conn.close()
+
+
+async def open_store(path: str) -> JobStore:
+    """Open (and schema-init) the job store at ``path``.
+
+    Connects, enables WAL (Pitfall 7), sets a ``Row`` factory for dict-shaped
+    reads, creates the table + partial unique index if absent, and returns a
+    ready :class:`JobStore`.
+    """
+    conn = await aiosqlite.connect(path)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.executescript(_CREATE_SCHEMA)
+    await conn.commit()
+    return JobStore(conn)

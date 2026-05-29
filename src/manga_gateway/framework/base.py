@@ -69,3 +69,18 @@ class Source(ABC):
     ) -> list[Release]:
         """Return newest-first recent releases (RCNT-01/02)."""
         ...
+
+    @abstractmethod
+    async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
+        """Resolve a chapter id → ordered page URLs, INTERNALLY (PKG-01/R6).
+
+        The manifest (page URLs / any fresh at-home token) is resolved at grab time and
+        NEVER returned to a caller — only the gateway's own engine consumes it. Declared
+        abstractly so the job engine dispatches source-agnostically (SRC-01).
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
+        """Fetch one page image's raw bytes through the shared session (PKG-02)."""
+        ...

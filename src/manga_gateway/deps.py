@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from .framework.session import SessionManager
     from .framework.transport import Transport
     from .handles.store import HandleStore
+    from .jobs.manager import JobManager
 
 
 def get_settings(request: Request) -> Settings:
@@ -60,3 +61,8 @@ def get_caps_cache(request: Request) -> TTLCache[str, object]:
 def get_handle_store(request: Request) -> HandleStore:
     store: HandleStore = request.app.state.handle_store
     return store
+
+
+def get_job_manager(request: Request) -> JobManager:
+    job_manager: JobManager = request.app.state.job_manager
+    return job_manager

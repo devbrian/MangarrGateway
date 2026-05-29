@@ -23,6 +23,11 @@ _USER_AGENT = "MangaGateway/1.0"
 # construct their own client, so this bounds outbound concurrency process-wide.
 _LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 
+# Explicit per-request deadlines so no outbound call can hang unbounded (CR-02).
+# Lives HERE with the other client-level config; the per-job asyncio.timeout wrapper
+# is a separate concern handled in the job engine, not added here.
+_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+
 # HTTP/2 needs the optional ``h2`` package; enable only when present so the gateway
 # runs with the locked dependency set (falls back to HTTP/1.1 transparently).
 _HTTP2 = importlib.util.find_spec("h2") is not None
@@ -56,6 +61,7 @@ class HttpxTransport:
             headers={"User-Agent": _USER_AGENT},
             http2=_HTTP2,
             limits=_LIMITS,
+            timeout=_TIMEOUT,  # bounded per-request deadline (CR-02)
         )
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:

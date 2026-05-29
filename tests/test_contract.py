@@ -40,8 +40,19 @@ from .conftest import BASE_URL, TEST_API_KEY
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "manga-gateway.openapi.yaml"
 
 # Implemented operations this plan exercises (D-06). Grows as endpoints land.
-# Plan 01-02 adds getStatus + getCaps; /search, /recent, /downloads* stay excluded.
-IMPLEMENTED_OPERATIONS = ["getVersion", "getStatus", "getCaps", "search", "getRecent"]
+# Plan 03-04 adds the four download-surface ops (submit/list/get/remove) now that the
+# full submit→fetch→package→poll→delete loop is contract-faithful.
+IMPLEMENTED_OPERATIONS = [
+    "getVersion",
+    "getStatus",
+    "getCaps",
+    "search",
+    "getRecent",
+    "submitDownload",
+    "getDownloads",
+    "getDownload",
+    "removeDownload",
+]
 
 # Response-conformance checks: stable from endpoint #1.
 CONTRACT_CHECKS = [

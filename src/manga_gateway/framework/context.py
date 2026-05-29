@@ -96,3 +96,25 @@ class SourceContext:
         resp.raise_for_status()  # 5xx → HTTPStatusError → retried by _is_retryable
         result: dict[str, Any] = resp.json()
         return result
+
+    @tenacity.retry(
+        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
+        stop=tenacity.stop_after_attempt(4),
+        retry=tenacity.retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+    async def get_bytes(self, url: str) -> bytes:
+        """GET ``url`` → raw response bytes, retried like ``get_json`` but NOT limited.
+
+        Image bytes are served by the at-home node host (``uploads.mangadex.org``),
+        NOT ``api.mangadex.org``: they are not counted against the per-source API
+        budget, so this deliberately does NOT acquire ``self._limiter`` (D-31 /
+        Pitfall 3). The per-job ``asyncio.Semaphore`` (Plan 03) is the real ceiling.
+        Raises ``SourceError`` on a permanent 4xx; lets transport errors / 5xx bubble
+        to tenacity. Bytes are returned unchanged: never recompressed (PKG-04).
+        """
+        resp = await self._session.transport.request("GET", url)
+        if resp.status_code in _PERMANENT_STATUSES:
+            raise SourceError("source_unavailable", f"upstream {resp.status_code}")
+        resp.raise_for_status()  # 5xx → HTTPStatusError → retried by _is_retryable
+        return resp.content

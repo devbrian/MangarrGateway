@@ -85,12 +85,13 @@ async def test_status_shape(client: httpx.AsyncClient) -> None:
 
     # isLocalhost is true under the default 127.0.0.1 test bind (AUTH-02).
     assert body["isLocalhost"] is True
-    assert isinstance(body["outputRootFolders"], list)
-    assert all(isinstance(f, str) for f in body["outputRootFolders"])
+    # STAT-01: outputRootFolders reports the gateway-determined output root.
+    assert body["outputRootFolders"] == ["/data/manga"]
     assert isinstance(body["version"], str) and body["version"]
-    assert body["removesCompletedDownloads"] is False
+    assert body["removesCompletedDownloads"] is False  # D-28
 
     caps = body["capabilities"]
-    assert isinstance(caps["pause"], bool)
-    assert isinstance(caps["outputFormats"], list)
-    assert isinstance(caps["maxConcurrentChapters"], int)
+    assert caps["pause"] is False  # PAUSE-01 is v2 — unsupported in v1
+    assert set(caps["outputFormats"]) >= {"cbz", "cbt", "folder"}
+    # STAT-01: maxConcurrentChapters reflects the effective D-30 config global (3).
+    assert caps["maxConcurrentChapters"] == 3
