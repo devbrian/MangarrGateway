@@ -28,6 +28,20 @@ if TYPE_CHECKING:
 _PERMANENT_STATUSES = (401, 403, 404)
 
 
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry transport errors and 5xx responses; never permanent 4xx (Pattern 3).
+
+    ``raise_for_status`` turns a 5xx into ``httpx.HTTPStatusError`` AFTER the
+    permanent-4xx gate has already converted 401/403/404 into ``SourceError``, so
+    any ``HTTPStatusError`` reaching here with a >=500 status is genuinely transient.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return False
+
+
 class SourceContext:
     """Framework-owned HTTP + warning context handed to a source hook."""
 
@@ -66,7 +80,7 @@ class SourceContext:
     @tenacity.retry(
         wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
         stop=tenacity.stop_after_attempt(4),
-        retry=tenacity.retry_if_exception_type(httpx.TransportError),
+        retry=tenacity.retry_if_exception(_is_retryable),
         reraise=True,
     )
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
@@ -79,6 +93,6 @@ class SourceContext:
             resp = await self._session.transport.request("GET", url, params=params)
         if resp.status_code in _PERMANENT_STATUSES:
             raise SourceError("source_unavailable", f"upstream {resp.status_code}")
-        resp.raise_for_status()  # 5xx → httpx.HTTPStatusError; tenacity won't retry it
+        resp.raise_for_status()  # 5xx → HTTPStatusError → retried by _is_retryable
         result: dict[str, Any] = resp.json()
         return result

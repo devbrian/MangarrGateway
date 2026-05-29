@@ -116,6 +116,48 @@ async def test_recent_returns_releases_newest_first(client: httpx.AsyncClient) -
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_recent_sorts_by_instant_across_mixed_offsets(
+    client: httpx.AsyncClient,
+) -> None:
+    """WR-02 regression: newest-first compares true instants, not ISO strings.
+
+    A lexicographic string sort would order ``+09:00`` ahead of a later ``+00:00``
+    timestamp because the date substring compares before the offset suffix. Parsing
+    to aware datetimes orders them by actual instant.
+    """
+    manga_id = str(uuid.uuid4())
+    # X: EARLIER instant (2026-05-28T15:00Z) but a LATER local date string.
+    x_local = "2026-05-29T00:00:00+09:00"
+    # Y: LATER instant (2026-05-28T20:00Z) but an earlier date string.
+    y_utc = "2026-05-28T20:00:00+00:00"
+    chapters = [
+        _chapter(
+            chapter="10",
+            chapter_id=str(uuid.uuid4()),
+            manga_id=manga_id,
+            published=x_local,
+        ),
+        _chapter(
+            chapter="11",
+            chapter_id=str(uuid.uuid4()),
+            manga_id=manga_id,
+            published=y_utc,
+        ),
+    ]
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        return_value=httpx.Response(200, json=_recent_payload(chapters))
+    )
+
+    resp = await client.get("/recent")
+    assert resp.status_code == 200
+    releases = resp.json()["releases"]
+    # True newest-first: Y (20:00Z) precedes X (15:00Z) — opposite of a string sort.
+    assert releases[0]["publishDate"] == y_utc
+    assert releases[1]["publishDate"] == x_local
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_recent_languages_filter_and_limit_clamp(
     client: httpx.AsyncClient,
 ) -> None:

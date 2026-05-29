@@ -11,6 +11,7 @@ contract guarantee holds regardless of whether a source honored the upstream hin
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -40,6 +41,28 @@ router = APIRouter()
 
 # Contract ceiling for the recent feed (openapi.yaml: limit maximum 100, T-02-06).
 _MAX_LIMIT = 100
+
+# Floor for empty/malformed timestamps so they sort oldest and never crash the
+# comparison — guards a source emitting an empty publishDate (WR-05).
+_TS_FLOOR = datetime.min.replace(tzinfo=UTC)
+
+
+def _parse_ts(raw: str) -> datetime:
+    """Parse an ISO-8601 timestamp to an aware datetime (handles ``Z`` and offsets).
+
+    Lexicographic string comparison of ISO timestamps is unsafe across mixed
+    ``Z``/``+00:00`` suffixes and future multi-source merges (WR-02), so ``since``
+    filtering and the newest-first sort compare parsed datetimes instead. Empty or
+    malformed values floor to epoch-min (compare as oldest) rather than raising.
+    """
+    if not raw:
+        return _TS_FLOOR
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return _TS_FLOOR
+    # Normalize naive timestamps to UTC so every comparison is aware-vs-aware.
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _split_csv(raw: str | None) -> list[str] | None:
@@ -125,12 +148,14 @@ async def get_recent(
     releases, warning_tuples = await fan_out(selected, _run_one)
 
     # RCNT-02: defensive client-side `since` cut — the contract guarantee holds even if
-    # a source ignored the upstream hint (RESEARCH A3).
+    # a source ignored the upstream hint (RESEARCH A3). Datetime-parsed compare (WR-02):
+    # a release with no provable publishDate (floor) is conservatively excluded.
     if since is not None:
-        releases = [rel for rel in releases if rel.publish_date > since]
+        since_dt = _parse_ts(since)
+        releases = [rel for rel in releases if _parse_ts(rel.publish_date) > since_dt]
 
-    # RCNT-01: merge newest-first by publishDate across all sources.
-    releases.sort(key=lambda rel: rel.publish_date, reverse=True)
+    # RCNT-01: merge newest-first by publishDate across all sources (datetime-parsed).
+    releases.sort(key=lambda rel: _parse_ts(rel.publish_date), reverse=True)
 
     warnings = [
         SourceWarning(source_key=key, code=code, message=message)

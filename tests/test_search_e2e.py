@@ -172,6 +172,68 @@ async def test_fanout_timeout_maps_to_warning() -> None:
     assert len(warnings) == 1
 
 
+# ───────────────────────── SourceContext retry (WR-01) ──────────────────────────
+
+
+class _SequenceTransport:
+    """Fake Transport returning a queued sequence of responses, one per request."""
+
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self._responses = responses
+        self.calls = 0
+
+    async def request(
+        self, method: str, url: str, **kwargs: object
+    ) -> httpx.Response:
+        self.calls += 1
+        return self._responses.pop(0)
+
+    async def aclose(self) -> None:  # pragma: no cover - interface completeness
+        pass
+
+
+def _ctx_over(transport: _SequenceTransport) -> object:
+    from manga_gateway.framework.context import SourceContext
+    from manga_gateway.framework.ratelimit import RateLimiter
+    from manga_gateway.framework.session import SessionManager
+
+    return SourceContext(
+        source_key="x",
+        rate_limit_per_minute=6000,
+        session=SessionManager(transport),
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_retries_5xx_then_succeeds() -> None:
+    # WR-01: a 5xx is transient and MUST be retried (matching the docstring/plan);
+    # a subsequent 200 wins and the parsed body is returned.
+    req = httpx.Request("GET", f"{'https://x/api'}")
+    transport = _SequenceTransport(
+        [
+            httpx.Response(503, request=req),
+            httpx.Response(200, json={"data": "ok"}, request=req),
+        ]
+    )
+    ctx = _ctx_over(transport)
+    result = await ctx.get_json("https://x/api")  # type: ignore[attr-defined]
+    assert result == {"data": "ok"}
+    assert transport.calls == 2  # retried once after the 503
+
+
+@pytest.mark.asyncio
+async def test_context_does_not_retry_permanent_4xx() -> None:
+    # 401/403/404 are permanent → SourceError on the FIRST attempt, never retried.
+    req = httpx.Request("GET", "https://x/api")
+    transport = _SequenceTransport([httpx.Response(404, request=req)])
+    ctx = _ctx_over(transport)
+    with pytest.raises(SourceError):
+        await ctx.get_json("https://x/api")  # type: ignore[attr-defined]
+    assert transport.calls == 1  # no retry on a permanent 4xx
+
+
 # ─────────────────────────── E2E POST /search (Task 3) ──────────────────────────
 
 _MANGADEX = "https://api.mangadex.org"
