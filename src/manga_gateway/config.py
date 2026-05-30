@@ -1,8 +1,8 @@
 """Application settings + API-key provisioning.
 
-TOML is the source of truth (D-10); env vars override ONLY ops knobs
-(host/port/output_root) (D-11). The API key is auto-generated-and-persisted on
-first start and is NEVER supplied via the environment (D-01).
+TOML is the source of truth (D-10); env vars override ops knobs (D-11).
+Precedence: env > TOML > default. The API key is auto-generated-and-persisted
+on first start and is NEVER supplied via the environment (D-01).
 
 Env-exclusion mechanism for ``api_key`` (Open Question 2 / Pitfall 4):
 ``load_settings`` constructs ``Settings(api_key=<from TOML>, ...)`` passing the
@@ -10,6 +10,12 @@ key as an explicit init keyword. In pydantic-settings, init keywords take
 precedence over the environment source, so ``GATEWAY_API_KEY`` can never set the
 effective key. The ``alias`` on ``api_key`` further decouples it from the
 ``GATEWAY_`` env prefix. A regression test asserts the env value is ignored.
+
+TOML→Settings merge for ops knobs (issue #3): any non-``api_key`` field declared
+on :class:`Settings` may be set from the TOML file. Per-field precedence is
+preserved by passing the TOML value as an init kwarg ONLY when the corresponding
+``GATEWAY_<NAME>`` env var is unset — env vars still win when present, matching
+what ``config.example.toml`` advertises.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import secrets
 import tempfile
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import tomli_w
 from pydantic import Field
@@ -150,6 +157,18 @@ def load_settings(path: Path | None = None) -> Settings:
         # operator reads the key from the persisted TOML at `path` (CodeRabbit).
         _log.info("Generated a new API key and persisted it to %s", path)
 
-    # api_key passed explicitly (beats env); host/port/output_root come from
-    # env overrides via pydantic-settings (D-11). GATEWAY_API_KEY is ignored.
-    return Settings(api_key=api_key)
+    # Merge TOML-provided ops knobs into init kwargs, but ONLY for fields whose
+    # ``GATEWAY_<NAME>`` env var is unset — env > TOML > default (issue #3).
+    # Unknown TOML keys are silently ignored (mirrors model_config extra="ignore").
+    # ``api_key`` is handled separately above; never bridge it from env.
+    toml_kwargs: dict[str, Any] = {}
+    for field_name in Settings.model_fields:
+        if field_name == "api_key" or field_name not in data:
+            continue
+        if f"GATEWAY_{field_name.upper()}" in os.environ:
+            continue  # env wins
+        toml_kwargs[field_name] = data[field_name]
+
+    # api_key passed explicitly (beats env, D-01); ops knobs come from TOML when
+    # not env-overridden (D-11). GATEWAY_API_KEY is ignored.
+    return Settings(api_key=api_key, **toml_kwargs)

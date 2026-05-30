@@ -140,3 +140,79 @@ def test_env_overrides_ops_knobs(
     assert settings.host == "0.0.0.0"
     assert settings.port == 8080
     assert settings.output_root == "/mnt/custom"
+
+
+def test_toml_sets_ops_knobs_when_env_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #3: TOML values for host/port/url_base/output_root take effect when
+    no ``GATEWAY_<NAME>`` env var is set — env > TOML > default."""
+    # Strip any inherited env that would clobber TOML.
+    for name in (
+        "GATEWAY_HOST",
+        "GATEWAY_PORT",
+        "GATEWAY_URL_BASE",
+        "GATEWAY_OUTPUT_ROOT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'api_key = "k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+        'host = "10.0.0.5"\n'
+        "port = 7777\n"
+        'url_base = "/manga"\n'
+        'output_root = "/srv/manga"\n',
+        encoding="utf-8",
+    )
+
+    settings = load_settings(cfg)
+
+    assert settings.host == "10.0.0.5"
+    assert settings.port == 7777
+    assert settings.url_base == "/manga"
+    assert settings.output_root == "/srv/manga"
+
+
+def test_env_beats_toml_per_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #3: env wins on a per-field basis — TOML still supplies fields the
+    env didn't set, defaults supply the rest."""
+    monkeypatch.setenv("GATEWAY_HOST", "0.0.0.0")  # env wins for host only
+    monkeypatch.delenv("GATEWAY_PORT", raising=False)
+    monkeypatch.delenv("GATEWAY_URL_BASE", raising=False)
+    monkeypatch.delenv("GATEWAY_OUTPUT_ROOT", raising=False)
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'api_key = "k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+        'host = "10.0.0.5"\n'
+        "port = 7777\n"
+        'url_base = "/manga"\n',
+        encoding="utf-8",
+    )
+
+    settings = load_settings(cfg)
+
+    assert settings.host == "0.0.0.0"  # env override
+    assert settings.port == 7777  # TOML value (env unset)
+    assert settings.url_base == "/manga"  # TOML value
+    assert settings.output_root == "/data/manga"  # default (neither set)
+
+
+def test_unknown_toml_keys_are_ignored(tmp_path: Path) -> None:
+    """Issue #3: TOML keys that don't match a Settings field are silently
+    dropped — mirrors ``model_config = ConfigDict(extra='ignore')``."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'api_key = "k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n'
+        'made_up_key = "ignored"\n'
+        "port = 7777\n",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(cfg)
+
+    assert settings.port == 7777
+    assert not hasattr(settings, "made_up_key")
