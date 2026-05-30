@@ -465,7 +465,13 @@ class ComixSource(Source):
             urls = await solver.fetch_via_browser(
                 chapter_url,
                 extract=_CHAPTER_PAGES_EXTRACT_JS,
-                wait_for=_CHAPTER_PAGES_WAIT_FOR,
+                # Issue #20: pass wait_for=None and let the JS extractor's
+                # own Step-1 scaffold wait do the readiness check. A Python-
+                # side wait_for_selector AND a JS-side scaffold poll would
+                # double-wait the same condition; the JS poll runs inside
+                # page.evaluate which Playwright is happy to schedule
+                # immediately after goto commits.
+                wait_for=None,
                 # Issue #20: per-div watchers now run in PARALLEL (Promise.all)
                 # so wall-clock collapses from O(pages × ~1s) to ~max single-page
                 # latency. The 30s ceiling still gives plenty of headroom for an

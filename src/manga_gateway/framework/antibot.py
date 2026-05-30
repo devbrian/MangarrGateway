@@ -318,9 +318,13 @@ class CloudflareSolver:
             timeout_ms = int(timeout * 1000)
             try:
                 try:
-                    await page.goto(
-                        url, wait_until="domcontentloaded", timeout=timeout_ms
-                    )
+                    # ``wait_until="commit"`` returns as soon as the response
+                    # is committed (issue #20). The caller's ``wait_for``
+                    # selector / predicate is the meaningful readiness signal —
+                    # blocking goto on ``domcontentloaded`` first adds 1–2s of
+                    # pure overhead since the scaffold wait already covers DOM
+                    # readiness.
+                    await page.goto(url, wait_until="commit", timeout=timeout_ms)
                 except Exception as exc:  # noqa: BLE001
                     raise BrowserFetchError(f"goto {url!r} failed: {exc}") from exc
                 if wait_for is not None:

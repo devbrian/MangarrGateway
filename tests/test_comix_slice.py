@@ -483,10 +483,10 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert "rpage-page" in extract_body
     assert "scrollIntoView" in extract_body
     assert "sort" in extract_body
-    # wait_for waits for the reader scaffold (every page's wrapper div) rather
-    # than the first rendered image — the extractor needs the full scaffold
-    # to enumerate all pages, not just the head-of-page above-the-fold ones.
-    assert wait_for == ".rpage-page[data-page]"
+    # Issue #20: wait_for is now None — the extractor's own Step-1 polls for
+    # the scaffold from inside ``page.evaluate``. A Python-side wait_for_selector
+    # would double-wait the same condition and add ~1 s of pure overhead.
+    assert wait_for is None
 
     # The series-page chapter-list call also happened — its URL has NO
     # ``-chapter-`` segment and its wait_for targets chapter anchors.
