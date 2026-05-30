@@ -1,0 +1,78 @@
+# Nightly per-source live-smoke run.
+#
+# Phase 5 D-56 / D-57 / D-58 / D-59 productionization:
+#   * D-56: fires on cron '0 3 * * *' (03:00 UTC) + workflow_dispatch (manual).
+#   * D-57: minimal permissions — contents:read (matches ci.yml) PLUS issues:write
+#     (sticky-issue upsert/close performed by scripts/nightly_triage.py).
+#   * D-58: the JOB exit code is owned by scripts/nightly_triage.py — single-source
+#     failures route to a sticky GitHub issue (badge stays green); only an
+#     all-sources-fail flips the workflow red ("hold the line").
+#   * D-59: artifact upload is logs-only — junit.xml + pytest-live.log. NO CBZs,
+#     NO screenshots, NO captured fixtures (RESEARCH Security Domain explicit).
+#
+# Sibling to .github/workflows/ci.yml (the deterministic gate). D-12 invariant:
+# this workflow NEVER replaces `uv run nox -s gate` — they run independently;
+# the nightly is an additive recurring real-network signal, not a gate.
+#
+# Action SHA pinning + persist-credentials:false mirror ci.yml's supply-chain
+# discipline (RESEARCH security domain — CodeRabbit/zizmor: excessive-permissions
+# + tampering via floating tag).
+
+name: nightly-live-smoke
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # D-56: 03:00 UTC daily
+  workflow_dispatch: {}
+
+# Least-privilege workflow token (D-57).
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  live-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned to full commit SHAs (supply-chain hardening); trailing
+      # comment records the human-readable tag — same discipline as ci.yml.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false  # don't leak the token into the checkout
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - run: uv python install 3.12
+      - run: uv sync --dev
+      # Patchright (the Cloudflare solver) ships only the driver; the Chromium
+      # binary must be installed separately. The Comix live smoke launches the
+      # solver via lifespan + warm() and would otherwise hang until the runner
+      # timeout — same reasoning as ci.yml line 30.
+      - run: uv run patchright install --with-deps chromium
+
+      # Live step — D-58 / Pitfall 4: `continue-on-error: true` so a per-source
+      # failure does NOT short-circuit the triage step below. The job's final
+      # exit code is owned by the triage step, not by this `pytest` invocation.
+      - id: live
+        continue-on-error: true
+        run: uv run nox -s live 2>&1 | tee pytest-live.log
+
+      # Triage step — `if: always()` so it runs whether the live step passed
+      # or failed (Pitfall 4). The script parses junit.xml, buckets results by
+      # source_key, upserts/closes per-source sticky issues, and returns the
+      # D-58 all-sources-fail exit code that becomes the JOB conclusion.
+      - if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: uv run python scripts/nightly_triage.py --junit junit.xml --run-url "$RUN_URL"
+
+      # Logs-only artifact upload (D-59). NO CBZ glob, NO screenshot glob, NO
+      # captured-fixture glob — the nightly is a signal, not a data drop.
+      # `if: always()` so triage can be performed on a red run too.
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-live-smoke-logs
+          path: |
+            junit.xml
+            pytest-live.log
+          retention-days: 14
