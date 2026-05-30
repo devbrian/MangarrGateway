@@ -171,7 +171,10 @@ def _mock_comix_search(solver: _ComixSolver) -> None:
     Search is PLAINTEXT ``/api/v1/manga`` returning ``result.items[{hid, url, …}]``.
     Chapter list (Plan 04-04 Option A) is a browser-DOM read of the series page
     ``/title/{hid}-{slug}`` — staged on the fake solver's ``fetch_via_browser``
-    registry as the JSON-serializable shape ``_series_chapters`` returns.
+    registry as the JSON-serializable shape ``_series_chapters`` returns. The
+    plaintext ``/chapter-indexes`` (issue #19 side-channel) is mocked empty here
+    so the canonical DOM ``groups`` from the row is what survives; a dedicated
+    test below exercises the merge path with non-empty chapter-indexes data.
     """
     respx.get(f"{_COMIX}/api/v1/manga").mock(
         return_value=httpx.Response(
@@ -198,6 +201,12 @@ def _mock_comix_search(solver: _ComixSolver) -> None:
                 },
             },
         )
+    )
+    # Issue #19: ``_series_chapters`` now fetches ``/chapter-indexes`` as a
+    # side-channel for scanlation groups. Default the existing tests to an
+    # empty result so the DOM groups field stays authoritative.
+    respx.get(f"{_COMIX}/api/v1/manga/{_SERIES_ID}/chapter-indexes").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "result": {"items": []}})
     )
     # Browser-DOM chapter-list: the series page URL navigated by _series_chapters.
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
@@ -491,3 +500,186 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert series_wait is not None
     assert "mchap-row__primary" in series_wait
     assert series_wait.startswith("() =>")
+
+
+# ─── (6) issue #19: chapter-indexes backfills scanlationGroup ──────────────────
+
+
+def _stage_dom_chapter_without_group(solver: _ComixSolver) -> None:
+    """Stage the same series-page DOM read but with EMPTY ``groups`` per row.
+
+    The live extractor's CSS selectors (``.scanlation`` / ``.group`` / …) do
+    not match Comix's current chapter-row markup, so the DOM ``groups`` list
+    is always empty — issue #19 baseline. Returning ``[]`` here mirrors that
+    failure mode without depending on the JS extractor body.
+    """
+    series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
+    solver.stage_browser_fetch(
+        series_url,
+        [{"id": _CHAPTER_ID, "chapter": "1", "lang": "en", "groups": []}],
+    )
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_chapter_indexes_backfills_scanlation_group(
+    comix_client: httpx.AsyncClient, solver: _ComixSolver
+) -> None:
+    """Issue #19: when the DOM extractor returns no groups but ``/chapter-indexes``
+    carries one, the resulting Release.scanlationGroup is populated from the
+    side-channel (and not ``null``)."""
+    respx.get(f"{_COMIX}/api/v1/manga").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {
+                            "id": 116210,
+                            "hid": _SERIES_ID,
+                            "title": "Cipher Tales",
+                            "url": f"/title/{_SERIES_ID}-cipher-tales",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    indexes_route = respx.get(
+        f"{_COMIX}/api/v1/manga/{_SERIES_ID}/chapter-indexes"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {"chapter": "1", "groups": [{"id": 42, "name": "mr3m0"}]},
+                        {"chapter": "2", "groups": [{"id": 99, "name": "other"}]},
+                    ]
+                },
+            },
+        )
+    )
+    _stage_dom_chapter_without_group(solver)
+
+    resp = await comix_client.post(
+        "/search",
+        json={"type": "chapter", "query": "Cipher", "sources": ["comix"]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert indexes_route.called, "chapter-indexes endpoint must be consulted"
+    releases = body["releases"]
+    assert len(releases) == 1
+    # Backfilled from the chapter-indexes side-channel.
+    assert releases[0]["scanlationGroup"] == "mr3m0"
+    # The chapter-indexes side-channel passed ``group_id=-1`` per the live
+    # recon — verifies the route shape we send (issue #19 / comix.py:39).
+    request = indexes_route.calls.last.request
+    assert request.url.params.get("group_id") == "-1"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_dom_group_wins_over_chapter_indexes(
+    comix_client: httpx.AsyncClient, solver: _ComixSolver
+) -> None:
+    """If the DOM row already carries a group, the chapter-indexes signal is
+    NOT used for that row — the live DOM is authoritative when present."""
+    respx.get(f"{_COMIX}/api/v1/manga").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {
+                            "id": 116210,
+                            "hid": _SERIES_ID,
+                            "title": "Cipher Tales",
+                            "url": f"/title/{_SERIES_ID}-cipher-tales",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    respx.get(f"{_COMIX}/api/v1/manga/{_SERIES_ID}/chapter-indexes").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [{"chapter": "1", "groups": [{"name": "fallback"}]}]
+                },
+            },
+        )
+    )
+    series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
+    solver.stage_browser_fetch(
+        series_url,
+        [
+            {
+                "id": _CHAPTER_ID,
+                "chapter": "1",
+                "lang": "en",
+                "groups": [{"name": "dom-wins"}],
+            }
+        ],
+    )
+
+    resp = await comix_client.post(
+        "/search",
+        json={"type": "chapter", "query": "Cipher", "sources": ["comix"]},
+    )
+    assert resp.status_code == 200
+    releases = resp.json()["releases"]
+    assert releases[0]["scanlationGroup"] == "dom-wins"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_chapter_indexes_failure_is_degraded_not_fatal(
+    comix_client: httpx.AsyncClient, solver: _ComixSolver
+) -> None:
+    """A failing ``/chapter-indexes`` MUST NOT fail the search — the release
+    still flows with ``scanlationGroup: null`` and a soft warning is emitted."""
+    respx.get(f"{_COMIX}/api/v1/manga").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {
+                            "id": 116210,
+                            "hid": _SERIES_ID,
+                            "title": "Cipher Tales",
+                            "url": f"/title/{_SERIES_ID}-cipher-tales",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    # Chapter-indexes returns a permanent 404 — tenacity STOPS on 4xx; the
+    # source converts it to SourceError; ``_fetch_chapter_group_map`` catches
+    # it and warns instead of failing the whole search (issue #19).
+    respx.get(f"{_COMIX}/api/v1/manga/{_SERIES_ID}/chapter-indexes").mock(
+        return_value=httpx.Response(404)
+    )
+    _stage_dom_chapter_without_group(solver)
+
+    resp = await comix_client.post(
+        "/search",
+        json={"type": "chapter", "query": "Cipher", "sources": ["comix"]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["releases"]) == 1
+    assert body["releases"][0]["scanlationGroup"] is None
+    # A soft warning surfaces the degraded path without poisoning the request.
+    codes = [w["code"] for w in body["warnings"] if w["sourceKey"] == "comix"]
+    assert "scanlation_group_unavailable" in codes

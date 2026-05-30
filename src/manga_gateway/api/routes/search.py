@@ -9,6 +9,8 @@ id) returns ``bad_request`` BEFORE any fan-out (D-23). Per-source failures surfa
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Depends
@@ -44,6 +46,8 @@ from ...models.search import (
 
 if TYPE_CHECKING:
     from ...framework.base import Source
+
+_log = logging.getLogger("manga_gateway.api.search")
 
 router = APIRouter()
 
@@ -104,6 +108,11 @@ async def search(
         )
 
     sources = _select_sources(registry, req.sources)
+    # Per-source soft warnings (D-14): a source that partially degrades emits
+    # ``ctx.warn(code, msg)`` and we surface those alongside the fan-out's
+    # hard-failure warnings. Captured in a closure so ``collect_warnings``
+    # can read them after the source returns.
+    soft_warnings: dict[str, list[tuple[str, str]]] = {}
 
     async def _run_one(src: Source) -> list[Release]:
         # D-45: the comix-v1 decrypt scheme delegates to the warm Patchright solver
@@ -123,9 +132,31 @@ async def search(
             decrypt_config=decrypt_config,
             source_health=health_map.get(src.key),
         )
-        return await src.search(req, ctx)
+        started = time.perf_counter()
+        try:
+            releases = await src.search(req, ctx)
+        finally:
+            # Capture even on failure: a source that warned then raised should
+            # still surface the warning beside its hard-failure entry.
+            soft_warnings[src.key] = list(ctx.warnings)
+        elapsed = time.perf_counter() - started
+        # #21: one INFO per source dispatched. Per-source warnings count helps
+        # an operator spot a degraded source without re-parsing the response.
+        _log.info(
+            "search source=%s query=%r results=%d warnings=%d elapsed=%.2fs",
+            src.key,
+            (req.query or "")[:80],
+            len(releases),
+            len(ctx.warnings),
+            elapsed,
+        )
+        return releases
 
-    releases, warning_tuples = await fan_out(sources, _run_one)
+    releases, warning_tuples = await fan_out(
+        sources,
+        _run_one,
+        collect_warnings=lambda src: soft_warnings.get(src.key, []),
+    )
     # T-02-04: bound the total releases/handles a single search can mint. A title
     # search fans across multiple candidate manga, so per-source/per-manga paging
     # alone does not cap the merged total — truncate to the requested limit.
