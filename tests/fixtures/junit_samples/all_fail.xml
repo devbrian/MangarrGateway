@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="2" failures="2" errors="0" skipped="0">
+    <testcase classname="tests.live.test_caps_smoke" name="test_caps_smoke[mangadex]" time="0.42">
+      <failure message="AssertionError: mangadex disabled">stack trace for mangadex failure</failure>
+    </testcase>
+    <testcase classname="tests.live.test_caps_smoke" name="test_caps_smoke[comix]" time="1.18">
+      <failure message="AssertionError: comix antibot mismatch">stack trace for comix failure</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
