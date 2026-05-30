@@ -22,3 +22,21 @@ config.toml
 # SQLite job store (runtime persistence — PLAT-03) + WAL/SHM sidecars.
 # Scoped to the runtime DB only so unrelated *.db fixtures aren't ignored (CR).
 gateway.db*
+
+# Patchright persistent-context dir holding cf_clearance (D-34) — runtime artifact,
+# never committed (T-04-03). The committed D-44 decrypt fixtures stay tracked.
+# The default name is config.cloudflare_user_data_dir ("cloudflare-userdata"); the
+# legacy "comix-userdata" entry remains for repos that were initialized before the
+# 04-04 rename.
+cloudflare-userdata/
+comix-userdata/
+
+# Live-smoke (pytest -m live) runtime breadcrumb. The REAL D-44 *.bin/*.plain
+# ciphertext+plaintext fixtures under tests/fixtures/comix/ STAY tracked — only the
+# transient capture note the recorder drops is ignored.
+tests/fixtures/comix/CAPTURE_NOTES.txt
+
+# Throwaway recon output (scripts/comix_recon.py) — network logs, JS dumps, DOM
+# snapshots used to pin RESEARCH Open Q1/Q3 and the D-44 cipher pair. Never committed.
+_recon_out/
+_e2e_out/

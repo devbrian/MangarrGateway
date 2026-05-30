@@ -1,0 +1,515 @@
+"""Comix anti-bot fetch seam: clearance injection, 403 re-solve, decrypt, health.
+
+Exercises the load-bearing ``SourceContext`` refactor (Plan 04-02) with the in-repo
+``_SequenceTransport`` harness + a fake solver — no real Patchright browser, no network:
+
+* D-40: a ``cloudflare*`` source injects ``clearance.cookies`` + the EXACT
+  ``clearance.user_agent`` per outbound request; the injected UA equals the cookie's
+  UA (Pitfall 1). MangaDex (``antibot="none"``) sends NO Cookie/UA override.
+* D-35: a ``cloudflare*`` 403 carrying CF challenge markers triggers exactly ONE forced
+  re-solve + retry; a non-challenge 403, a second challenge, or a MangaDex 403 is
+  terminal (Pitfall 2).
+* D-39: a declared ``decrypt_scheme`` routes the response body through the framework
+  decrypt seam; ``None`` is identity pass-through.
+* D-36: a terminal failure feeds ``source_health.record_failure()``; a success feeds
+  ``record_success()``.
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+
+from manga_gateway.framework.antibot import Clearance
+from manga_gateway.framework.context import SourceContext, is_cf_challenge
+from manga_gateway.framework.decrypt import _SCHEMES, register_scheme
+from manga_gateway.framework.errors import SourceError
+from manga_gateway.framework.health import SourceHealth
+from manga_gateway.handles.store import HandleStore
+
+# ───────────────────────────── transport / solver fakes ──────────────────────────
+
+
+class _RecordingTransport:
+    """Fake Transport returning queued responses, recording each request's kwargs."""
+
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self._responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return self._responses.pop(0)
+
+    async def aclose(self) -> None:  # pragma: no cover - interface completeness
+        pass
+
+
+class _CountingSolver:
+    """Fake solver supporting the internal ``force_resolve`` path (kept off Protocol).
+
+    Returns a fixed ``Clearance`` (cf_clearance=X, UA ``Chrome/cf``) and counts both
+    plain and forced ``get_clearance`` calls so tests can assert the re-solve happened.
+    """
+
+    USER_AGENT = "Mozilla/5.0 Chrome/cf"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.forced = 0
+
+    async def get_clearance(
+        self, source_key: str, *, force_resolve: bool = False
+    ) -> Clearance:
+        self.calls += 1
+        if force_resolve:
+            self.forced += 1
+        return Clearance(cookies={"cf_clearance": "X"}, user_agent=self.USER_AGENT)
+
+
+class _NullSolver:
+    """A solver returning ``None`` (no clearance needed)."""
+
+    async def get_clearance(
+        self, source_key: str, *, force_resolve: bool = False
+    ) -> None:
+        return None
+
+
+def _ctx(
+    transport: _RecordingTransport,
+    *,
+    antibot: str = "none",
+    solver: object | None = None,
+    decrypt_scheme: str | None = None,
+    decrypt_config: dict[str, object] | None = None,
+    source_health: SourceHealth | None = None,
+) -> SourceContext:
+    from manga_gateway.framework.ratelimit import RateLimiter
+    from manga_gateway.framework.session import SessionManager
+
+    return SourceContext(
+        source_key="comix",
+        rate_limit_per_minute=6000,
+        session=SessionManager(transport),  # type: ignore[arg-type]
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+        solver=solver,  # type: ignore[arg-type]
+        antibot=antibot,  # type: ignore[arg-type]
+        decrypt_scheme=decrypt_scheme,
+        decrypt_config=decrypt_config,
+        source_health=source_health,
+    )
+
+
+def _cf_challenge_response(req: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        403,
+        headers={"server": "cloudflare", "cf-mitigated": "challenge"},
+        content=b"...challenge-platform...",
+        request=req,
+    )
+
+
+# ───────────────────────── D-40: clearance injection (UA match) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_get_json_injects_clearance_with_matching_ua() -> None:
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [httpx.Response(200, json={"ok": True}, request=req)]
+    )
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare+encrypted", solver=solver)
+
+    out = await ctx.get_json("https://comix/api")
+
+    assert out == {"ok": True}
+    assert solver.calls == 1
+    call = transport.calls[0]
+    # Pitfall 1: the injected UA MUST equal the cookie's UA.
+    assert call["headers"] == {"User-Agent": _CountingSolver.USER_AGENT}
+    assert call["cookies"] == {"cf_clearance": "X"}
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_get_bytes_injects_clearance_with_matching_ua() -> None:
+    req = httpx.Request("GET", "https://comix/p/1")
+    transport = _RecordingTransport([httpx.Response(200, content=b"img", request=req)])
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare", solver=solver)
+
+    out = await ctx.get_bytes("https://comix/p/1")
+
+    assert out == b"img"
+    call = transport.calls[0]
+    assert call["headers"]["User-Agent"] == _CountingSolver.USER_AGENT  # type: ignore[index]
+    assert call["cookies"] == {"cf_clearance": "X"}
+
+
+@pytest.mark.asyncio
+async def test_mangadex_sends_no_cookie_or_ua_override() -> None:
+    # Regression: antibot="none" / no solver → request kwargs identical to today.
+    req = httpx.Request("GET", "https://api.mangadex.org/x")
+    transport = _RecordingTransport(
+        [httpx.Response(200, json={"result": "ok"}, request=req)]
+    )
+    ctx = _ctx(transport, antibot="none", solver=None)
+
+    await ctx.get_json("https://api.mangadex.org/x")
+
+    call = transport.calls[0]
+    assert "cookies" not in call or call["cookies"] is None
+    assert "headers" not in call or call["headers"] is None
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_with_null_clearance_sends_no_override() -> None:
+    # A cloudflare source whose solver returns None still works, with no override.
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport([httpx.Response(200, json={"ok": 1}, request=req)])
+    ctx = _ctx(transport, antibot="cloudflare", solver=_NullSolver())
+
+    await ctx.get_json("https://comix/api")
+
+    call = transport.calls[0]
+    assert "cookies" not in call or call["cookies"] is None
+    assert "headers" not in call or call["headers"] is None
+
+
+# ───────────────────────── D-35: 403 challenge → re-solve ─────────────────────────
+
+
+def test_is_cf_challenge_detects_markers() -> None:
+    req = httpx.Request("GET", "https://comix/api")
+    assert is_cf_challenge(_cf_challenge_response(req)) is True
+    # A plain 403 (no CF markers) is NOT a challenge.
+    assert is_cf_challenge(httpx.Response(403, request=req)) is False
+    # A 200 is never a challenge.
+    assert is_cf_challenge(httpx.Response(200, request=req)) is False
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_challenge_403_triggers_single_resolve_and_retry() -> None:
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [
+            _cf_challenge_response(req),  # first → challenge → re-solve + retry
+            httpx.Response(200, json={"ok": True}, request=req),  # retry succeeds
+        ]
+    )
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare+encrypted", solver=solver)
+
+    out = await ctx.get_json("https://comix/api")
+
+    assert out == {"ok": True}
+    assert solver.forced == 1  # exactly ONE forced re-solve
+    assert len(transport.calls) == 2  # initial + single retry
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_second_challenge_after_resolve_is_terminal() -> None:
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [
+            _cf_challenge_response(req),  # challenge → re-solve
+            _cf_challenge_response(req),  # still challenge after re-solve → terminal
+        ]
+    )
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare", solver=solver)
+
+    with pytest.raises(SourceError):
+        await ctx.get_json("https://comix/api")
+    assert solver.forced == 1  # bounded — only ONE re-solve (T-04-07)
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_non_challenge_403_is_terminal_without_resolve() -> None:
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport([httpx.Response(403, request=req)])  # no CF markers
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare", solver=solver)
+
+    with pytest.raises(SourceError):
+        await ctx.get_json("https://comix/api")
+    assert solver.forced == 0  # not a challenge → no re-solve
+
+
+@pytest.mark.asyncio
+async def test_mangadex_403_stops_immediately_no_resolve() -> None:
+    # Regression: MangaDex 403 still STOPs immediately (no re-solve, no solver).
+    req = httpx.Request("GET", "https://api.mangadex.org/x")
+    transport = _RecordingTransport([httpx.Response(403, request=req)])
+    ctx = _ctx(transport, antibot="none", solver=None)
+
+    with pytest.raises(SourceError):
+        await ctx.get_json("https://api.mangadex.org/x")
+    assert len(transport.calls) == 1
+
+
+# ───────────────────────── D-39: decrypt seam ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_bytes_passthrough_when_no_scheme() -> None:
+    req = httpx.Request("GET", "https://comix/p/1")
+    transport = _RecordingTransport(
+        [httpx.Response(200, content=b"raw-bytes", request=req)]
+    )
+    ctx = _ctx(transport, antibot="cloudflare", solver=_CountingSolver())
+
+    out = await ctx.get_bytes("https://comix/p/1")
+
+    assert out == b"raw-bytes"  # decrypt_scheme=None → unchanged
+
+
+@pytest.mark.asyncio
+async def test_get_bytes_routes_through_registered_scheme() -> None:
+    scheme = "test-rot1"
+
+    @register_scheme(scheme)
+    def _rot1(body: bytes, config: dict[str, object]) -> bytes:
+        return bytes((b + 1) % 256 for b in body)
+
+    try:
+        req = httpx.Request("GET", "https://comix/p/1")
+        transport = _RecordingTransport(
+            [httpx.Response(200, content=b"abc", request=req)]
+        )
+        ctx = _ctx(
+            transport,
+            antibot="cloudflare+encrypted",
+            solver=_CountingSolver(),
+            decrypt_scheme=scheme,
+        )
+
+        out = await ctx.get_bytes("https://comix/p/1")
+
+        assert out == bytes((b + 1) % 256 for b in b"abc")
+    finally:
+        _SCHEMES.pop(scheme, None)
+
+
+# ─────────────────────── D-45: comix-v1 happy path via FakeSolver ──────────
+
+
+class _DecryptingSolver:
+    """A solver that ALSO implements ``decrypt`` for the D-45 browser-evaluated
+    seam — the framework threads it into ``decrypt_config["solver"]``."""
+
+    USER_AGENT = "Mozilla/5.0 Chrome/cf"
+
+    def __init__(self, *, plaintexts: dict[bytes, bytes]) -> None:
+        self.plaintexts = plaintexts
+        self.decrypt_calls: list[bytes] = []
+
+    async def get_clearance(
+        self, source_key: str, *, force_resolve: bool = False
+    ) -> Clearance:
+        return Clearance(cookies={"cf_clearance": "X"}, user_agent=self.USER_AGENT)
+
+    async def decrypt(self, ciphertext: bytes) -> bytes:
+        self.decrypt_calls.append(ciphertext)
+        return self.plaintexts[ciphertext]
+
+
+@pytest.mark.asyncio
+async def test_get_json_routes_through_comix_v1_via_solver() -> None:
+    """D-45: a cloudflare+encrypted source with ``decrypt_scheme='comix-v1'`` runs
+    every response body through ``solver.decrypt`` — proving the SourceContext
+    threads the solver into decrypt_config and the comix-v1 registration delegates
+    correctly. The slice test exercises the full search→download flow; this test
+    pins the wiring at the SourceContext layer."""
+    ciphertext = b"CIPHER-ENVELOPE"
+    plaintext = b'{"chapters": [{"id": "c1"}]}'
+    solver = _DecryptingSolver(plaintexts={ciphertext: plaintext})
+
+    req = httpx.Request("GET", "https://comix.to/api/v1/manga/mr3m0/chapters")
+    transport = _RecordingTransport(
+        [httpx.Response(200, content=ciphertext, request=req)]
+    )
+    ctx = _ctx(
+        transport,
+        antibot="cloudflare+encrypted",
+        solver=solver,
+        decrypt_scheme="comix-v1",
+        decrypt_config={"solver": solver},
+    )
+
+    out = await ctx.get_json("https://comix.to/api/v1/manga/mr3m0/chapters")
+
+    assert out == {"chapters": [{"id": "c1"}]}
+    assert solver.decrypt_calls == [ciphertext]
+
+
+@pytest.mark.asyncio
+async def test_get_bytes_plain_bypasses_comix_v1_decrypt() -> None:
+    """``get_bytes_plain`` must NOT run the comix-v1 seam — Comix's image CDN
+    (``wowpic*.store``) serves plaintext WebP per the 2026-05-30 live e2e, and
+    routing the binary blob through ``solver.decrypt`` would treat the raw
+    bytes as ciphertext (and corrupt them on the UTF-8 boundary when handed to
+    ``page.evaluate``)."""
+    plain = b"\x52\x49\x46\x46\x10\x00\x00\x00WEBPVP8 "  # WebP header
+    solver = _DecryptingSolver(plaintexts={})  # no entries — decrypt would KeyError
+
+    req = httpx.Request("GET", "https://cdn.example.store/si/TOKEN/01.webp")
+    transport = _RecordingTransport([httpx.Response(200, content=plain, request=req)])
+    ctx = _ctx(
+        transport,
+        antibot="cloudflare+encrypted",
+        solver=solver,
+        decrypt_scheme="comix-v1",
+        decrypt_config={"solver": solver},
+    )
+
+    out = await ctx.get_bytes_plain("https://cdn.example.store/si/TOKEN/01.webp")
+
+    assert out == plain
+    assert solver.decrypt_calls == []  # decrypt was NOT called for the plaintext path
+
+
+@pytest.mark.asyncio
+async def test_get_json_plain_bypasses_comix_v1_decrypt() -> None:
+    """``get_json_plain`` must NOT run the comix-v1 seam — Comix's search and
+    chapter-index endpoints are plaintext per live recon, and routing them
+    through ``solver.decrypt`` would treat plaintext JSON as ciphertext."""
+    plain = b'{"status":"ok","result":{"items":[]}}'
+    solver = _DecryptingSolver(plaintexts={})  # no entries — decrypt would KeyError
+
+    req = httpx.Request("GET", "https://comix.to/api/v1/manga")
+    transport = _RecordingTransport([httpx.Response(200, content=plain, request=req)])
+    ctx = _ctx(
+        transport,
+        antibot="cloudflare+encrypted",
+        solver=solver,
+        decrypt_scheme="comix-v1",
+        decrypt_config={"solver": solver},
+    )
+
+    out = await ctx.get_json_plain("https://comix.to/api/v1/manga")
+
+    assert out == {"status": "ok", "result": {"items": []}}
+    assert solver.decrypt_calls == []  # decrypt was NOT called for the plaintext path
+
+
+# ───────────────────────── D-36: health failure-feed ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_record_success_on_clean_fetch() -> None:
+    health = SourceHealth(threshold=3)
+    health.record_failure()  # prime the counter
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport([httpx.Response(200, json={"ok": 1}, request=req)])
+    ctx = _ctx(
+        transport,
+        antibot="cloudflare",
+        solver=_CountingSolver(),
+        source_health=health,
+    )
+
+    await ctx.get_json("https://comix/api")
+
+    assert health.consecutive_failures == 0  # success reset the breaker
+
+
+@pytest.mark.asyncio
+async def test_record_failure_on_terminal_failure() -> None:
+    health = SourceHealth(threshold=3)
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport([httpx.Response(403, request=req)])  # terminal
+    ctx = _ctx(
+        transport,
+        antibot="cloudflare",
+        solver=_CountingSolver(),
+        source_health=health,
+    )
+
+    with pytest.raises(SourceError):
+        await ctx.get_json("https://comix/api")
+
+    assert health.consecutive_failures == 1  # terminal failure fed the breaker
+
+
+# ───────────────────────── D-38: dynamic /caps enabled per source ─────────────────
+
+
+def test_registry_caps_threads_health_so_a_tripped_breaker_disables() -> None:
+    # D-38 + the PATTERNS TTLCache-masking caveat: a tripped Comix breaker flips its
+    # SourceCap.enabled in the SAME computation, while MangaDex (no health) stays True.
+    from manga_gateway.framework.base import Source
+    from manga_gateway.framework.registry import SourceRegistry
+
+    class _FakeSource(Source):
+        languages = ["en"]
+        id_types = ["x"]
+        rate_limit_per_minute = 10
+
+        async def search(self, req, ctx):  # type: ignore[no-untyped-def]
+            return []
+
+        async def recent(self, *, languages, limit, since, ctx):  # type: ignore[no-untyped-def]
+            return []
+
+        async def fetch_manifest(self, chapter_id, ctx):  # type: ignore[no-untyped-def]
+            return []
+
+        async def fetch_image(self, url, ctx):  # type: ignore[no-untyped-def]
+            return b""
+
+    class _MangaDexLike(_FakeSource):
+        key = "mangadex"
+        name = "MangaDex"
+        base_url = "https://api.mangadex.org"
+        antibot = "none"
+
+    class _ComixLike(_FakeSource):
+        key = "comix"
+        name = "Comix"
+        base_url = "https://comix"
+        antibot = "cloudflare+encrypted"
+
+    registry = SourceRegistry()
+    registry.register("mangadex")(_MangaDexLike)
+    registry.register("comix")(_ComixLike)
+
+    comix_health = SourceHealth(threshold=2)
+    comix_health.record_failure()
+    comix_health.record_failure()  # breaker OPEN
+    assert comix_health.is_enabled is False
+
+    caps = {c.key: c for c in registry.caps({"comix": comix_health})}
+
+    assert caps["comix"].enabled is False  # tripped breaker → disabled in this poll
+    assert caps["mangadex"].enabled is True  # no health → unchanged always-enabled
+
+
+@pytest.mark.asyncio
+async def test_caps_route_reports_tripped_breaker_in_same_poll(
+    app,
+    client,  # type: ignore[no-untyped-def]
+) -> None:
+    # The 12h skeleton cache must NOT mask a freshly-tripped breaker (D-38). Trip a
+    # registered source's health, then assert /caps reports enabled:false immediately.
+    registry = app.state.registry
+    keys = registry.keys()
+    if not keys:  # pragma: no cover - no sources registered in this build
+        pytest.skip("no sources registered")
+    target = keys[0]
+
+    # Warm the skeleton cache (first poll: target enabled).
+    first = (await client.get("/caps")).json()
+    assert any(s["key"] == target and s["enabled"] for s in first["sources"])
+
+    # Trip the breaker for the target source via the app-state health map.
+    health = SourceHealth(threshold=1)
+    health.record_failure()  # OPEN
+    app.state.source_health = {target: health}
+
+    # Same poll cadence: the cached skeleton must NOT mask the live enabled flip.
+    second = (await client.get("/caps")).json()
+    assert any(s["key"] == target and s["enabled"] is False for s in second["sources"])

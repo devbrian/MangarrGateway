@@ -98,7 +98,9 @@ async def test_recent_returns_releases_newest_first(client: httpx.AsyncClient) -
         return_value=httpx.Response(200, json=_recent_payload(chapters))
     )
 
-    resp = await client.get("/recent")
+    # Scope to mangadex so the multi-source fan-out (comix added in 04-03) does not
+    # make unmocked calls; this test asserts MangaDex's recent parsing specifically.
+    resp = await client.get("/recent", params={"sources": "mangadex"})
     assert resp.status_code == 200
     body = resp.json()
     releases = body["releases"]
@@ -149,7 +151,7 @@ async def test_recent_sorts_by_instant_across_mixed_offsets(
         return_value=httpx.Response(200, json=_recent_payload(chapters))
     )
 
-    resp = await client.get("/recent")
+    resp = await client.get("/recent", params={"sources": "mangadex"})
     assert resp.status_code == 200
     releases = resp.json()["releases"]
     # True newest-first: Y (20:00Z) precedes X (15:00Z) — opposite of a string sort.
@@ -176,7 +178,7 @@ async def test_recent_truncates_merged_to_limit(client: httpx.AsyncClient) -> No
         return_value=httpx.Response(200, json=_recent_payload(chapters))
     )
 
-    resp = await client.get("/recent", params={"limit": "2"})
+    resp = await client.get("/recent", params={"limit": "2", "sources": "mangadex"})
     assert resp.status_code == 200
     assert len(resp.json()["releases"]) == 2
 
@@ -203,7 +205,9 @@ async def test_recent_languages_filter_and_limit_clamp(
         )
     )
 
-    resp = await client.get("/recent", params={"languages": "en", "limit": "9999"})
+    resp = await client.get(
+        "/recent", params={"languages": "en", "limit": "9999", "sources": "mangadex"}
+    )
     assert resp.status_code == 200
     assert route.called
     sent = str(route.calls.last.request.url)
@@ -236,7 +240,7 @@ async def test_recent_since_filters_older_items(client: httpx.AsyncClient) -> No
     )
 
     since = "2026-05-20T00:00:00+00:00"
-    resp = await client.get("/recent", params={"since": since})
+    resp = await client.get("/recent", params={"since": since, "sources": "mangadex"})
     assert resp.status_code == 200
     releases = resp.json()["releases"]
     # RCNT-02: only items newer than `since` survive — compare instants, not ISO
@@ -262,7 +266,7 @@ async def test_recent_erroring_source_yields_warning_still_200(
         return_value=httpx.Response(500, json={"result": "error"})
     )
 
-    resp = await client.get("/recent")
+    resp = await client.get("/recent", params={"sources": "mangadex"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["releases"] == []
@@ -279,9 +283,10 @@ async def test_caps_advertises_live_mangadex_source(client: httpx.AsyncClient) -
     assert resp.status_code == 200
     body = resp.json()
     sources = body["sources"]
-    assert len(sources) == 1
-    md = sources[0]
-    assert md["key"] == "mangadex"
+    # The live registry now advertises MangaDex AND Comix (04-03) — assert MangaDex's
+    # SourceCap shape specifically rather than the full source count.
+    md = next((s for s in sources if s["key"] == "mangadex"), None)
+    assert md is not None
     assert md["antibot"] == "none"
     assert md["enabled"] is True
     assert "mangadexId" in md["idTypes"]
@@ -291,12 +296,17 @@ async def test_caps_advertises_live_mangadex_source(client: httpx.AsyncClient) -
 
 @pytest.mark.asyncio
 async def test_caps_served_read_through_cache(client: httpx.AsyncClient, app) -> None:
-    # First call populates the 12h caps cache; second returns the same cached object.
+    # First call populates the 12h STATIC skeleton cache (D-38: the per-source
+    # sources[] is rebuilt live each call so a breaker trip is never masked by the
+    # cache, but the version/limits/formats skeleton stays cached).
     first = await client.get("/caps")
     assert first.status_code == 200
-    cached = app.state.caps_cache.get("caps")
-    assert cached is not None
+    cached = app.state.caps_cache.get("caps_skeleton")
+    assert cached is not None  # skeleton cached after the first poll
     second = await client.get("/caps")
+    # The full document (skeleton + live sources) is byte-stable across polls when
+    # no breaker trips, even though sources[] is recomputed each call.
     assert second.json() == first.json()
-    # Same object instance is served within TTL (read-through, built once).
-    assert app.state.caps_cache.get("caps") is cached
+    # Same cached SKELETON instance is reused within TTL (the dynamic sources[] is
+    # layered on via model_copy, not re-cached).
+    assert app.state.caps_cache.get("caps_skeleton") is cached

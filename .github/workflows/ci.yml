@@ -21,5 +21,12 @@ jobs:
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - run: uv python install 3.12
       - run: uv sync --dev
+      # Patchright (the Cloudflare solver) ships only the driver; the Chromium
+      # binary must be installed separately. The deterministic gate exercises
+      # the lifespan (test_solver_wiring) which spawns a non-blocking
+      # ``solver.warm()`` — without an installed Chromium that task hangs the
+      # process until the runner's job timeout. Install it once here so warm
+      # either succeeds or fails fast, never the SIGTERM-on-timeout path.
+      - run: uv run patchright install --with-deps chromium
       # The SAME command runnable locally (D-12).
       - run: uv run nox -s gate

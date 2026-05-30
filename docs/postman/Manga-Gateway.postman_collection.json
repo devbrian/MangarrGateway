@@ -1,0 +1,348 @@
+{
+  "info": {
+    "_postman_id": "b7e7e7c4-0001-4f4d-9b1a-mangagateway001",
+    "name": "Manga Gateway — End-to-End",
+    "description": "Drives the full search → handle → download → poll → CBZ loop against the local Manga Gateway.\n\n## Flow\n\n1. **/version** — health probe.\n2. **/caps** — enumerate sources + their `antibot` level.\n3. **/search** — find a chapter; first release's `downloadHandle` + `sourceKey` auto-captured into the environment.\n4. **/recent** — alternative feed (not required for the e2e).\n5. **/downloads (POST)** — submit the captured handle; `jobId` auto-captured.\n6. **/downloads (GET)** — poll the queue until the job leaves a live state.\n7. **/downloads/{jobId} (GET)** — final job state (assert `completed` + non-null `outputPath`).\n8. **/downloads/{jobId} (DELETE)** — remove the job (optionally `deleteData=true` to unlink the CBZ).\n\n## Environment\n\nImport `Manga-Gateway.local.postman_environment.json` and set:\n- `baseUrl` (default `http://localhost:9191/api/v1`)\n- `apiKey` (read from your `manga-gateway.json` config — also the value Mangarr uses)\n- `sourceKey` (default `mangadex`; switch to `comix` for the cloudflare+encrypted path)\n- `searchQuery` (default `the forgotten field`)\n\nVariables that the requests POPULATE (you don't set them):\n- `downloadHandle`, `releaseSourceKey`, `releaseTitle`, `mangaTitle`, `jobId`.\n\n## Running it\n\n- Either step through requests manually, or\n- **Collection Runner** the whole thing — the `/downloads (GET)` polling step re-runs itself via `postman.setNextRequest` until the job terminates (capped at ~120 iterations to avoid runaway loops).\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key", "value": "X-Api-Key", "type": "string" },
+      { "key": "value", "value": "{{apiKey}}", "type": "string" },
+      { "key": "in", "value": "header", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "downloadHandle", "value": "" },
+    { "key": "releaseSourceKey", "value": "" },
+    { "key": "releaseTitle", "value": "" },
+    { "key": "mangaTitle", "value": "" },
+    { "key": "jobId", "value": "" },
+    { "key": "pollCount", "value": "0" }
+  ],
+  "item": [
+    {
+      "name": "1. /version — health probe",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/version",
+          "host": ["{{baseUrl}}"],
+          "path": ["version"]
+        },
+        "description": "Sanity check the gateway is up + the API key works."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('has version', () => pm.expect(body).to.have.property('version'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. /caps — sources and limits",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/caps",
+          "host": ["{{baseUrl}}"],
+          "path": ["caps"]
+        },
+        "description": "Capabilities handshake — enumerates configured sources, their antibot level (none / cloudflare / cloudflare+encrypted), rate-limit ceilings, and supported output formats. Mangarr caches this for 12 h.\n\nUse the response to confirm `{{sourceKey}}` is enabled before searching."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('advertises sources[]', () => pm.expect(body.sources).to.be.an('array').that.is.not.empty);",
+              "const want = pm.environment.get('sourceKey') || pm.collectionVariables.get('sourceKey') || 'mangadex';",
+              "const match = (body.sources || []).find(s => s.sourceKey === want);",
+              "pm.test(`source ${want} present`, () => pm.expect(match, JSON.stringify(body.sources)).to.exist);",
+              "if (match) {",
+              "  pm.test(`source ${want} enabled`, () => pm.expect(match.enabled).to.eq(true));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. /search — find a chapter and capture the handle",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"type\": \"chapter\",\n  \"query\": \"{{searchQuery}}\",\n  \"sources\": [\"{{sourceKey}}\"],\n  \"limit\": 5,\n  \"interactive\": true\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/search",
+          "host": ["{{baseUrl}}"],
+          "path": ["search"]
+        },
+        "description": "Search for chapters matching `{{searchQuery}}` on `{{sourceKey}}`.\n\nThe first release's `downloadHandle` + `sourceKey` + `title` are captured into environment variables for the download step. The handle is opaque (TTL ≥ 30 min) and gateway-issued — Mangarr never inspects it (R6)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('returned releases', () => pm.expect(body.releases).to.be.an('array').that.is.not.empty);",
+              "",
+              "const warnings = body.warnings || [];",
+              "const ourSource = pm.environment.get('sourceKey') || 'mangadex';",
+              "const ourWarnings = warnings.filter(w => w.sourceKey === ourSource);",
+              "if (ourWarnings.length) {",
+              "  console.log(`${ourSource} warnings:`, JSON.stringify(ourWarnings, null, 2));",
+              "}",
+              "",
+              "const rel = body.releases[0];",
+              "pm.test('release has downloadHandle', () => pm.expect(rel.downloadHandle).to.be.a('string').and.not.empty);",
+              "pm.test('release has sourceKey', () => pm.expect(rel.sourceKey).to.be.a('string').and.not.empty);",
+              "",
+              "pm.environment.set('downloadHandle', rel.downloadHandle);",
+              "pm.environment.set('releaseSourceKey', rel.sourceKey);",
+              "pm.environment.set('releaseTitle', rel.title || '');",
+              "pm.environment.set('mangaTitle', rel.mangaTitle || rel.title || '');",
+              "",
+              "console.log('captured handle:', rel.downloadHandle);",
+              "console.log('release title :', rel.title);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. /recent — recent-release feed (optional)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/recent?sources={{sourceKey}}&limit=10",
+          "host": ["{{baseUrl}}"],
+          "path": ["recent"],
+          "query": [
+            { "key": "sources", "value": "{{sourceKey}}" },
+            { "key": "limit", "value": "10" },
+            { "key": "since", "value": "", "disabled": true, "description": "ISO-8601 cut; omit for everything" }
+          ]
+        },
+        "description": "RSS-sync peer of `IIndexer.FetchRecent` — not required for the e2e download flow, included for exploration."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('shape: releases[]', () => pm.expect(body.releases).to.be.an('array'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. POST /downloads — submit the captured handle",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"releaseHandle\": \"{{downloadHandle}}\",\n  \"sourceKey\": \"{{releaseSourceKey}}\",\n  \"title\": \"{{releaseTitle}}\",\n  \"mangaTitle\": \"{{mangaTitle}}\",\n  \"mangaId\": 1,\n  \"outputFormat\": \"cbz\"\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/downloads",
+          "host": ["{{baseUrl}}"],
+          "path": ["downloads"]
+        },
+        "description": "Submit the opaque handle from /search. The gateway resolves it into a page manifest INTERNALLY (R6 — the manifest never crosses back to the client), fetches every page under one shared session, validates each image, and packages a CBZ.\n\nResponse always 200 with `{ jobId }`. `jobId` is `null` on rejection; otherwise the download id. Submission is **idempotent on releaseHandle** (R5) — resubmitting the same handle returns the same `jobId` until the underlying job's TTL expires."
+      },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Reset the poll counter before the polling step begins.",
+              "pm.environment.set('pollCount', '0');"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('jobId present (not a rejection)', () => pm.expect(body.jobId, JSON.stringify(body)).to.be.a('string').and.not.empty);",
+              "pm.environment.set('jobId', body.jobId);",
+              "console.log('jobId:', body.jobId, 'status:', body.status, 'message:', body.message || '(none)');"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "6. GET /downloads — poll until terminal",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/downloads",
+          "host": ["{{baseUrl}}"],
+          "path": ["downloads"]
+        },
+        "description": "List of live + recently-finished jobs (poll-friendly: served from in-memory projection, never re-scans disk).\n\nWhen run via Collection Runner this request loops itself (1 s sleep between iterations, ~120 iterations max ≈ 2 min) until the captured `{{jobId}}` reaches a terminal state (`completed` or `failed`)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('jobs[] present', () => pm.expect(body.jobs).to.be.an('array'));",
+              "",
+              "const jobId = pm.environment.get('jobId');",
+              "const job = (body.jobs || []).find(j => j.jobId === jobId);",
+              "pm.test(`our job ${jobId} visible`, () => pm.expect(job, JSON.stringify(body.jobs)).to.exist);",
+              "",
+              "if (!job) { return; }",
+              "",
+              "const TERMINAL = ['completed', 'failed'];",
+              "const count = parseInt(pm.environment.get('pollCount') || '0', 10) + 1;",
+              "pm.environment.set('pollCount', String(count));",
+              "console.log(`[poll ${count}] ${job.status}  pages=${job.downloadedPages || 0}/${job.totalPages || '?'}  msg=${job.message || ''}`);",
+              "",
+              "if (TERMINAL.includes(job.status)) {",
+              "  pm.test('job reached terminal state', () => pm.expect(job.status).to.be.oneOf(TERMINAL));",
+              "  // Stop the loop — fall through to the next request in the collection.",
+              "  return;",
+              "}",
+              "",
+              "if (count >= 120) {",
+              "  pm.test('poll budget exceeded', () => pm.expect.fail(`job did not terminate within ${count} polls; last status=${job.status}`));",
+              "  return;",
+              "}",
+              "",
+              "// 1-second cadence; matches the contract's ~1 min Mangarr poll but tighter.",
+              "setTimeout(() => {}, 1000);",
+              "postman.setNextRequest('6. GET /downloads — poll until terminal');"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "7. GET /downloads/{jobId} — final state + outputPath",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/downloads/{{jobId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["downloads", "{{jobId}}"]
+        },
+        "description": "Single-job lookup (Mangarr's `GetImportItem`). Used to refine `outputPath` after a completed job lands on disk."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const job = pm.response.json();",
+              "pm.test('status known', () => pm.expect(job.status).to.be.oneOf(['queued','resolving','downloading','archiving','completed','failed','warning','paused']));",
+              "",
+              "if (job.status === 'completed') {",
+              "  pm.test('outputPath populated', () => pm.expect(job.outputPath).to.be.a('string').and.not.empty);",
+              "  console.log('CBZ at:', job.outputPath);",
+              "} else if (job.status === 'failed') {",
+              "  console.log('job failed; message:', job.message);",
+              "} else {",
+              "  console.log('job not terminal:', job.status);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "8. DELETE /downloads/{jobId} — remove the job",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/downloads/{{jobId}}?deleteData=false",
+          "host": ["{{baseUrl}}"],
+          "path": ["downloads", "{{jobId}}"],
+          "query": [
+            { "key": "deleteData", "value": "false", "description": "true also unlinks the gateway-stored output file" }
+          ]
+        },
+        "description": "Remove the job from the queue (Mangarr's `RemoveItem`). Pass `deleteData=true` to also unlink the CBZ the gateway wrote — but only the gateway-stored output path, never a client-supplied path (SSRF-style guardrail)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('204 No Content', () => pm.response.to.have.status(204));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "9. GET /status — service-level overview (optional)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/status",
+          "host": ["{{baseUrl}}"],
+          "path": ["status"]
+        },
+        "description": "Service-wide status: output root, max concurrent chapters, supported output formats. Not required for the e2e — useful for verifying gateway config."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

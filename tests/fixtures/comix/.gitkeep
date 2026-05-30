@@ -1,0 +1,3 @@
+# Real-ciphertext fixture slot for the Comix decrypt cipher (D-44).
+# The committed *.bin capture fixtures land here in a later plan once the Plan 04
+# live smoke reveals the concrete cipher; this .gitkeep holds the directory.

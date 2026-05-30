@@ -55,6 +55,24 @@ class Settings(BaseSettings):
         default=6, ge=1
     )  # D-31: per-job image-fetch bound
     db_path: str = "gateway.db"  # RESEARCH Open Q2: aiosqlite job store path
+    # ── Cloudflare-solver / anti-bot knobs — env-overridable ops knobs (D-11),
+    # same treatment as host/port/output_root (NOT the api_key exclusion). These
+    # govern the framework's shared CloudflareSolver (lifespan-owned R1) and
+    # apply to ALL cloudflare-gated sources registered in the source registry.
+    # ``ge=1`` bounds keep the breaker/semaphore valid against zero/negative
+    # overrides (T-04-02).
+    cloudflare_breaker_threshold: int = Field(
+        default=5, ge=1
+    )  # D-36: N consecutive failures flips is_enabled False
+    cloudflare_solve_concurrency: int = Field(
+        default=1, ge=1
+    )  # D-33/Pattern 7: solve cap; default 1 collapses to single-flight
+    cloudflare_headless: bool = True  # Open Q2: run the stealth browser headless
+    # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at
+    # the use site (Plan 04), NOT under output_root (T-04-03 — never logged).
+    cloudflare_user_data_dir: str = "cloudflare-userdata"
+    # D-37: watchdog re-clearance backoff schedule (min_hours, max_hours).
+    cloudflare_watchdog_backoff_hours: tuple[int, int] = (1, 6)
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
 

@@ -21,8 +21,12 @@ proven separately and exhaustively in ``tests/test_auth.py`` (Task 2).
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
+import pytest
+import respx
 import schemathesis
 from schemathesis import AuthContext, Case
 from schemathesis.checks import not_a_server_error
@@ -35,6 +39,15 @@ from manga_gateway.app import create_app
 from manga_gateway.config import Settings
 
 from .conftest import BASE_URL, TEST_API_KEY
+
+# Comix (04-03) is now registered, so every generated ``search``/``getRecent`` case
+# fans out to its ``cloudflare+encrypted`` host. Without a stub that host is
+# unroutable (``.example``) and tenacity would retry the ConnectError on exponential
+# backoff for EVERY generated case — turning the contract suite into a multi-minute,
+# network-dependent hang. A fast permanent 403 short-circuits Comix to a per-source
+# ``warnings[]`` entry instantly (no retry, no real network), keeping the gate
+# deterministic (D-42) while still exercising both sources' contract paths.
+_COMIX_HOST = "comix.to"
 
 # Contract of record lives at the repo root (D-07), copied from .handoff/.
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "manga-gateway.openapi.yaml"
@@ -80,6 +93,28 @@ class ApiKeyAuth:
     def set(self, case: Case, data: str, ctx: AuthContext) -> None:
         case.headers = dict(case.headers or {})
         case.headers["X-Api-Key"] = data
+
+
+@pytest.fixture(autouse=True)
+def _stub_source_hosts() -> Iterator[None]:
+    """Intercept all source HTTP so the contract suite touches NO real network.
+
+    schemathesis generates many ``search``/``getRecent`` cases; each fans out to
+    every registered source. We stub the upstream hosts so the suite is fast and
+    deterministic (D-42): MangaDex returns an empty-but-valid collection (→ 0
+    releases, still 200), and Comix returns a fast permanent 403 (→ a per-source
+    ``warnings[]`` entry, no retry). The gateway's contract-level response shape —
+    the only thing schemathesis validates here — is unchanged either way.
+    """
+    with respx.mock(assert_all_called=False) as mock:
+        mock.route(host="api.mangadex.org").mock(
+            return_value=httpx.Response(
+                200,
+                json={"result": "ok", "response": "collection", "data": []},
+            )
+        )
+        mock.route(host=_COMIX_HOST).mock(return_value=httpx.Response(403))
+        yield
 
 
 @schema.parametrize()

@@ -314,7 +314,10 @@ async def test_search_title_returns_releases(client: httpx.AsyncClient) -> None:
     )
 
     resp = await client.post(
-        "/search", json={"type": "chapter", "query": "Solo Leveling"}
+        # Scope to mangadex so the multi-source fan-out (comix added in 04-03) does
+        # not make unmocked calls; this test asserts MangaDex parsing specifically.
+        "/search",
+        json={"type": "chapter", "query": "Solo Leveling", "sources": ["mangadex"]},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -355,7 +358,12 @@ async def test_search_by_id_hits_direct_lookup(client: httpx.AsyncClient) -> Non
     )
 
     resp = await client.post(
-        "/search", json={"type": "manga", "ids": {"mangadexId": manga_id}}
+        "/search",
+        json={
+            "type": "manga",
+            "ids": {"mangadexId": manga_id},
+            "sources": ["mangadex"],
+        },
     )
     assert resp.status_code == 200
     assert direct.called  # SRCH-07/D-22: direct /manga/{id} lookup
@@ -426,7 +434,8 @@ async def test_search_truncates_to_limit(client: httpx.AsyncClient) -> None:
     )
 
     resp = await client.post(
-        "/search", json={"type": "chapter", "query": "X", "limit": 2}
+        "/search",
+        json={"type": "chapter", "query": "X", "limit": 2, "sources": ["mangadex"]},
     )
     assert resp.status_code == 200
     assert len(resp.json()["releases"]) == 2  # merged total truncated to limit
@@ -446,7 +455,8 @@ async def test_search_minted_handle_resolves_in_store(
     )
 
     resp = await client.post(
-        "/search", json={"type": "chapter", "query": "Solo Leveling"}
+        "/search",
+        json={"type": "chapter", "query": "Solo Leveling", "sources": ["mangadex"]},
     )
     assert resp.status_code == 200
     handle = resp.json()["releases"][0]["downloadHandle"]

@@ -1,0 +1,901 @@
+"""Comix source — the first ``cloudflare+encrypted`` declarative source (SRC-06).
+
+Subclasses :class:`~manga_gateway.framework.base.Source` exactly like
+``mangadex.py``: it declares its D-13 metadata as class attributes and overrides the
+four hooks (``search``/``recent``/``fetch_manifest``/``fetch_image``). ALL networking,
+rate-limiting, retry, Cloudflare clearance injection (D-40), challenge re-solve (D-35),
+and response decryption (D-39) live in the injected ``ctx`` — this module is just
+Comix param shaping + response parsing. This is the reusability proof of the phase
+(criterion #1): a new cloudflare+encrypted source is a declarative subclass with ZERO
+new networking/glue, riding the Wave-1/2 seams.
+
+Two anti-bot declarations distinguish Comix from MangaDex:
+
+* ``antibot = "cloudflare+encrypted"`` — the framework injects the captured
+  ``cf_clearance`` + matching UA per request and re-solves a challenge 403 (D-40/D-35).
+* ``decrypt_scheme = "comix-v1"`` — the framework routes every response body through
+  ``framework.decrypt`` (D-39); the concrete cipher is a browser-evaluated decrypt
+  delegated to the warm Patchright solver (D-45). NOTE: in the Option A pivot
+  (Plan 04-04 commit 2/3, 2026-05-30), the chapter-pages and chapter-list paths
+  switched to browser-DOM read via ``solver.fetch_via_browser`` — the ``comix-v1``
+  decrypt seam is no longer in the hot path for Comix BUT the registration stays
+  as the documented seam-shape proof for future encrypted sources whose token+
+  cipher problem CAN be split. The ``get_json_plain`` opt-out is what the still-
+  plaintext endpoints (search, chapter-indexes) use.
+
+ENDPOINT SHAPES (live-recon-pinned, Plan 04-04 Commit 3):
+
+The shapes below come from real Comix traffic captured via the Plan 04-04 recon
+(see ``.planning/phases/04-comix-source-anti-bot-stack/04-CONTEXT.md``'s
+``<live_recon>`` block):
+
+* base: ``https://comix.to``
+* search (PLAINTEXT, httpx): ``GET /api/v1/manga`` with ``keyword``, ``limit``,
+  ``page``, ``content_rating=suggestive``, ``order[relevance]=desc``
+  → ``{"status":"ok","result":{"items":[{"hid","title","url","latestChapter", …}]}}``
+* chapter list (Option A — browser-DOM): navigate ``/title/{hid}-{slug}`` and
+  read the rendered chapter list off the DOM. (The plaintext
+  ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` is a fallback signal — it
+  carries chapter numbers + scanlation groups but NOT chapter IDs.)
+* chapter pages (Option A — browser-DOM): navigate
+  ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and read the rendered
+  ``<img src="https://{cdn}.store/si/{token}/{NN}.webp">`` tags off the DOM.
+  The page's own JS handles token-mint + encrypted-API call + decrypt + render;
+  we just read the result.
+* image CDN: ``https://{cdn}.store/si/{32-char-token}/{NN}.webp`` — fetched via
+  httpx (NOT through the browser, CLAUDE.md). The browser only resolves the URL
+  list; the bulk byte fetch is the cleared httpx client.
+
+D-46 (hid is the canonical Comix identifier): Comix uses a 5-char base32-ish slug
+(``mr3m0``, ``qeq3x``, …) as the series identifier; releaseHandle / guid composition
+uses ``hid`` (not the numeric ``id``).
+
+Composite chapter id: ``ResolutionRecord.chapter_id`` for Comix is the composite
+string ``"{chapter_id}|{hid}|{slug}|{chapter_number}"`` so :meth:`fetch_manifest`
+can reconstruct the full chapter URL the browser needs. The numeric chapter_id
+is the leading segment; the rest are URL-construction-only metadata. The
+framework treats chapter_id as source-opaque (engine just passes it through to
+fetch_manifest), so the composite is self-contained.
+"""
+
+from __future__ import annotations
+
+import re
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+
+from ..framework.base import Source
+from ..framework.decrypt import DecryptError, register_scheme
+from ..framework.errors import SourceError
+from ..handles.store import ResolutionRecord
+from ..models.search import Release
+
+if TYPE_CHECKING:
+    from ..framework.context import SourceContext
+    from ..models.search import SearchRequest
+
+
+# ─────────────────────────── comix-v1 cipher (D-45) ───────────────────────────
+#
+# Browser-evaluated decrypt of the Comix encrypted-response envelope. The cipher
+# (``comix-v1``) is a jsdefender/jscrambler VM stream cipher that derives runtime
+# keys from ``navigator.appCodeName`` + a timestamp-shaped fingerprint — not
+# statically reversible in v1. We reuse the warm ``CloudflareSolver`` (which has
+# already loaded ``secure-*.js`` to pass the Cloudflare challenge) and call its
+# ``decrypt`` method, which executes ``await globalThis.t(ciphertext)`` on the
+# warm comix.to page.
+#
+# The solver is threaded through ``decrypt_config["solver"]`` by the framework at
+# every ``SourceContext`` construction site; a missing solver is a wiring bug,
+# not a recoverable condition. Registered at module import time so the framework
+# decrypt registry sees ``"comix-v1"`` as soon as :mod:`sources.comix` loads.
+
+
+@register_scheme("comix-v1")
+async def _comix_v1_decrypt(body: bytes, config: dict[str, Any]) -> bytes:
+    solver = config.get("solver")
+    if solver is None or not hasattr(solver, "decrypt"):
+        raise DecryptError(
+            "comix-v1 requires 'solver' in decrypt_config (browser-evaluated, D-45)"
+        )
+    plaintext: bytes = await solver.decrypt(body)
+    return plaintext
+
+
+# Bound a title search's candidate series; interactive widens it (mirrors MangaDex).
+_DEFAULT_SERIES_CANDIDATES = 5
+_INTERACTIVE_SERIES_CANDIDATES = 15
+# Comix chapter-feed page-size ceiling (live recon: server default limit=20).
+_MAX_FEED_LIMIT = 100
+# Comix search page size (live recon: full-results page uses limit=28).
+_SEARCH_PAGE_SIZE = 28
+# Default content_rating param (live recon: "suggestive" pulls the same items
+# that the public site shows — `safe` would drop suggestive titles).
+_CONTENT_RATING = "suggestive"
+
+# Composite chapter-id separator. ``chapter_id`` for Comix is the composite
+# string ``"{numeric_chapter_id}|{hid}|{slug}|{chapter_number}"`` so the
+# stateless ``fetch_manifest(chapter_id, ctx)`` hook can reconstruct the
+# chapter URL the browser navigates to (Option A — Plan 04-04). The framework
+# treats chapter_id as source-opaque, so the composite is contained.
+_CID_SEP = "|"
+
+
+# SSRF allowlist for image-CDN URLs returned by the browser-DOM extractor
+# (CLAUDE.md: never fetch client-supplied / DOM-supplied URLs blindly). The JS
+# regex in the extractor already enforces the `/si/{token}/{NN}.{ext}` path
+# shape, but it cannot tell us anything about the *host* — a poisoned DOM
+# response (or a future extractor regression) could still surface a path of
+# the right shape on an off-domain host. Restrict the manifest to the
+# observed Comix CDN: ``https://{sub}.wowpic\d+.store/si/{token}/{NN}.{ext}``.
+# Subdomains seen live across recon: ``jdpw``, ``jloo``, etc. The pattern
+# tolerates any non-empty alphanumeric subdomain and any wowpic shard digit.
+_COMIX_CDN_HOST_RE = re.compile(r"^[a-z0-9-]+\.wowpic\d+\.store$", re.IGNORECASE)
+_COMIX_CDN_PATH_RE = re.compile(
+    r"^/si/[A-Za-z0-9_-]{16,}/\d+\.(webp|jpg|jpeg|png)$", re.IGNORECASE
+)
+
+
+def _is_allowed_image_url(url: str) -> bool:
+    """True if ``url`` looks like a Comix CDN page image (SSRF allowlist).
+
+    Belt-and-suspenders defense atop the JS extractor's path filter: rejects
+    cross-domain hosts, non-HTTPS schemes, and anything whose path does not
+    match the expected ``/si/{token}/{NN}.{ext}`` shape. Called on every URL
+    returned by the browser-DOM page-list extractor before the framework
+    fetches it.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and bool(_COMIX_CDN_HOST_RE.match(host))
+        and bool(_COMIX_CDN_PATH_RE.match(parsed.path))
+    )
+
+
+# JS extractor that returns the rendered chapter-page image URLs in NN order.
+# Matches the live-recon-observed pattern ``/si/{token}/{NN}.{ext}`` and filters
+# out cross-site ad imagery (gravatar, postimg, etc.) so the manifest is the
+# chapter pages ONLY. Numbering may have gaps (01,02,04,05,07,…) — the recon
+# shows real chapter pages with gaps, NOT lazy-load artifacts; we sort by
+# embedded NN so the gaps survive.
+_CHAPTER_PAGES_EXTRACT_JS = """
+  // Comix's chapter reader is a Swiper.js long-strip component
+  // (`class="rpage rpage--long-strip rpage--ttb"`). Each page is wrapped in a
+  // `<div class="rpage-page" data-page="N">` whose <img> child is LAZY-LOADED
+  // by an IntersectionObserver. `window.scrollTo()` does not move the inner
+  // Swiper viewport, so a blind window scroll only renders head/tail pages.
+  //
+  // Strategy: enumerate every `.rpage-page[data-page]` div the reader has
+  // scaffolded, then `scrollIntoView` each in order so the IntersectionObserver
+  // fires per-page and the lazy loader populates `<img src>`. The Map keyed by
+  // `data-page` preserves the canonical chapter ordering even if the reader
+  // evicts images on later scroll (`url` is captured the first time we see
+  // each page).
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const rx = /\\/si\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
+
+  // Step 1: wait until the page scaffold exists. The reader populates
+  // `.rpage-page[data-page]` divs once it has the decrypted page list.
+  for (let i = 0; i < 50; i++) {
+    if (document.querySelectorAll('.rpage-page[data-page]').length > 0) break;
+    await sleep(200);
+  }
+
+  const pageDivs = Array.from(document.querySelectorAll('.rpage-page[data-page]'))
+    .sort((a, b) => {
+      const an = parseInt(a.getAttribute('data-page') || '0', 10);
+      const bn = parseInt(b.getAttribute('data-page') || '0', 10);
+      return an - bn;
+    });
+
+  // Step 2: walk each scaffolded page. `scrollIntoView` works in ANY scroll
+  // container (window or inner overflow). After scrolling, poll the div for
+  // an <img> whose src matches the CDN pattern. 4s/page max wait.
+  const seen = new Map();
+  for (const div of pageDivs) {
+    div.scrollIntoView({ behavior: 'instant', block: 'center' });
+    for (let attempt = 0; attempt < 20; attempt++) {
+      let found = false;
+      for (const img of div.querySelectorAll('img')) {
+        const src = img.currentSrc || img.src || '';
+        const m = src.match(rx);
+        if (m) {
+          const n = parseInt(m[2], 10);
+          if (!seen.has(n)) seen.set(n, src);
+          found = true;
+          break;
+        }
+      }
+      if (found) break;
+      await sleep(200);
+    }
+  }
+
+  // Step 3 (fallback): sweep the document for any <img> the per-div walk
+  // missed (covers reader-shape variants where the canonical `data-page`
+  // wrapper is absent but images still match the CDN pattern).
+  for (const img of document.querySelectorAll('img')) {
+    const src = img.currentSrc || img.src || '';
+    const m = src.match(rx);
+    if (m) {
+      const n = parseInt(m[2], 10);
+      if (!seen.has(n)) seen.set(n, src);
+    }
+  }
+
+  return Array.from(seen.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(e => e[1]);
+"""
+
+# CSS selector ``solver.fetch_via_browser`` waits for before reading the DOM.
+# The chapter reader scaffolds `<div class="rpage-page" data-page="N">` for
+# every page in the chapter once the encrypted page-list arrives and decrypts;
+# images inside are lazy-loaded later via IntersectionObserver. Waiting for
+# the first scaffold div (not the first image) ensures the extract starts as
+# soon as the reader knows the chapter length, and the per-div scrollIntoView
+# loop in _CHAPTER_PAGES_EXTRACT_JS triggers the actual image loads.
+_CHAPTER_PAGES_WAIT_FOR = ".rpage-page[data-page]"
+
+# JS extractor that returns the rendered chapter list off the series page DOM.
+# Selects ``<a>`` elements whose href matches the recon-pinned chapter URL
+# pattern ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and emits a
+# ``{chapter_id, number, lang, group}`` shape per chapter — match-compatible
+# with the encrypted-API ``_to_release`` consumer. Lang defaults to "en" (Comix
+# is English-only per live recon) and group is best-effort extracted from a
+# sibling ``.scanlation`` / ``.group`` element when present; absent the live-
+# smoke is allowed to refine the selector. Chapter IDs and numbers are
+# load-bearing — the rest is advisory.
+_CHAPTER_LIST_EXTRACT_JS = """
+  const rx = /\\/title\\/[A-Za-z0-9_-]+\\/(\\d+)-chapter-([0-9.]+)(?:[/?#]|$)/i;
+  const seen = new Set();
+  const out = [];
+  const anchors = Array.from(document.querySelectorAll('a[href*="-chapter-"]'));
+  for (const a of anchors) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(rx);
+    if (!m) continue;
+    const id = m[1];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    // Best-effort group extraction: scan the anchor's ancestor row for a
+    // recognizable scanlation-group hint. The live smoke pins this selector;
+    // a miss here is still a valid chapter row (group simply omitted).
+    let group = null;
+    const row = a.closest('li, tr, [data-chapter], .chapter, .chapter-item');
+    if (row) {
+      const g = row.querySelector(
+        '.scanlation, .group, [data-group], .scanlator'
+      );
+      if (g && g.textContent) group = g.textContent.trim() || null;
+    }
+    out.push({
+      id: id,
+      chapter: m[2],
+      lang: 'en',
+      groups: group ? [{ name: group }] : []
+    });
+  }
+  return out;
+"""
+
+# CSS selector ``solver.fetch_via_browser`` waits for before reading the series
+# page DOM — any anchor whose href contains ``-chapter-``. Once at least one
+# such anchor has rendered, the chapter-list SPA component has hydrated.
+# JS predicate (not CSS selector — routes to page.wait_for_function): chapter
+# anchors carry class ``mchap-row__primary`` once the live recon confirmed the
+# series-page reader rendered them. We poll DOM attachment (not visibility)
+# because some anchors render off-screen / inside scroll containers and the
+# default CSS-selector wait_for would block on visibility forever (the e2e
+# test uncovered this — a[href*="-chapter-"] timed out at 20s).
+_CHAPTER_LIST_WAIT_FOR = (
+    "() => document.querySelectorAll('a.mchap-row__primary').length > 0"
+)
+
+
+def _title_to_slug(title: str) -> str:
+    """Best-effort title → URL slug fallback (lowercase + hyphenate non-alnum runs).
+
+    Used only when the search item is missing a ``url`` field (defensive — the
+    live ``/api/v1/manga`` response always carries one). Idempotent; never
+    raises; collapses runs of non-alnum to single ``-`` and strips leading/
+    trailing hyphens.
+    """
+    out: list[str] = []
+    in_dash = True  # treat leading non-alnum as a leading dash to be stripped
+    for ch in title.lower():
+        if ch.isalnum():
+            out.append(ch)
+            in_dash = False
+        elif not in_dash:
+            out.append("-")
+            in_dash = True
+    slug = "".join(out).rstrip("-")
+    return slug or "manga"
+
+
+class ComixSource(Source):
+    """Comix — antibot ``cloudflare+encrypted``, decrypt ``comix-v1`` (SRC-06)."""
+
+    key = "comix"
+    name = "Comix"
+    base_url = "https://comix.to"
+    # Title-search fallback only — no external id namespace (SRCH-07).
+    id_types: list[str] = []
+    languages = ["en"]
+    # CLAUDE.md: "Comix ~10" req/min — the per-source aiolimiter is keyed to this.
+    rate_limit_per_minute = 10
+    # caps.AntibotLevel already carries this literal (CAPS-02). The framework injects
+    # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
+    antibot = "cloudflare+encrypted"
+    # The URL the framework solver navigates to so Cloudflare issues a
+    # ``cf_clearance`` cookie + the warm decrypt/fetch page loads ``secure-*.js``
+    # (D-45 / Option A). Read by the application wiring (app.py lifespan), not
+    # by the framework solver itself.
+    cloudflare_challenge_url = "https://comix.to/"
+    # D-39/D-45: every encrypted response body is routed through framework.decrypt
+    # which delegates to solver.decrypt() (browser-evaluated). The framework injects
+    # ``solver`` into ``decrypt_config`` at each SourceContext construction site, so
+    # this declaration stays empty (no source-supplied key material in v1).
+    decrypt_scheme = "comix-v1"
+    decrypt_config: dict[str, Any] = {}
+
+    async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
+        """Title-search → series candidates → chapter-list enumeration (SRCH-01..07).
+
+        Comix has no external id namespace (``id_types == []``), so this is always
+        the title-search path: resolve candidate series for the query (PLAINTEXT
+        ``/api/v1/manga`` per live recon), then enumerate each series' chapter
+        list via a browser-DOM read of the series page (Option A, Plan 04-04).
+
+        Identical contract shape to MangaDex (one Release per chapter upload, an
+        opaque ``comix:`` handle minted per release). The encrypted
+        ``/api/v1/manga/{hid}/chapters`` endpoint is bypassed for the same
+        Option A reason as the chapter-pages endpoint: rather than maintain two
+        decrypt paths (one statically-decrypted list endpoint and one
+        browser-driven pages endpoint), funnel both through the warm Patchright
+        page that the SPA already drives correctly.
+        """
+        _ = req.languages  # Comix is English-only (live recon); honored downstream
+        count = (
+            _INTERACTIVE_SERIES_CANDIDATES
+            if req.interactive
+            else _DEFAULT_SERIES_CANDIDATES
+        )
+        series = await self._search_series(req.query or "", count, ctx)
+
+        releases: list[Release] = []
+        feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
+        for series_hid, series_slug, series_title in series:
+            chapters = await self._series_chapters(
+                series_hid, series_slug, feed_limit, req.offset, ctx
+            )
+            for chapter in chapters:
+                # Inject the series-page-known title into the chapter dict so the
+                # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /
+                # ``series`` / ``title`` keys) does not need to know whether the
+                # data came from the browser DOM or the legacy encrypted API.
+                if "seriesTitle" not in chapter and series_title:
+                    chapter = {**chapter, "seriesTitle": series_title}
+                rel = self._to_release(series_hid, series_slug, chapter, ctx)
+                if rel is not None:
+                    releases.append(rel)
+        return releases
+
+    async def recent(
+        self,
+        *,
+        languages: list[str] | None,
+        limit: int,
+        since: str | None,
+        ctx: SourceContext,
+    ) -> list[Release]:
+        """Newest-first recent chapters across all series (RCNT-01/02).
+
+        The live Comix API has no public "all-recent" feed — the public site renders
+        a Recent shelf by hitting per-series chapter feeds. This hook returns an
+        empty list rather than fabricating an endpoint; recent-Comix coverage will
+        come via a per-followed-series fan-out in a future plan (deferred). The
+        framework's per-source isolation means an empty Comix recent is a no-op,
+        not a contract failure.
+        """
+        _ = (languages, limit, since, ctx)  # unused — see docstring
+        return []
+
+    # ───────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
+
+    async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
+        """Resolve a chapter id → ordered page-image URLs, INTERNALLY (PKG-01/R6).
+
+        Option A (Plan 04-04, 2026-05-30): drive the chapter HTML page in the
+        warm Patchright browser and read the rendered image-tag URLs off the DOM.
+        The page's own JS does token-mint + encrypted-API call + decrypt + image
+        rendering — we just read the result. Bypasses the encrypted
+        ``/api/v1/chapters/{id}`` endpoint entirely because its ``_=`` request
+        token is minted by the same VM-obfuscated ``secure-*.js`` that does
+        decryption, and we cannot reliably mint it statically.
+
+        Composite-id contract: ``chapter_id`` is the
+        ``"{numeric_id}|{hid}|{slug}|{number}"`` composite the search step
+        encoded into the handle's ``ResolutionRecord.chapter_id``. We decode
+        here, construct the live chapter URL, and call
+        :meth:`solver.fetch_via_browser` with a JS extractor that returns the
+        rendered ``/si/{token}/{NN}.{ext}`` image URLs in NN order. A malformed
+        composite or an empty page list raises
+        ``SourceError("source_unavailable")`` so it surfaces as a contract
+        warning, never a raw KeyError (WR-06). The manifest is consumed only by
+        the gateway's own engine — never returned to a caller (R6).
+
+        The image-byte fetch (the next step in the engine) still runs through
+        httpx (``ctx.get_bytes``) — the browser is NEVER used for bulk image
+        fetch (CLAUDE.md).
+        """
+        try:
+            numeric_id, hid, slug, number = self._parse_composite_chapter_id(chapter_id)
+        except ValueError as exc:
+            raise SourceError(
+                "source_unavailable", f"malformed comix chapter id: {exc}"
+            ) from None
+        solver = self._solver_from_ctx(ctx)
+        chapter_url = (
+            f"{self.base_url}/title/{hid}-{slug}/{numeric_id}-chapter-{number}"
+        )
+        try:
+            urls = await solver.fetch_via_browser(
+                chapter_url,
+                extract=_CHAPTER_PAGES_EXTRACT_JS,
+                wait_for=_CHAPTER_PAGES_WAIT_FOR,
+                # The Swiper.js long-strip walker iterates every .rpage-page div
+                # and waits up to ~4s/page for the lazy loader. A 25-page chapter
+                # can need ~100s of evaluate time; 120s gives margin for slow CDN
+                # warm-ups + initial Cloudflare round-trip + ad-banner shuffles.
+                timeout=120.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
+            raise SourceError(
+                "source_unavailable", f"browser manifest fetch failed: {exc}"
+            ) from exc
+        if (
+            not isinstance(urls, list)
+            or not urls
+            or not all(
+                isinstance(u, str) and u and _is_allowed_image_url(u) for u in urls
+            )
+        ):
+            raise SourceError("source_unavailable", "malformed chapter manifest")
+        return urls
+
+    async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
+        """Fetch one page image's raw bytes via the shared session (PKG-02).
+
+        Delegates to ``ctx.get_bytes_plain`` — cleared by the framework seam
+        (D-40) but the decrypt seam is opted out: the Comix CDN
+        (``https://{cdn}.store/si/{token}/{NN}.webp``) serves plaintext WebP,
+        and the ``comix-v1`` scheme is a browser-eval cipher that does not
+        apply to image bytes (and would corrupt them on the UTF-8 boundary
+        when handed to ``page.evaluate``). The browser is NEVER used for
+        image fetch (CLAUDE.md): the cleared httpx client does the bulk fetch,
+        bounded by the per-job semaphore. The host + token come from the
+        browser-DOM page-list (Option A pivot — Plan 04-04).
+        """
+        return await ctx.get_bytes_plain(url)
+
+    # ─────────────────────────── composite chapter-id ────────────────────────────
+
+    @staticmethod
+    def _make_composite_chapter_id(
+        numeric_id: str, hid: str, slug: str, number: str
+    ) -> str:
+        """Pack the four URL-construction fields into one opaque-to-engine string.
+
+        The framework treats ``chapter_id`` as source-opaque (engine just passes
+        it through to ``fetch_manifest``), so the composite is contained inside
+        ComixSource. Every field is non-empty by precondition; an empty ``slug``
+        produces a still-valid composite but the resulting chapter URL would be
+        invalid — guarded at parse time.
+        """
+        return _CID_SEP.join((numeric_id, hid, slug, number))
+
+    @staticmethod
+    def _parse_composite_chapter_id(composite: str) -> tuple[str, str, str, str]:
+        """Unpack ``{numeric_id}|{hid}|{slug}|{number}``.
+
+        Raises ``ValueError`` for a malformed composite (wrong segment count,
+        empty segments) so :meth:`fetch_manifest` can translate it to a
+        :class:`SourceError` (WR-06).
+        """
+        parts = composite.split(_CID_SEP)
+        if len(parts) != 4 or not all(parts):
+            raise ValueError(
+                f"expected 4 non-empty segments separated by {_CID_SEP!r}, "
+                f"got {len(parts)}: {composite!r}"
+            )
+        return parts[0], parts[1], parts[2], parts[3]
+
+    @staticmethod
+    def _solver_from_ctx(ctx: SourceContext) -> Any:
+        """Pull the AntiBotSolver out of ``ctx`` for the browser-fetch path.
+
+        The framework wires the solver into ``SourceContext`` for any
+        ``cloudflare*`` source (D-40 clearance injection). For Comix's browser-
+        DOM read we ALSO need ``solver.fetch_via_browser`` — distinct from the
+        request-clearance use, same instance. Raises ``SourceError`` when the
+        solver is missing OR lacks the primitive (a wiring bug, not a runtime
+        condition).
+        """
+        solver = getattr(ctx, "_solver", None)
+        if solver is None or not hasattr(solver, "fetch_via_browser"):
+            raise SourceError(
+                "source_unavailable",
+                "comix browser-fetch requires a solver with fetch_via_browser",
+            )
+        return solver
+
+    # ─────────────────────────── Comix fetch helpers ──────────────────────────
+
+    async def _search_series(
+        self, query: str, limit: int, ctx: SourceContext
+    ) -> list[tuple[str, str, str]]:
+        """PLAINTEXT search → ``(hid, slug, title)`` (D-46) via ``/api/v1/manga``.
+
+        Returns ``(hid, slug, title)`` tuples. The 5-char ``hid`` is the canonical
+        series identifier; the ``slug`` is extracted from the item's ``url`` field
+        (``/title/{hid}-{slug}`` per live recon); the ``title`` is the rendered
+        series title and is threaded through to ``_to_release`` so the per-
+        chapter Release carries the manga title (the browser-DOM chapter rows do
+        not repeat the series title — it's on the series-page header). Plain
+        query params; the ``order[relevance]=desc`` and
+        ``content_rating=suggestive`` match what the public site sends.
+        """
+        params: dict[str, Any] = {
+            "keyword": query,
+            "limit": min(limit or _SEARCH_PAGE_SIZE, _SEARCH_PAGE_SIZE),
+            "page": 1,
+            "content_rating": _CONTENT_RATING,
+            # httpx encodes ``order[relevance]`` as a bracketed key by default; the
+            # live API tolerates either bracketed or repeated keys.
+            "order[relevance]": "desc",
+        }
+        # PLAINTEXT endpoint (live recon) — bypass the comix-v1 decrypt seam.
+        data = await ctx.get_json_plain(f"{self.base_url}/api/v1/manga", **params)
+        items = self._result_items(data)
+        out: list[tuple[str, str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            hid = item.get("hid")
+            if not hid:
+                continue
+            # Skip series that have no published chapters yet (``hasChapters: false``
+            # in the search response) — navigating their series page would hang the
+            # chapter-list extractor's wait_for since ``a.mchap-row__primary`` never
+            # renders. Real production case: e.g. announced-but-not-yet-released
+            # series surface in keyword matches.
+            if item.get("hasChapters") is False:
+                continue
+            slug = self._slug_from_item(item)
+            title = str(item.get("title") or "")
+            out.append((str(hid), slug, title))
+        return out
+
+    @staticmethod
+    def _slug_from_item(item: dict[str, Any]) -> str:
+        """Extract the title-derived slug from a Comix search item.
+
+        The live ``/api/v1/manga`` response carries ``url=/title/{hid}-{slug}``.
+        We strip the leading ``/title/{hid}-`` to get the slug. If the URL is
+        missing or doesn't fit the pattern, we fall back to a slug derived from
+        the item's ``title`` field (lowercased + non-alnum runs collapsed to
+        hyphens) so the URL ComixSource builds is still navigable — the live
+        site appears tolerant of slug drift as long as ``hid`` and chapter id
+        are correct.
+        """
+        raw_url = item.get("url")
+        hid = item.get("hid") or ""
+        if isinstance(raw_url, str) and raw_url and hid:
+            # Patterns: ``/title/{hid}-{slug}`` or ``title/{hid}-{slug}``.
+            stripped = raw_url.lstrip("/")
+            prefix = f"title/{hid}-"
+            if stripped.startswith(prefix):
+                slug = stripped[len(prefix) :]
+                # Drop any trailing path segment (defensive).
+                slug = slug.split("/", 1)[0]
+                if slug:
+                    return slug
+        # Title-derived fallback (best-effort; real recon never hit this path).
+        title = item.get("title")
+        if isinstance(title, str) and title:
+            return _title_to_slug(title)
+        return "manga"  # last-resort placeholder; bare URL would still 404 cleanly
+
+    async def _series_chapters(
+        self,
+        series_hid: str,
+        series_slug: str,
+        limit: int,
+        offset: int,
+        ctx: SourceContext,
+    ) -> list[dict[str, Any]]:
+        """Browser-DOM read of the series page chapter list (Plan 04-04 Option A).
+
+        Navigates ``{base_url}/title/{hid}-{slug}`` in the warm Patchright
+        browser, waits for the chapter-list anchors to hydrate, and reads
+        ``[{id, chapter, lang, groups}, …]`` off the rendered DOM. The numeric
+        chapter id (URL leading segment) and chapter number (URL trailing
+        segment after ``-chapter-``) are load-bearing — group/lang/date are
+        best-effort extracted and the live smoke pins selector refinements.
+
+        We sort newest-first by chapter number and slice the
+        ``offset..offset+limit`` window so the contract behaves identically to
+        the prior encrypted-API path. A failed browser fetch surfaces as
+        ``SourceError("source_unavailable")`` → per-source warning (WR-06).
+
+        Fallback note: the still-plaintext
+        ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` endpoint carries
+        chapter numbers + scanlation groups but NOT chapter IDs — so it cannot
+        substitute for the DOM read (download needs the numeric chapter id to
+        construct the chapter URL). It remains a future signal source for
+        per-chapter group disambiguation if the DOM read drifts.
+        """
+        solver = self._solver_from_ctx(ctx)
+        series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
+        try:
+            raw = await solver.fetch_via_browser(
+                series_url,
+                extract=_CHAPTER_LIST_EXTRACT_JS,
+                wait_for=_CHAPTER_LIST_WAIT_FOR,
+                # Series page renders the first 20 chapters in <2s on a warm
+                # context (recon-measured). Cap at 15s so the call stays inside
+                # the framework's 20s per-source fan-out timeout when search
+                # enumerates a series' chapters.
+                timeout=15.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as typed source failure
+            raise SourceError(
+                "source_unavailable", f"browser chapter-list fetch failed: {exc}"
+            ) from exc
+        if not isinstance(raw, list):
+            raise SourceError("source_unavailable", "malformed chapter list")
+        # Normalize to the dict shape ``_to_release`` already consumes (the
+        # encrypted-API path produced the same shape, so the consumer is
+        # source-agnostic). Sort newest-first by chapter number when parseable;
+        # then apply the offset/limit window.
+        chapters: list[dict[str, Any]] = [c for c in raw if isinstance(c, dict)]
+        chapters.sort(
+            key=lambda c: self._parse_decimal(c.get("chapter")) or Decimal(0),
+            reverse=True,
+        )
+        feed_limit = min(limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
+        return chapters[offset : offset + feed_limit]
+
+    # ─────────────────────────── Release normalization ───────────────────────────
+
+    def _to_release(
+        self,
+        series_hid: str,
+        series_slug: str,
+        chapter: dict[str, Any],
+        ctx: SourceContext,
+    ) -> Release | None:
+        chapter_id = chapter.get("id")
+        if not chapter_id:
+            return None
+        chapter_id = str(chapter_id)
+
+        raw_chapter = chapter.get("chapter") or chapter.get("number")
+        chapter_number = self._parse_decimal(raw_chapter)
+        chapter_number_str = self._stringify(raw_chapter) or "0"
+        volume = self._parse_int(chapter.get("volume"))
+        language = chapter.get("lang") or chapter.get("language") or "en"
+        page_count = self._parse_int(chapter.get("pages") or chapter.get("pageCount"))
+        publish_date = chapter.get("publishedAt") or chapter.get("date") or ""
+
+        series_title = self._series_title(chapter)
+        group = self._scanlation_group(chapter)
+
+        title = self._build_title(
+            series_title or "Unknown",
+            self._stringify(raw_chapter),
+            volume=volume,
+            language=language,
+            group=group,
+        )
+        # Per-upload uniqueness across groups (mirrors MangaDex's D-21 guid shape).
+        # D-46: ``hid`` is the canonical series identifier — NOT the numeric id.
+        guid = (
+            f"comix:{series_hid}:ch-{self._stringify(raw_chapter) or '?'}"
+            f":{language}:{chapter_id}"
+        )
+
+        # Composite chapter id (Plan 04-04 Option A): pack the URL-construction
+        # fields ComixSource.fetch_manifest needs into the stored chapter_id so
+        # the stateless ``fetch_manifest(chapter_id, ctx)`` hook can reconstruct
+        # the chapter URL without a framework-wide signature change. Engine
+        # treats chapter_id as source-opaque (only stores + passes through).
+        composite_id = self._make_composite_chapter_id(
+            chapter_id, series_hid, series_slug, chapter_number_str
+        )
+
+        handle = ctx.handle_store.mint(
+            ResolutionRecord(
+                source_key=self.key,
+                chapter_id=composite_id,
+                language=language,
+                title=title,
+                manga_title=series_title,
+                chapter_number=chapter_number,
+                volume=volume,
+                scanlation_group=group,
+                page_count=page_count,
+            )
+        )
+
+        return Release(
+            guid=guid,
+            title=title,
+            source_key=self.key,
+            download_handle=handle,
+            publish_date=publish_date,
+            manga_title=series_title,
+            chapter_number=chapter_number,
+            volume=volume,
+            language=language,
+            scanlation_group=group,
+            page_count=page_count,
+            # D-46: ``comixSeriesId`` carries the hid (canonical series slug).
+            ids={"comixChapterId": chapter_id, "comixSeriesId": series_hid},
+        )
+
+    @staticmethod
+    def _build_title(
+        series_title: str,
+        chapter: str | None,
+        *,
+        volume: int | None,
+        language: str | None,
+        group: str | None,
+    ) -> str:
+        """Title template — MUST stay MangaParser-parseable (REL-02), like MangaDex."""
+        parts = [series_title, "-"]
+        if volume is not None:
+            parts.append(f"Vol. {volume}")
+        parts.append(f"Chapter {chapter}" if chapter else "Chapter ?")
+        if language:
+            parts.append(f"({language})")
+        if group:
+            parts.append(f"[{group}]")
+        return " ".join(parts)
+
+    # ─────────────────────────── parse helpers ───────────────────────────
+
+    @staticmethod
+    def _result_items(data: Any) -> list[Any]:
+        """Extract ``result.items`` (live-recon search/index shape) tolerantly."""
+        if not isinstance(data, dict):
+            return []
+        result = data.get("result") if isinstance(data.get("result"), dict) else None
+        if result is None:
+            # Some endpoints may return items at the top level.
+            items = data.get("items") or data.get("data") or []
+        else:
+            items = result.get("items") or result.get("data") or []
+        return items if isinstance(items, list) else []
+
+    @staticmethod
+    def _chapter_list(data: Any) -> list[dict[str, Any]]:
+        """Tolerant chapter-list extraction (decrypted JSON shape).
+
+        The exact decrypted key is pinned by the live smoke; we accept the common
+        ``chapters`` / ``data`` / nested ``result.{items|chapters|data}`` shapes.
+        """
+        if not isinstance(data, dict):
+            return []
+        # Try a nested result wrapper first (matches the plaintext-endpoint shape).
+        result = data.get("result")
+        if isinstance(result, dict):
+            items = (
+                result.get("chapters")
+                or result.get("items")
+                or result.get("data")
+                or []
+            )
+        else:
+            items = data.get("chapters") or data.get("data") or []
+        return [c for c in items if isinstance(c, dict)]
+
+    @staticmethod
+    def _extract_pages(data: Any) -> list[Any]:
+        """Decrypted chapter-pages → ordered raw entries (objects or strings).
+
+        Pin-by-tolerance: prefer ``pages`` (likely a list of ``{url}`` dicts per the
+        rendered DOM); fall back to ``images`` (string list per CDN URL pattern).
+        Nested under ``result`` like every other Comix endpoint.
+        """
+        if not isinstance(data, dict):
+            return []
+        result = data.get("result") if isinstance(data.get("result"), dict) else None
+        source = result if result is not None else data
+        pages = source.get("pages") if isinstance(source, dict) else None
+        if isinstance(pages, list) and pages:
+            return pages
+        images = source.get("images") if isinstance(source, dict) else None
+        if isinstance(images, list) and images:
+            return images
+        return []
+
+    @staticmethod
+    def _series_title(chapter: dict[str, Any]) -> str | None:
+        for key in ("seriesTitle", "series", "title"):
+            value = chapter.get(key)
+            if isinstance(value, dict):  # e.g. {"name": "..."}
+                name = value.get("name") or value.get("title")
+                if name:
+                    return str(name)
+            elif value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _scanlation_group(chapter: dict[str, Any]) -> str | None:
+        # Live recon chapter-indexes carry ``groups: [{id, name}, …]``; the
+        # encrypted chapter feed likely mirrors that shape (pinned by smoke).
+        groups = chapter.get("groups")
+        if isinstance(groups, list) and groups:
+            first = groups[0]
+            if isinstance(first, dict):
+                name = first.get("name")
+                if name:
+                    return str(name)
+            elif isinstance(first, str) and first:
+                return first
+        for key in ("group", "scanlationGroup", "team"):
+            value = chapter.get(key)
+            if isinstance(value, dict):
+                name = value.get("name")
+                if name:
+                    return str(name)
+            elif value:
+                return str(value)
+        return None
+
+    @staticmethod
+    def _page_url(page: Any) -> str | None:
+        """Extract a page URL from a manifest entry (str or ``{"url": ...}`` object).
+
+        Image CDN pattern: ``https://{cdn}.store/si/{token}/{NN}.webp``.
+        """
+        if isinstance(page, str) and page:
+            return page
+        if isinstance(page, dict):
+            url = page.get("url") or page.get("src") or page.get("href")
+            if isinstance(url, str) and url:
+                return url
+        return None
+
+    @staticmethod
+    def _stringify(raw: Any) -> str | None:
+        if raw is None or raw == "":
+            return None
+        return str(raw)
+
+    @staticmethod
+    def _parse_decimal(raw: Any) -> Decimal | None:
+        """Parse a chapter number STRING to Decimal (SRCH-06 / Pitfall 1)."""
+        if raw is None or raw == "":
+            return None
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_int(raw: Any) -> int | None:
+        if raw is None or raw == "":
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None

@@ -62,17 +62,22 @@ async def test_caps_served_from_cache(client: httpx.AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_caps_cache_object_identity(app, client: httpx.AsyncClient) -> None:  # type: ignore[no-untyped-def]
-    """PLAT-04: the cache holds the SAME Capabilities object across requests."""
-    from manga_gateway.api.routes.caps import _CAPS_KEY
+    """PLAT-04: the cache holds the SAME static skeleton object across requests.
+
+    D-38 refactor: only the STATIC skeleton (version/limits/formats) is cached; the
+    per-source ``sources[]`` is recomputed live each call so a breaker trip is never
+    masked by the 12h cache. The cached skeleton object is still reused by identity.
+    """
+    from manga_gateway.api.routes.caps import _CAPS_SKELETON_KEY
     from manga_gateway.models.caps import Capabilities
 
     await client.get("/caps")
-    cached_first = app.state.caps_cache.get(_CAPS_KEY)
+    cached_first = app.state.caps_cache.get(_CAPS_SKELETON_KEY)
     assert isinstance(cached_first, Capabilities)
 
     await client.get("/caps")
-    cached_second = app.state.caps_cache.get(_CAPS_KEY)
-    # Identity: the read-through did not rebuild the document.
+    cached_second = app.state.caps_cache.get(_CAPS_SKELETON_KEY)
+    # Identity: the read-through did not rebuild the cached skeleton.
     assert cached_first is cached_second
 
 

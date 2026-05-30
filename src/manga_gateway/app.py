@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from typing import Any
 
 from cachetools import TTLCache
 from fastapi import Depends, FastAPI
@@ -24,7 +25,8 @@ from fastapi import Depends, FastAPI
 from .api import api_router
 from .config import Settings
 from .errors import register_error_handlers
-from .framework.antibot import NoopSolver
+from .framework.antibot import CloudflareSolver
+from .framework.health import SourceHealth
 from .framework.ratelimit import RateLimiter
 from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
@@ -41,6 +43,11 @@ _CAPS_TTL_SECONDS = 43_200
 # Bound shutdown drain so a wedged in-flight job cannot hang teardown forever
 # (CR-01). On timeout the stragglers are cancelled and shutdown proceeds.
 _SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 30.0
+
+# How often each D-37 recovery supervisor checks whether its cloudflare-gated
+# source's breaker has tripped (cheap; the escalating +1h/+6h re-probe runs
+# only once a trip is seen).
+_RECOVERY_POLL_SECONDS = 60.0
 
 _log = logging.getLogger("manga_gateway")
 
@@ -78,6 +85,40 @@ def _sweep_staging(output_root: str) -> int:
     return swept
 
 
+async def _real_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def _recovery_watchdog(
+    health: SourceHealth,
+    *,
+    backoff_hours: tuple[int, int],
+    sleep: Callable[[float], Awaitable[None]] = _real_sleep,
+    probe: Callable[[], Awaitable[bool]],
+) -> None:
+    """D-37 escalating-backoff recovery for a tripped per-source breaker.
+
+    On a tripped breaker, re-probe the source on an ESCALATING schedule (+1h, then
+    +6h by default) — NOT on the request path. A probe that succeeds resets the
+    breaker (``record_success`` → re-enabled); after the last backoff step the
+    source stays down until a manual restart (no busy retry, D-37).
+
+    ``sleep``/``probe`` are injectable so tests assert the schedule with a fake clock
+    and no real waiting. The probe returns ``True`` on recovery, ``False`` otherwise.
+    """
+    for hours in backoff_hours:
+        if health.is_enabled:
+            return  # already recovered elsewhere — nothing to do
+        await sleep(hours * 3600.0)
+        recovered = await probe()
+        if recovered:
+            health.record_success()  # breaker resets → source re-enabled
+            _log.info("Recovery watchdog re-enabled a source after a re-probe")
+            return
+    # Exhausted the backoff schedule — stay down until manual restart (D-37).
+    _log.warning("Recovery watchdog exhausted backoff; source stays down until restart")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Build the R1 singleton seams once; tear the transport down on shutdown."""
@@ -85,11 +126,74 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     transport = HttpxTransport(settings)  # SRC-04 injectable seam
     app.state.transport = transport
     app.state.session = SessionManager(transport)  # R1 shared session
-    app.state.solver = NoopSolver()  # BOT-01 default
-    app.state.ratelimiter = RateLimiter()  # rate-limit seam
-    registry = SourceRegistry()  # SRC-01
-    register_builtin_sources(registry)  # register MangaDex into THIS instance
+    # SRC-01: build the registry first so the rest of the lifespan can inspect
+    # per-source metadata (antibot level, decrypt scheme) WITHOUT hardcoding any
+    # source key by name. Adding the 50+ planned sources is a register call and
+    # zero edits to this shell (CLAUDE.md "framework knows no source by name").
+    registry = SourceRegistry()
+    register_builtin_sources(registry)
     app.state.registry = registry
+    # Derive the set of cloudflare-gated source classes from the registry rather
+    # than hardcoding it — anything whose ``antibot`` declares cloudflare needs
+    # both a SourceHealth breaker (D-38) and a slot in the solver's key set.
+    cf_sources: dict[str, type] = {
+        key: cls
+        for key, cls in registry.items()
+        if getattr(cls, "antibot", "none").startswith("cloudflare")
+    }
+    cloudflare_keys: frozenset[str] = frozenset(cf_sources)
+    # Per-source health map (D-38): one breaker per cloudflare-gated source.
+    # JobManager + the search route read this by reference (deps.get_source_health).
+    source_health: dict[str, SourceHealth] = {
+        key: SourceHealth(threshold=settings.cloudflare_breaker_threshold)
+        for key in cloudflare_keys
+    }
+    app.state.source_health = source_health
+    # Resolve the Cloudflare clearance URL from the first cloudflare-gated source's
+    # ``cloudflare_challenge_url`` metadata — the framework solver itself never
+    # names a host. If multiple cloudflare sources are registered, the first
+    # with a non-None URL wins; sources without a URL fall back to the framework
+    # solver default (an invalid.example placeholder useful only for tests).
+    challenge_url: str | None = next(
+        (
+            getattr(cls, "cloudflare_challenge_url", None)
+            for cls in cf_sources.values()
+            if getattr(cls, "cloudflare_challenge_url", None)
+        ),
+        None,
+    )
+    solver_kwargs: dict[str, Any] = {
+        "user_data_dir": settings.cloudflare_user_data_dir,
+        "headless": settings.cloudflare_headless,
+        "solve_concurrency": settings.cloudflare_solve_concurrency,
+        "cloudflare_keys": cloudflare_keys,
+    }
+    if challenge_url is not None:
+        # Both URLs come from the same source for v1 (one cloudflare-gated source
+        # = Comix); when multiple cf sources land, the solver still serves them
+        # all under one warm browser, so we use the first-source URL for both.
+        solver_kwargs["challenge_url"] = challenge_url
+        solver_kwargs["decrypt_url"] = challenge_url
+    # Swap NoopSolver for the ONE shared CloudflareSolver (R1/BOT-01). Construction is
+    # cheap (no browser yet — the lazy patchright launch happens on the first solve);
+    # the eager warm() is fired NON-BLOCKING so a Patchright failure degrades only
+    # cloudflare-gated sources and NEVER aborts startup (D-33/Pitfall 3). Non-
+    # cloudflare sources (e.g. ``antibot="none"``) resolve no-clearance.
+    solver = CloudflareSolver(**solver_kwargs)
+    app.state.solver = solver
+
+    async def _warm_solver() -> None:
+        try:
+            await solver.warm()  # eager best-effort solve + recycle watchdog (D-33)
+        except Exception:  # noqa: BLE001 — cloudflare sources boot disabled, gateway lives
+            for key in cloudflare_keys:
+                source_health[key].force_disabled = True
+            _log.warning(
+                "CloudflareSolver warm failed; cloudflare-gated sources disabled (D-33)"
+            )
+
+    warm_task = asyncio.create_task(_warm_solver())  # non-blocking (Pitfall 3)
+    app.state.ratelimiter = RateLimiter()  # rate-limit seam
     app.state.caps_cache = TTLCache(maxsize=1, ttl=_CAPS_TTL_SECONDS)  # PLAT-04
     app.state.handle_store = HandleStore()  # opaque downloadHandle store (HDL-01/02)
     # Download surface: aiosqlite job store + lifespan-owned JobManager (PLAT-03).
@@ -101,6 +205,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ratelimiter=app.state.ratelimiter,
         handle_store=app.state.handle_store,
         settings=settings,
+        solver=solver,
+        source_health=source_health,
     )
     await job_manager.rehydrate()  # flip in-flight->failed + project rows (PLAT-03)
     # Restart staging sweep (PLAT-03 / T-03-13): clear orphan *.tmp archives left by a
@@ -110,9 +216,51 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if swept:
         _log.info("Swept %d orphan staging artifact(s) on startup", swept)
     app.state.job_manager = job_manager
+
+    # D-37 recovery supervisor: once a cloudflare-gated breaker trips, re-probe
+    # on the escalating +1h/+6h schedule (off the request path), then stay down
+    # until a manual restart. Strong-ref'd (manager.py:247-251 idiom) so each
+    # fire-and-forget task is never GC'd. A ``force_disabled`` (eager-launch-
+    # failed) source is left down. One supervisor task per cloudflare-gated
+    # source so they recover independently.
+    async def _probe_source(source_key: str) -> bool:
+        try:
+            clearance = await solver.get_clearance(source_key, force_resolve=True)
+        except Exception:  # noqa: BLE001 — a failed re-probe just keeps it down
+            return False
+        return clearance is not None
+
+    async def _supervise_source(source_key: str) -> None:
+        health = source_health[source_key]
+        while True:
+            await asyncio.sleep(_RECOVERY_POLL_SECONDS)
+            # eager-launch-failed (stay down) or healthy — nothing to do
+            if health.force_disabled or health.is_enabled:
+                continue
+            await _recovery_watchdog(
+                health,
+                backoff_hours=settings.cloudflare_watchdog_backoff_hours,
+                probe=lambda: _probe_source(source_key),
+            )
+
+    watchdog_tasks: list[asyncio.Task[None]] = [
+        asyncio.create_task(_supervise_source(key)) for key in cloudflare_keys
+    ]
     try:
         yield
     finally:
+        # Cancel the warm + watchdog bg tasks and close the solver BEFORE the
+        # transport, so no orphan Chromium survives shutdown (Pitfall 4).
+        bg_tasks = [warm_task, *watchdog_tasks]
+        for bg in bg_tasks:
+            bg.cancel()
+        with suppress(Exception):
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+        # Tear the bounded lifecycle + patchright down (Pitfall 4 — orphan Chromium).
+        # Guarded so a solver-close failure (timeout/CDP error) does not skip the
+        # store + transport teardown that follows.
+        with suppress(Exception):
+            await solver.aclose()
         # Await in-flight jobs BEFORE releasing the store/transport they depend on
         # (CR-01). Bound the drain so a wedged job cannot hang shutdown: on timeout,
         # cancel the stragglers, then proceed to close the store and transport.

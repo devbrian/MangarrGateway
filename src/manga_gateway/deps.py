@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from .config import Settings
     from .framework.antibot import AntiBotSolver
+    from .framework.health import SourceHealth
     from .framework.ratelimit import RateLimiter
     from .framework.registry import SourceRegistry
     from .framework.session import SessionManager
@@ -41,6 +42,19 @@ def get_session(request: Request) -> SessionManager:
 def get_solver(request: Request) -> AntiBotSolver:
     solver: AntiBotSolver = request.app.state.solver
     return solver
+
+
+def get_source_health(request: Request) -> dict[str, SourceHealth]:
+    """The lifespan-owned per-source health map (D-36/D-38).
+
+    Mirrors ``get_solver`` but tolerates the pre-Plan-04 app:
+    ``app.state.source_health`` is wired in Plan 04, so until then this returns an
+    empty map and every
+    ``health_map.get(key)`` is ``None`` (sources stay always-enabled — MangaDex
+    regression, no breaker yet).
+    """
+    health: dict[str, SourceHealth] = getattr(request.app.state, "source_health", {})
+    return health
 
 
 def get_ratelimiter(request: Request) -> RateLimiter:

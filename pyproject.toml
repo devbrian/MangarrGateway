@@ -8,6 +8,7 @@ dependencies = [
     "cachetools==7.1.4",
     "fastapi==0.136.3",
     "httpx==0.28.1",
+    "patchright==1.60.0",
     "pillow==12.2.0",
     "pydantic==2.13.4",
     "pydantic-settings==2.14.1",
@@ -36,6 +37,8 @@ packages = ["src/manga_gateway"]
 [tool.ruff]
 src = ["src", "tests"]
 target-version = "py312"
+# Throwaway recon scripts are not gated (one-shot live-tooling, not shipped code).
+extend-exclude = ["scripts"]
 
 [tool.ruff.lint]
 # F=pyflakes, E=pycodestyle, I=isort, UP=pyupgrade, B=bugbear,
@@ -58,3 +61,8 @@ disallow_untyped_decorators = false
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# Live tests (real third-party site through a real Patchright browser) are excluded
+# from the gate by default (D-43); run them explicitly with `pytest -m live`. The
+# deterministic gate never launches a browser (D-42).
+markers = ["live: hits a real site through a real Patchright browser (excluded from the gate)"]
+addopts = "-m 'not live'"

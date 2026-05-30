@@ -40,6 +40,8 @@ from .model import Job, JobStatus
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from ..framework.antibot import AntiBotSolver
+    from ..framework.health import SourceHealth
     from ..framework.ratelimit import RateLimiter
     from ..framework.registry import SourceRegistry
     from ..framework.session import SessionManager
@@ -64,6 +66,8 @@ class JobManager:
         ratelimiter: RateLimiter,
         handle_store: HandleStore,
         settings: Settings,
+        solver: AntiBotSolver | None = None,
+        source_health: dict[str, SourceHealth] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -78,6 +82,8 @@ class JobManager:
             ratelimiter=ratelimiter,
             handle_store=handle_store,
             settings=settings,
+            solver=solver,
+            source_health=source_health,
         )
 
     # ─────────────────────────── submit ───────────────────────────

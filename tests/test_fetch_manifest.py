@@ -69,6 +69,13 @@ def _ctx_over(transport: _SequenceTransport) -> SourceContext:
         session=SessionManager(transport),  # type: ignore[arg-type]
         ratelimiter=RateLimiter(),
         handle_store=HandleStore(),
+        # Plan 04-02 anti-bot seams — default-off so MangaDex/manifest tests stay
+        # byte-for-byte unchanged (no clearance, no decrypt, no health feed).
+        solver=None,
+        antibot="none",
+        decrypt_scheme=None,
+        decrypt_config=None,
+        source_health=None,
     )
 
 

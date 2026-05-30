@@ -19,14 +19,18 @@ from ...deps import (
     get_ratelimiter,
     get_registry,
     get_session,
+    get_solver,
+    get_source_health,
 )
 from ...errors import _error
-from ...framework.context import SourceContext
-from ...framework.fanout import fan_out
 
 # Runtime imports: FastAPI must resolve the route's Annotated[T, Depends(...)] types
 # at import time (``from __future__ import annotations`` makes them strings), so the
 # dependency types cannot live under TYPE_CHECKING.
+from ...framework.antibot import AntiBotSolver
+from ...framework.context import SourceContext
+from ...framework.fanout import fan_out
+from ...framework.health import SourceHealth
 from ...framework.ratelimit import RateLimiter
 from ...framework.registry import SourceRegistry
 from ...framework.session import SessionManager
@@ -88,6 +92,8 @@ async def search(
     ratelimiter: Annotated[RateLimiter, Depends(get_ratelimiter)],
     registry: Annotated[SourceRegistry, Depends(get_registry)],
     handle_store: Annotated[HandleStore, Depends(get_handle_store)],
+    solver: Annotated[AntiBotSolver, Depends(get_solver)],
+    health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
 ) -> ReleaseListResponse | JSONResponse:
     """Fan out the search across selected sources; isolate failures into warnings[]."""
     # SRCH-05 / D-23: neither query nor a usable id → 400 bad_request.
@@ -100,12 +106,22 @@ async def search(
     sources = _select_sources(registry, req.sources)
 
     async def _run_one(src: Source) -> list[Release]:
+        # D-45: the comix-v1 decrypt scheme delegates to the warm Patchright solver
+        # at runtime, so the framework injects the solver into decrypt_config here
+        # (alongside the source-declared keys). MangaDex (scheme=None) ignores it.
+        decrypt_config = dict(getattr(src, "decrypt_config", None) or {})
+        decrypt_config["solver"] = solver
         ctx = SourceContext(
             source_key=src.key,
             rate_limit_per_minute=src.rate_limit_per_minute,
             session=session,
             ratelimiter=ratelimiter,
             handle_store=handle_store,
+            solver=solver,
+            antibot=src.antibot,
+            decrypt_scheme=src.decrypt_scheme,
+            decrypt_config=decrypt_config,
+            source_health=health_map.get(src.key),
         )
         return await src.search(req, ctx)
 

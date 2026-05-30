@@ -17,12 +17,53 @@ from fastapi import FastAPI
 
 from manga_gateway.app import create_app
 from manga_gateway.config import Settings
+from manga_gateway.framework.antibot import Clearance, CloudflareSolver
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cloudflare_warm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace ``CloudflareSolver.warm`` with a no-op for every deterministic test.
+
+    The lifespan fires ``warm()`` as a non-blocking task (D-33) that tries to
+    solve real Cloudflare against ``comix.to`` through a real Patchright
+    browser. Locally that completes fast (cookies are cached in
+    ``cloudflare-userdata/``); on a fresh CI runner it hangs the worker for
+    minutes and eventually gets SIGTERMed by the runner (CI gate exit 143).
+    Tests never depend on warm actually solving — they only assert the
+    lifespan wired the solver type correctly (R1/BOT-01). Wiping warm to a
+    no-op preserves every assertion the deterministic suite makes while
+    deleting the only path that touches the network. Individual tests that
+    need a specific warm behavior (e.g. forcing failure to exercise the D-33
+    ``force_disabled`` path) override this with their own ``monkeypatch``,
+    which wins because it runs after this autouse fixture.
+    """
+
+    async def _noop_warm(self: CloudflareSolver) -> None:
+        return None
+
+    monkeypatch.setattr(CloudflareSolver, "warm", _noop_warm)
+
 
 # Deterministic key injected into every test app (D-03). NOT read from a file,
 # NOT taken from the environment.
 TEST_API_KEY = "test-key-deterministic-0123456789"
 
 BASE_URL = "http://testserver/api/v1"
+
+
+class _FakeSolver:
+    """Canned ``AntiBotSolver`` for Wave-2/3 tests (satisfies the runtime_checkable
+    Protocol). Returns a fixed ``Clearance`` so solver-consuming code is testable
+    without a real Patchright browser (RESEARCH Wave-0 gap)."""
+
+    async def get_clearance(self, source_key: str) -> Clearance:
+        return Clearance(cookies={"cf_clearance": "X"}, user_agent="UA/1")
+
+
+@pytest.fixture
+def fake_solver() -> _FakeSolver:
+    """A canned solver returning a fixed ``Clearance`` (cf_clearance=X, UA/1)."""
+    return _FakeSolver()
 
 
 @pytest.fixture

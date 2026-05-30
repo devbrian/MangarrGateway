@@ -20,6 +20,7 @@ from ..models.caps import AntibotLevel, SourceCap
 if TYPE_CHECKING:
     from ..models.search import Release, SearchRequest
     from .context import SourceContext
+    from .health import SourceHealth
 
 
 class Source(ABC):
@@ -35,16 +36,32 @@ class Source(ABC):
     languages: list[str]
     rate_limit_per_minute: int
     antibot: AntibotLevel = "none"
+    # D-39: the encrypted-response decrypt scheme dispatched via framework/decrypt.py.
+    # None = non-encrypted; a concrete source registers + names a scheme at module
+    # load time (e.g. ``@register_scheme("<name>") + decrypt_scheme = "<name>"``).
+    decrypt_scheme: str | None = None
+    # Optional Cloudflare-clearance URL the framework solver navigates to so the
+    # site issues a ``cf_clearance`` cookie bound to the bypassed session. Set on
+    # any ``antibot="cloudflare*"`` source; ignored otherwise. The application
+    # wiring (app.py lifespan) reads this off the first cloudflare-gated source
+    # and passes it to ``CloudflareSolver`` so the framework solver itself need
+    # not know any source-specific URL by name.
+    cloudflare_challenge_url: str | None = None
     supports_search: bool = True
     supports_recent: bool = True
 
     @classmethod
-    def source_cap(cls) -> SourceCap:
-        """Build the ``SourceCap`` the registry advertises (CAPS-02)."""
+    def source_cap(cls, health: SourceHealth | None = None) -> SourceCap:
+        """Build the ``SourceCap`` the registry advertises (CAPS-02).
+
+        ``enabled`` is dynamic (D-38): it reflects the live per-source breaker when
+        a ``health`` is supplied, and defaults to ``True`` when none is (MangaDex /
+        no-anti-bot sources keep their unchanged always-enabled behavior).
+        """
         return SourceCap(
             key=cls.key,
             name=cls.name,
-            enabled=True,
+            enabled=(health.is_enabled if health else True),
             supports_search=cls.supports_search,
             supports_recent=cls.supports_recent,
             id_types=cls.id_types,
