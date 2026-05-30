@@ -24,12 +24,12 @@ This is the discovery seam for the per-source nightly live-smoke framework
   invariant; proved by ``tests/test_live_collection.py``).
 * **D-55 — Per-test timeout markers from the profile.**
   ``pytest_collection_modifyitems`` attaches
-  ``pytest.mark.timeout(profile.download_timeout_s, method="signal")`` to
+  ``pytest.mark.timeout(profile.download_timeout_s, method=...)`` to
   every collected item whose keywords include ``live`` AND whose callspec
-  carries a ``source_key`` parameter. ``method="signal"`` is the cross-
-  platform default; on Windows ``signal`` is not deliverable so
-  pytest-timeout silently falls back to ``thread`` — both modes interrupt
-  a stuck live test (RESEARCH Pitfall 2).
+  carries a ``source_key`` parameter. ``method`` is platform-aware:
+  ``signal`` on POSIX (interrupts blocking C I/O via ``SIGALRM``),
+  ``thread`` on Windows where ``SIGALRM`` is unavailable — both modes
+  interrupt a stuck live test (RESEARCH Pitfall 2).
 
 Additionally, the autouse ``_no_real_cloudflare_warm`` fixture in
 ``tests/conftest.py`` monkeypatches ``CloudflareSolver.warm`` to a no-op
@@ -45,6 +45,7 @@ ends.
 from __future__ import annotations
 
 import importlib
+import sys
 
 import pytest
 
@@ -123,14 +124,18 @@ def pytest_collection_modifyitems(
     """Attach ``pytest.mark.timeout(profile.download_timeout_s)`` to every
     parametrized live test (D-55).
 
-    ``method="signal"`` is the cross-platform default — pytest-timeout
-    silently downgrades to ``thread`` on Windows (RESEARCH Pitfall 2).
-    Items without a ``source_key`` parameter or without the ``live``
-    keyword are skipped untouched. ``pytest.UsageError`` from
-    ``_load_profile`` is NOT swallowed here — a missing profile must
+    Method selection is platform-aware: ``signal`` on POSIX (interrupts
+    blocking C I/O via ``SIGALRM``), ``thread`` on Windows where
+    ``signal.SIGALRM`` is unavailable. pytest-timeout 2.4.0 honors a
+    marker-supplied ``method`` literally and will crash on Windows if
+    given ``method="signal"`` — the platform branch here is what makes
+    the dev host runnable. Items without a ``source_key`` parameter or
+    without the ``live`` keyword are skipped untouched. ``pytest.UsageError``
+    from ``_load_profile`` is NOT swallowed here — a missing profile must
     propagate as the documented D-50 collection error.
     """
     del config  # signature requirement only
+    timeout_method = "thread" if sys.platform == "win32" else "signal"
     for item in items:
         if "live" not in item.keywords:
             continue
@@ -140,7 +145,7 @@ def pytest_collection_modifyitems(
             continue
         profile = _load_profile(source_key)
         item.add_marker(
-            pytest.mark.timeout(profile.download_timeout_s, method="signal")
+            pytest.mark.timeout(profile.download_timeout_s, method=timeout_method)
         )
 
 
