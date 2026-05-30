@@ -21,7 +21,7 @@ Two anti-bot declarations distinguish Comix from MangaDex:
   decrypt seam is no longer in the hot path for Comix BUT the registration stays
   as the documented seam-shape proof for future encrypted sources whose token+
   cipher problem CAN be split. The ``get_json_plain`` opt-out is what the still-
-  plaintext endpoints (search, chapter-indexes) use.
+  plaintext ``/api/v1/manga`` search endpoint uses.
 
 ENDPOINT SHAPES (live-recon-pinned, Plan 04-04 Commit 3):
 
@@ -34,9 +34,12 @@ The shapes below come from real Comix traffic captured via the Plan 04-04 recon
   ``page``, ``content_rating=suggestive``, ``order[relevance]=desc``
   → ``{"status":"ok","result":{"items":[{"hid","title","url","latestChapter", …}]}}``
 * chapter list (Option A — browser-DOM): navigate ``/title/{hid}-{slug}`` and
-  read the rendered chapter list off the DOM. (The plaintext
-  ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` is a fallback signal — it
-  carries chapter numbers + scanlation groups but NOT chapter IDs.)
+  read the rendered chapter list off the DOM, including the scanlation group
+  name from each row's ``<a class="mchap-row__group">`` anchor. (The plaintext
+  ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` endpoint now requires
+  a JS-minted ``_=`` request token and returns 403 ``{"message":"Invalid
+  token."}`` for any unsigned call; the browser-DOM read is the only
+  reachable source for the group name.)
 * chapter pages (Option A — browser-DOM): navigate
   ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and read the rendered
   ``<img src="https://{cdn}.store/si/{token}/{NN}.webp">`` tags off the DOM.
@@ -279,16 +282,24 @@ _CHAPTER_LIST_EXTRACT_JS = """
     const id = m[1];
     if (seen.has(id)) continue;
     seen.add(id);
-    // Best-effort group extraction: scan the anchor's ancestor row for a
-    // recognizable scanlation-group hint. The live smoke pins this selector;
-    // a miss here is still a valid chapter row (group simply omitted).
+    // Each chapter row is a ``<div class="mchap-row">`` carrying an
+    // ``<a class="mchap-row__group">…<span>{name}</span></a>``. Walk to the
+    // row, find the group anchor, and prefer its inner <span> (the anchor
+    // itself contains an SVG icon whose textContent is empty/whitespace).
+    // A miss is still a valid chapter row (group simply omitted).
     let group = null;
-    const row = a.closest('li, tr, [data-chapter], .chapter, .chapter-item');
+    const row = a.closest(
+      '.mchap-row, li, tr, [data-chapter], .chapter, .chapter-item'
+    );
     if (row) {
       const g = row.querySelector(
-        '.scanlation, .group, [data-group], .scanlator'
+        'a.mchap-row__group, .scanlation, .group, [data-group], .scanlator'
       );
-      if (g && g.textContent) group = g.textContent.trim() || null;
+      if (g) {
+        const span = g.querySelector('span');
+        const text = ((span && span.textContent) || g.textContent || '').trim();
+        if (text) group = text;
+      }
     }
     out.push({
       id: id,
@@ -658,17 +669,11 @@ class ComixSource(Source):
         the prior encrypted-API path. A failed browser fetch surfaces as
         ``SourceError("source_unavailable")`` → per-source warning (WR-06).
 
-        Scanlation-group merge (issue #19): the rendered chapter-row markup
-        does NOT expose the group with the selectors the DOM extractor probes
-        (live recon: ``.scanlation`` / ``.group`` / ``[data-group]`` /
-        ``.scanlator`` are absent), so ``groups`` is always empty from the DOM
-        read. The plaintext
-        ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` endpoint carries
-        ``{chapter, groups: [{id, name}, …]}`` but no chapter id, so we use the
-        DOM read for the canonical (id, chapter) pairing and merge groups onto
-        each chapter by chapter number. A failed chapter-indexes fetch is
-        degraded behaviour, not fatal — release rows simply carry the original
-        empty ``groups`` and ``scanlationGroup`` stays ``null``.
+        Scanlation-group extraction: each chapter row is a
+        ``<div class="mchap-row">`` carrying an ``<a class="mchap-row__group">
+        …<span>{group_name}</span></a>``. The DOM extractor reads the name
+        directly off that anchor; a row that omits the anchor simply yields
+        an empty ``groups`` list (``scanlationGroup`` stays ``null``).
         """
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
@@ -699,86 +704,7 @@ class ComixSource(Source):
             reverse=True,
         )
         feed_limit = min(limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
-        window = chapters[offset : offset + feed_limit]
-        # Issue #19: merge scanlation groups from the plaintext chapter-indexes
-        # endpoint onto the DOM rows. Run AFTER the offset/limit slice so the
-        # merge work scales with what we return, not with the full series.
-        group_map = await self._fetch_chapter_group_map(series_hid, ctx)
-        if group_map:
-            window = [self._merge_chapter_group(c, group_map) for c in window]
-        return window
-
-    async def _fetch_chapter_group_map(
-        self, series_hid: str, ctx: SourceContext
-    ) -> dict[str, str]:
-        """Return ``{chapter_number_str: group_name}`` from the chapter-indexes API.
-
-        Issue #19 / Plan 04-04: the plaintext
-        ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` carries every
-        chapter's scanlation group(s) but NOT the numeric chapter id. We use
-        it as a side-channel to backfill the group field the DOM extractor
-        cannot read off the rendered series page. The endpoint shape is the
-        same ``{result: {items: [...]}}`` envelope as ``/api/v1/manga`` (live
-        recon, Plan 04-04). A network/parse failure returns an empty map —
-        callers treat that as "no merge", not a hard error.
-        """
-        try:
-            data = await ctx.get_json_plain(
-                f"{self.base_url}/api/v1/manga/{series_hid}/chapter-indexes",
-                group_id=-1,
-            )
-        except Exception:  # noqa: BLE001 — degraded, not fatal (issue #19)
-            ctx.warn(
-                "scanlation_group_unavailable",
-                "comix chapter-indexes fetch failed; scanlationGroup will be null",
-            )
-            return {}
-        items = self._result_items(data)
-        group_map: dict[str, str] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            number = self._stringify(item.get("chapter") or item.get("number"))
-            if not number or number in group_map:
-                continue
-            group_name = self._first_group_name(item.get("groups"))
-            if group_name:
-                group_map[number] = group_name
-        return group_map
-
-    @staticmethod
-    def _first_group_name(groups: Any) -> str | None:
-        """Best-effort name extraction from ``[{id, name}, …]`` or ``[str, …]``."""
-        if not isinstance(groups, list) or not groups:
-            return None
-        first = groups[0]
-        if isinstance(first, dict):
-            name = first.get("name") or first.get("title")
-            return str(name) if name else None
-        if isinstance(first, str) and first:
-            return first
-        return None
-
-    @staticmethod
-    def _merge_chapter_group(
-        chapter: dict[str, Any], group_map: dict[str, str]
-    ) -> dict[str, Any]:
-        """Inject ``groups: [{"name": …}]`` from ``group_map`` if the DOM row is empty.
-
-        Idempotent: a DOM row that already carries a non-empty ``groups`` list
-        wins over the chapter-indexes signal (the live DOM is authoritative
-        when present). Returns the merged dict; the caller may treat the
-        input as immutable.
-        """
-        existing = chapter.get("groups")
-        if isinstance(existing, list) and existing:
-            return chapter
-        number = chapter.get("chapter") or chapter.get("number")
-        key = str(number) if number is not None else ""
-        group_name = group_map.get(key)
-        if not group_name:
-            return chapter
-        return {**chapter, "groups": [{"name": group_name}]}
+        return chapters[offset : offset + feed_limit]
 
     # ─────────────────────────── Release normalization ───────────────────────────
 
