@@ -134,6 +134,59 @@ async def test_distinct_solves_after_first_completes() -> None:
     await lc.aclose()
 
 
+# ───────────────────────────── D-35 held clearance ─────────────────────────────
+
+
+async def test_sequential_nonforced_solves_reuse_held_clearance() -> None:
+    """D-35: subsequent non-forced solve() calls return the held Clearance from
+    the first solve. Without this, every outbound request drives a fresh
+    Patchright solve and the per-search budget exhausts as
+    ``source_unavailable / timed out`` (see debug session
+    `comix-cf-solver-loop`)."""
+    fake = FakeBrowser()
+    lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
+    first = await lc.solve()
+    second = await lc.solve()
+    third = await lc.solve()
+    assert fake.solve_count == 1
+    # All three callers see the EXACT same Clearance instance — the cache is
+    # by-reference, not a re-issued copy.
+    assert first is second is third
+    await lc.aclose()
+
+
+async def test_force_resolve_replaces_held_clearance() -> None:
+    """A force=True solve must overwrite the cached value so the next non-forced
+    caller sees the freshly-issued Clearance (D-35 reactive re-solve)."""
+    fake = FakeBrowser()
+    lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
+    first = await lc.solve()
+    second = await lc.solve(force=True)
+    # held updated → next non-forced returns the FORCED clearance, not the first.
+    third = await lc.solve()
+    assert fake.solve_count == 2
+    assert third is second
+    assert third is not first
+    await lc.aclose()
+
+
+async def test_recycle_invalidates_held_clearance() -> None:
+    """The recycle watchdog tears the persistent context down; the cached
+    Clearance is bound to that session so the next call must re-solve against
+    the fresh context (no orphan cookies, no stale UA)."""
+    fake = FakeBrowser()
+    lc = BrowserLifecycle(
+        launch=fake.launch, solve=fake.solve, solve_concurrency=1, recycle_seconds=0.05
+    )
+    await lc.solve()  # solve #1, held populated, launch #1
+    lc.start_recycle_watchdog()
+    await asyncio.sleep(0.12)  # let the watchdog fire at least once
+    await lc.solve()  # held was cleared by _close_context → real re-solve
+    assert fake.solve_count >= 2
+    assert fake.launch_count >= 2
+    await lc.aclose()
+
+
 # ───────────────────────────── solve cap ─────────────────────────────
 
 

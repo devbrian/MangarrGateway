@@ -68,6 +68,7 @@ class BrowserLifecycle:
         self._context: Any = None
         self._context_lock = asyncio.Lock()  # guards launch/recycle of the context
         self._inflight: asyncio.Future[Clearance] | None = None  # single-flight
+        self._held: Clearance | None = None  # D-35: reuse last-good until challenged
         self._recycle_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -91,9 +92,15 @@ class BrowserLifecycle:
         return self._context
 
     async def _close_context(self) -> None:
-        """Close the persistent context if one is live (idempotent, error-tolerant)."""
+        """Close the persistent context if one is live (idempotent, error-tolerant).
+
+        Also clears the held :class:`Clearance` — the cached cookies + UA are
+        bound to the torn-down browser session, so the next caller must re-solve
+        against the freshly launched context (D-35).
+        """
         ctx = self._context
         self._context = None
+        self._held = None
         if ctx is not None:
             with contextlib.suppress(Exception):
                 await ctx.close()
@@ -103,11 +110,20 @@ class BrowserLifecycle:
     async def solve(self, *, force: bool = False) -> Clearance:
         """Return a :class:`Clearance`, collapsing concurrent callers (single-flight).
 
-        Non-``force`` callers that arrive while a solve is already in flight await
-        that SAME solve (Pitfall 6). A ``force``ed solve (the D-35 re-solve) always
-        runs its own solve under the solve-cap semaphore.
+        Non-``force`` callers reuse the last-good :class:`Clearance` if one is
+        held (D-35: hold until a request returns a CF challenge or the cookie is
+        rejected; no proactive TTL). If no clearance is held, non-``force``
+        callers that arrive while a solve is already in flight await that SAME
+        solve (Pitfall 6). A ``force``ed solve (the D-35 re-solve) always runs
+        its own solve under the solve-cap semaphore and replaces the held
+        clearance on success.
         """
         if not force:
+            # Fast path: reuse the last-good clearance until a caller forces a
+            # re-solve or _close_context() (recycle/aclose) invalidates it.
+            held = self._held
+            if held is not None:
+                return held
             # Snapshot the inflight future BEFORE awaiting so the leader's
             # ``finally`` cannot clear it to ``None`` between the .done()
             # check and the await (single-flight race).
@@ -116,7 +132,9 @@ class BrowserLifecycle:
                 return await inflight
 
         if force:
-            return await self._run_solve()
+            clearance = await self._run_solve()
+            self._held = clearance  # D-35 re-solve replaces the cached value
+            return clearance
 
         # Become the single-flight leader: publish a Future others can await.
         loop = asyncio.get_running_loop()
@@ -128,6 +146,7 @@ class BrowserLifecycle:
                 self._inflight.set_exception(exc)
             raise
         else:
+            self._held = clearance  # cache for subsequent non-forced callers
             if self._inflight is not None and not self._inflight.done():
                 self._inflight.set_result(clearance)
             return clearance
