@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="2" failures="0" errors="0" skipped="0">
+    <testcase classname="tests.live.test_caps_smoke" name="test_caps_smoke[mangadex]" time="0.42"/>
+    <testcase classname="tests.live.test_caps_smoke" name="test_caps_smoke[comix]" time="1.18"/>
+  </testsuite>
+</testsuites>
