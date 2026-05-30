@@ -53,7 +53,8 @@ def test_parse_junit_perf_classname_bucketing() -> None:
     """Pitfall 7: non-parametrized perf test must bucket to ``comix`` via classname."""
     per_source = nightly_triage.parse_junit(_FIXTURES / "perf_only_fail.xml")
     assert "comix" in per_source, (
-        f"Pitfall 7: expected 'comix' bucket from classname-only testcase, got {per_source!r}"
+        f"Pitfall 7: expected 'comix' bucket from classname-only testcase, "
+        f"got {per_source!r}"
     )
     assert per_source["comix"]["fail"] == 1
     # The single failing test must be recorded by name.
