@@ -88,13 +88,15 @@ async def test_caps_advertises_source(
 
         payload = resp.json()
         sources = payload.get("sources") or []
+        # SourceCap.key is the field name in manga-gateway.openapi.yaml
+        # (NOT sourceKey — that name is on Release/SubmitRequest/SourceWarning).
         match = next(
-            (s for s in sources if s.get("sourceKey") == source_key),
+            (s for s in sources if s.get("key") == source_key),
             None,
         )
         assert match is not None, (
             f"{source_key}: not advertised in /caps; sources keys="
-            f"{[s.get('sourceKey') for s in sources]}"
+            f"{[s.get('key') for s in sources]}"
         )
         assert match.get("enabled") is True, (
             f"{source_key}: advertised but enabled is not True: {match}"
