@@ -100,23 +100,28 @@ def test_gateway_config_env_var_selects_path(
 def test_relative_path_is_resolved_to_absolute(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A relative ``path`` is resolved against CWD ONCE so a later chdir cannot
-    drift the resolution (IN-04)."""
+    """``load_settings`` calls ``path.resolve()`` so a relative ``path`` binds
+    to the CURRENT cwd at the moment of the call (IN-04). The per-call resolve
+    is the well-defined contract; cross-cwd stability is what ``GATEWAY_CONFIG``
+    is for."""
     monkeypatch.chdir(tmp_path)
-    # Generate at the relative path...
+    # First call: relative path resolves under tmp_path → fresh key.
     first = load_settings(Path("config.toml"))
     persisted = tmp_path / "config.toml"
     assert persisted.exists()
 
-    # ...then chdir elsewhere and load AGAIN by the same relative name. Without
-    # explicit env-var or path, the default lookup still resolves to whatever the
-    # CURRENT cwd is — that's the documented contract; the fix is GATEWAY_CONFIG
-    # for cross-cwd stability. Here we just assert the absolute-resolve happens.
+    # chdir elsewhere and reload by the same RELATIVE name — resolution against
+    # the new cwd yields a DISTINCT file with a freshly generated key.
     other = tmp_path / "other"
     other.mkdir()
     monkeypatch.chdir(other)
-    second = load_settings(persisted)  # explicit absolute path
-    assert second.api_key == first.api_key
+    second = load_settings(Path("config.toml"))
+    assert (other / "config.toml").exists()
+    assert second.api_key != first.api_key
+
+    # Loading the original absolute path still returns the original key — the
+    # per-call resolve never drifted away from a fully-qualified path.
+    assert load_settings(persisted).api_key == first.api_key
 
 
 def test_env_overrides_ops_knobs(
