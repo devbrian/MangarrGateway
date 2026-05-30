@@ -133,12 +133,13 @@ async def search(
             source_health=health_map.get(src.key),
         )
         started = time.perf_counter()
-        try:
-            releases = await src.search(req, ctx)
-        finally:
-            # Capture even on failure: a source that warned then raised should
-            # still surface the warning beside its hard-failure entry.
-            soft_warnings[src.key] = list(ctx.warnings)
+        releases = await src.search(req, ctx)
+        # ``fan_out`` calls ``collect_warnings`` on the SUCCESS path only — its
+        # Timeout/SourceError/Exception branches append a hard-failure warning
+        # and short-circuit. Recording soft warnings here matches that contract:
+        # a source that warned then raised is already represented by the
+        # hard-failure entry, so the soft tail would never be read anyway.
+        soft_warnings[src.key] = list(ctx.warnings)
         elapsed = time.perf_counter() - started
         # #21: one INFO per source dispatched. Per-source warnings count helps
         # an operator spot a degraded source without re-parsing the response.

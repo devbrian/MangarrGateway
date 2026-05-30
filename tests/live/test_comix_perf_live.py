@@ -38,6 +38,7 @@ Knobs:
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from pathlib import Path
@@ -71,9 +72,15 @@ def _budget_seconds() -> float:
     if not raw:
         return _DEFAULT_BUDGET_SECONDS
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         return _DEFAULT_BUDGET_SECONDS
+    # Reject inf/nan/non-positive: an `inf` override would silently disable the
+    # perf guard, a `nan` would make the assertion always false, and a negative
+    # value would make it always fail without diagnostic value.
+    if not math.isfinite(value) or value <= 0:
+        return _DEFAULT_BUDGET_SECONDS
+    return value
 
 
 def _headless() -> bool:
@@ -112,11 +119,13 @@ async def _poll_until_terminal(
 
 
 async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
-    """Warm-solver Comix download must complete under the #20 budget.
+    """Warm-solver Comix download must complete under the regression budget.
 
     Search → submit first release → measure ``POST /downloads`` → first
     ``status: completed`` observation. Asserts the elapsed wall-clock is
-    under :func:`_budget_seconds` (default 5 s per #20).
+    under :func:`_budget_seconds` (default ``_DEFAULT_BUDGET_SECONDS`` = 8 s,
+    the post-parallel-watcher regression guard; tighten once the persistent-
+    reader-page follow-up lands the < 5 s target from #20).
     """
     output_root = tmp_path / "out"
     await asyncio.to_thread(output_root.mkdir)
