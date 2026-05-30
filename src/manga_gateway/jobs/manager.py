@@ -105,6 +105,15 @@ class JobManager:
         terminal job ``completed`` with an output file still on disk? — a SINGLE
         ``os.path.exists`` (DL-05, NOT a per-poll rescan) — return it. Only if neither
         holds do we mint a fresh job (the re-grab path: deleted job or file gone).
+
+        WR-03 TOCTOU note (documented as accepted): the (2) branch holds no lock
+        across ``find_latest_by_handle`` → ``os.path.exists`` → return. A concurrent
+        ``DELETE /downloads/{id}?deleteData=true`` for ``latest.job_id`` between the
+        store read and the caller's follow-up ``GET /downloads/{id}`` will yield a
+        404 on the GET (the row + file are gone). This is an inconsistent-response
+        race under concurrent submit + delete-with-data, NOT corruption — no
+        partial CBZ is written and the caller is free to re-submit. The fix
+        (per-handle locking) is not warranted for v1 (low impact, low frequency).
         """
         # (1) live job for this handle → idempotent same-id return (D-27).
         live = await self._store.find_live_by_handle(req.release_handle)
@@ -233,11 +242,22 @@ class JobManager:
     async def rehydrate(self) -> None:
         """Load store rows into the projection at startup (PLAT-03).
 
-        The store's own ``rehydrate`` has already flipped any in-flight (live) job left
-        by an unclean shutdown to ``failed``; here we mirror the durable rows into the
-        in-memory read model. (The full staging sweep + DELETE land in Plan 04.)
+        Order matters (IN-05): (1) ``store.rehydrate`` flips any live row left
+        by an unclean shutdown to ``failed`` so it counts as terminal; (2) we
+        then prune terminal rows down to ``Settings.max_history_jobs`` so a
+        long-running gateway does not grow the projection / ``GET /downloads``
+        payload without bound; (3) finally we read the surviving rows into the
+        in-memory read model. Live jobs are never pruned.
         """
-        rows = await self._store.rehydrate()
+        await self._store.rehydrate()
+        pruned = await self._store.prune_terminal(self._settings.max_history_jobs)
+        if pruned:
+            _log.info(
+                "pruned %s terminal job rows (max_history_jobs=%s)",
+                pruned,
+                self._settings.max_history_jobs,
+            )
+        rows = await self._store.all()
         self._projection = {row.job_id: row for row in rows}
 
     async def drain(self) -> None:
@@ -267,12 +287,24 @@ class JobManager:
         task.add_done_callback(self._tasks.discard)
 
     async def _run_guarded(self, job_id: str) -> None:
-        """Acquire the global + per-source semaphores, then drive the engine (D-30)."""
+        """Acquire the global + per-source semaphores, then drive the engine (D-30).
+
+        The per-source semaphore is sized from ``max_concurrent_per_source`` (WR-02)
+        — a distinct, intentionally tighter knob than the global
+        ``max_concurrent_chapters``. Previously both were sized to the same value
+        so the per-source layer never constrained anything; this is the meaningful
+        ceiling that keeps one slow source from saturating every global slot.
+        """
         job = self._projection.get(job_id)
         if job is None:  # pragma: no cover - defensive; submit always projects first
+            # #14 / IN-02: a queued job was DELETEd before its task acquired the
+            # semaphore — no orphaned state, but log it so the queued→nothing
+            # transition isn't silent.
+            _log.debug("job=%s dropped before semaphore acquire (deleted)", job_id)
             return
         source_sem = self._source_sems.setdefault(
-            job.source_key, asyncio.Semaphore(self._settings.max_concurrent_chapters)
+            job.source_key,
+            asyncio.Semaphore(self._settings.max_concurrent_per_source),
         )
         async with self._global_sem, source_sem:
             await self._engine.run(job)

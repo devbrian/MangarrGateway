@@ -247,6 +247,30 @@ class JobStore:
             await self._conn.commit()
         return await self.all()
 
+    async def prune_terminal(self, keep_last: int) -> int:
+        """Trim terminal-status rows so at most ``keep_last`` survive (IN-05).
+
+        Keeps the ``keep_last`` most-recently-updated TERMINAL (completed/failed)
+        rows; older terminal rows are deleted. LIVE rows are never touched.
+        Returns the number of rows deleted. ``keep_last < 1`` is treated as 1 to
+        keep the bound meaningful (``Field(ge=1)`` already enforces this on the
+        Settings side, this is belt-and-suspenders).
+        """
+        keep = max(1, keep_last)
+        async with self._write_lock:
+            cur = await self._conn.execute(
+                f"DELETE FROM jobs WHERE status NOT IN {_LIVE_SET_SQL} "
+                "AND job_id NOT IN ("
+                f"  SELECT job_id FROM jobs WHERE status NOT IN {_LIVE_SET_SQL} "
+                "   ORDER BY updated_at DESC, rowid DESC LIMIT ?"
+                ")",
+                (keep,),
+            )
+            deleted = cur.rowcount or 0
+            await cur.close()
+            await self._conn.commit()
+        return deleted
+
     async def close(self) -> None:
         """Close the backing connection (lifespan teardown)."""
         await self._conn.close()

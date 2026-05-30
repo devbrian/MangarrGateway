@@ -66,11 +66,19 @@ def _req(release_handle: str = "h_abc") -> SubmitRequest:
     )
 
 
-async def _make_manager(store: JobStore, *, max_concurrent: int = 3) -> JobManager:
+async def _make_manager(
+    store: JobStore,
+    *,
+    max_concurrent: int = 3,
+    max_concurrent_per_source: int = 3,
+    max_history_jobs: int = 500,
+) -> JobManager:
     settings = Settings(
         api_key="k",
         output_root="/tmp/out",
         max_concurrent_chapters=max_concurrent,
+        max_concurrent_per_source=max_concurrent_per_source,
+        max_history_jobs=max_history_jobs,
     )
     registry = SourceRegistry()
     return JobManager(
@@ -207,6 +215,34 @@ async def test_global_semaphore_bounds_running_jobs(tmp_path: Path) -> None:
         await store.close()
 
 
+# ──────────── 4b. per-source semaphore bound (WR-02) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_per_source_semaphore_caps_below_global(tmp_path: Path) -> None:
+    """``max_concurrent_per_source`` constrains same-source concurrency below
+    the global cap (WR-02). Four jobs on the same source with global=4 and
+    per-source=1 must run strictly serially."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        mgr = await _make_manager(store, max_concurrent=4, max_concurrent_per_source=1)
+        engine = _CountingEngine()
+        mgr._engine = engine  # type: ignore[assignment]
+
+        for i in range(4):
+            await mgr.submit(_record(), _req(f"h{i}"))
+
+        await asyncio.sleep(0.05)
+        # Per-source cap of 1 keeps concurrency at 1 even with global=4.
+        assert engine.peak_concurrent <= 1
+
+        engine.release_all()
+        await mgr.drain()
+        assert engine.total_completed == 4
+    finally:
+        await store.close()
+
+
 # ─────────────────────── 5. rehydrate populates projection (PLAT-03) ─────────
 
 
@@ -230,6 +266,39 @@ async def test_rehydrate_populates_projection_from_store(tmp_path: Path) -> None
         jobs = mgr2.list()
         assert len(jobs) == 1
         assert jobs[0].status == "failed"
+    finally:
+        await store2.close()
+
+
+# ─────────────── 6. rehydrate trims terminal history (IN-05) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_rehydrate_prunes_terminal_history_to_max_history_jobs(
+    tmp_path: Path,
+) -> None:
+    """``max_history_jobs`` caps persisted terminal rows at rehydrate (IN-05).
+
+    Five terminal jobs persisted; ``max_history_jobs=2`` keeps the two most
+    recently updated; live jobs are never pruned."""
+    db = str(tmp_path / "jobs.db")
+    store = await open_store(db)
+    try:
+        mgr = await _make_manager(store)
+        mgr._engine = _NoopEngine()  # type: ignore[assignment]
+        for i in range(5):
+            await mgr.submit(_record(), _req(f"h{i}"))
+        await mgr.drain()  # all five terminate
+        assert len(mgr.list()) == 5
+    finally:
+        await store.close()
+
+    store2 = await open_store(db)
+    try:
+        mgr2 = await _make_manager(store2, max_history_jobs=2)
+        await mgr2.rehydrate()
+        # Only the 2 most-recently-updated terminal rows survive.
+        assert len(mgr2.list()) == 2
     finally:
         await store2.close()
 

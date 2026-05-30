@@ -51,10 +51,22 @@ class Settings(BaseSettings):
     max_concurrent_chapters: int = Field(
         default=3, ge=1
     )  # D-30: global job bound, reported by /status
+    # D-30 / WR-02: per-source ceiling, intentionally <= max_concurrent_chapters.
+    # Without a distinct knob the per-source semaphore was sized to the global
+    # bound and so never constrained anything for the single-registered-source
+    # case. Defaulting to 1 makes the second source's first job queue behind the
+    # first source's job in the obvious way; operators raise it per deployment.
+    max_concurrent_per_source: int = Field(default=1, ge=1)
     image_fetch_concurrency: int = Field(
         default=6, ge=1
     )  # D-31: per-job image-fetch bound
     db_path: str = "gateway.db"  # RESEARCH Open Q2: aiosqlite job store path
+    # IN-05: cap the persisted terminal-job history so a long-running gateway
+    # does not grow the projection / GET /downloads payload without bound.
+    # Applied at rehydrate: keep at most this many TERMINAL (completed/failed)
+    # rows ordered by updated_at DESC; older rows are dropped. Live jobs are
+    # never trimmed. ge=1 keeps the bound valid against zero/negative overrides.
+    max_history_jobs: int = Field(default=500, ge=1)
     # ── Cloudflare-solver / anti-bot knobs — env-overridable ops knobs (D-11),
     # same treatment as host/port/output_root (NOT the api_key exclusion). These
     # govern the framework's shared CloudflareSolver (lifespan-owned R1) and
@@ -77,16 +89,35 @@ class Settings(BaseSettings):
     api_key: str = Field(alias="api_key")
 
 
-def load_settings(path: Path = Path("config.toml")) -> Settings:
+def load_settings(path: Path | None = None) -> Settings:
     """Load settings from TOML, generating + persisting the key on first run.
 
     Args:
-        path: TOML config path (source of truth, D-10).
+        path: TOML config path (source of truth, D-10). When ``None`` (the
+            default), resolves in priority order:
+
+            1. ``GATEWAY_CONFIG`` env var (absolute or CWD-relative path)
+            2. ``./config.toml`` in the process CWD
+
+            The resolved path is converted to ABSOLUTE so a later ``cwd`` change
+            (or an integration test launching the app from a tmp dir) can't
+            silently re-resolve to a different file. Running ``python -m
+            manga_gateway`` from two different directories with NEITHER an
+            explicit ``path`` nor ``GATEWAY_CONFIG`` is what previously generated
+            two independent ``config.toml`` files and two independent API keys
+            (IN-04); the env-var override is the supported escape hatch.
 
     Returns:
         Fully-provisioned ``Settings``. The ``api_key`` always comes from the
         TOML data, never from the environment (D-01/D-11).
     """
+    if path is None:
+        env_path = os.environ.get("GATEWAY_CONFIG")
+        path = Path(env_path) if env_path else Path("config.toml")
+    # Resolve to absolute so the path doesn't drift under a later cwd change
+    # (IN-04). ``resolve(strict=False)`` works even when the file does not yet
+    # exist (the first-run key-generation path).
+    path = path.resolve(strict=False)
     data: dict[str, object] = {}
     if path.exists():
         data = tomllib.loads(path.read_text(encoding="utf-8"))
