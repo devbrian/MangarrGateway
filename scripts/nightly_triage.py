@@ -23,8 +23,11 @@ and exercise every branch with synthetic JUnit fixtures + a mocked
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
-import subprocess  # noqa: F401  (used by upsert/close logic added in Task 2)
+import subprocess
+import sys
 import xml.etree.ElementTree as ET  # safe: no external entity resolution by default
 from collections import defaultdict
 from pathlib import Path
@@ -32,6 +35,11 @@ from typing import Any
 
 # Parametrize IDs at the tail of a pytest testcase name: ``test_foo[mangadex]``.
 PARAM_RE = re.compile(r"\[([^\]]+)\]$")
+
+# Defensive guard for source_key spliced into gh argv (label flags + issue
+# titles). gh is invoked via argv (never shell) so this is belt-and-braces,
+# but a strict character class rules out any surprises in URLs/labels.
+_SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def parse_junit(path: Path) -> dict[str, dict[str, Any]]:
@@ -90,5 +98,181 @@ def compute_exit(per_source: dict[str, dict[str, Any]]) -> int:
     return 1 if all(bucket["fail"] > 0 for bucket in per_source.values()) else 0
 
 
-# upsert_sticky_issue, close_if_open, _ensure_label, _format_body, main():
-# implemented in Task 2.
+def _validate_source_key(source_key: str) -> str:
+    """Reject source keys that would be unsafe to splice into label flags."""
+    if not _SOURCE_KEY_RE.match(source_key):
+        raise ValueError(
+            f"refusing to invoke gh with unsafe source_key: {source_key!r}"
+        )
+    return source_key
+
+
+def _ensure_label(source_key: str) -> None:
+    """Idempotently create the ``source:{key}`` label (Pitfall 5).
+
+    ``check=False`` so a pre-existing label silently no-ops — ``gh label
+    create`` returns non-zero when the label already exists, which is the
+    overwhelmingly common case after the first nightly run.
+    """
+    _validate_source_key(source_key)
+    subprocess.run(
+        [
+            "gh",
+            "label",
+            "create",
+            f"source:{source_key}",
+            "--color",
+            "FF0000",
+            "--description",
+            "Per-source nightly bucket",
+        ],
+        check=False,
+    )
+
+
+def upsert_sticky_issue(source_key: str, body: str, run_url: str) -> None:
+    """Create-or-comment the sticky failure issue for ``source_key`` (D-57).
+
+    Looks up an open issue via label-based filter (``nightly-failure`` +
+    ``source:{key}``) — NOT title search (RESEARCH anti-pattern). If one
+    exists, comments on it; otherwise creates a fresh issue with both labels.
+
+    Labels are passed via repeated ``--label`` flags (cli.github.com manual).
+    """
+    _validate_source_key(source_key)
+    _ensure_label(source_key)
+    out = subprocess.check_output(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--label",
+            "nightly-failure",
+            "--label",
+            f"source:{source_key}",
+            "--state",
+            "open",
+            "--json",
+            "number,title",
+        ]
+    )
+    existing = json.loads(out or b"[]")
+    if existing:
+        number = existing[0]["number"]
+        subprocess.run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                str(number),
+                "--body",
+                f"{run_url}\n\n{body}",
+            ],
+            check=True,
+        )
+    else:
+        subprocess.run(
+            [
+                "gh",
+                "issue",
+                "create",
+                "--title",
+                f"nightly: {source_key} live smoke failing",
+                "--body",
+                f"{run_url}\n\n{body}",
+                "--label",
+                f"source:{source_key}",
+                "--label",
+                "nightly-failure",
+            ],
+            check=True,
+        )
+
+
+def close_if_open(source_key: str, run_url: str) -> None:
+    """Auto-close any open sticky issue for ``source_key`` (next-night pass)."""
+    _validate_source_key(source_key)
+    out = subprocess.check_output(
+        [
+            "gh",
+            "issue",
+            "list",
+            "--label",
+            "nightly-failure",
+            "--label",
+            f"source:{source_key}",
+            "--state",
+            "open",
+            "--json",
+            "number",
+        ]
+    )
+    for issue in json.loads(out or b"[]"):
+        subprocess.run(
+            [
+                "gh",
+                "issue",
+                "close",
+                str(issue["number"]),
+                "--comment",
+                f"Live smoke passing again — auto-closed.\n\n{run_url}",
+            ],
+            check=True,
+        )
+
+
+def _format_body(source_bucket: dict[str, Any], junit_path: Path) -> str:
+    """Build a Markdown-ish sticky-issue body — bounded-noise (D-57).
+
+    Includes the recorded testcase names for the bucket plus the tail (~50
+    lines) of an adjacent ``pytest-live.log`` when present.
+    """
+    failing = list(source_bucket.get("tests", []))
+    lines: list[str] = ["**Failing tests in this bucket:**"]
+    if failing:
+        lines.extend(f"- `{name}`" for name in failing)
+    else:
+        lines.append("- (no test names recorded)")
+    lines.append("")
+    log_path = junit_path.parent / "pytest-live.log"
+    if log_path.exists():
+        try:
+            log_tail = log_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()[-50:]
+            lines.append("**Log tail (last 50 lines):**")
+            lines.append("```")
+            lines.extend(log_tail)
+            lines.append("```")
+        except OSError:
+            lines.append("(log read failed)")
+    else:
+        lines.append("(no pytest-live.log adjacent to junit.xml)")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point — parse JUnit, upsert/close per source, return D-58 exit code.
+
+    Does NOT call ``sys.exit`` itself so unit tests can call ``main`` directly
+    and inspect the integer return code.
+    """
+    parser = argparse.ArgumentParser(
+        description="Triage pytest JUnit XML and upsert sticky GitHub issues."
+    )
+    parser.add_argument("--junit", required=True, type=Path)
+    parser.add_argument("--run-url", required=True, type=str)
+    ns = parser.parse_args(argv)
+
+    per_source = parse_junit(ns.junit)
+    for source_key, bucket in per_source.items():
+        if bucket["fail"] > 0:
+            body = _format_body(bucket, ns.junit)
+            upsert_sticky_issue(source_key, body, ns.run_url)
+        else:
+            close_if_open(source_key, ns.run_url)
+    return compute_exit(per_source)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

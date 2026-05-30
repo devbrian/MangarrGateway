@@ -129,14 +129,10 @@ def test_upsert_creates_issue_when_none_exist(
     )
     monkeypatch.setattr(nightly_triage.subprocess, "run", recorder)
 
-    nightly_triage.upsert_sticky_issue(
-        "comix", "body text", "https://example/run/1"
-    )
+    nightly_triage.upsert_sticky_issue("comix", "body text", "https://example/run/1")
 
     create_calls = [
-        c
-        for c in recorder.calls
-        if len(c) >= 3 and c[:3] == ["gh", "issue", "create"]
+        c for c in recorder.calls if len(c) >= 3 and c[:3] == ["gh", "issue", "create"]
     ]
     assert create_calls, f"expected gh issue create call, got: {recorder.calls!r}"
     argv = create_calls[0]
@@ -151,33 +147,30 @@ def test_upsert_creates_issue_when_none_exist(
 
 def test_upsert_comments_on_existing(monkeypatch: pytest.MonkeyPatch) -> None:
     recorder = _SubprocessRecorder()
+    _existing_issue_json = (
+        b'[{"number": 42, "title": "nightly: comix live smoke failing"}]'
+    )
     monkeypatch.setattr(
         nightly_triage.subprocess,
         "check_output",
-        lambda *a, **kw: b'[{"number": 42, "title": "nightly: comix live smoke failing"}]',
+        lambda *a, **kw: _existing_issue_json,
     )
     monkeypatch.setattr(nightly_triage.subprocess, "run", recorder)
 
-    nightly_triage.upsert_sticky_issue(
-        "comix", "body text", "https://example/run/1"
-    )
+    nightly_triage.upsert_sticky_issue("comix", "body text", "https://example/run/1")
 
     comment_calls = [
-        c
-        for c in recorder.calls
-        if len(c) >= 3 and c[:3] == ["gh", "issue", "comment"]
+        c for c in recorder.calls if len(c) >= 3 and c[:3] == ["gh", "issue", "comment"]
     ]
-    assert comment_calls, (
-        f"expected gh issue comment call, got: {recorder.calls!r}"
-    )
+    assert comment_calls, f"expected gh issue comment call, got: {recorder.calls!r}"
     argv = comment_calls[0]
     assert "42" in argv
     body_idx = argv.index("--body")
     assert "https://example/run/1" in argv[body_idx + 1]
     # When commenting on an existing issue we must NOT also issue create.
-    assert not any(
-        c[:3] == ["gh", "issue", "create"] for c in recorder.calls
-    ), f"unexpected gh issue create call: {recorder.calls!r}"
+    assert not any(c[:3] == ["gh", "issue", "create"] for c in recorder.calls), (
+        f"unexpected gh issue create call: {recorder.calls!r}"
+    )
 
 
 def test_close_if_open_closes_each(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,9 +185,7 @@ def test_close_if_open_closes_each(monkeypatch: pytest.MonkeyPatch) -> None:
     nightly_triage.close_if_open("comix", "https://example/run/1")
 
     close_calls = [
-        c
-        for c in recorder.calls
-        if len(c) >= 3 and c[:3] == ["gh", "issue", "close"]
+        c for c in recorder.calls if len(c) >= 3 and c[:3] == ["gh", "issue", "close"]
     ]
     closed_numbers = [c[3] for c in close_calls]
     assert "11" in closed_numbers
@@ -210,9 +201,7 @@ def test_label_create_is_idempotent_no_raise(
         argv: list[str], *args: Any, **kwargs: Any
     ) -> subprocess.CompletedProcess[bytes]:
         # Simulate gh returning non-zero (label already exists).
-        return subprocess.CompletedProcess(
-            argv, returncode=1, stdout=b"", stderr=b""
-        )
+        return subprocess.CompletedProcess(argv, returncode=1, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(nightly_triage.subprocess, "run", _run_fail)
     # MUST NOT raise.
