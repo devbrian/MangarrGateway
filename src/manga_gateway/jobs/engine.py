@@ -67,7 +67,13 @@ def _now_iso() -> str:
 
 
 def _page_filename(url: str) -> str:
-    """The original page filename (last path segment) — preserves the extension."""
+    """The original page filename (last path segment), with extension when present.
+
+    For a normal page URL like ``.../h/p1.png`` returns ``p1.png`` (extension
+    preserved). For a degenerate manifest URL ending in ``/`` (no path segment)
+    returns the constant ``"page"`` — extensionless; the engine writes entries by
+    index so the fallback name is harmless (IN-03).
+    """
     return url.rsplit("/", 1)[-1] or "page"
 
 
@@ -214,7 +220,12 @@ class JobEngine:
         except* SourceError as eg:
             # A 403 from the image host means a stale baseUrl → re-resolve (Pitfall 4);
             # any other SourceError is a genuine unrecoverable page loss (D-29 strict).
-            if any("403" in str(e) for e in eg.exceptions):
+            # Branch on the structured ``status`` attribute (WR-07) — not substring
+            # presence of "403" in the rendered message, which misclassifies any
+            # error whose message happens to contain those digits.
+            if any(
+                isinstance(e, SourceError) and e.status == 403 for e in eg.exceptions
+            ):
                 raise _StaleManifest from None
             raise eg.exceptions[0] from None
 

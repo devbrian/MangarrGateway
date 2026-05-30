@@ -313,7 +313,9 @@ async def test_run_reresolves_manifest_on_image_403_then_completes(
                 fresh[0]: _png_bytes(),
                 fresh[1]: _png_bytes(),
             },
-            image_errors={stale[1]: SourceError("source_unavailable", "upstream 403")},
+            image_errors={
+                stale[1]: SourceError("source_unavailable", "upstream 403", status=403)
+            },
         )
         engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
         job = _make_job()
@@ -342,7 +344,9 @@ async def test_run_fails_when_reresolve_budget_exceeded(tmp_path: Path) -> None:
         image_errors: dict[str, Exception] = {}
         for m in manifests:
             image_map[m[0]] = _png_bytes()
-            image_errors[m[1]] = SourceError("source_unavailable", "upstream 403")
+            image_errors[m[1]] = SourceError(
+                "source_unavailable", "upstream 403", status=403
+            )
         src = _StubSource(
             manifest_sequence=manifests,
             image_map=image_map,
@@ -355,6 +359,41 @@ async def test_run_fails_when_reresolve_budget_exceeded(tmp_path: Path) -> None:
         await engine.run(job)
 
         assert job.status == JobStatus.FAILED
+        assert not _has_cbz_under(tmp_path / "out")
+    finally:
+        await store.close()
+
+
+# ─────────── stale-baseUrl detection (WR-07: branch on status, not text) ───
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_reresolve_when_message_only_mentions_403(
+    tmp_path: Path,
+) -> None:
+    """A non-403 SourceError whose message contains the digits "403" must NOT
+    trigger stale-baseUrl re-resolve (WR-07). Engine branches on ``e.status``."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        urls = ["http://node/data/h/p1.png", "http://node/data/h/p2.png"]
+        src = _StubSource(
+            manifest=urls,
+            image_map={urls[0]: _png_bytes()},
+            image_errors={
+                # No status= → ``status`` is None, so this is NOT a 403 even
+                # though the rendered message contains the digits "403".
+                urls[1]: SourceError("source_unavailable", "page 403 invalid layout"),
+            },
+        )
+        engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
+        job = _make_job()
+        await store.insert(job)
+
+        await engine.run(job)
+
+        assert job.status == JobStatus.FAILED
+        # Manifest fetched exactly once — no re-resolve was triggered.
+        assert src._manifest_calls == 1
         assert not _has_cbz_under(tmp_path / "out")
     finally:
         await store.close()

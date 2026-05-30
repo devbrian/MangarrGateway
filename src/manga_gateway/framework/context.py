@@ -311,7 +311,11 @@ class SourceContext:
                 url, params=params, limited=limited, force_resolve=True
             )
         if resp.status_code in _PERMANENT_STATUSES:
-            raise SourceError("source_unavailable", f"upstream {resp.status_code}")
+            raise SourceError(
+                "source_unavailable",
+                f"upstream {resp.status_code}",
+                status=resp.status_code,
+            )
         resp.raise_for_status()  # 5xx → HTTPStatusError → retried by _is_retryable
         if not decrypt:
             return resp.content

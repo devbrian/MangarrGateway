@@ -76,6 +76,54 @@ def test_env_api_key_is_ignored(
     assert settings.api_key != "env-key-should-be-ignored"
 
 
+def test_gateway_config_env_var_selects_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GATEWAY_CONFIG`` overrides the default ``./config.toml`` lookup (IN-04).
+
+    Without this, running ``python -m manga_gateway`` from two different
+    directories silently generates two independent config + API key files."""
+    cfg = tmp_path / "elsewhere" / "gw.toml"
+    cfg.parent.mkdir()
+    monkeypatch.setenv("GATEWAY_CONFIG", str(cfg))
+    # CWD does NOT have a config.toml; without GATEWAY_CONFIG this would have
+    # generated ``<cwd>/config.toml`` instead of the env-pointed path.
+    monkeypatch.chdir(tmp_path)
+
+    settings = load_settings()
+
+    assert cfg.exists()
+    assert not (tmp_path / "config.toml").exists()
+    assert len(settings.api_key) >= 32
+
+
+def test_relative_path_is_resolved_to_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``load_settings`` calls ``path.resolve()`` so a relative ``path`` binds
+    to the CURRENT cwd at the moment of the call (IN-04). The per-call resolve
+    is the well-defined contract; cross-cwd stability is what ``GATEWAY_CONFIG``
+    is for."""
+    monkeypatch.chdir(tmp_path)
+    # First call: relative path resolves under tmp_path → fresh key.
+    first = load_settings(Path("config.toml"))
+    persisted = tmp_path / "config.toml"
+    assert persisted.exists()
+
+    # chdir elsewhere and reload by the same RELATIVE name — resolution against
+    # the new cwd yields a DISTINCT file with a freshly generated key.
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    second = load_settings(Path("config.toml"))
+    assert (other / "config.toml").exists()
+    assert second.api_key != first.api_key
+
+    # Loading the original absolute path still returns the original key — the
+    # per-call resolve never drifted away from a fully-qualified path.
+    assert load_settings(persisted).api_key == first.api_key
+
+
 def test_env_overrides_ops_knobs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
