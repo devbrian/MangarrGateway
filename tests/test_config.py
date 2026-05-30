@@ -201,6 +201,29 @@ def test_env_beats_toml_per_field(
     assert settings.output_root == "/data/manga"  # default (neither set)
 
 
+def test_lowercase_env_var_still_beats_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (CodeRabbit PR #27): pydantic-settings is ``case_sensitive=False``
+    by default, so a lowercase ``GATEWAY_host`` is a valid env override. The
+    TOML→init-kwarg guard must therefore detect env vars case-insensitively —
+    otherwise the TOML value gets passed as an init kwarg and beats the env."""
+    for name in ("GATEWAY_HOST", "GATEWAY_host", "GATEWAY_Host"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GATEWAY_host", "0.0.0.0")  # lowercase env var
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        'api_key = "k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\nhost = "10.0.0.5"\n',
+        encoding="utf-8",
+    )
+
+    settings = load_settings(cfg)
+
+    # Env wins even when its name casing doesn't match the field exactly.
+    assert settings.host == "0.0.0.0"
+
+
 def test_unknown_toml_keys_are_ignored(tmp_path: Path) -> None:
     """Issue #3: TOML keys that don't match a Settings field are silently
     dropped — mirrors ``model_config = ConfigDict(extra='ignore')``."""

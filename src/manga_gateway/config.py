@@ -161,11 +161,17 @@ def load_settings(path: Path | None = None) -> Settings:
     # ``GATEWAY_<NAME>`` env var is unset — env > TOML > default (issue #3).
     # Unknown TOML keys are silently ignored (mirrors model_config extra="ignore").
     # ``api_key`` is handled separately above; never bridge it from env.
+    #
+    # Case-insensitive presence check: pydantic-settings uses ``case_sensitive=False``
+    # by default, so an env var set as e.g. ``GATEWAY_host`` is honored just the same
+    # as ``GATEWAY_HOST``. Comparing uppercased names ensures we don't pass a TOML
+    # init kwarg that would then beat a differently-cased env var (CodeRabbit PR #27).
+    env_names_upper = {name.upper() for name in os.environ}
     toml_kwargs: dict[str, Any] = {}
     for field_name in Settings.model_fields:
         if field_name == "api_key" or field_name not in data:
             continue
-        if f"GATEWAY_{field_name.upper()}" in os.environ:
+        if f"GATEWAY_{field_name.upper()}" in env_names_upper:
             continue  # env wins
         toml_kwargs[field_name] = data[field_name]
 
