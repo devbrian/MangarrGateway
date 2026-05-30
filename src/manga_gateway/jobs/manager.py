@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import secrets
 from datetime import UTC, datetime
@@ -37,6 +38,8 @@ import aiosqlite
 from ..models.download import DownloadJob
 from .engine import JobEngine
 from .model import Job, JobStatus
+
+_log = logging.getLogger("manga_gateway.jobs.manager")
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -151,6 +154,13 @@ class JobManager:
             raise
         self._projection[job_id] = job
         self._spawn(job_id)
+        _log.info(
+            "job=%s source=%s submitted format=%s manga_id=%s",
+            job_id,
+            job.source_key,
+            job.output_format,
+            job.manga_id,
+        )
         return job_id, JobStatus.QUEUED.value
 
     # ─────────────────────────── read model (DL-05) ───────────────────────────

@@ -26,6 +26,7 @@ Blocking work (Pillow ``verify``, ``zipfile`` write, ``os.replace``) is offloade
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,8 @@ from .package import (
     write_cbz,
     write_folder,
 )
+
+_log = logging.getLogger("manga_gateway.jobs.engine")
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -248,13 +251,32 @@ class JobEngine:
 
     async def _transition(self, job: Job, status: JobStatus) -> None:
         """Persist a status transition: SQLite write-through FIRST (Pattern 2)."""
+        previous = job.status
         job.status = status
         await self._store.update(job)
+        # #21: one log per state transition is the operator's primary signal
+        # that the gateway is actually working during a long download.
+        _log.info(
+            "job=%s source=%s %s→%s pages=%s",
+            job.job_id,
+            job.source_key,
+            previous.value,
+            status.value,
+            job.total_pages if job.total_pages is not None else "?",
+        )
 
     async def _fail(self, job: Job, message: str) -> None:
+        previous = job.status
         job.status = JobStatus.FAILED
         job.message = message
         await self._store.update(job)
+        _log.warning(
+            "job=%s source=%s %s→failed reason=%r",
+            job.job_id,
+            job.source_key,
+            previous.value,
+            message,
+        )
 
 
 class _StaleManifest(Exception):
