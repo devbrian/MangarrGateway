@@ -1,13 +1,13 @@
 """Contract JSON error model + exception handlers (ERR-01).
 
 The wire shape is ``{"error": {"code": <enum>, "message": <str>}}`` where code is
-one of [auth, rate_limited, source_unavailable, bad_request, internal]. A 429
-carries a ``Retry-After`` header.
+one of [auth, rate_limited, source_unavailable, bad_request, not_found, internal].
+A 429 carries a ``Retry-After`` header.
 
 Pitfall 5: the catch-all ``Exception`` handler must NOT swallow Starlette's
 ``HTTPException`` / FastAPI validation. We register specific handlers for our
-contract-shaped paths and leave FastAPI's default ``HTTPException``/404 handling
-intact — so a genuine 404 stays a 404, never ``code: "internal"``.
+contract-shaped paths so a genuine 404 stays a 404 (now wrapped in the contract
+Error envelope, code ``not_found`` — issue #2), never ``code: "internal"``.
 """
 
 from __future__ import annotations
@@ -21,7 +21,12 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 ErrorCode = Literal[
-    "auth", "rate_limited", "source_unavailable", "bad_request", "internal"
+    "auth",
+    "rate_limited",
+    "source_unavailable",
+    "bad_request",
+    "not_found",
+    "internal",
 ]
 
 
@@ -76,12 +81,20 @@ def register_error_handlers(app: FastAPI) -> None:
         # A 400 from a body-parse failure (FastAPI raises a 400 HTTPException, not a
         # RequestValidationError, when the body is undecodable) must still serialize
         # the contract Error envelope (CTRT-01 / T-02-05) — never Starlette's bare
-        # {"detail": ...}. Other statuses (e.g. 404) keep the default JSON detail
-        # shape so a genuine 404 stays a normal 404 (Pitfall 5).
+        # {"detail": ...}. 404s are wrapped in the same Error envelope so the
+        # contract's /downloads/{jobId} 404 NotFound response (issue #2) matches the
+        # wire shape; other statuses keep the default JSON detail shape (Pitfall 5).
         if exc.status_code == 400:
             return JSONResponse(
                 status_code=400,
                 content=_error("bad_request", "Malformed request"),
+                headers=getattr(exc, "headers", None),
+            )
+        if exc.status_code == 404:
+            message = str(exc.detail) if exc.detail else "Not found"
+            return JSONResponse(
+                status_code=404,
+                content=_error("not_found", message),
                 headers=getattr(exc, "headers", None),
             )
         return JSONResponse(

@@ -19,11 +19,15 @@ Guarantees:
 * ``compute_output_path`` lays out ``{output_root}/manga-{mangaId}/{title}{suffix}``
   with the source-scraped title AND the mangaId slug run through
   ``util/sanitize.py`` so neither can traverse out of the output root
-  (SEC-02/D-24/D-25, T-03-04).
+  (SEC-02/D-24/D-25, T-03-04). When ``manga_id`` is ``None`` it falls back to
+  ``manga-unknown/`` (D-24); a ``fallback_discriminator`` (typically the source-
+  stable chapter id) is folded into the filename as a short hash so two
+  different series with the same title cannot collide in that bucket (issue #9).
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import shutil
@@ -67,15 +71,24 @@ def compute_output_path(
     title: str,
     *,
     output_format: str = "cbz",
+    fallback_discriminator: str | None = None,
 ) -> Path:
     """Compute the gateway-owned output path, traversal-safe (D-24/D-25, SEC-02).
 
     Layout: ``{output_root}/manga-{mangaId}/{sanitized title}{suffix}``. Both the
     ``mangaId`` slug and the source-scraped ``title`` pass through
     ``sanitize_filename`` so a malicious value (e.g. ``../../etc``) is reduced to a
-    single safe path component and can never escape ``output_root`` (T-03-04). A
-    missing ``manga_id`` falls back to ``manga-unknown`` (D-24). ``folder`` format
-    yields a directory path (no suffix).
+    single safe path component and can never escape ``output_root`` (T-03-04).
+    ``folder`` format yields a directory path (no suffix).
+
+    Missing-mangaId fallback (D-24, issue #9): when ``manga_id`` is ``None`` the
+    folder is ``manga-unknown/``. To prevent cross-series collisions in that
+    shared bucket (two unrelated mangas with the same chapter title would
+    otherwise clobber each other) the optional ``fallback_discriminator`` —
+    typically the source-stable chapter id — is folded into the filename as an
+    8-char SHA-256 prefix: ``{title}-{hash}{suffix}``. When the discriminator is
+    ``None`` (no chapter id available) the filename is left bare, preserving the
+    pre-issue-#9 layout for callers that don't have a stable id to hand.
     """
     slug = (
         sanitize_filename(str(manga_id), fallback="unknown")
@@ -84,6 +97,9 @@ def compute_output_path(
     )
     folder = f"manga-{slug}"
     name = sanitize_filename(title, fallback="untitled")
+    if manga_id is None and fallback_discriminator:
+        digest = hashlib.sha256(fallback_discriminator.encode("utf-8")).hexdigest()[:8]
+        name = f"{name}-{digest}"
     suffix = _FORMAT_SUFFIX.get(output_format, "")  # folder -> "" (directory)
     return Path(output_root) / folder / f"{name}{suffix}"
 

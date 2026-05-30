@@ -119,7 +119,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DownloadJob" }
-        "404": { description: Unknown job id }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
     delete:
       summary: Remove job (and optionally its files) — maps to RemoveItem
       operationId: removeDownload
@@ -127,7 +128,8 @@ paths:
         - { name: deleteData, in: query, schema: { type: boolean, default: false } }
       responses:
         "204": { description: Removed }
-        "404": { description: Unknown job id }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /status:
     get:
@@ -157,6 +159,7 @@ paths:
                 properties:
                   version: { type: string }
                   status:  { type: string, enum: [ok, degraded] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
 components:
   securitySchemes:
@@ -169,6 +172,9 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     BadRequest:
       description: Malformed request
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Resource not found
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     RateLimited:
       description: Too many requests
@@ -185,7 +191,7 @@ components:
           type: object
           required: [code, message]
           properties:
-            code:    { type: string, enum: [auth, rate_limited, source_unavailable, bad_request, internal] }
+            code:    { type: string, enum: [auth, rate_limited, source_unavailable, bad_request, not_found, internal] }
             message: { type: string }
 
     Capabilities:

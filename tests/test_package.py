@@ -170,3 +170,36 @@ def test_compute_output_path_sanitizes_manga_id_slug() -> None:
 def test_compute_output_path_empty_title_falls_back() -> None:
     path = package.compute_output_path("/data/manga", 1, "   ")
     assert path.stem  # non-empty fallback applied
+
+
+def test_compute_output_path_fallback_discriminator_disambiguates_unknown() -> None:
+    """Issue #9: two different sources/chapters with the same title must not
+    collide inside ``manga-unknown/`` when no mangaId is provided.
+
+    The source-stable chapter id is folded into the filename as a short hash so
+    distinct discriminators yield distinct filenames; the bucket folder remains
+    ``manga-unknown/`` (D-24 fallback)."""
+    path_a = package.compute_output_path(
+        "/data/manga", None, "Chapter 1", fallback_discriminator="uuid-aaa"
+    )
+    path_b = package.compute_output_path(
+        "/data/manga", None, "Chapter 1", fallback_discriminator="uuid-bbb"
+    )
+    assert path_a.parent == Path("/data/manga/manga-unknown")
+    assert path_b.parent == Path("/data/manga/manga-unknown")
+    assert path_a != path_b
+    # Same discriminator → deterministic path (idempotent re-grabs).
+    again = package.compute_output_path(
+        "/data/manga", None, "Chapter 1", fallback_discriminator="uuid-aaa"
+    )
+    assert again == path_a
+
+
+def test_compute_output_path_discriminator_ignored_when_mangaid_known() -> None:
+    """When ``manga_id`` is set the discriminator is NOT applied — the mangaId
+    already disambiguates and the legacy filename layout is preserved."""
+    with_disc = package.compute_output_path(
+        "/data/manga", 178, "Chapter 1", fallback_discriminator="uuid-aaa"
+    )
+    without = package.compute_output_path("/data/manga", 178, "Chapter 1")
+    assert with_disc == without
