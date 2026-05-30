@@ -102,11 +102,11 @@ async def test_singleton_seams_built_once(app: FastAPI) -> None:
 
 
 async def test_catch_all_does_not_swallow_404(client: httpx.AsyncClient) -> None:
-    """A genuine 404 stays a normal 404, never code 'internal' (Pitfall 5)."""
+    """A genuine 404 stays a 404, wrapped in the contract Error envelope with
+    code ``not_found`` (issue #2) — never ``code: 'internal'`` (Pitfall 5)."""
     resp = await client.get("/no-such-route")
     assert resp.status_code == 404
-    # FastAPI default 404 body, not our internal error envelope.
-    assert resp.json().get("error", {}).get("code") != "internal"
+    assert resp.json()["error"]["code"] == "not_found"
 
 
 async def test_ratelimited_handler_sets_retry_after() -> None:

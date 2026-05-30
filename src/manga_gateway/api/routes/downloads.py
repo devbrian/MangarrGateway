@@ -122,11 +122,12 @@ async def get_download(
     job_id: str,
     job_manager: Annotated[JobManager, Depends(get_job_manager)],
 ) -> DownloadJob:
-    """Return one job (DL-06) or a genuine 404 for an unknown id (Pitfall 8).
+    """Return one job (DL-06) or a 404 for an unknown id (Pitfall 8, issue #2).
 
-    The 404 is raised as an ``HTTPException`` so ``errors.py``'s ``_http_exc`` keeps it
-    a bare 404 (default ``{detail}`` shape) — never the ``{error:{code:internal}}``
-    envelope a 5xx would produce (T-03-14).
+    The 404 is raised as an ``HTTPException`` so ``errors.py``'s ``_http_exc``
+    serializes it as the contract Error envelope
+    ``{error:{code:not_found,message}}`` — never the ``code: internal`` envelope
+    a 5xx would produce (T-03-14).
     """
     job = job_manager.get_dto(job_id)
     if job is None:

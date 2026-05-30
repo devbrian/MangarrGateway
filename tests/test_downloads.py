@@ -458,9 +458,9 @@ async def test_get_single_download_unknown_returns_404(
 ) -> None:
     resp = await dl_client.get("/downloads/j_does-not-exist")
     assert resp.status_code == 404
-    # Pitfall 8: a genuine 404, NOT the {error:{code:internal}} envelope.
-    body = resp.json()
-    assert "error" not in body or body.get("error", {}).get("code") != "internal"
+    # Pitfall 8 / issue #2: a genuine 404, wrapped in the contract Error envelope
+    # with code ``not_found`` — never ``code: 'internal'``.
+    assert resp.json()["error"]["code"] == "not_found"
 
 
 # ─────────────────────────── DL-07 DELETE /downloads/{id} ────────────────────
