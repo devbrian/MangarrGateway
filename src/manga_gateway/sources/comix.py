@@ -161,6 +161,16 @@ def _is_allowed_image_url(url: str) -> bool:
 # chapter pages ONLY. Numbering may have gaps (01,02,04,05,07,…) — the recon
 # shows real chapter pages with gaps, NOT lazy-load artifacts; we sort by
 # embedded NN so the gaps survive.
+#
+# Issue #20 (2026-05-30): the previous strategy walked pages SEQUENTIALLY —
+# scrollIntoView one div, poll up to 4s for its <img src>, advance. For a
+# 10-page chapter that meant ~10 × (scroll + lazy-load round-trip) of in-page
+# JS, blowing the wall-clock to ~25s. The fix below fires every scrollIntoView
+# UP FRONT (the IntersectionObserver fires per-div in rapid succession) and
+# polls every div IN PARALLEL via Promise.all. Each watcher captures the src
+# the FIRST time it appears, so a Swiper.js eviction after later scrolling
+# does not lose a URL we already saw. Wall-clock collapses from O(pages) ×
+# 1s to ~max single-page latency.
 _CHAPTER_PAGES_EXTRACT_JS = """
   // Comix's chapter reader is a Swiper.js long-strip component
   // (`class="rpage rpage--long-strip rpage--ttb"`). Each page is wrapped in a
@@ -168,12 +178,12 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   // by an IntersectionObserver. `window.scrollTo()` does not move the inner
   // Swiper viewport, so a blind window scroll only renders head/tail pages.
   //
-  // Strategy: enumerate every `.rpage-page[data-page]` div the reader has
-  // scaffolded, then `scrollIntoView` each in order so the IntersectionObserver
-  // fires per-page and the lazy loader populates `<img src>`. The Map keyed by
-  // `data-page` preserves the canonical chapter ordering even if the reader
-  // evicts images on later scroll (`url` is captured the first time we see
-  // each page).
+  // Strategy: enumerate every `.rpage-page[data-page]` div, fire every
+  // `scrollIntoView` up front (no awaits between them) so the lazy loader
+  // observers fire concurrently, then poll every div IN PARALLEL for the
+  // first <img> whose src matches the CDN pattern. The Map keyed by
+  // `data-page` preserves chapter ordering even if Swiper later evicts a
+  // page's <img> — we captured the src on its first appearance.
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const rx = /\\/si\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
 
@@ -191,30 +201,38 @@ _CHAPTER_PAGES_EXTRACT_JS = """
       return an - bn;
     });
 
-  // Step 2: walk each scaffolded page. `scrollIntoView` works in ANY scroll
-  // container (window or inner overflow). After scrolling, poll the div for
-  // an <img> whose src matches the CDN pattern. 4s/page max wait.
-  const seen = new Map();
+  // Step 2: fire every scroll trigger UP FRONT — synchronous loop, no awaits.
+  // `scrollIntoView` returns immediately; the IntersectionObserver callback
+  // runs asynchronously when the page actually crosses the viewport. Firing
+  // them all in succession schedules the observers concurrently rather than
+  // one-blocking-at-a-time.
   for (const div of pageDivs) {
     div.scrollIntoView({ behavior: 'instant', block: 'center' });
-    for (let attempt = 0; attempt < 20; attempt++) {
-      let found = false;
+  }
+
+  // Step 3: spawn ONE watcher per page div and Promise.all them. Each watcher
+  // polls its own div on a tight cadence for the FIRST <img> whose src
+  // matches the CDN pattern, then resolves. Per-page budget (~4s) matches
+  // the previous sequential cap, but because watchers run concurrently the
+  // wall-clock is O(slowest-single-page), not O(pages × per-page).
+  const seen = new Map();
+  const watchers = pageDivs.map(async (div) => {
+    const n = parseInt(div.getAttribute('data-page') || '0', 10);
+    for (let attempt = 0; attempt < 40; attempt++) {
       for (const img of div.querySelectorAll('img')) {
         const src = img.currentSrc || img.src || '';
         const m = src.match(rx);
         if (m) {
-          const n = parseInt(m[2], 10);
           if (!seen.has(n)) seen.set(n, src);
-          found = true;
-          break;
+          return;
         }
       }
-      if (found) break;
-      await sleep(200);
+      await sleep(100);
     }
-  }
+  });
+  await Promise.all(watchers);
 
-  // Step 3 (fallback): sweep the document for any <img> the per-div walk
+  // Step 4 (fallback): sweep the document for any <img> the per-div walk
   // missed (covers reader-shape variants where the canonical `data-page`
   // wrapper is absent but images still match the CDN pattern).
   for (const img of document.querySelectorAll('img')) {
@@ -447,12 +465,19 @@ class ComixSource(Source):
             urls = await solver.fetch_via_browser(
                 chapter_url,
                 extract=_CHAPTER_PAGES_EXTRACT_JS,
-                wait_for=_CHAPTER_PAGES_WAIT_FOR,
-                # The Swiper.js long-strip walker iterates every .rpage-page div
-                # and waits up to ~4s/page for the lazy loader. A 25-page chapter
-                # can need ~100s of evaluate time; 120s gives margin for slow CDN
-                # warm-ups + initial Cloudflare round-trip + ad-banner shuffles.
-                timeout=120.0,
+                # Issue #20: pass wait_for=None and let the JS extractor's
+                # own Step-1 scaffold wait do the readiness check. A Python-
+                # side wait_for_selector AND a JS-side scaffold poll would
+                # double-wait the same condition; the JS poll runs inside
+                # page.evaluate which Playwright is happy to schedule
+                # immediately after goto commits.
+                wait_for=None,
+                # Issue #20: per-div watchers now run in PARALLEL (Promise.all)
+                # so wall-clock collapses from O(pages × ~1s) to ~max single-page
+                # latency. The 30s ceiling still gives plenty of headroom for an
+                # initial Cloudflare round-trip + slow CDN warm-up; a chapter
+                # whose evaluate exceeds this is genuinely degraded, not slow.
+                timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
             raise SourceError(
@@ -633,12 +658,17 @@ class ComixSource(Source):
         the prior encrypted-API path. A failed browser fetch surfaces as
         ``SourceError("source_unavailable")`` → per-source warning (WR-06).
 
-        Fallback note: the still-plaintext
+        Scanlation-group merge (issue #19): the rendered chapter-row markup
+        does NOT expose the group with the selectors the DOM extractor probes
+        (live recon: ``.scanlation`` / ``.group`` / ``[data-group]`` /
+        ``.scanlator`` are absent), so ``groups`` is always empty from the DOM
+        read. The plaintext
         ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` endpoint carries
-        chapter numbers + scanlation groups but NOT chapter IDs — so it cannot
-        substitute for the DOM read (download needs the numeric chapter id to
-        construct the chapter URL). It remains a future signal source for
-        per-chapter group disambiguation if the DOM read drifts.
+        ``{chapter, groups: [{id, name}, …]}`` but no chapter id, so we use the
+        DOM read for the canonical (id, chapter) pairing and merge groups onto
+        each chapter by chapter number. A failed chapter-indexes fetch is
+        degraded behaviour, not fatal — release rows simply carry the original
+        empty ``groups`` and ``scanlationGroup`` stays ``null``.
         """
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
@@ -669,7 +699,86 @@ class ComixSource(Source):
             reverse=True,
         )
         feed_limit = min(limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
-        return chapters[offset : offset + feed_limit]
+        window = chapters[offset : offset + feed_limit]
+        # Issue #19: merge scanlation groups from the plaintext chapter-indexes
+        # endpoint onto the DOM rows. Run AFTER the offset/limit slice so the
+        # merge work scales with what we return, not with the full series.
+        group_map = await self._fetch_chapter_group_map(series_hid, ctx)
+        if group_map:
+            window = [self._merge_chapter_group(c, group_map) for c in window]
+        return window
+
+    async def _fetch_chapter_group_map(
+        self, series_hid: str, ctx: SourceContext
+    ) -> dict[str, str]:
+        """Return ``{chapter_number_str: group_name}`` from the chapter-indexes API.
+
+        Issue #19 / Plan 04-04: the plaintext
+        ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` carries every
+        chapter's scanlation group(s) but NOT the numeric chapter id. We use
+        it as a side-channel to backfill the group field the DOM extractor
+        cannot read off the rendered series page. The endpoint shape is the
+        same ``{result: {items: [...]}}`` envelope as ``/api/v1/manga`` (live
+        recon, Plan 04-04). A network/parse failure returns an empty map —
+        callers treat that as "no merge", not a hard error.
+        """
+        try:
+            data = await ctx.get_json_plain(
+                f"{self.base_url}/api/v1/manga/{series_hid}/chapter-indexes",
+                group_id=-1,
+            )
+        except Exception:  # noqa: BLE001 — degraded, not fatal (issue #19)
+            ctx.warn(
+                "scanlation_group_unavailable",
+                "comix chapter-indexes fetch failed; scanlationGroup will be null",
+            )
+            return {}
+        items = self._result_items(data)
+        group_map: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            number = self._stringify(item.get("chapter") or item.get("number"))
+            if not number or number in group_map:
+                continue
+            group_name = self._first_group_name(item.get("groups"))
+            if group_name:
+                group_map[number] = group_name
+        return group_map
+
+    @staticmethod
+    def _first_group_name(groups: Any) -> str | None:
+        """Best-effort name extraction from ``[{id, name}, …]`` or ``[str, …]``."""
+        if not isinstance(groups, list) or not groups:
+            return None
+        first = groups[0]
+        if isinstance(first, dict):
+            name = first.get("name") or first.get("title")
+            return str(name) if name else None
+        if isinstance(first, str) and first:
+            return first
+        return None
+
+    @staticmethod
+    def _merge_chapter_group(
+        chapter: dict[str, Any], group_map: dict[str, str]
+    ) -> dict[str, Any]:
+        """Inject ``groups: [{"name": …}]`` from ``group_map`` if the DOM row is empty.
+
+        Idempotent: a DOM row that already carries a non-empty ``groups`` list
+        wins over the chapter-indexes signal (the live DOM is authoritative
+        when present). Returns the merged dict; the caller may treat the
+        input as immutable.
+        """
+        existing = chapter.get("groups")
+        if isinstance(existing, list) and existing:
+            return chapter
+        number = chapter.get("chapter") or chapter.get("number")
+        key = str(number) if number is not None else ""
+        group_name = group_map.get(key)
+        if not group_name:
+            return chapter
+        return {**chapter, "groups": [{"name": group_name}]}
 
     # ─────────────────────────── Release normalization ───────────────────────────
 

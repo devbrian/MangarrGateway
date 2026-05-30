@@ -13,11 +13,14 @@ Phase 3 resolves them fresh at grab time.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from dataclasses import dataclass
 from decimal import Decimal
 
 from cachetools import TTLCache
+
+_log = logging.getLogger("manga_gateway.handles")
 
 # 60-min handle TTL (HDL-02, >= the 30-min Mangarr interactive-search floor).
 _HANDLE_TTL_SECONDS = 3600
@@ -58,8 +61,18 @@ class HandleStore:
         """Mint an opaque handle for ``record`` and return it (D-15 CSPRNG token)."""
         handle = secrets.token_urlsafe(16)  # opaque, zero structure, 128-bit
         self._cache[handle] = record
+        # #21: DEBUG (not INFO) — a title search mints one handle per release,
+        # which would drown the console at INFO. Operator opts in with
+        # GATEWAY_LOG_LEVEL=DEBUG when chasing handle/TTL behaviour.
+        _log.debug("minted handle src=%s ttl=%ds", record.source_key, self._cache.ttl)
         return handle
 
     def resolve(self, handle: str) -> ResolutionRecord | None:
         """Resolve a handle to its record, or ``None`` if unknown/expired (Phase 3)."""
-        return self._cache.get(handle)
+        record = self._cache.get(handle)
+        _log.debug(
+            "resolve handle %s src=%s",
+            "hit" if record is not None else "miss",
+            record.source_key if record is not None else "?",
+        )
+        return record

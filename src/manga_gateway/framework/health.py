@@ -16,6 +16,10 @@ single-process model (R1) means there is no cross-process contention to guard.
 
 from __future__ import annotations
 
+import logging
+
+_log = logging.getLogger("manga_gateway.framework.health")
+
 
 class SourceHealth:
     """Consecutive-failure breaker for one source (D-36)."""
@@ -28,11 +32,23 @@ class SourceHealth:
 
     def record_failure(self) -> None:
         """Count one consecutive failure toward the breaker threshold."""
+        was_enabled = self.is_enabled
         self.consecutive_failures += 1
+        # #21: log only the level-edge (breaker TRIP), not every counted failure
+        # — the latter would be tied to retry storms and add noise.
+        if was_enabled and not self.is_enabled:
+            _log.warning(
+                "health breaker TRIPPED after %d consecutive failures (threshold=%d)",
+                self.consecutive_failures,
+                self.threshold,
+            )
 
     def record_success(self) -> None:
         """Reset the consecutive-failure counter (the breaker self-heals)."""
+        was_tripped = not self.is_enabled and not self.force_disabled
         self.consecutive_failures = 0
+        if was_tripped:
+            _log.info("health breaker RECOVERED")
 
     @property
     def is_enabled(self) -> bool:
