@@ -131,6 +131,146 @@ _CONTENT_RATING = "suggestive"
 # treats chapter_id as source-opaque, so the composite is contained.
 _CID_SEP = "|"
 
+# Issue #42: recent-feed-minted handles carry this literal in the numeric_id
+# slot of the composite. ``fetch_manifest`` detects it and late-binds the real
+# chapter id via :func:`_resolve_deferred` + ``_series_chapters``. The
+# composite still has exactly 4 non-empty segments so the existing
+# ``_parse_composite_chapter_id`` accepts it unchanged (locked decision 8).
+_DEFERRED_SENTINEL = "DEFERRED"
+
+
+def _make_deferred_composite(hid: str, slug: str, chapter_number: str) -> str:
+    """Build a recent-feed handle's composite ``chapter_id`` (issue #42).
+
+    Shape: ``"DEFERRED|{hid}|{slug}|{chapter_number}"``. Every segment must be
+    non-empty so the existing :meth:`ComixSource._parse_composite_chapter_id`
+    accepts it unchanged (locked decision 8). The ``DEFERRED`` sentinel takes
+    the place of the numeric chapter id; ``fetch_manifest`` substitutes the
+    real id by re-fetching the series page at download time.
+    """
+    if not (hid and slug and chapter_number):
+        raise ValueError("hid, slug, chapter_number must all be non-empty")
+    return _CID_SEP.join((_DEFERRED_SENTINEL, hid, slug, chapter_number))
+
+
+class _DeferredResolutionError(Exception):
+    """Internal — translated to ``SourceError('source_unavailable', ...)`` by caller.
+
+    Raised by :func:`_resolve_deferred` when the chapter number promised by a
+    recent-feed-minted handle is no longer on the series page (the chapter was
+    deleted/replaced upstream) or when the matching row carries no id. The
+    strict-match staleness policy (locked decision 4) requires this to surface
+    as an explicit failure — never a silent rebind to a different chapter.
+    """
+
+
+def _id_sort_key(raw: Any) -> tuple[int, str]:
+    """Sort numeric ids numerically; non-numeric ids fall back to string compare.
+
+    Returns ``(category, value)`` so numeric ids always sort before string ids.
+    Lifted verbatim from spike 002 ``deferred_resolver.py`` (test-covered).
+    """
+    if raw is None:
+        return (2, "")
+    s = str(raw)
+    try:
+        return (0, str(int(s)).zfill(20))
+    except ValueError:
+        return (1, s)
+
+
+def _relative_seconds(text: str | None) -> int | None:
+    """Approximate ``"Nu ago"`` text into seconds for tie-break ordering only.
+
+    Calendar-naive; precision is not load-bearing here — only the *ordering*
+    matters. Returns ``None`` for unparseable input so the tie-break treats it
+    as "infinitely old." Lifted verbatim from spike 002 ``deferred_resolver``.
+    """
+    if not text:
+        return None
+    m = re.match(
+        r"^\s*(\d+)\s*(s|m|h|d|w|mo|mos|y)\w*\s*ago\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    n = int(m.group(1))
+    u = m.group(2).lower()
+    if u.startswith("mo"):
+        return n * 30 * 86400
+    return {
+        "s": n,
+        "m": n * 60,
+        "h": n * 3600,
+        "d": n * 86400,
+        "w": n * 7 * 86400,
+        "y": n * 365 * 86400,
+    }.get(u)
+
+
+def _pick_among_duplicates(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Tie-break when multiple rows share the same chapter number (issue #42).
+
+    Order of preference (locked decision 6):
+      1. Smallest ``publishedAtRelative`` seconds (newest upload).
+      2. Non-empty ``groups`` over empty.
+      3. Lowest numeric ``id`` (stable, deterministic — last resort).
+
+    Choosing newest-upload first matches the ``latestChapter`` semantics the
+    recent feed already encoded — if Comix's sort key for
+    ``chapter_updated_at`` picked the newest upload of that chapter, the
+    resolver follows the same choice.
+    """
+    return min(
+        rows,
+        key=lambda r: (
+            _relative_seconds(r.get("publishedAtRelative")) or 10**12,
+            0 if r.get("groups") else 1,
+            _id_sort_key(r.get("id")),
+        ),
+    )
+
+
+def _resolve_deferred(
+    chapter_number: str, series_chapters: list[dict[str, Any]]
+) -> str:
+    """Strict-match a recent-feed chapter_number against a series-page row list.
+
+    Decimal-aware (locked decision 5): ``'23'`` matches series row chapter
+    ``'23.0'`` and vice versa via :meth:`ComixSource._parse_decimal`. Multi-
+    group ties are broken by :func:`_pick_among_duplicates` (locked decision
+    6). On no-match OR a matching row without an ``id``, raises
+    :class:`_DeferredResolutionError` (the caller translates it to
+    ``SourceError('source_unavailable', ...)`` per locked decision 4 —
+    strict-match staleness; never silently rebind).
+    """
+    target = ComixSource._parse_decimal(chapter_number)
+    if target is None:
+        raise ValueError(
+            f"deferred chapter_number not Decimal-parseable: {chapter_number!r}"
+        )
+    matches: list[dict[str, Any]] = []
+    for row in series_chapters:
+        if not isinstance(row, dict):
+            continue
+        row_num = ComixSource._parse_decimal(row.get("chapter") or row.get("number"))
+        if row_num is None:
+            continue
+        if row_num == target:
+            matches.append(row)
+    if not matches:
+        raise _DeferredResolutionError(
+            f"deferred resolution: chapter {chapter_number} not present on series page"
+        )
+    chosen = matches[0] if len(matches) == 1 else _pick_among_duplicates(matches)
+    cid = chosen.get("id")
+    if not cid:
+        raise _DeferredResolutionError(
+            f"deferred resolution: matching row carries no chapter id: {chosen!r}"
+        )
+    return str(cid)
+
 
 # SSRF allowlist for image-CDN URLs returned by the browser-DOM extractor
 # (CLAUDE.md: never fetch client-supplied / DOM-supplied URLs blindly). The JS
