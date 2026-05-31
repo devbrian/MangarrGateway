@@ -115,11 +115,10 @@ async def search(
     soft_warnings: dict[str, list[tuple[str, str]]] = {}
 
     async def _run_one(src: Source) -> list[Release]:
-        # D-45: the comix-v1 decrypt scheme delegates to the warm Patchright solver
-        # at runtime, so the framework injects the solver into decrypt_config here
-        # (alongside the source-declared keys). MangaDex (scheme=None) ignores it.
-        decrypt_config = dict(getattr(src, "decrypt_config", None) or {})
-        decrypt_config["solver"] = solver
+        # Copy ``decrypt_config`` per request so a scheme that mutates its
+        # config cannot leak state across concurrent requests via the source
+        # CLASS attribute.
+        src_decrypt_config = getattr(src, "decrypt_config", None)
         ctx = SourceContext(
             source_key=src.key,
             rate_limit_per_minute=src.rate_limit_per_minute,
@@ -129,7 +128,7 @@ async def search(
             solver=solver,
             antibot=src.antibot,
             decrypt_scheme=src.decrypt_scheme,
-            decrypt_config=decrypt_config,
+            decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
             source_health=health_map.get(src.key),
         )
         started = time.perf_counter()

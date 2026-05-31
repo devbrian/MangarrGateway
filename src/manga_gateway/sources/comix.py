@@ -3,25 +3,25 @@
 Subclasses :class:`~manga_gateway.framework.base.Source` exactly like
 ``mangadex.py``: it declares its D-13 metadata as class attributes and overrides the
 four hooks (``search``/``recent``/``fetch_manifest``/``fetch_image``). ALL networking,
-rate-limiting, retry, Cloudflare clearance injection (D-40), challenge re-solve (D-35),
-and response decryption (D-39) live in the injected ``ctx`` — this module is just
-Comix param shaping + response parsing. This is the reusability proof of the phase
-(criterion #1): a new cloudflare+encrypted source is a declarative subclass with ZERO
-new networking/glue, riding the Wave-1/2 seams.
+rate-limiting, retry, and Cloudflare clearance injection (D-40) / challenge re-solve
+(D-35) live in the injected ``ctx`` — this module is just Comix param shaping +
+response parsing. This is the reusability proof of the phase (criterion #1): a new
+cloudflare+encrypted source is a declarative subclass with ZERO new networking/glue,
+riding the Wave-1/2 seams.
 
-Two anti-bot declarations distinguish Comix from MangaDex:
+The single anti-bot declaration that distinguishes Comix from MangaDex:
 
 * ``antibot = "cloudflare+encrypted"`` — the framework injects the captured
   ``cf_clearance`` + matching UA per request and re-solves a challenge 403 (D-40/D-35).
-* ``decrypt_scheme = "comix-v1"`` — the framework routes every response body through
-  ``framework.decrypt`` (D-39); the concrete cipher is a browser-evaluated decrypt
-  delegated to the warm Patchright solver (D-45). NOTE: in the Option A pivot
-  (Plan 04-04 commit 2/3, 2026-05-30), the chapter-pages and chapter-list paths
-  switched to browser-DOM read via ``solver.fetch_via_browser`` — the ``comix-v1``
-  decrypt seam is no longer in the hot path for Comix BUT the registration stays
-  as the documented seam-shape proof for future encrypted sources whose token+
-  cipher problem CAN be split. The ``get_json_plain`` opt-out is what the still-
-  plaintext ``/api/v1/manga`` search endpoint uses.
+
+In the Option A pivot (Plan 04-04 commit 2/3, 2026-05-30), the chapter-pages and
+chapter-list paths switched to a browser-DOM read via ``solver.fetch_via_browser``,
+and the plaintext search endpoint uses ``get_json_plain``. As a result Comix has
+no live encrypted-response path — ``decrypt_scheme`` stays ``None`` (issue #46
+Option A: the ``comix-v1`` browser-evaluated decrypt seam was non-functional dead
+code on the current ``secure-*.js`` bundle and has been removed; the
+``framework.decrypt`` registry remains the seam shape for future sources whose
+token + cipher problem CAN be split).
 
 ENDPOINT SHAPES (live-recon-pinned, Plan 04-04 Commit 3):
 
@@ -104,7 +104,6 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from ..framework.base import Source
-from ..framework.decrypt import DecryptError, register_scheme
 from ..framework.errors import SourceError
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
@@ -112,33 +111,6 @@ from ..models.search import Release
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
     from ..models.search import SearchRequest
-
-
-# ─────────────────────────── comix-v1 cipher (D-45) ───────────────────────────
-#
-# Browser-evaluated decrypt of the Comix encrypted-response envelope. The cipher
-# (``comix-v1``) is a jsdefender/jscrambler VM stream cipher that derives runtime
-# keys from ``navigator.appCodeName`` + a timestamp-shaped fingerprint — not
-# statically reversible in v1. We reuse the warm ``CloudflareSolver`` (which has
-# already loaded ``secure-*.js`` to pass the Cloudflare challenge) and call its
-# ``decrypt`` method, which executes ``await globalThis.t(ciphertext)`` on the
-# warm comix.to page.
-#
-# The solver is threaded through ``decrypt_config["solver"]`` by the framework at
-# every ``SourceContext`` construction site; a missing solver is a wiring bug,
-# not a recoverable condition. Registered at module import time so the framework
-# decrypt registry sees ``"comix-v1"`` as soon as :mod:`sources.comix` loads.
-
-
-@register_scheme("comix-v1")
-async def _comix_v1_decrypt(body: bytes, config: dict[str, Any]) -> bytes:
-    solver = config.get("solver")
-    if solver is None or not hasattr(solver, "decrypt"):
-        raise DecryptError(
-            "comix-v1 requires 'solver' in decrypt_config (browser-evaluated, D-45)"
-        )
-    plaintext: bytes = await solver.decrypt(body)
-    return plaintext
 
 
 # Bound a title search's candidate series; interactive widens it (mirrors MangaDex).
@@ -604,7 +576,13 @@ def _title_to_slug(title: str) -> str:
 
 
 class ComixSource(Source):
-    """Comix — antibot ``cloudflare+encrypted``, decrypt ``comix-v1`` (SRC-06)."""
+    """Comix — antibot ``cloudflare+encrypted`` (SRC-06).
+
+    Comix's live read path is Option A browser-DOM (``solver.fetch_via_browser``)
+    + plaintext httpx (``get_json_plain``/``get_bytes_plain``), so the framework
+    decrypt seam is never invoked here. ``decrypt_scheme`` is inherited as
+    ``None`` from the base.
+    """
 
     key = "comix"
     name = "Comix"
@@ -618,16 +596,9 @@ class ComixSource(Source):
     # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
     antibot = "cloudflare+encrypted"
     # The URL the framework solver navigates to so Cloudflare issues a
-    # ``cf_clearance`` cookie + the warm decrypt/fetch page loads ``secure-*.js``
-    # (D-45 / Option A). Read by the application wiring (app.py lifespan), not
-    # by the framework solver itself.
+    # ``cf_clearance`` cookie. Read by the application wiring (app.py lifespan),
+    # not by the framework solver itself.
     cloudflare_challenge_url = "https://comix.to/"
-    # D-39/D-45: every encrypted response body is routed through framework.decrypt
-    # which delegates to solver.decrypt() (browser-evaluated). The framework injects
-    # ``solver`` into ``decrypt_config`` at each SourceContext construction site, so
-    # this declaration stays empty (no source-supplied key material in v1).
-    decrypt_scheme = "comix-v1"
-    decrypt_config: dict[str, Any] = {}
     # Issue #31 (2026-05-30): Comix has NO public all-recent-chapters feed.
     # The public "Recently Added" UI is a list-mangas-sorted-by-
     # ``chapter_updated_at`` view (a series feed), not a chapter feed. The
@@ -779,13 +750,11 @@ class ComixSource(Source):
 
         Delegates to ``ctx.get_bytes_plain`` — cleared by the framework seam
         (D-40) but the decrypt seam is opted out: the Comix CDN
-        (``https://{cdn}.store/si/{token}/{NN}.webp``) serves plaintext WebP,
-        and the ``comix-v1`` scheme is a browser-eval cipher that does not
-        apply to image bytes (and would corrupt them on the UTF-8 boundary
-        when handed to ``page.evaluate``). The browser is NEVER used for
-        image fetch (CLAUDE.md): the cleared httpx client does the bulk fetch,
-        bounded by the per-job semaphore. The host + token come from the
-        browser-DOM page-list (Option A pivot — Plan 04-04).
+        (``https://{cdn}.store/si/{token}/{NN}.webp``) serves plaintext WebP.
+        The browser is NEVER used for image fetch (CLAUDE.md): the cleared
+        httpx client does the bulk fetch, bounded by the per-job semaphore.
+        The host + token come from the browser-DOM page-list (Option A pivot —
+        Plan 04-04).
         """
         return await ctx.get_bytes_plain(url)
 
@@ -865,7 +834,8 @@ class ComixSource(Source):
             # live API tolerates either bracketed or repeated keys.
             "order[relevance]": "desc",
         }
-        # PLAINTEXT endpoint (live recon) — bypass the comix-v1 decrypt seam.
+        # PLAINTEXT endpoint (live recon) — use get_json_plain so the framework
+        # decrypt seam stays out of this path.
         data = await ctx.get_json_plain(f"{self.base_url}/api/v1/manga", **params)
         items = self._result_items(data)
         out: list[tuple[str, str, str]] = []

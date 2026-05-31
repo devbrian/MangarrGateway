@@ -171,9 +171,9 @@ class SourceContext:
     async def _decrypt(self, body: bytes) -> bytes:
         """Route ``body`` through the framework decrypt seam (D-39; None = identity).
 
-        Async since 04-04 / D-45: the comix-v1 scheme delegates to a browser-evaluated
-        decrypt on the warm Patchright solver, so the seam is awaited even though
-        ``None`` and sync schemes pass through synchronously.
+        Async by contract since 04-04: a registered scheme may be either sync or async,
+        so the seam is awaited even though ``None`` and sync schemes pass through
+        synchronously.
         """
         return await decrypt(self._decrypt_scheme, body, self._decrypt_config or {})
 
@@ -270,10 +270,9 @@ class SourceContext:
         their API responses are encrypted (Comix: ``/api/v1/chapters/{id}`` is
         encrypted but the resolved ``https://{cdn}.store/si/{token}/{NN}.webp``
         CDN serves plaintext WebP). Without this opt-out, routing a binary blob
-        through the source's registered ``decrypt_scheme`` corrupts the bytes
-        (or decodes them as UTF-8 inside a browser-evaluated scheme — D-45).
-        Everything else (clearance injection, retry, 403 reconciliation, health
-        feed) stays identical to :meth:`get_bytes`.
+        through the source's registered ``decrypt_scheme`` would corrupt the
+        bytes. Everything else (clearance injection, retry, 403 reconciliation,
+        health feed) stays identical to :meth:`get_bytes`.
         """
         try:
             body = await self._request_bytes(

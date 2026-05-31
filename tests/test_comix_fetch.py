@@ -294,106 +294,68 @@ async def test_get_bytes_routes_through_registered_scheme() -> None:
         _SCHEMES.pop(scheme, None)
 
 
-# ─────────────────────── D-45: comix-v1 happy path via FakeSolver ──────────
-
-
-class _DecryptingSolver:
-    """A solver that ALSO implements ``decrypt`` for the D-45 browser-evaluated
-    seam — the framework threads it into ``decrypt_config["solver"]``."""
-
-    USER_AGENT = "Mozilla/5.0 Chrome/cf"
-
-    def __init__(self, *, plaintexts: dict[bytes, bytes]) -> None:
-        self.plaintexts = plaintexts
-        self.decrypt_calls: list[bytes] = []
-
-    async def get_clearance(
-        self, source_key: str, *, force_resolve: bool = False
-    ) -> Clearance:
-        return Clearance(cookies={"cf_clearance": "X"}, user_agent=self.USER_AGENT)
-
-    async def decrypt(self, ciphertext: bytes) -> bytes:
-        self.decrypt_calls.append(ciphertext)
-        return self.plaintexts[ciphertext]
+# ─────────────────────── plain-path bypass of the decrypt seam ──────────
 
 
 @pytest.mark.asyncio
-async def test_get_json_routes_through_comix_v1_via_solver() -> None:
-    """D-45: a cloudflare+encrypted source with ``decrypt_scheme='comix-v1'`` runs
-    every response body through ``solver.decrypt`` — proving the SourceContext
-    threads the solver into decrypt_config and the comix-v1 registration delegates
-    correctly. The slice test exercises the full search→download flow; this test
-    pins the wiring at the SourceContext layer."""
-    ciphertext = b"CIPHER-ENVELOPE"
-    plaintext = b'{"chapters": [{"id": "c1"}]}'
-    solver = _DecryptingSolver(plaintexts={ciphertext: plaintext})
+async def test_get_bytes_plain_bypasses_registered_scheme() -> None:
+    """``get_bytes_plain`` must NOT run the decrypt seam — Comix's image CDN
+    serves plaintext WebP per live recon, so routing the binary blob through a
+    registered ``decrypt_scheme`` would corrupt the bytes. This regression test
+    pins the seam-bypass even when a scheme IS registered for the source."""
+    scheme = "test-rot1-bytes-plain"
 
-    req = httpx.Request("GET", "https://comix.to/api/v1/manga/mr3m0/chapters")
-    transport = _RecordingTransport(
-        [httpx.Response(200, content=ciphertext, request=req)]
-    )
-    ctx = _ctx(
-        transport,
-        antibot="cloudflare+encrypted",
-        solver=solver,
-        decrypt_scheme="comix-v1",
-        decrypt_config={"solver": solver},
-    )
+    @register_scheme(scheme)
+    def _rot1(body: bytes, config: dict[str, object]) -> bytes:  # pragma: no cover
+        return bytes((b + 1) % 256 for b in body)
 
-    out = await ctx.get_json("https://comix.to/api/v1/manga/mr3m0/chapters")
+    try:
+        plain = b"\x52\x49\x46\x46\x10\x00\x00\x00WEBPVP8 "  # WebP header
+        req = httpx.Request("GET", "https://cdn.example.store/si/TOKEN/01.webp")
+        transport = _RecordingTransport(
+            [httpx.Response(200, content=plain, request=req)]
+        )
+        ctx = _ctx(
+            transport,
+            antibot="cloudflare+encrypted",
+            solver=_CountingSolver(),
+            decrypt_scheme=scheme,
+        )
 
-    assert out == {"chapters": [{"id": "c1"}]}
-    assert solver.decrypt_calls == [ciphertext]
-
-
-@pytest.mark.asyncio
-async def test_get_bytes_plain_bypasses_comix_v1_decrypt() -> None:
-    """``get_bytes_plain`` must NOT run the comix-v1 seam — Comix's image CDN
-    (``wowpic*.store``) serves plaintext WebP per the 2026-05-30 live e2e, and
-    routing the binary blob through ``solver.decrypt`` would treat the raw
-    bytes as ciphertext (and corrupt them on the UTF-8 boundary when handed to
-    ``page.evaluate``)."""
-    plain = b"\x52\x49\x46\x46\x10\x00\x00\x00WEBPVP8 "  # WebP header
-    solver = _DecryptingSolver(plaintexts={})  # no entries — decrypt would KeyError
-
-    req = httpx.Request("GET", "https://cdn.example.store/si/TOKEN/01.webp")
-    transport = _RecordingTransport([httpx.Response(200, content=plain, request=req)])
-    ctx = _ctx(
-        transport,
-        antibot="cloudflare+encrypted",
-        solver=solver,
-        decrypt_scheme="comix-v1",
-        decrypt_config={"solver": solver},
-    )
-
-    out = await ctx.get_bytes_plain("https://cdn.example.store/si/TOKEN/01.webp")
-
-    assert out == plain
-    assert solver.decrypt_calls == []  # decrypt was NOT called for the plaintext path
+        out = await ctx.get_bytes_plain("https://cdn.example.store/si/TOKEN/01.webp")
+        assert out == plain  # untouched by the scheme
+    finally:
+        _SCHEMES.pop(scheme, None)
 
 
 @pytest.mark.asyncio
-async def test_get_json_plain_bypasses_comix_v1_decrypt() -> None:
-    """``get_json_plain`` must NOT run the comix-v1 seam — Comix's search and
+async def test_get_json_plain_bypasses_registered_scheme() -> None:
+    """``get_json_plain`` must NOT run the decrypt seam — Comix's search and
     chapter-index endpoints are plaintext per live recon, and routing them
-    through ``solver.decrypt`` would treat plaintext JSON as ciphertext."""
-    plain = b'{"status":"ok","result":{"items":[]}}'
-    solver = _DecryptingSolver(plaintexts={})  # no entries — decrypt would KeyError
+    through a registered scheme would corrupt plaintext JSON."""
+    scheme = "test-rot1-json-plain"
 
-    req = httpx.Request("GET", "https://comix.to/api/v1/manga")
-    transport = _RecordingTransport([httpx.Response(200, content=plain, request=req)])
-    ctx = _ctx(
-        transport,
-        antibot="cloudflare+encrypted",
-        solver=solver,
-        decrypt_scheme="comix-v1",
-        decrypt_config={"solver": solver},
-    )
+    @register_scheme(scheme)
+    def _rot1(body: bytes, config: dict[str, object]) -> bytes:  # pragma: no cover
+        return bytes((b + 1) % 256 for b in body)
 
-    out = await ctx.get_json_plain("https://comix.to/api/v1/manga")
+    try:
+        plain = b'{"status":"ok","result":{"items":[]}}'
+        req = httpx.Request("GET", "https://comix.to/api/v1/manga")
+        transport = _RecordingTransport(
+            [httpx.Response(200, content=plain, request=req)]
+        )
+        ctx = _ctx(
+            transport,
+            antibot="cloudflare+encrypted",
+            solver=_CountingSolver(),
+            decrypt_scheme=scheme,
+        )
 
-    assert out == {"status": "ok", "result": {"items": []}}
-    assert solver.decrypt_calls == []  # decrypt was NOT called for the plaintext path
+        out = await ctx.get_json_plain("https://comix.to/api/v1/manga")
+        assert out == {"status": "ok", "result": {"items": []}}
+    finally:
+        _SCHEMES.pop(scheme, None)
 
 
 # ───────────────────────── D-36: health failure-feed ─────────────────────────
