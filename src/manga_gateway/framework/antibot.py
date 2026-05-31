@@ -22,6 +22,17 @@ let the live page's own JS do token-mint + API call + decrypt + image-tag render
 then read the result from the DOM. The httpx path remains the bulk image fetcher
 (CLAUDE.md "image fetch is NEVER through the browser"); the browser only drives
 the manifest resolution step.
+
+Engine selection (#35): the underlying browser is selected via the ``engine``
+parameter (``"patchright"`` Chromium-based, default; ``"camoufox"`` Firefox-based).
+Patchright passes Cloudflare reliably on residential IPs (dev/Windows); Camoufox
+is the documented escalation when Patchright's Chromium fingerprint is flagged
+by Cloudflare's encrypted tier on cloud Linux runners (ubuntu-latest in CI). Both
+engines back the SAME ``AntiBotSolver`` interface — the swap is a single
+constructor argument with no rewrite (CLAUDE.md "keep the browser behind an
+interface so this is a config flip"). The launch closure is selected at
+``__init__`` and remains LAZY (the heavy import happens only on first solve),
+so neither browser binary is touched by the deterministic gate (D-42).
 """
 
 from __future__ import annotations
@@ -30,7 +41,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 from .decrypt import DecryptError
@@ -43,11 +54,18 @@ _log = logging.getLogger("manga_gateway")
 
 # Default URLs the solver navigates to for cf_clearance acquisition + the warm
 # decrypt page. Overridden by the application wiring (app.py lifespan) from the
-# concrete source's metadata — the framework defaults exist only so unit tests
-# can spin up a CloudflareSolver without naming a host. Pinned by Plan 04-04
-# live recon when the application supplies a real source.
+# concrete source's metadata — the framework solver itself never names a host.
+# The framework defaults exist only so unit tests can spin up a CloudflareSolver
+# without naming a host. Pinned by Plan 04-04 live recon when the application
+# supplies a real source.
 _DEFAULT_CHALLENGE_URL = "https://example.invalid/"
 _DEFAULT_DECRYPT_URL = "https://example.invalid/"
+
+# Supported anti-bot browser engines (#35). The selector lives on
+# ``Settings.cloudflare_engine`` and is forwarded into ``CloudflareSolver``.
+# Patchright is the default (dev parity on Windows); Camoufox is the CI
+# escalation (cloud Linux runners).
+AntibotEngine = Literal["patchright", "camoufox"]
 
 
 def _belongs_to_host(cookie: dict[str, Any], host: str) -> bool:
@@ -112,19 +130,23 @@ class NoopSolver:
 
 
 class CloudflareSolver:
-    """Patchright-backed Cloudflare clearance solver (BOT-01/BOT-02).
+    """Patchright/Camoufox-backed Cloudflare clearance solver (BOT-01/BOT-02).
 
-    Drives a Patchright persistent context (D-34 cross-restart clearance) to solve
-    the Cloudflare challenge, then captures the ``cf_clearance`` cookie + the EXACT
-    ``navigator.userAgent`` of that SAME session (Pitfall 1 — the cookie is bound to
-    its issuing UA) into a :class:`Clearance`. All browser work runs OFF the event
-    loop via Patchright's native async API, behind a bounded
+    Drives a stealth-browser persistent context (D-34 cross-restart clearance) to
+    solve the Cloudflare challenge, then captures the ``cf_clearance`` cookie + the
+    EXACT ``navigator.userAgent`` of that SAME session (Pitfall 1 — the cookie is
+    bound to its issuing UA) into a :class:`Clearance`. All browser work runs OFF
+    the event loop via Playwright's native async API, behind a bounded
     :class:`BrowserLifecycle` (solve cap + single-flight + recycle + cleanup-on-all-
     paths, criterion #4).
 
-    ``patchright`` is imported LAZILY inside the launch closure so the deterministic
-    gate never imports/launches a browser (D-42); tests inject a ``lifecycle`` whose
-    ``launch``/``solve`` drive a mocked browser instead.
+    Engine selection (#35): ``engine="patchright"`` (default) uses Patchright's
+    Chromium build; ``engine="camoufox"`` uses Camoufox's Firefox build. The choice
+    affects ONLY which launch closure is wired into the lifecycle — the solve
+    closure (cf_clearance polling) is engine-agnostic. The heavy import happens
+    inside the launch closure so the deterministic gate never imports/launches a
+    browser (D-42); tests inject a ``lifecycle`` whose ``launch``/``solve`` drive
+    a mocked browser instead.
 
     The internal keyword-only ``force_resolve`` on ``get_clearance`` is the D-35
     re-solve path; it is deliberately kept OFF the ``AntiBotSolver`` Protocol (D-41).
@@ -140,6 +162,7 @@ class CloudflareSolver:
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         decrypt_url: str = _DEFAULT_DECRYPT_URL,
         cloudflare_keys: Iterable[str] = (),
+        engine: AntibotEngine = "patchright",
         lifecycle: BrowserLifecycle | None = None,
         decrypt_page_factory: Any = None,
     ) -> None:
@@ -148,27 +171,39 @@ class CloudflareSolver:
         self._challenge_url = challenge_url
         self._decrypt_url = decrypt_url
         self._cloudflare_keys = frozenset(cloudflare_keys)
+        self._engine: AntibotEngine = engine
         # Tests inject a lifecycle wrapping a MOCKED browser; production builds one
-        # wrapping the real lazy-patchright launch/solve closures (no real Chromium
-        # is touched until the first solve / explicit warm()).
+        # wrapping the real lazy-launch/solve closures. The launch closure is
+        # selected by ``engine`` (Patchright default; Camoufox escalation, #35).
+        # No real browser is touched until the first solve / explicit warm().
+        launch = (
+            self._launch_camoufox_context
+            if engine == "camoufox"
+            else self._launch_patchright_context
+        )
         self._lifecycle = lifecycle or BrowserLifecycle(
-            launch=self._launch_real_context,
+            launch=launch,
             solve=self._solve_real,
             solve_concurrency=solve_concurrency,
             recycle_seconds=recycle_seconds,
         )
-        self._playwright: Any = None  # the started patchright instance (real path)
+        self._playwright: Any = None  # the started playwright instance (real path)
         # D-45 warm decrypt page lifecycle. Lazy-warmed on first decrypt(); shares
         # the solver's persistent context (the same browser session that holds
         # cf_clearance), so secure-*.js loads under the same fingerprint that
         # passed Cloudflare. ``_decrypt_lock`` serializes page.evaluate() calls
-        # (Patchright is not parallel-safe on a single page). The optional
+        # (neither engine is parallel-safe on a single page). The optional
         # ``decrypt_page_factory`` is the test injection seam (mocked browser).
         self._decrypt_page: Any = None
         self._decrypt_lock = asyncio.Lock()
         self._decrypt_page_factory = decrypt_page_factory or self._open_decrypt_page
 
     # ─────────────────────────── public seam (D-41) ───────────────────────────
+
+    @property
+    def engine(self) -> AntibotEngine:
+        """The configured anti-bot browser engine (#35)."""
+        return self._engine
 
     async def get_clearance(
         self, source_key: str, *, force_resolve: bool = False
@@ -372,7 +407,7 @@ class CloudflareSolver:
         return page
 
     async def _open_decrypt_page(self, context: Any, url: str) -> Any:
-        """Default real-Patchright warm-page factory: new_page → goto → wait."""
+        """Default real-browser warm-page factory: new_page → goto → wait."""
         page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded")
         # Wait briefly for secure-*.js to attach globalThis.t. Bounded so a
@@ -384,7 +419,7 @@ class CloudflareSolver:
         return page
 
     async def aclose(self) -> None:
-        """Tear the bounded lifecycle down + stop patchright (Pitfall 4).
+        """Tear the bounded lifecycle down + stop playwright (Pitfall 4).
 
         Closes the warm decrypt page BEFORE the lifecycle's persistent context
         (closing the context implicitly closes its pages, but explicit teardown
@@ -402,14 +437,17 @@ class CloudflareSolver:
             with contextlib.suppress(Exception):
                 await pw.stop()
 
-    # ─────────────────────── real patchright launch/solve ───────────────────────
+    # ─────────────────────── real launch/solve closures ───────────────────────
 
-    async def _launch_real_context(self) -> Any:
-        """Launch the Patchright persistent context (lazy import — D-42).
+    async def _launch_patchright_context(self) -> Any:
+        """Launch a Patchright persistent context (lazy import — D-42).
 
         Uses ``launch_persistent_context`` with the on-disk ``user_data_dir`` so the
         cf_clearance persists across restarts (D-34). NO custom UA/headers/fingerprint
-        injection (Anti-Patterns — re-introduces detectable inconsistencies).
+        injection (Anti-Patterns — re-introduces detectable inconsistencies). This is
+        the dev/Windows default — passes Cloudflare reliably on residential IPs but
+        is flagged by Cloudflare's encrypted tier on cloud Linux runners (#35); CI
+        flips to the Camoufox closure below.
         """
         import asyncio  # noqa: PLC0415
         from pathlib import Path  # noqa: PLC0415
@@ -432,12 +470,62 @@ class CloudflareSolver:
             no_viewport=True,
         )
 
+    async def _launch_camoufox_context(self) -> Any:
+        """Launch a Camoufox (Firefox-based) persistent context (lazy import — D-42).
+
+        Camoufox wraps Playwright's Firefox driver with a C++ fingerprint spoof; per
+        CLAUDE.md it is the strongest open-source stealth in 2026 (~0% headless
+        detection) and is the documented escalation when Patchright/Chromium stops
+        passing Cloudflare's encrypted tier on cloud Linux runners (#35). The CI
+        nightly-live-smoke workflow sets ``GATEWAY_CLOUDFLARE_ENGINE=camoufox`` and
+        runs ``uv run camoufox fetch`` to download its Firefox binary.
+
+        Camoufox uses ``AsyncNewBrowser(playwright, persistent_context=True, ...)``
+        to return a ``BrowserContext`` that matches the shape Patchright's
+        ``launch_persistent_context`` returns — both back the lifecycle's
+        injection seam identically, so the solve closure stays engine-agnostic.
+
+        ``user_data_dir`` carries cf_clearance across restarts (D-34), same as the
+        Patchright closure. NO custom UA/headers (Camoufox handles fingerprint
+        spoofing internally; injecting our own would re-introduce detectable
+        inconsistencies — same Anti-Patterns note as Patchright).
+        """
+        import asyncio  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        from camoufox.async_api import (  # noqa: PLC0415 — lazy (D-42)
+            AsyncNewBrowser,
+        )
+        from playwright.async_api import (  # noqa: PLC0415
+            async_playwright,
+        )
+
+        await asyncio.to_thread(
+            Path(self._user_data_dir).mkdir, mode=0o700, parents=True, exist_ok=True
+        )
+
+        self._playwright = await async_playwright().start()
+        # ``persistent_context=True`` returns a BrowserContext (same shape as
+        # Patchright's launch_persistent_context); Camoufox routes its
+        # ``user_data_dir`` through Playwright's launch_persistent_context under
+        # the hood. ``no_viewport=True`` matches the Patchright launch for
+        # parity — Cloudflare's encrypted tier checks viewport-derived signals.
+        return await AsyncNewBrowser(
+            self._playwright,
+            persistent_context=True,
+            user_data_dir=self._user_data_dir,
+            headless=self._headless,
+            no_viewport=True,
+        )
+
     async def _solve_real(self, context: Any) -> Clearance:
         """Solve the challenge on the live context; capture cf_clearance + UA.
 
-        Browser work runs on Patchright's native async API (already off the event
-        loop). The image fetch is NEVER done through the browser (CLAUDE.md) — only
-        the token capture is.
+        Engine-agnostic: the polling-cookies + capture-UA logic depends only on
+        Playwright's ``BrowserContext`` API surface, which both Patchright (Chromium)
+        and Camoufox (Firefox) expose identically. Browser work runs on the
+        Playwright async API (already off the event loop). The image fetch is NEVER
+        done through the browser (CLAUDE.md) — only the token capture is.
         """
         page = await context.new_page()
         try:

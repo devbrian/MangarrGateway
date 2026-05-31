@@ -26,7 +26,7 @@ import secrets
 import tempfile
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tomli_w
 from pydantic import Field
@@ -92,6 +92,18 @@ class Settings(BaseSettings):
     cloudflare_user_data_dir: str = "cloudflare-userdata"
     # D-37: watchdog re-clearance backoff schedule (min_hours, max_hours).
     cloudflare_watchdog_backoff_hours: tuple[int, int] = (1, 6)
+    # Anti-bot engine selector (#35): which stealth browser drives the
+    # CloudflareSolver. ``patchright`` (Chromium-based) is the dev/Windows
+    # default — passes Cloudflare reliably on residential IPs. ``camoufox``
+    # (Firefox-based, C++ fingerprint spoof) is the CI/Linux escalation;
+    # Patchright's Chromium fingerprint is flagged by Cloudflare's encrypted
+    # tier on ubuntu-latest runners, so CI flips this to ``camoufox`` via
+    # ``GATEWAY_CLOUDFLARE_ENGINE=camoufox``. Both back the SAME
+    # ``AntiBotSolver`` interface — swap is a config flip, not a rewrite
+    # (CLAUDE.md "keep the browser behind an interface so this is a config
+    # flip"). Camoufox requires ``uv run camoufox fetch`` to download its
+    # Firefox binary before first use.
+    cloudflare_engine: Literal["patchright", "camoufox"] = "patchright"
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
 

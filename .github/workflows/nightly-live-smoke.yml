@@ -10,6 +10,14 @@
 #   * D-59: artifact upload is logs-only — junit.xml + pytest-live.log. NO CBZs,
 #     NO screenshots, NO captured fixtures (RESEARCH Security Domain explicit).
 #
+# Issue #35 — Cloudflare engine: dev/Windows uses Patchright (the default,
+# residential-IP friendly); CI uses Camoufox (Firefox-based, C++ fingerprint
+# spoof) because Patchright/Chromium's headless fingerprint is flagged by
+# Cloudflare's encrypted tier on ubuntu-latest Azure runners (Comix would
+# otherwise time out at warm()). Both engines back the same AntiBotSolver
+# interface; the swap is a single env var. Camoufox requires ``uv run camoufox
+# fetch`` to download its bundled Firefox build before first use (~200 MB).
+#
 # Sibling to .github/workflows/ci.yml (the deterministic gate). D-12 invariant:
 # this workflow NEVER replaces `uv run nox -s gate` — they run independently;
 # the nightly is an additive recurring real-network signal, not a gate.
@@ -33,6 +41,13 @@ permissions:
 jobs:
   live-smoke:
     runs-on: ubuntu-latest
+    # #35: flip the Cloudflare engine to Camoufox on CI. Patchright (the dev
+    # default on Windows) is detected by Cloudflare's encrypted tier on cloud
+    # Linux runners — every Comix warm() hangs the 60s outer budget. Camoufox
+    # is the documented escalation (CLAUDE.md "swap is cheap"), surfaced
+    # behind the existing AntiBotSolver interface.
+    env:
+      GATEWAY_CLOUDFLARE_ENGINE: camoufox
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.
@@ -42,10 +57,14 @@ jobs:
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - run: uv python install 3.12
       - run: uv sync --dev
-      # Patchright (the Cloudflare solver) ships only the driver; the Chromium
-      # binary must be installed separately. The Comix live smoke launches the
-      # solver via lifespan + warm() and would otherwise hang until the runner
-      # timeout — same reasoning as ci.yml line 30.
+      # Camoufox ships only the Python driver; its bundled Firefox binary must
+      # be downloaded separately (~200 MB, runner has the disk). Same role as
+      # ``patchright install chromium`` previously — without this step the
+      # solver would fail on first launch (#35).
+      - run: uv run camoufox fetch
+      # Patchright's Chromium is still installed so a local re-run / debug
+      # session with GATEWAY_CLOUDFLARE_ENGINE unset (the default) works on
+      # the runner too. Cheap relative to the Camoufox Firefox download.
       - run: uv run patchright install --with-deps chromium
 
       # Live step — D-58 / Pitfall 4: `continue-on-error: true` so a per-source
