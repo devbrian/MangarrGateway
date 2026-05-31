@@ -175,13 +175,15 @@ Do not make direct repo edits outside a GSD workflow unless the user explicitly 
 
 ### Branching & PR workflow (required)
 
-`main` is protected — never commit or push directly to it. Every unit of work goes on its own branch and reaches `main` only through a reviewed PR:
+`main` is reserved for reviewed, PR-gated changes. Every unit of work with code, test, or contract impact goes on its own branch and reaches `main` only through a reviewed PR:
 
 - **Phases** — `/gsd-execute-phase` auto-creates a branch (`git.branching_strategy: phase` → `gsd/phase-{phase}-{slug}`). Open a PR from that branch back to `main` when the phase verifies.
 - **Quick tasks** — `/gsd-quick` branches via `gsd/quick-{slug}`; PR back to `main`.
-- **Debug sessions / ad-hoc fixes / chores** — create a descriptive branch first (e.g. `debug/{slug}`, `fix/{slug}`, `chore/{slug}`), then PR back to `main`.
+- **Debug sessions / ad-hoc fixes / chores with real changes** — create a descriptive branch first (e.g. `debug/{slug}`, `fix/{slug}`, `chore/{slug}`), then PR back to `main`.
 
-Run the full CI gate locally before pushing (`uv run nox -s gate` — runs ruff check + ruff format --check + mypy + pytest over the whole repo, not a scoped path). Track any deferred/declined items as GitHub issues, the single source of truth for outstanding work.
+**Exception — tracking-only bookkeeping commits go straight to `main`.** Commits whose entire diff is metadata bookkeeping with zero functional impact (`.planning/STATE.md` "Quick Tasks Completed" Status column updates, "Last activity" line bumps, session/phase status moves to resolved/completed, equivalent metadata-only `.planning/` edits) should be committed directly on `main` — no chore branch, no PR. CodeRabbit + CI add no value to a row-status flip, and the prior pattern (chore branch → PR → merge → delete) was pure churn.
+
+Run the full CI gate locally before pushing PR branches (`uv run nox -s gate` — runs ruff check + ruff format --check + mypy + pytest over the whole repo, not a scoped path). Tracking-only STATE.md commits don't need the gate (pure markdown). Track any deferred/declined items as GitHub issues, the single source of truth for outstanding work.
 <!-- GSD:workflow-end -->
 
 
