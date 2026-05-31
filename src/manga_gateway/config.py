@@ -108,6 +108,18 @@ class Settings(BaseSettings):
     # a config flip"). Camoufox requires ``uv run camoufox fetch`` to
     # download its Firefox binary before first use (~200 MB, one-time).
     cloudflare_engine: Literal["patchright", "camoufox"] = "camoufox"
+    # Diagnostic-only: when True, ``CloudflareSolver._fetch_via_browser_once``
+    # attaches ``page.on("pageerror" | "console" | "requestfailed")`` listeners
+    # so we can capture the JS throw site behind the Playwright Firefox driver
+    # crash investigated in debug session ``comix-pageerror-throw-site-54``
+    # (issue #54). OFF by default — the handlers log INFO-level per-event
+    # lines, which are too noisy for production and add a small per-page
+    # overhead. Enable for nightly evidence-capture runs with
+    # ``GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS=1`` (pydantic-settings auto-binds
+    # the ``GATEWAY_`` prefix to this field). When evidence has been captured,
+    # this flag should be turned back off (or the instrumentation removed
+    # entirely) — it is NOT intended as a permanent runtime knob.
+    cloudflare_log_browser_events: bool = False
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
 

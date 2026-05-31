@@ -18,6 +18,9 @@ captured ``user_agent`` comes from the SAME session as the ``cf_clearance`` cook
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 
@@ -317,7 +320,13 @@ class _SharedConcurrency:
 
 class _FakeFetchPage:
     """A FakePage for ``fetch_via_browser`` — records goto/wait/evaluate/close
-    and lets each test stage the return value or an error per stage."""
+    and lets each test stage the return value or an error per stage.
+
+    Also records ``page.on(event, handler)`` calls so the #54 diagnostic
+    instrumentation tests can assert which handlers were attached. The
+    ``url`` attribute is exposed so the instrumented handlers' ``getattr(
+    page, "url", None)`` reads have something to read (real Playwright pages
+    expose ``.url`` synchronously)."""
 
     def __init__(
         self,
@@ -328,6 +337,7 @@ class _FakeFetchPage:
         wait_selector_error: Exception | None = None,
         evaluate_error: Exception | None = None,
         shared_concurrency: _SharedConcurrency | None = None,
+        page_url: str = "https://example.test/page-url",
     ) -> None:
         self.evaluate_result = evaluate_result
         self.goto_error = goto_error
@@ -344,6 +354,27 @@ class _FakeFetchPage:
         # Optional — set by _FetchContext.new_page() so concurrent evaluates
         # across DIFFERENT pages count against a single shared peak.
         self._shared = shared_concurrency
+        # #54 instrumentation: record every ``page.on(event, handler)`` call.
+        # Mirrors Playwright's sync ``Page.on`` surface (NOT awaitable). Tests
+        # can fire a registered handler manually via :meth:`fire`.
+        self.on_calls: list[tuple[str, Callable[[object], None]]] = []
+        # The ``page.url`` attribute the instrumented handlers read via
+        # ``getattr(page, "url", None)``. Matches Playwright's sync property.
+        self.url = page_url
+
+    def on(self, event: str, handler: Callable[[object], None]) -> None:
+        """Record an ``on(event, handler)`` registration. Sync — Playwright's
+        ``Page.on`` is sync; an ``async def`` handler would silently no-op."""
+        self.on_calls.append((event, handler))
+
+    def fire(self, event: str, payload: object) -> None:
+        """Invoke every registered handler for ``event`` with ``payload``.
+
+        Tests use this to drive the instrumented pageerror/console/
+        requestfailed handlers without booting a real browser."""
+        for ev, handler in self.on_calls:
+            if ev == event:
+                handler(payload)
 
     async def goto(self, url: str, **kwargs: object) -> None:
         if self.goto_error is not None:
@@ -415,12 +446,16 @@ class _FetchContext:
         self.closed = True
 
 
-def _solver_with_fetch_context(ctx: _FetchContext) -> CloudflareSolver:
+def _solver_with_fetch_context(
+    ctx: _FetchContext, *, log_browser_events: bool = False
+) -> CloudflareSolver:
     """Build a CloudflareSolver whose lifecycle yields the given fetch context.
 
     The lifecycle's ``solve`` callable is never invoked by these tests (they
     exercise ``fetch_via_browser`` directly), but we still supply a stub that
-    would record a Clearance if called.
+    would record a Clearance if called. ``log_browser_events`` toggles the
+    #54 diagnostic instrumentation under test in the
+    ``test_browser_event_*`` cases below.
     """
 
     async def _launch() -> _FetchContext:
@@ -430,7 +465,7 @@ def _solver_with_fetch_context(ctx: _FetchContext) -> CloudflareSolver:
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
-    return CloudflareSolver(lifecycle=lc)
+    return CloudflareSolver(lifecycle=lc, log_browser_events=log_browser_events)
 
 
 async def test_fetch_via_browser_goto_evaluate_roundtrip() -> None:
@@ -912,3 +947,125 @@ def test_looks_like_dead_driver_handles_cyclic_cause_chain() -> None:
     # Returns False (no marker anywhere) AND terminates — pytest would hang
     # otherwise; a failure here means the loop guard regressed.
     assert _looks_like_dead_driver(a) is False
+
+
+# ───────────────────── #54 diagnostic browser-event instrumentation ─────────────────
+#
+# The instrumentation under test attaches ``page.on("pageerror" | "console" |
+# "requestfailed")`` handlers in ``_fetch_via_browser_once`` ONLY when
+# ``Settings.cloudflare_log_browser_events`` (forwarded as
+# ``CloudflareSolver(log_browser_events=...)``) is True. The handlers log
+# INFO-level lines for nightly evidence capture investigating the upstream
+# Playwright Firefox handler crash (issue #54). Tests below cover:
+#
+#   1. flag=True → all three handlers registered before goto;
+#   2. flag=False (default) → no handlers registered;
+#   3. pageerror handler survives a ``location=None`` payload — the very
+#      pattern that crashes Playwright's own handler upstream MUST NOT also
+#      crash our diagnostic listener (a handler that raised would corrupt
+#      its own evidence stream).
+
+
+async def test_browser_event_handlers_attached_when_flag_true() -> None:
+    """When ``log_browser_events=True``, all three handlers register on the
+    page BEFORE ``goto`` — early registration matters because we want to
+    capture errors thrown during navigation itself, not just post-load."""
+    page = _FakeFetchPage(evaluate_result="ok")
+    ctx = _FetchContext([page])
+    solver = _solver_with_fetch_context(ctx, log_browser_events=True)
+
+    await solver.fetch_via_browser("https://x/y", extract="return 1;")
+
+    events_registered = [event for event, _ in page.on_calls]
+    assert sorted(events_registered) == ["console", "pageerror", "requestfailed"]
+    # Exactly one handler per event — no duplicate registration on the single fetch.
+    assert len(page.on_calls) == 3
+
+    await solver.aclose()
+
+
+async def test_browser_event_handlers_not_attached_when_flag_false() -> None:
+    """Default (``log_browser_events=False``): NO handlers attached.
+
+    Production must not pay the per-page listener overhead or emit the
+    pageerror/console/requestfailed log spam by default — the flag is a
+    diagnostic-only opt-in for nightly evidence capture."""
+    page = _FakeFetchPage(evaluate_result="ok")
+    ctx = _FetchContext([page])
+    solver = _solver_with_fetch_context(ctx)  # log_browser_events defaults to False
+
+    await solver.fetch_via_browser("https://x/y", extract="return 1;")
+
+    # No ``page.on(...)`` call was issued by the production code path.
+    assert page.on_calls == []
+
+    await solver.aclose()
+
+
+async def test_browser_event_pageerror_handler_survives_location_none(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The diagnostic-safety guarantee: the pageerror handler MUST NOT raise
+    when its payload has ``location=None`` — the exact pattern under
+    investigation. A handler that crashed on this would (a) defeat the purpose
+    (no evidence is captured), (b) silently swallow other still-firing events
+    on the same page, and (c) potentially trigger the very driver-crash path
+    we're trying to instrument. ``getattr(..., None)`` on every attribute
+    read is what protects us; this test asserts the guarantee end-to-end.
+
+    Also covers the matching defensive behavior for the console and
+    requestfailed handlers — none of the three handlers may raise on a
+    location-less payload, regardless of which surface triggers it."""
+    page = _FakeFetchPage(evaluate_result="ok")
+    ctx = _FetchContext([page])
+    solver = _solver_with_fetch_context(ctx, log_browser_events=True)
+
+    with caplog.at_level(logging.INFO, logger="manga_gateway"):
+        await solver.fetch_via_browser(
+            "https://comix.to/title/abc/1-chapter-1", extract="return 1;"
+        )
+
+        # Payload shape mirrors the #54 trigger: a PageError whose ``location``
+        # is None / undefined. ``name`` and ``message`` ARE present but
+        # ``stack`` is None to also stress the stack-absent path. Using
+        # SimpleNamespace because real Playwright Error objects expose
+        # attributes via the same dotted-access surface.
+        pageerror_payload = SimpleNamespace(
+            name="TypeError",
+            message="Script error.",
+            stack=None,
+            location=None,
+        )
+        page.fire("pageerror", pageerror_payload)
+
+        # A console message with a None location is also a documented pattern
+        # for cross-origin sanitized errors.
+        console_payload = SimpleNamespace(
+            type="error",
+            text="Uncaught (in promise) Script error.",
+            location=None,
+        )
+        page.fire("console", console_payload)
+
+        # A failed request with a None failure dict (Playwright surfaces
+        # ``request.failure()`` as a dict-or-None) — same defensive path.
+        requestfailed_payload = SimpleNamespace(
+            url="https://thirdparty.invalid/widget.js",
+            method="GET",
+            failure=None,
+        )
+        page.fire("requestfailed", requestfailed_payload)
+
+    # All three handlers executed without raising (otherwise pytest would
+    # have reported the uncaught exception from ``fire``). Confirm the
+    # diagnostic stream DID receive each event — proving the handlers ran
+    # to completion, not that they early-exited under a try/except that
+    # swallowed the work itself.
+    info_messages = [
+        rec.getMessage() for rec in caplog.records if rec.levelno == logging.INFO
+    ]
+    assert any("pageerror" in m and "TypeError" in m for m in info_messages)
+    assert any("console" in m and "Script error" in m for m in info_messages)
+    assert any("requestfailed" in m and "widget.js" in m for m in info_messages)
+
+    await solver.aclose()
