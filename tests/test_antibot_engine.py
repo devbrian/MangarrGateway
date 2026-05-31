@@ -30,8 +30,15 @@ def _settings(**over: object) -> Settings:
 # ──────────────────────── Settings.cloudflare_engine ────────────────────────
 
 
-def test_settings_default_engine_is_patchright() -> None:
-    """Default (dev/Windows) — Patchright is the engine."""
+def test_settings_default_engine_is_patchright(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (dev/Windows) — Patchright is the engine.
+
+    Hermetic against an ambient ``GATEWAY_CLOUDFLARE_ENGINE`` (e.g. the
+    nightly-live-smoke workflow sets it to ``camoufox``).
+    """
+    monkeypatch.delenv("GATEWAY_CLOUDFLARE_ENGINE", raising=False)
     assert _settings().cloudflare_engine == "patchright"
 
 
