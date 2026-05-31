@@ -26,10 +26,12 @@ nav in ``recent()``) are unit-asserted.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from manga_gateway.framework.errors import SourceError
+from manga_gateway.handles.store import HandleStore
 from manga_gateway.sources.comix import (
     _DEFERRED_SENTINEL,
     ComixSource,
@@ -37,6 +39,9 @@ from manga_gateway.sources.comix import (
     _make_deferred_composite,
     _resolve_deferred,
 )
+
+if TYPE_CHECKING:
+    from manga_gateway.framework.context import SourceContext
 
 
 def _row(
@@ -216,3 +221,168 @@ def test_make_deferred_composite_decimal_chapter_roundtrips() -> None:
 # Note: ``test_comix_declares_supports_recent_true`` lives at the end of this
 # file once Task 3 flips the capability — kept out of Task 1 so the helpers
 # can land independently of the flag (the plan deliberately stages it).
+
+
+# ────────────────── fetch_manifest deferred-branch (Task 2) ─────────────────
+
+
+class _FakeSolver:
+    """Records the ``chapter_url`` passed to ``fetch_via_browser`` so the test
+    can assert the deferred branch resolved the sentinel before navigating."""
+
+    def __init__(self, urls: list[str] | None = None) -> None:
+        self.last_url: str | None = None
+        self._urls = urls or [
+            "https://jdpw.wowpic1.store/si/AAAAAAAAAAAAAAAAAAAA/01.webp",
+            "https://jdpw.wowpic1.store/si/AAAAAAAAAAAAAAAAAAAA/02.webp",
+        ]
+
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: Any,
+        timeout: float,  # noqa: ASYNC109 — mirrors the real solver signature
+    ) -> list[str]:
+        self.last_url = url
+        return self._urls
+
+
+class _FakeCtxForFetchManifest:
+    """Minimal ``SourceContext`` stand-in for the deferred-branch path.
+
+    ``fetch_manifest`` reads ``ctx`` only via :meth:`ComixSource._solver_from_ctx`
+    (which reads ``_solver``) and via the ``_series_chapters`` browser nav
+    (also through the same solver). ``handle_store`` is included for parity
+    with the real ``SourceContext``.
+    """
+
+    def __init__(self, solver: _FakeSolver) -> None:
+        self._solver = solver
+        self.handle_store = HandleStore()
+
+
+def _ctx_for_fetch(solver: _FakeSolver) -> SourceContext:
+    return _FakeCtxForFetchManifest(solver)  # type: ignore[return-value]
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_resolves_deferred_composite_then_navigates_resolved_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A composite with ``numeric_id == 'DEFERRED'`` triggers
+    ``_series_chapters`` + ``_resolve_deferred`` and the resulting chapter URL
+    contains the resolved numeric id, NOT the ``DEFERRED`` sentinel."""
+    source = ComixSource()
+    composite = _make_deferred_composite("mr3m0", "the-forgotten-field", "23")
+    # Confirm parser roundtrip (Task 1 already pinned this, asserted again
+    # here so a parser regression breaks this test on the right line).
+    numeric_id, hid, slug, number = ComixSource._parse_composite_chapter_id(composite)
+    assert numeric_id == _DEFERRED_SENTINEL
+    assert (hid, slug, number) == ("mr3m0", "the-forgotten-field", "23")
+
+    # Monkeypatch _series_chapters to return a synthetic list containing the
+    # deferred chapter number. Real chapter-id strings are numeric and
+    # downstream code uses them to build the chapter URL.
+    async def fake_series_chapters(
+        self: ComixSource,
+        series_hid: str,
+        series_slug: str,
+        limit: int,
+        offset: int,
+        ctx: Any,
+    ) -> list[dict[str, Any]]:
+        assert series_hid == "mr3m0"
+        assert series_slug == "the-forgotten-field"
+        return [
+            {"id": "9938735", "chapter": "23", "groups": [{"name": "Thunderscans"}]},
+            {"id": "9938700", "chapter": "22", "groups": []},
+        ]
+
+    monkeypatch.setattr(ComixSource, "_series_chapters", fake_series_chapters)
+
+    solver = _FakeSolver()
+    urls = await source.fetch_manifest(composite, _ctx_for_fetch(solver))
+    assert urls  # the fake returns a non-empty allowed-CDN list
+    # The chapter URL embeds the RESOLVED numeric id from the series row, not
+    # the sentinel — proves the deferred branch substituted before navigating.
+    assert solver.last_url is not None
+    assert "/9938735-chapter-23" in solver.last_url
+    assert "DEFERRED" not in solver.last_url
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_deferred_chapter_missing_raises_source_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Locked decision 4: when the deferred chapter is no longer present on
+    the series page, ``fetch_manifest`` translates ``_DeferredResolutionError``
+    into ``SourceError('source_unavailable', ...)`` — never silently rebinds
+    to a different chapter."""
+    source = ComixSource()
+    composite = _make_deferred_composite("mr3m0", "the-forgotten-field", "23")
+
+    async def fake_series_chapters_without_23(
+        self: ComixSource,
+        series_hid: str,
+        series_slug: str,
+        limit: int,
+        offset: int,
+        ctx: Any,
+    ) -> list[dict[str, Any]]:
+        # Chapter 23 has been deleted/replaced upstream — only 22 and 24 remain.
+        return [
+            {"id": "9938800", "chapter": "24", "groups": []},
+            {"id": "9938700", "chapter": "22", "groups": []},
+        ]
+
+    monkeypatch.setattr(
+        ComixSource, "_series_chapters", fake_series_chapters_without_23
+    )
+
+    solver = _FakeSolver()
+    with pytest.raises(SourceError) as excinfo:
+        await source.fetch_manifest(composite, _ctx_for_fetch(solver))
+    assert excinfo.value.code == "source_unavailable"
+    assert "not present" in str(excinfo.value)
+    # The solver was NEVER called — we failed BEFORE navigating to the
+    # (now-stale) chapter URL.
+    assert solver.last_url is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_resolved_composite_skips_deferred_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NON-deferred composite (numeric_id is a real id) MUST NOT call
+    ``_series_chapters`` — zero regression on the search-path download flow."""
+    source = ComixSource()
+    resolved_composite = ComixSource._make_composite_chapter_id(
+        "9938735", "mr3m0", "the-forgotten-field", "23"
+    )
+
+    series_calls: list[tuple[str, str]] = []
+
+    async def fake_series_chapters_should_not_be_called(
+        self: ComixSource,
+        series_hid: str,
+        series_slug: str,
+        limit: int,
+        offset: int,
+        ctx: Any,
+    ) -> list[dict[str, Any]]:
+        series_calls.append((series_hid, series_slug))
+        return []
+
+    monkeypatch.setattr(
+        ComixSource, "_series_chapters", fake_series_chapters_should_not_be_called
+    )
+
+    solver = _FakeSolver()
+    urls = await source.fetch_manifest(resolved_composite, _ctx_for_fetch(solver))
+    assert urls
+    assert series_calls == [], "deferred branch ran on a resolved composite"
+    # URL uses the search-path numeric id verbatim.
+    assert solver.last_url is not None
+    assert "/9938735-chapter-23" in solver.last_url

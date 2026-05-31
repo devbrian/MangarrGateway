@@ -840,6 +840,14 @@ class ComixSource(Source):
         The image-byte fetch (the next step in the engine) still runs through
         httpx (``ctx.get_bytes``) — the browser is NEVER used for bulk image
         fetch (CLAUDE.md).
+
+        Issue #42 — composites whose ``numeric_id == 'DEFERRED'`` are recent-
+        feed-minted handles that re-resolve their chapter id at download time
+        via :meth:`_series_chapters` + :func:`_resolve_deferred`; one extra
+        browser nav on the first download per recent-minted Release. The
+        resolved id is local to this call; the ``ResolutionRecord`` stored
+        under the opaque handle is NOT mutated (locked decision 1 — the
+        ``:DEFERRED`` guid suffix is permanent).
         """
         try:
             numeric_id, hid, slug, number = self._parse_composite_chapter_id(chapter_id)
@@ -847,6 +855,17 @@ class ComixSource(Source):
             raise SourceError(
                 "source_unavailable", f"malformed comix chapter id: {exc}"
             ) from None
+        # Issue #42: recent-feed handles defer chapter-id resolution to download
+        # time. One extra browser nav (re-reads the series page chapter list,
+        # the same path search uses) replaces the DEFERRED sentinel with the
+        # real numeric id. Strict-match staleness (locked decision 4): a
+        # missing chapter surfaces as SourceError, never a silent rebind.
+        if numeric_id == _DEFERRED_SENTINEL:
+            chapters = await self._series_chapters(hid, slug, _MAX_FEED_LIMIT, 0, ctx)
+            try:
+                numeric_id = _resolve_deferred(number, chapters)
+            except _DeferredResolutionError as exc:
+                raise SourceError("source_unavailable", str(exc)) from None
         solver = self._solver_from_ctx(ctx)
         chapter_url = (
             f"{self.base_url}/title/{hid}-{slug}/{numeric_id}-chapter-{number}"
