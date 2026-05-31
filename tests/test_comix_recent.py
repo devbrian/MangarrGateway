@@ -26,6 +26,7 @@ nav in ``recent()``) are unit-asserted.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -386,3 +387,225 @@ async def test_fetch_manifest_resolved_composite_skips_deferred_branch(
     # URL uses the search-path numeric id verbatim.
     assert solver.last_url is not None
     assert "/9938735-chapter-23" in solver.last_url
+
+
+# ───────────────────────── recent() shape (Task 3) ──────────────────────────
+
+
+class _FakeCtxForRecent:
+    """Minimal ``SourceContext`` stand-in for the ``recent()`` plaintext path.
+
+    ``recent()`` reads ``ctx`` only via :meth:`get_json_plain` (one call) and
+    ``handle_store.mint``. We capture the URL + params for assertion and serve
+    a canned payload. No respx needed — ``recent()`` does not touch httpx
+    directly; the production ``SourceContext.get_json_plain`` is the layer
+    that does.
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.handle_store = HandleStore()
+        self._payload = payload
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((url, params))
+        return self._payload
+
+
+def _ctx_for_recent(payload: dict[str, Any]) -> SourceContext:
+    return _FakeCtxForRecent(payload)  # type: ignore[return-value]
+
+
+def _viable_item(
+    *,
+    hid: str,
+    slug_url: str,
+    title: str,
+    latest_chapter: Any,
+    relative: str = "3h ago",
+) -> dict[str, Any]:
+    """One viable ``/api/v1/manga`` item shape (matches live recon)."""
+    return {
+        "hid": hid,
+        "title": title,
+        "url": slug_url,
+        "latestChapter": latest_chapter,
+        "chapterUpdatedAtFormatted": relative,
+        "hasChapters": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_recent_returns_releases_with_deferred_guids_and_composites() -> None:
+    """``recent()`` synthesizes one Release per viable item:
+
+    * Exactly 10 viable rows → 10 Releases (3 skip rows ignored).
+    * Every guid ends with the literal ``:DEFERRED`` (locked decision 1).
+    * Every ``scanlation_group`` and ``page_count`` is ``None`` (populated
+      at download-resolve, not at mint).
+    * Every Release's resolved ``ResolutionRecord`` carries a composite
+      ``chapter_id`` starting with ``DEFERRED|`` matching
+      ``_make_deferred_composite(hid, slug, ch_str)``.
+    * ``chapter_number`` for the ``"30.1"`` row equals ``Decimal('30.1')``
+      (decimal-normalized; not ``Decimal('30.10')``).
+    * The fake ctx records exactly one ``get_json_plain`` call (locked
+      decision 7: no series-page nav from the ``recent`` path).
+    """
+    payload = {
+        "status": "ok",
+        "result": {
+            "items": [
+                _viable_item(
+                    hid="aaaa1",
+                    slug_url="/title/aaaa1-series-one",
+                    title="Series One",
+                    latest_chapter="23",
+                ),
+                _viable_item(
+                    hid="aaaa2",
+                    slug_url="/title/aaaa2-series-two",
+                    title="Series Two",
+                    latest_chapter="30.1",
+                ),
+                _viable_item(
+                    hid="aaaa3",
+                    slug_url="/title/aaaa3-series-three",
+                    title="Series Three",
+                    latest_chapter="72.8",
+                ),
+                _viable_item(
+                    hid="aaaa4",
+                    slug_url="/title/aaaa4-series-four",
+                    title="Series Four",
+                    latest_chapter="1.2",
+                ),
+                _viable_item(
+                    hid="aaaa5",
+                    slug_url="/title/aaaa5-series-five",
+                    title="Series Five",
+                    latest_chapter=23,  # int form
+                ),
+                _viable_item(
+                    hid="aaaa6",
+                    slug_url="/title/aaaa6-series-six",
+                    title="Series Six",
+                    latest_chapter=0.5,
+                    relative="1d ago",
+                ),
+                _viable_item(
+                    hid="aaaa7",
+                    slug_url="/title/aaaa7-series-seven",
+                    title="Series Seven",
+                    latest_chapter="100",
+                    relative="2w ago",
+                ),
+                _viable_item(
+                    hid="aaaa8",
+                    slug_url="/title/aaaa8-series-eight",
+                    title="Series Eight",
+                    latest_chapter="5",
+                    relative="1mo ago",
+                ),
+                _viable_item(
+                    hid="aaaa9",
+                    slug_url="/title/aaaa9-series-nine",
+                    title="Series Nine",
+                    latest_chapter="2.5",
+                ),
+                _viable_item(
+                    hid="aaab0",
+                    slug_url="/title/aaab0-series-ten",
+                    title="Series Ten",
+                    latest_chapter="7",
+                ),
+                # SKIP rows below.
+                {
+                    "hid": "skip1",
+                    "title": "Has No Chapters",
+                    "url": "/title/skip1-has-no-chapters",
+                    "latestChapter": 0,
+                    "chapterUpdatedAtFormatted": "1h ago",
+                    "hasChapters": False,
+                },
+                {
+                    # Missing hid.
+                    "title": "Missing Hid",
+                    "url": "/title/-missing-hid",
+                    "latestChapter": "9",
+                    "chapterUpdatedAtFormatted": "2h ago",
+                    "hasChapters": True,
+                },
+                {
+                    "hid": "skip3",
+                    "title": "Unparseable Time",
+                    "url": "/title/skip3-unparseable-time",
+                    "latestChapter": "12",
+                    "chapterUpdatedAtFormatted": "yesterday",
+                    "hasChapters": True,
+                },
+            ],
+        },
+    }
+    source = ComixSource()
+    ctx = _ctx_for_recent(payload)
+    releases = await source.recent(languages=None, limit=20, since=None, ctx=ctx)
+
+    assert len(releases) == 10
+    # Locked decision 7: exactly one outbound plaintext call from recent().
+    assert len(ctx.calls) == 1  # type: ignore[attr-defined]
+    called_url, called_params = ctx.calls[0]  # type: ignore[attr-defined]
+    assert called_url == "https://comix.to/api/v1/manga"
+    assert called_params["order[chapter_updated_at]"] == "desc"
+    assert called_params["page"] == 1
+    assert called_params["content_rating"] == "suggestive"
+    assert called_params["limit"] == 20
+
+    # Locked decision 1: literal `:DEFERRED` guid suffix on every Release.
+    for rel in releases:
+        assert rel.guid.endswith(":DEFERRED"), rel.guid
+        assert rel.scanlation_group is None
+        assert rel.page_count is None
+        assert rel.source_key == "comix"
+        assert rel.language == "en"
+        assert rel.download_handle
+
+    # Locked decision 5: decimal-normalized chapter strings flow through to
+    # both the composite and the Release.chapter_number.
+    by_hid = {rel.ids["comixSeriesId"]: rel for rel in releases}
+    rel_2 = by_hid["aaaa2"]
+    assert rel_2.chapter_number == Decimal("30.1")
+    # The guid uses the normalized ch_str ("30.1", NOT "30.10").
+    assert ":ch-30.1:" in rel_2.guid
+
+    # Resolution record carries the deferred composite — matches what the
+    # search-path's fetch_manifest deferred branch (Task 2) will decode.
+    for rel in releases:
+        record = ctx.handle_store.resolve(rel.download_handle)  # type: ignore[attr-defined]
+        assert record is not None
+        assert record.chapter_id.startswith("DEFERRED|")
+        # Composite roundtrips through the existing parser unchanged.
+        sentinel, hid, slug, number = ComixSource._parse_composite_chapter_id(
+            record.chapter_id
+        )
+        assert sentinel == _DEFERRED_SENTINEL
+        assert hid == rel.ids["comixSeriesId"]
+        assert slug  # non-empty
+        # The chapter_number on the record (Decimal) round-trips with ch_str.
+        assert record.chapter_number is not None
+        assert format(record.chapter_number.normalize(), "f") == number
+
+
+# Need this import after the test definition above to avoid a forward
+# reference in the type annotations; pytest collects on import regardless.
+
+
+# ────────────────────── Symmetric capability assertion ──────────────────────
+
+
+def test_comix_declares_supports_recent_true() -> None:
+    """Symmetric counterpart to the now-deleted issue-#31 assertion.
+
+    Issue #42 flipped ``supports_recent`` from ``False`` to ``True``; ``/caps``
+    advertises ``supportsRecent: true`` for Comix (the route-level assertion
+    is in ``tests/test_comix_publishdate_and_recent.py``)."""
+    assert ComixSource.supports_recent is True

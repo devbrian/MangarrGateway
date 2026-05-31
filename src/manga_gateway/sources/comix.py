@@ -739,15 +739,13 @@ class ComixSource(Source):
     # ``cf_clearance`` cookie. Read by the application wiring (app.py lifespan),
     # not by the framework solver itself.
     cloudflare_challenge_url = "https://comix.to/"
-    # Issue #31 (2026-05-30): Comix has NO public all-recent-chapters feed.
-    # The public "Recently Added" UI is a list-mangas-sorted-by-
-    # ``chapter_updated_at`` view (a series feed), not a chapter feed. The
-    # ``recent`` hook returns an empty list (see the override below); this
-    # declaration is what makes ``/caps`` advertise the gap honestly so
-    # clients can branch on ``supportsRecent: false`` instead of guessing
-    # from a silently-empty release array. A per-followed-series fan-out
-    # would close this gap in a future plan; for now we tell the truth.
-    supports_recent = False
+    # Issue #42: flipped from False — recent uses a plaintext one-call feed
+    # with deferred chapter-id resolution; see ``recent()`` below. Late-binding
+    # of the chapter id happens in ``fetch_manifest`` (one extra browser nav
+    # per first download), keeping the per-poll cost to one cheap plaintext
+    # call (1 of 10/min rate-limit budget) rather than the N+1 series-page
+    # drill-down PR #41 originally rejected as too expensive.
+    supports_recent = True
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
         """Title-search → series candidates → chapter-list enumeration (SRCH-01..07).
@@ -799,19 +797,99 @@ class ComixSource(Source):
         since: str | None,
         ctx: SourceContext,
     ) -> list[Release]:
-        """Newest-first recent chapters across all series (RCNT-01/02).
+        """Newest-first recent chapters via the plaintext list-mangas feed (RCNT-01/02).
 
-        Comix has no public "all-recent-chapters" feed (the public site's
-        "Recently Added" UI is a list-mangas-sorted-by-``chapter_updated_at``
-        view, not a chapter feed). This hook returns an empty list and the
-        class declares ``supports_recent = False`` so ``/caps`` advertises
-        the gap explicitly (Issue #31). Recent-Comix coverage will come via
-        a per-followed-series fan-out in a future plan (deferred); the
-        framework's per-source isolation means an empty Comix recent is a
-        no-op, not a contract failure.
+        Issue #42 (supersedes #31): synthesizes one ``Release`` per viable item
+        from a single plaintext ``GET /api/v1/manga?order[chapter_updated_at]=desc``
+        call (the same plaintext path search uses, one of 10/min rate budget).
+        Each Release carries a ``:DEFERRED`` guid suffix and a deferred
+        composite ``chapter_id`` whose numeric id is late-bound by
+        :meth:`fetch_manifest` at download time (one extra browser nav per
+        FIRST download of a recent-minted Release — not per ``/recent`` poll).
+
+        Recent and search Releases for the same chapter intentionally do not
+        dedup — they are different objects (a late-binding promise vs a
+        concrete upload). See locked decisions 1, 3, 7 in the PLAN.
+
+        ``since`` and ``languages`` are noted unused: Comix is English-only
+        (live recon) and ``since`` is enforced upstream by the route-level cut
+        already (same no-op pattern as today). Items missing ``hid``,
+        ``hasChapters: false``, an unparseable ``latestChapter``, no slug, or
+        an unparseable ``chapterUpdatedAtFormatted`` are SKIPPED rather than
+        faked (REL-01 requires ``format: date-time``).
         """
-        _ = (languages, limit, since, ctx)  # unused — see docstring
-        return []
+        _ = (languages, since)  # see docstring — both deliberately unused here
+        params: dict[str, Any] = {
+            "order[chapter_updated_at]": "desc",
+            "limit": min(limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT),
+            "page": 1,
+            "content_rating": _CONTENT_RATING,
+        }
+        data = await ctx.get_json_plain(f"{self.base_url}/api/v1/manga", **params)
+        items = self._result_items(data)
+
+        releases: list[Release] = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("hasChapters") is False:
+                continue
+            hid = item.get("hid")
+            if not hid:
+                continue
+            ch_dec = self._parse_decimal(item.get("latestChapter"))
+            if ch_dec is None:
+                continue
+            slug = self._slug_from_item(item)
+            if not slug:
+                continue
+            publish_date = _parse_relative_time(item.get("chapterUpdatedAtFormatted"))
+            if not publish_date:
+                continue  # REL-01 requires format: date-time — skip rather than fake
+            # Decimal-normalize per locked decision 5: ``Decimal('23')`` ->
+            # ``"23"`` (not ``"23.0"``), ``Decimal('1.20')`` -> ``"1.2"``.
+            ch_str = format(ch_dec.normalize(), "f")
+            series_title = str(item.get("title") or "Unknown")
+            language = "en"
+            composite = _make_deferred_composite(str(hid), slug, ch_str)
+            title = self._build_title(
+                series_title, ch_str, volume=None, language=language, group=None
+            )
+            # Locked decision 1: literal ``:DEFERRED`` suffix in the guid's
+            # chapter_id segment. NEVER rewrite this when the composite
+            # resolves at download time — recent and search intentionally do
+            # not dedup (different resolution states). The search-path guid
+            # shape ``…:{chapter_id}`` stays unchanged for D-21 multi-group
+            # uniqueness.
+            guid = f"comix:{hid}:ch-{ch_str}:{language}:DEFERRED"
+            handle = ctx.handle_store.mint(
+                ResolutionRecord(
+                    source_key=self.key,
+                    chapter_id=composite,
+                    language=language,
+                    title=title,
+                    manga_title=series_title,
+                    chapter_number=ch_dec,
+                    volume=None,
+                    scanlation_group=None,  # populated at download-resolve
+                    page_count=None,  # populated at download-resolve
+                )
+            )
+            releases.append(
+                Release(
+                    guid=guid,
+                    title=title,
+                    source_key=self.key,
+                    download_handle=handle,
+                    publish_date=publish_date,
+                    manga_title=series_title,
+                    chapter_number=ch_dec,
+                    volume=None,
+                    language=language,
+                    scanlation_group=None,
+                    page_count=None,
+                    ids={"comixSeriesId": str(hid)},
+                )
+            )
+        return releases
 
     # ───────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
 
