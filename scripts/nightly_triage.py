@@ -117,13 +117,34 @@ def _validate_source_key(source_key: str) -> str:
 
 
 def _ensure_label(source_key: str) -> None:
-    """Idempotently create the ``source:{key}`` label (Pitfall 5).
+    """Idempotently create both labels used by the sticky-issue flow (Pitfall 5).
+
+    Creates the per-source ``source:{key}`` label AND the cross-cutting
+    ``nightly-failure`` umbrella label. Both must exist before
+    ``gh issue create --label`` will accept them; the first failing nightly
+    HAS to bootstrap both, otherwise ``upsert_sticky_issue`` fails with
+    ``could not add label: 'nightly-failure' not found`` (first dispatch on
+    main 2026-05-31 surfaced this).
 
     ``check=False`` so a pre-existing label silently no-ops — ``gh label
     create`` returns non-zero when the label already exists, which is the
     overwhelmingly common case after the first nightly run.
     """
     _validate_source_key(source_key)
+    subprocess.run(
+        [
+            "gh",
+            "label",
+            "create",
+            "nightly-failure",
+            "--color",
+            "B60205",
+            "--description",
+            "Umbrella label for all nightly-live-smoke sticky issues",
+        ],
+        check=False,
+        timeout=GH_TIMEOUT_SECONDS,
+    )
     subprocess.run(
         [
             "gh",
