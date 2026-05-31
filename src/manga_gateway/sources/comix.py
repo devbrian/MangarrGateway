@@ -77,6 +77,22 @@ first live-smoke run and fixed in branch ``fix/comix-publishdate-recent``:
   feed). The source now declares ``supports_recent = False`` so ``/caps``
   advertises the gap explicitly and clients can branch on it instead of
   guessing from the empty array.
+
+Issue #32 (2026-05-31): the parallel ``scrollIntoView`` extractor introduced
+by issue #20 was structurally broken: a synchronous burst of ``scrollIntoView``
+calls leaves the viewport at the LAST element's position only — intermediate
+pages never enter view, so the per-div IntersectionObserver never fires and
+the lazy ``<img>`` never loads. The per-div Promise.all watchers then time
+out polling for an ``<img src>`` the observer was never triggered on. Only
+head pages (above the fold) + the final 1-2 pages (where the scroll lands)
+were captured. This was a silent data-loss bug in the production download
+path, not just a drift-test bug: every Comix CBZ shipped for a chapter
+longer than ~4 pages was missing middle pages. The fix walks pages
+SEQUENTIALLY again, scroll → small await → poll for the page's img with
+a tight per-page budget, accepting an O(pages) wall-clock term in exchange
+for correctness. The Step-1 scaffold wait is also hardened to wait for
+COUNT STABILITY (count unchanged for 3 x 100ms ticks, capped at 8s) so
+the extractor never snapshots a partial scaffold.
 """
 
 from __future__ import annotations
@@ -270,15 +286,24 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 # shows real chapter pages with gaps, NOT lazy-load artifacts; we sort by
 # embedded NN so the gaps survive.
 #
-# Issue #20 (2026-05-30): the previous strategy walked pages SEQUENTIALLY —
-# scrollIntoView one div, poll up to 4s for its <img src>, advance. For a
-# 10-page chapter that meant ~10 × (scroll + lazy-load round-trip) of in-page
-# JS, blowing the wall-clock to ~25s. The fix below fires every scrollIntoView
-# UP FRONT (the IntersectionObserver fires per-div in rapid succession) and
-# polls every div IN PARALLEL via Promise.all. Each watcher captures the src
-# the FIRST time it appears, so a Swiper.js eviction after later scrolling
-# does not lose a URL we already saw. Wall-clock collapses from O(pages) ×
-# 1s to ~max single-page latency.
+# Issue #32 (2026-05-31): the prior parallel-scrollIntoView strategy (issue
+# #20) was structurally broken. ``scrollIntoView`` is a synchronous viewport
+# mutation; issuing N calls in a tight loop leaves the viewport at the FINAL
+# element's position only — intermediate pages never enter view, so the per-
+# page IntersectionObserver never fires and the lazy ``<img>`` never loads.
+# The per-div Promise.all watchers then timed out polling for an ``<img src>``
+# the observer was never triggered on. Result: only head pages (above the
+# fold) + the final 1-2 pages (where the scroll lands) were captured, every
+# Comix CBZ longer than ~4 pages silently shipped truncated. The fix below
+# walks pages SEQUENTIALLY: scroll the page into view, yield long enough for
+# the observer + lazy-load round-trip, then poll the div's <img> children for
+# a CDN-matching src. The per-page wait is tight (~200ms baseline + up to
+# ~2s poll budget per page); first-sight wins so a subsequent Swiper
+# eviction never loses a URL we already saw.
+#
+# Step-1 scaffold wait is also hardened: instead of returning on FIRST div
+# we wait for COUNT STABILITY (count unchanged across 3 consecutive 100ms
+# ticks, capped at 8s) so a partial scaffold cannot race the walk.
 _CHAPTER_PAGES_EXTRACT_JS = """
   // Comix's chapter reader is a Swiper.js long-strip component
   // (`class="rpage rpage--long-strip rpage--ttb"`). Each page is wrapped in a
@@ -286,20 +311,35 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   // by an IntersectionObserver. `window.scrollTo()` does not move the inner
   // Swiper viewport, so a blind window scroll only renders head/tail pages.
   //
-  // Strategy: enumerate every `.rpage-page[data-page]` div, fire every
-  // `scrollIntoView` up front (no awaits between them) so the lazy loader
-  // observers fire concurrently, then poll every div IN PARALLEL for the
-  // first <img> whose src matches the CDN pattern. The Map keyed by
-  // `data-page` preserves chapter ordering even if Swiper later evicts a
-  // page's <img> — we captured the src on its first appearance.
+  // Issue #32 fix: walk pages SEQUENTIALLY — scrollIntoView, await long
+  // enough for the IntersectionObserver to fire and the lazy <img> to load,
+  // then poll the div for a CDN-matching src. Issuing all scrollIntoView
+  // calls up front (the prior parallel attempt) was structurally broken:
+  // synchronous viewport mutations cancel each other and only the FINAL
+  // scroll target ever enters view. A first-sight Map preserves chapter
+  // ordering even if Swiper later evicts a page's <img>.
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const rx = /\\/si\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
 
-  // Step 1: wait until the page scaffold exists. The reader populates
-  // `.rpage-page[data-page]` divs once it has the decrypted page list.
-  for (let i = 0; i < 50; i++) {
-    if (document.querySelectorAll('.rpage-page[data-page]').length > 0) break;
-    await sleep(200);
+  // Step 1: wait for the page scaffold COUNT TO STABILIZE. Returning on the
+  // first .rpage-page[data-page] div (the prior strategy) races Swiper's
+  // incremental scaffold and snapshots a partial pageDivs list. We poll
+  // every 100ms and only declare the scaffold ready once the count has
+  // been unchanged for 3 consecutive ticks (with a minimum non-zero count
+  // so we don't accept "still zero" as stable). Cap at 8s wall-clock —
+  // beyond that the page is genuinely broken, not just slow.
+  let stable = 0;
+  let lastCount = -1;
+  for (let i = 0; i < 80; i++) {
+    const count = document.querySelectorAll('.rpage-page[data-page]').length;
+    if (count > 0 && count === lastCount) {
+      stable += 1;
+      if (stable >= 3) break;
+    } else {
+      stable = 0;
+      lastCount = count;
+    }
+    await sleep(100);
   }
 
   const pageDivs = Array.from(document.querySelectorAll('.rpage-page[data-page]'))
@@ -309,40 +349,49 @@ _CHAPTER_PAGES_EXTRACT_JS = """
       return an - bn;
     });
 
-  // Step 2: fire every scroll trigger UP FRONT — synchronous loop, no awaits.
-  // `scrollIntoView` returns immediately; the IntersectionObserver callback
-  // runs asynchronously when the page actually crosses the viewport. Firing
-  // them all in succession schedules the observers concurrently rather than
-  // one-blocking-at-a-time.
-  for (const div of pageDivs) {
-    div.scrollIntoView({ behavior: 'instant', block: 'center' });
-  }
-
-  // Step 3: spawn ONE watcher per page div and Promise.all them. Each watcher
-  // polls its own div on a tight cadence for the FIRST <img> whose src
-  // matches the CDN pattern, then resolves. Per-page budget (~4s) matches
-  // the previous sequential cap, but because watchers run concurrently the
-  // wall-clock is O(slowest-single-page), not O(pages × per-page).
+  // Step 2: sequential walk. For each div: scrollIntoView, await an initial
+  // settle window so the IntersectionObserver actually fires (the observer
+  // callback is scheduled async; without a yield, the next scrollIntoView
+  // cancels the viewport position before the observer ever runs), then poll
+  // the div's <img> children for a CDN-matching src. First-sight wins.
+  //
+  // Per-page budget: ~200ms settle + up to ~2s polling at 100ms cadence.
+  // For a typical 12-page chapter that's ~2.4-26.4s in the worst case but
+  // usually <5s — the poll exits as soon as the src appears. The 8s
+  // wall-clock target from #20 still holds for the typical case; pages
+  // that genuinely take longer surface as a tail.
   const seen = new Map();
-  const watchers = pageDivs.map(async (div) => {
+  for (const div of pageDivs) {
     const n = parseInt(div.getAttribute('data-page') || '0', 10);
-    for (let attempt = 0; attempt < 40; attempt++) {
+    div.scrollIntoView({ behavior: 'instant', block: 'center' });
+    // Initial settle — enough for the IntersectionObserver callback to fire
+    // and for the lazy <img>'s src to start propagating. 150ms covers the
+    // observer + a small network kickoff; the poll loop below catches any
+    // slower lazy-load.
+    await sleep(150);
+    let captured = false;
+    for (let attempt = 0; attempt < 20; attempt++) {
       for (const img of div.querySelectorAll('img')) {
         const src = img.currentSrc || img.src || '';
         const m = src.match(rx);
         if (m) {
           if (!seen.has(n)) seen.set(n, src);
-          return;
+          captured = true;
+          break;
         }
       }
+      if (captured) break;
       await sleep(100);
     }
-  });
-  await Promise.all(watchers);
+    // If we didn't capture, move on — the Step 4 sweep below is a final
+    // safety net. We do NOT bail the whole walk on a single miss so a
+    // genuinely-broken page does not nuke the rest of the chapter.
+  }
 
-  // Step 4 (fallback): sweep the document for any <img> the per-div walk
+  // Step 3 (fallback): sweep the document for any <img> the per-div walk
   // missed (covers reader-shape variants where the canonical `data-page`
-  // wrapper is absent but images still match the CDN pattern).
+  // wrapper is absent but images still match the CDN pattern, OR a page
+  // whose <img> only attached AFTER we walked past it).
   for (const img of document.querySelectorAll('img')) {
     const src = img.currentSrc || img.src || '';
     const m = src.match(rx);
@@ -617,12 +666,14 @@ class ComixSource(Source):
                 # page.evaluate which Playwright is happy to schedule
                 # immediately after goto commits.
                 wait_for=None,
-                # Issue #20: per-div watchers now run in PARALLEL (Promise.all)
-                # so wall-clock collapses from O(pages × ~1s) to ~max single-page
-                # latency. The 30s ceiling still gives plenty of headroom for an
-                # initial Cloudflare round-trip + slow CDN warm-up; a chapter
-                # whose evaluate exceeds this is genuinely degraded, not slow.
-                timeout=30.0,
+                # Issue #32: the sequential page walk adds an O(pages) term
+                # to the resolve wall-clock (~150ms settle + up to ~2s poll
+                # per page, exits on first sight). A 12-page chapter
+                # typically completes well under 8s. Raise the per-call
+                # ceiling to 60s so a slow-CDN or first-page warm-up tail
+                # has room without prematurely aborting a recoverable walk;
+                # the per-source rate limiter still bounds outer cadence.
+                timeout=60.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
             raise SourceError(

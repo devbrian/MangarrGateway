@@ -20,6 +20,14 @@ hashed differently".
 Sources whose profile declares ``fixture_drift_paths = []`` (MangaDex
 today) get a clean ``pytest.skip``. This keeps the parametrize-over-
 REGISTERED_KEYS shape symmetric with the other smoke modules.
+
+Issue #32 (2026-05-31): aligned the Comix call shape with production
+(``ComixSource.fetch_manifest``) — ``wait_for=None`` so the drift
+comparator and the live download path drive the extractor identically.
+The previous mismatch was a red herring (the bug was inside the JS
+extractor itself, not the Python-side wait), but symmetric call sites
+keep "drift" focused on real upstream/extractor changes rather than
+harness-vs-prod divergence.
 """
 
 from __future__ import annotations
@@ -66,7 +74,6 @@ async def test_fixture_drift(
     # MangaDex skips above).
     from manga_gateway.sources.comix import (
         _CHAPTER_PAGES_EXTRACT_JS,
-        _CHAPTER_PAGES_WAIT_FOR,
         ComixSource,
     )
 
@@ -84,11 +91,16 @@ async def test_fixture_drift(
         # there is no public httpx accessor in this version.
         solver = client._transport.app.state.solver
 
+        # Issue #32: mirror ``ComixSource.fetch_manifest`` exactly — same
+        # ``wait_for=None`` (the JS extractor's Step-1 scaffold wait does
+        # the readiness check) and same 60s ceiling. Any deviation between
+        # this call site and production reintroduces the harness-vs-prod
+        # divergence the original issue chased.
         captured = await solver.fetch_via_browser(
             chapter_url,
             extract=_CHAPTER_PAGES_EXTRACT_JS,
-            wait_for=_CHAPTER_PAGES_WAIT_FOR,
-            timeout=45.0,
+            wait_for=None,
+            timeout=60.0,
         )
 
         assert isinstance(captured, list) and captured, (
