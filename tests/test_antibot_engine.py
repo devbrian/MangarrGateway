@@ -15,6 +15,7 @@ it. This is what the nightly-live-smoke workflow uses on ubuntu-latest.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from manga_gateway.config import Settings
 from manga_gateway.framework.antibot import CloudflareSolver
@@ -55,7 +56,7 @@ def test_settings_engine_rejects_unknown_value(
 ) -> None:
     """``Literal["patchright", "camoufox"]`` rejects anything else at validation."""
     monkeypatch.setenv("GATEWAY_CLOUDFLARE_ENGINE", "selenium")
-    with pytest.raises(Exception):  # noqa: B017, PT011 — pydantic ValidationError
+    with pytest.raises(ValidationError):
         _settings()
 
 
