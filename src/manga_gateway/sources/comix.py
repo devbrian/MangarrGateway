@@ -253,7 +253,10 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
     base = now if now is not None else datetime.now(UTC)
     if base.tzinfo is None:
         base = base.replace(tzinfo=UTC)
-    when = base - timedelta(seconds=seconds)
+    try:
+        when = base - timedelta(seconds=seconds)
+    except OverflowError:
+        return None
     # Emit ``YYYY-MM-DDTHH:MM:SSZ`` (no microseconds) so the string parses
     # cleanly with ``datetime.fromisoformat`` AND the trailing ``Z`` matches
     # MangaDex's RFC 3339 emission for cross-source sorting in /recent.

@@ -106,6 +106,16 @@ def test_parse_relative_time_returns_none_for_unparseable(raw: str | None) -> No
     assert _parse_relative_time(raw) is None
 
 
+def test_parse_relative_time_handles_overflow() -> None:
+    """A quantity large enough to overflow ``timedelta`` falls back to ``None``
+    instead of propagating ``OverflowError`` and aborting release normalization
+    (CodeRabbit review on PR #41)."""
+    # timedelta tops out at ~2.7 million years of seconds; pick a year count
+    # that overflows when multiplied through to seconds.
+    huge = f"{10**12} y ago"
+    assert _parse_relative_time(huge) is None
+
+
 def test_parse_relative_time_defaults_to_current_utc() -> None:
     """When ``now`` is omitted the parser anchors on the current UTC time."""
     before = datetime.now(UTC)

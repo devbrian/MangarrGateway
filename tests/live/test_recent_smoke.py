@@ -69,7 +69,11 @@ async def test_recent_returns_newest_first(
         )
         caps = caps_resp.json().get("sources") or []
         cap = next((s for s in caps if s.get("key") == source_key), None)
-        if cap is not None and cap.get("supportsRecent") is False:
+        assert cap is not None, (
+            f"{source_key}: missing from /caps sources — caps-advertisement "
+            f"regression. Sources advertised: {[s.get('key') for s in caps]}"
+        )
+        if cap.get("supportsRecent") is False:
             pytest.skip(
                 f"{source_key}: supportsRecent=false in /caps — no public "
                 f"recent feed; per-source isolation surfaces this honestly "
