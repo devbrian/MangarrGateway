@@ -93,17 +93,21 @@ class Settings(BaseSettings):
     # D-37: watchdog re-clearance backoff schedule (min_hours, max_hours).
     cloudflare_watchdog_backoff_hours: tuple[int, int] = (1, 6)
     # Anti-bot engine selector (#35): which stealth browser drives the
-    # CloudflareSolver. ``patchright`` (Chromium-based) is the dev/Windows
-    # default — passes Cloudflare reliably on residential IPs. ``camoufox``
-    # (Firefox-based, C++ fingerprint spoof) is the CI/Linux escalation;
-    # Patchright's Chromium fingerprint is flagged by Cloudflare's encrypted
-    # tier on ubuntu-latest runners, so CI flips this to ``camoufox`` via
-    # ``GATEWAY_CLOUDFLARE_ENGINE=camoufox``. Both back the SAME
-    # ``AntiBotSolver`` interface — swap is a config flip, not a rewrite
-    # (CLAUDE.md "keep the browser behind an interface so this is a config
-    # flip"). Camoufox requires ``uv run camoufox fetch`` to download its
-    # Firefox binary before first use.
-    cloudflare_engine: Literal["patchright", "camoufox"] = "patchright"
+    # CloudflareSolver. ``camoufox`` (Firefox-based, C++ fingerprint spoof)
+    # is the default everywhere — local dev, CI, and prod — so that
+    # engine-specific failure modes (e.g. issue #54: Playwright Firefox
+    # handler crash on undefined pageError.location) surface in dev rather
+    # than only in nightly triage. Originally Patchright (Chromium-based)
+    # was the dev default for residential-IP friendliness on Windows, but
+    # the dev/prod engine split meant Camoufox-only failures went unseen
+    # locally; the dev-uses-camoufox-not-patchright preference (issue #40)
+    # made Camoufox the single default and demoted Patchright to an opt-in
+    # escalation (``GATEWAY_CLOUDFLARE_ENGINE=patchright``). Both back the
+    # SAME ``AntiBotSolver`` interface — swap is a config flip, not a
+    # rewrite (CLAUDE.md "keep the browser behind an interface so this is
+    # a config flip"). Camoufox requires ``uv run camoufox fetch`` to
+    # download its Firefox binary before first use (~200 MB, one-time).
+    cloudflare_engine: Literal["patchright", "camoufox"] = "camoufox"
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
 

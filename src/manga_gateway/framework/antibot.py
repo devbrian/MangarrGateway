@@ -17,16 +17,19 @@ then read the result from the DOM. The httpx path remains the bulk image fetcher
 (CLAUDE.md "image fetch is NEVER through the browser"); the browser only drives
 the manifest resolution step.
 
-Engine selection (#35): the underlying browser is selected via the ``engine``
-parameter (``"patchright"`` Chromium-based, default; ``"camoufox"`` Firefox-based).
-Patchright passes Cloudflare reliably on residential IPs (dev/Windows); Camoufox
-is the documented escalation when Patchright's Chromium fingerprint is flagged
-by Cloudflare's encrypted tier on cloud Linux runners (ubuntu-latest in CI). Both
-engines back the SAME ``AntiBotSolver`` interface — the swap is a single
-constructor argument with no rewrite (CLAUDE.md "keep the browser behind an
-interface so this is a config flip"). The launch closure is selected at
-``__init__`` and remains LAZY (the heavy import happens only on first solve),
-so neither browser binary is touched by the deterministic gate (D-42).
+Engine selection (#35 / #40): the underlying browser is selected via the
+``engine`` parameter (``"camoufox"`` Firefox-based, default; ``"patchright"``
+Chromium-based, opt-in). Camoufox is the single dev/CI/prod default since #40 —
+the dev/prod engine split meant Camoufox-only failure modes (e.g. issue #54:
+Playwright Firefox handler crash on undefined pageError.location) went unseen
+locally and surfaced only in nightly triage. Patchright remains an opt-in
+escalation, historically friendlier to residential IPs but flagged by
+Cloudflare's encrypted tier on cloud Linux runners. Both engines back the SAME
+``AntiBotSolver`` interface — the swap is a single constructor argument with
+no rewrite (CLAUDE.md "keep the browser behind an interface so this is a
+config flip"). The launch closure is selected at ``__init__`` and remains LAZY
+(the heavy import happens only on first solve), so neither browser binary is
+touched by the deterministic gate (D-42).
 """
 
 from __future__ import annotations
@@ -55,8 +58,9 @@ _DEFAULT_CHALLENGE_URL = "https://example.invalid/"
 
 # Supported anti-bot browser engines (#35). The selector lives on
 # ``Settings.cloudflare_engine`` and is forwarded into ``CloudflareSolver``.
-# Patchright is the default (dev parity on Windows); Camoufox is the CI
-# escalation (cloud Linux runners).
+# Camoufox is the default everywhere (dev + CI + prod) so engine-specific
+# failure modes surface locally instead of only in nightly triage (#40 /
+# #54). Patchright is the opt-in escalation.
 AntibotEngine = Literal["patchright", "camoufox"]
 
 
@@ -171,13 +175,19 @@ class CloudflareSolver:
     :class:`BrowserLifecycle` (solve cap + single-flight + recycle + cleanup-on-all-
     paths, criterion #4).
 
-    Engine selection (#35): ``engine="patchright"`` (default) uses Patchright's
-    Chromium build; ``engine="camoufox"`` uses Camoufox's Firefox build. The choice
-    affects ONLY which launch closure is wired into the lifecycle — the solve
-    closure (cf_clearance polling) is engine-agnostic. The heavy import happens
-    inside the launch closure so the deterministic gate never imports/launches a
-    browser (D-42); tests inject a ``lifecycle`` whose ``launch``/``solve`` drive
-    a mocked browser instead.
+    Engine selection (#35 / #40): ``engine="camoufox"`` (the default everywhere
+    since #40) uses Camoufox's Firefox build with C++ fingerprint spoofing —
+    chosen as the single dev/CI/prod default so engine-specific failure modes
+    (e.g. issue #54: Playwright Firefox handler crash on undefined
+    pageError.location) surface in local dev rather than only in nightly
+    triage. ``engine="patchright"`` is the opt-in escalation — Chromium-based,
+    historically friendlier to residential IPs but flagged by Cloudflare's
+    encrypted tier on cloud Linux runners. The choice affects ONLY which
+    launch closure is wired into the lifecycle — the solve closure
+    (cf_clearance polling) is engine-agnostic. The heavy import happens
+    inside the launch closure so the deterministic gate never imports/launches
+    a browser (D-42); tests inject a ``lifecycle`` whose ``launch``/``solve``
+    drive a mocked browser instead.
 
     The internal keyword-only ``force_resolve`` on ``get_clearance`` is the D-35
     re-solve path; it is deliberately kept OFF the ``AntiBotSolver`` Protocol (D-41).
@@ -192,7 +202,7 @@ class CloudflareSolver:
         recycle_seconds: float | None = None,
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         cloudflare_keys: Iterable[str] = (),
-        engine: AntibotEngine = "patchright",
+        engine: AntibotEngine = "camoufox",
         lifecycle: BrowserLifecycle | None = None,
     ) -> None:
         self._user_data_dir = user_data_dir
@@ -202,7 +212,7 @@ class CloudflareSolver:
         self._engine: AntibotEngine = engine
         # Tests inject a lifecycle wrapping a MOCKED browser; production builds one
         # wrapping the real lazy-launch/solve closures. The launch closure is
-        # selected by ``engine`` (Patchright default; Camoufox escalation, #35).
+        # selected by ``engine`` (Camoufox default since #40; Patchright opt-in).
         # No real browser is touched until the first solve / explicit warm().
         launch = (
             self._launch_camoufox_context
@@ -424,10 +434,12 @@ class CloudflareSolver:
 
         Uses ``launch_persistent_context`` with the on-disk ``user_data_dir`` so the
         cf_clearance persists across restarts (D-34). NO custom UA/headers/fingerprint
-        injection (Anti-Patterns — re-introduces detectable inconsistencies). This is
-        the dev/Windows default — passes Cloudflare reliably on residential IPs but
-        is flagged by Cloudflare's encrypted tier on cloud Linux runners (#35); CI
-        flips to the Camoufox closure below.
+        injection (Anti-Patterns — re-introduces detectable inconsistencies). Opt-in
+        escalation only since #40 — Camoufox is the default everywhere (dev + CI +
+        prod) to keep engine-specific failures visible in local dev. Patchright
+        passes Cloudflare reliably on residential IPs but is flagged by Cloudflare's
+        encrypted tier on cloud Linux runners (#35), and the dev/prod engine split
+        previously hid Camoufox-only crashes (issue #54) from local repro.
         """
         import asyncio  # noqa: PLC0415
         from pathlib import Path  # noqa: PLC0415
@@ -455,10 +467,12 @@ class CloudflareSolver:
 
         Camoufox wraps Playwright's Firefox driver with a C++ fingerprint spoof; per
         CLAUDE.md it is the strongest open-source stealth in 2026 (~0% headless
-        detection) and is the documented escalation when Patchright/Chromium stops
-        passing Cloudflare's encrypted tier on cloud Linux runners (#35). The CI
-        nightly-live-smoke workflow sets ``GATEWAY_CLOUDFLARE_ENGINE=camoufox`` and
-        runs ``uv run camoufox fetch`` to download its Firefox binary.
+        detection). Since #40 it is the default engine everywhere (dev + CI + prod)
+        — the previous Patchright-on-dev / Camoufox-on-CI split meant Firefox-only
+        failure modes (e.g. issue #54) went unseen in local repro and surfaced only
+        in nightly triage. First-time use requires ``uv run camoufox fetch`` to
+        download its Firefox binary (~200 MB, one-time, into a Camoufox-managed
+        cache dir).
 
         Camoufox uses ``AsyncNewBrowser(playwright, persistent_context=True, ...)``
         to return a ``BrowserContext`` that matches the shape Patchright's

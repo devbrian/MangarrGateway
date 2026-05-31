@@ -167,18 +167,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "headless": settings.cloudflare_headless,
         "solve_concurrency": settings.cloudflare_solve_concurrency,
         "cloudflare_keys": cloudflare_keys,
-        # #35: select the stealth-browser engine (patchright default for dev/
-        # Windows; camoufox for CI/Linux runners where Chromium fingerprint is
-        # flagged by Cloudflare's encrypted tier). Driven by Settings.cloudflare_engine.
+        # #35 / #40: select the stealth-browser engine (camoufox default
+        # everywhere — dev + CI + prod — so Firefox-only failure modes like
+        # issue #54 surface in local repro; patchright opt-in via
+        # GATEWAY_CLOUDFLARE_ENGINE=patchright). Driven by Settings.cloudflare_engine.
         "engine": settings.cloudflare_engine,
     }
     if challenge_url is not None:
         solver_kwargs["challenge_url"] = challenge_url
     # Swap NoopSolver for the ONE shared CloudflareSolver (R1/BOT-01). Construction is
-    # cheap (no browser yet — the lazy patchright launch happens on the first solve);
-    # the eager warm() is fired NON-BLOCKING so a Patchright failure degrades only
-    # cloudflare-gated sources and NEVER aborts startup (D-33/Pitfall 3). Non-
-    # cloudflare sources (e.g. ``antibot="none"``) resolve no-clearance.
+    # cheap (no browser yet — the lazy engine-specific launch happens on the first
+    # solve); the eager warm() is fired NON-BLOCKING so a launch/solve failure
+    # degrades only cloudflare-gated sources and NEVER aborts startup (D-33/Pitfall 3).
+    # Non-cloudflare sources (e.g. ``antibot="none"``) resolve no-clearance.
     solver = CloudflareSolver(**solver_kwargs)
     app.state.solver = solver
 
