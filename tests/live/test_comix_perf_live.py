@@ -38,7 +38,7 @@ New budget: **15.5 s** (default). Three back-to-back live runs on a
 10-page chapter (real Comix, warm solver, headless) measured 11.42 s,
 12.74 s, and 11.56 s end-to-end (resolving stage ~11.0 s — the extractor
 cost; the remainder is downloading + archiving). 15.5 s is the max
-observed (12.74 s) × ~1.21 — ~21 % headroom over the worst run, still
+observed (12.74 s) x ~1.21 — ~21 % headroom over the worst run, still
 well below the prior 20 s ceiling. Correctness is preserved:
 ``totalPages`` matched the pre-rewrite baseline (10/10 pages, no drops,
 no out-of-order) in every run, and the issue #32 final
@@ -92,7 +92,7 @@ _TEST_API_KEY = "test-perf-comix-key-DO-NOT-LOG-IN-PROD"
 # scrollTo(scrollHeight/2) then scrollTo(scrollHeight) with 500 ms settles,
 # plus a selective per-missing-page scrollIntoView fallback) measured
 # 11.42 s / 12.74 s / 11.56 s over three back-to-back live runs on a
-# 10-page chapter. 15.5 s = max-observed (12.74) × ~1.21, ~21 % headroom
+# 10-page chapter. 15.5 s = max-observed (12.74) x ~1.21, ~21 % headroom
 # over the worst run.
 _DEFAULT_BUDGET_SECONDS = 15.5
 # Outer poll budget — well above the perf budget so a regressed run still

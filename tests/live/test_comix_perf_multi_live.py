@@ -27,7 +27,7 @@ What the test asserts now:
   under this);
 * per-page wall-clock for chapters 2..N stays close to the first
   chapter's per-page wall-clock (``later_per_page_avg ≤ first_per_page
-  × 1.30``) — catches a state-leak regression where the solver gets
+  x 1.30``) — catches a state-leak regression where the solver gets
   cumulatively slower per page across N downloads.
 
 Like the rest of ``tests/live/``, this test:
@@ -92,7 +92,7 @@ _DEFAULT_PER_CHAPTER_BUDGET_SECONDS = 18.0
 # did (a real failure mode — solver state corruption, leaked browser
 # resources, etc.). Post-#45 baseline: first 11.46/10 = 1.15 s/page;
 # later avg (15.31/15 + 11.38/10)/2 = 1.08 s/page — so later costs
-# ~0.94 × first per page. 1.30 leaves CI-variance headroom while
+# ~0.94 x first per page. 1.30 leaves CI-variance headroom while
 # catching a ~30 % per-page slowdown.
 _SUBSEQUENT_PER_PAGE_CEIL = 1.30
 
@@ -294,7 +294,7 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
             # Per-page drift guard — catches a state-leak regression where
             # chapters 2..N start costing more per page than the first did.
             # Post-#45 baseline: first ~1.15 s/page; later avg ~1.08 s/page
-            # (later ≈ 0.94 × first). 1.30 leaves CI-variance headroom while
+            # (later ≈ 0.94 x first). 1.30 leaves CI-variance headroom while
             # catching a ~30 % per-page slowdown across the run.
             first_wall, _first_stages, first_pages = measurements[0]
             assert first_pages and first_pages > 0, (
@@ -315,7 +315,7 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
             drift_threshold = first_per_page * _SUBSEQUENT_PER_PAGE_CEIL
             assert later_per_page_avg <= drift_threshold, (
                 f"later-chapter per-page avg {later_per_page_avg:.2f}s/page "
-                f"exceeds {_SUBSEQUENT_PER_PAGE_CEIL:.2f} × first-chapter "
+                f"exceeds {_SUBSEQUENT_PER_PAGE_CEIL:.2f} x first-chapter "
                 f"per-page ({first_per_page:.2f}s/page, threshold "
                 f"{drift_threshold:.2f}s/page); chapters past the first "
                 f"appear to be paying per-page overhead the first chapter "

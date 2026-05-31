@@ -445,7 +445,7 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   // Step 2b: for any page the two-scroll walk missed, fall back to the
   // per-page scrollIntoView slow path (the issue #32 walk, applied
   // SELECTIVELY). Typical chapter → empty missing list → zero fallback
-  // cost. Pathological chapter → bounded by missing × ~1.4s, comfortably
+  // cost. Pathological chapter → bounded by missing x ~1.4s, comfortably
   // under the 60s solver timeout. The `scrollIntoView` marker required
   // by the offline slice test (test_comix_slice.py) lives in this block.
   const missing = pageDivs.filter(
