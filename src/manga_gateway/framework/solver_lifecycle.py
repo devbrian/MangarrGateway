@@ -105,6 +105,24 @@ class BrowserLifecycle:
             with contextlib.suppress(Exception):
                 await ctx.close()
 
+    async def recycle_now(self) -> None:
+        """Close the persistent context on-demand (crash-driven recycle, #54).
+
+        Distinct from the time-based ``_recycle_loop`` watchdog: callers that have
+        detected the underlying Playwright/Camoufox Node driver has died (e.g.
+        ``fetch_via_browser`` after catching "Connection closed while reading from
+        the driver" — Playwright 1.60.0 Firefox handler crash on undefined
+        ``pageError.location.url``) invoke this to force a fresh launch on the
+        next ``get_context()`` call. Without it, ``get_context()`` would happily
+        return the cached-but-dead handle because ``self._context is not None``.
+
+        Idempotent and error-tolerant (``_close_context`` already suppresses
+        teardown exceptions on a dead handle). Safe to call concurrently with
+        the time-based watchdog — both serialize through ``_context_lock``.
+        """
+        async with self._context_lock:
+            await self._close_context()
+
     # ─────────────────────────── solve ───────────────────────────
 
     async def solve(self, *, force: bool = False) -> Clearance:

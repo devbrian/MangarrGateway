@@ -26,6 +26,7 @@ from manga_gateway.framework.antibot import (
     BrowserFetchError,
     Clearance,
     CloudflareSolver,
+    _looks_like_dead_driver,
 )
 from manga_gateway.framework.solver_lifecycle import BrowserLifecycle
 
@@ -570,3 +571,344 @@ async def test_fetch_via_browser_context_failure_raises_browser_fetch_error() ->
         await solver.fetch_via_browser("https://x/y", extract="return 1;")
     assert "context unavailable" in str(exc.value)
     await solver.aclose()
+
+
+# ─────────────────────── #54: dead-driver recycle + retry-once ──────────────────
+
+
+# Marker substring emitted by Playwright when the underlying Node driver process
+# has exited (issue #54, Firefox handler crash on undefined pageError.location).
+# Substring-matched in production by ``_looks_like_dead_driver``; matched here
+# for direct dead-driver assertions.
+_DEAD_DRIVER_MSG = "Connection closed while reading from the driver"
+
+
+async def test_lifecycle_recycle_now_closes_and_clears_held_clearance() -> None:
+    """``recycle_now()`` closes the live context AND drops the cached Clearance.
+
+    The held clearance is bound to the torn-down session (its cookies and UA were
+    captured FROM that browser); the next solve must re-warm against the freshly
+    launched context. This is the same invariant ``_close_context`` enforces for
+    the time-based watchdog — verifies the crash-driven path keeps it.
+    """
+    browser = FakeBrowser()
+    lc = BrowserLifecycle(launch=browser.launch, solve=browser.solve)
+
+    # Drive one full solve so the lifecycle caches both a context and a Clearance.
+    first = await lc.solve()
+    assert isinstance(first, Clearance)
+    assert browser.launch_count == 1
+    assert lc._held is first  # cached for subsequent non-forced callers
+
+    await lc.recycle_now()
+
+    # Cached context cleared (next get_context relaunches), held Clearance cleared
+    # (next solve runs a fresh one).
+    assert lc._context is None
+    assert lc._held is None
+    assert browser.contexts[0].closed is True
+
+    # Re-solving relaunches a fresh context (verifies recycle_now actually
+    # invalidated the cache rather than just looking like it did).
+    second = await lc.solve()
+    assert isinstance(second, Clearance)
+    assert browser.launch_count == 2
+
+    await lc.aclose()
+
+
+async def test_lifecycle_recycle_now_is_noop_when_no_context_live() -> None:
+    """``recycle_now()`` before any launch is a no-op (no spurious launch/close).
+
+    Belt-and-braces — the production wrapper calls ``recycle_now`` immediately
+    after detecting a dead-driver crash, and a concurrent caller may have ALSO
+    closed the context first. Idempotent behavior keeps the second caller
+    correct without needing additional gating.
+    """
+    browser = FakeBrowser()
+    lc = BrowserLifecycle(launch=browser.launch, solve=browser.solve)
+
+    await lc.recycle_now()
+    await lc.recycle_now()  # double call
+
+    assert browser.launch_count == 0
+    assert lc._context is None
+    assert lc._held is None
+
+    await lc.aclose()
+
+
+class _DeadDriverContext:
+    """A FakeContext whose every ``new_page`` raises a Playwright-shaped
+    ``Connection closed while reading from the driver`` error — simulating the
+    state after the Node driver process has crashed (issue #54). ``cookies``
+    and ``close`` mirror the real shape so the solver's existing teardown path
+    works unchanged."""
+
+    def __init__(self) -> None:
+        self.new_page_calls = 0
+        self.closed = False
+
+    async def new_page(self) -> object:
+        self.new_page_calls += 1
+        # The real Playwright raises something like ``Error: BrowserContext.new_page:
+        # <msg>`` — the surrounding string is irrelevant to the detector; only the
+        # marker substring on the exception message matters.
+        raise RuntimeError(f"BrowserContext.new_page: {_DEAD_DRIVER_MSG}")
+
+    async def cookies(self) -> list[dict[str, str]]:  # pragma: no cover — unused here
+        return []
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_fetch_via_browser_recycles_on_dead_driver_and_retries_once() -> None:
+    """First ``new_page`` raises the dead-driver signal — solver recycles the
+    lifecycle and retries against a fresh context, which succeeds.
+
+    This is the #54 happy-path: the upstream Playwright Firefox handler crashed,
+    poisoning the cached BrowserContext. Without the shim, every subsequent
+    fetch in the same job queue fails with the same poisoned handle. With the
+    shim, one crash blast-radius collapses to "one transparent retry".
+    """
+    dead = _DeadDriverContext()
+    healthy_page = _FakeFetchPage(evaluate_result=["page1", "page2"])
+    healthy_ctx = _FetchContext([healthy_page])
+
+    contexts_to_launch: list[object] = [dead, healthy_ctx]
+    launch_count = 0
+
+    async def _launch() -> object:
+        nonlocal launch_count
+        launch_count += 1
+        return contexts_to_launch.pop(0)
+
+    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+        return Clearance(cookies={}, user_agent="ua")
+
+    lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
+    solver = CloudflareSolver(lifecycle=lc)
+
+    result = await solver.fetch_via_browser(
+        "https://comix.to/title/abc/1-chapter-1", extract="return [1,2];"
+    )
+
+    # Retry produced the result.
+    assert result == ["page1", "page2"]
+    # Dead ctx was opened once (the failing new_page), then closed by recycle.
+    assert dead.new_page_calls == 1
+    assert dead.closed is True
+    # A healthy ctx was launched after the recycle and ran the retry.
+    assert launch_count == 2
+    assert len(healthy_ctx.opened) == 1
+    assert healthy_ctx.opened[0] is healthy_page
+    assert healthy_page.closed is True
+
+    await solver.aclose()
+
+
+async def test_fetch_via_browser_recycles_on_dead_driver_via_evaluate_error() -> None:
+    """The dead-driver signal can also surface on ``page.evaluate`` — the engine
+    log in issue #54 shows ``page.evaluate failed: Connection closed while
+    reading from the driver`` for the first job in the failed run. Same recycle
+    + retry-once behavior is required there.
+    """
+    dead_page = _FakeFetchPage(
+        evaluate_error=RuntimeError(f"Page.evaluate: {_DEAD_DRIVER_MSG}")
+    )
+    dead_ctx = _FetchContext([dead_page])
+    healthy_page = _FakeFetchPage(evaluate_result="ok")
+    healthy_ctx = _FetchContext([healthy_page])
+
+    contexts_to_launch: list[object] = [dead_ctx, healthy_ctx]
+
+    async def _launch() -> object:
+        return contexts_to_launch.pop(0)
+
+    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+        return Clearance(cookies={}, user_agent="ua")
+
+    lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
+    solver = CloudflareSolver(lifecycle=lc)
+
+    result = await solver.fetch_via_browser("https://x/y", extract="return 1;")
+
+    assert result == "ok"
+    # First attempt closed its page (finally clause), second attempt's page closed too.
+    assert dead_page.closed is True
+    assert healthy_page.closed is True
+    # The dead-context was recycled (closed) before the second launch.
+    assert dead_ctx.closed is True
+
+    await solver.aclose()
+
+
+async def test_fetch_via_browser_does_not_retry_on_plain_timeout() -> None:
+    """A normal ``TimeoutError`` on ``page.evaluate`` is NOT a dead-driver
+    signal — must surface as a single ``BrowserFetchError`` with NO recycle and
+    NO second launch. False-positive recycles would silently re-burn a
+    Cloudflare solve (cost: ~10s + the cookie cycle, T-04-12) on every transient
+    page-load slowdown.
+
+    Implemented as a stub ``evaluate`` that raises ``TimeoutError`` synchronously
+    so ``asyncio.wait_for`` doesn't swallow the inner exception.
+    """
+
+    class _SlowPage(_FakeFetchPage):
+        async def evaluate(self, _script: str, *_args: object) -> object:
+            raise TimeoutError("evaluate timed out")
+
+    page = _SlowPage()
+    ctx = _FetchContext([page])
+    launch_count = 0
+
+    async def _launch() -> object:
+        nonlocal launch_count
+        launch_count += 1
+        return ctx
+
+    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+        return Clearance(cookies={}, user_agent="ua")
+
+    lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
+    solver = CloudflareSolver(lifecycle=lc)
+
+    with pytest.raises(BrowserFetchError) as exc:
+        await solver.fetch_via_browser("https://x/y", extract="return 1;")
+    # The wrapper surfaces the original page.evaluate failure unchanged — NOT a
+    # dead-driver retry path.
+    assert "page.evaluate" in str(exc.value)
+    # Single launch, single context use — recycle never fired.
+    assert launch_count == 1
+    assert ctx.closed is False  # recycle would have closed it
+    assert page.closed is True  # finally clause from the single attempt
+
+    await solver.aclose()
+
+
+async def test_fetch_via_browser_does_not_retry_on_non_dead_driver_error() -> None:
+    """A plain RuntimeError without a dead-driver marker (e.g. a thrown JS error
+    in the page's ``extract``) must also NOT trigger recycle. Mirrors
+    ``test_fetch_via_browser_closes_page_on_evaluate_error`` but adds the
+    additional assertion that the lifecycle was not recycled.
+    """
+    page = _FakeFetchPage(evaluate_error=RuntimeError("DOM read blew up"))
+    ctx = _FetchContext([page])
+    launch_count = 0
+
+    async def _launch() -> object:
+        nonlocal launch_count
+        launch_count += 1
+        return ctx
+
+    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+        return Clearance(cookies={}, user_agent="ua")
+
+    lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
+    solver = CloudflareSolver(lifecycle=lc)
+
+    with pytest.raises(BrowserFetchError) as exc:
+        await solver.fetch_via_browser("https://x/y", extract="return 1;")
+    assert "page.evaluate failed" in str(exc.value)
+    # Single launch — no recycle fired.
+    assert launch_count == 1
+    assert ctx.closed is False
+
+    await solver.aclose()
+
+
+async def test_fetch_via_browser_second_dead_driver_surfaces_as_fetch_error() -> None:
+    """Retry cap: if BOTH attempts die with a dead-driver signal, the wrapper
+    raises ``BrowserFetchError`` without a third attempt — the retry-once cap
+    is what prevents a hot-loop against a persistently broken driver. Two
+    crashes is a clear "browser is broken, give up and let the engine fail
+    the job" signal.
+    """
+    dead1 = _DeadDriverContext()
+    dead2 = _DeadDriverContext()
+    contexts: list[object] = [dead1, dead2]
+    launch_count = 0
+
+    async def _launch() -> object:
+        nonlocal launch_count
+        launch_count += 1
+        return contexts.pop(0)
+
+    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+        return Clearance(cookies={}, user_agent="ua")
+
+    lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
+    solver = CloudflareSolver(lifecycle=lc)
+
+    with pytest.raises(BrowserFetchError) as exc:
+        await solver.fetch_via_browser("https://x/y", extract="return 1;")
+    # Both dead contexts were exercised; no third launch.
+    assert launch_count == 2
+    assert dead1.new_page_calls == 1
+    assert dead2.new_page_calls == 1
+    # First was recycled; second is dead but the retry-once cap means we don't
+    # close it via recycle (only the first crash triggers a recycle).
+    assert dead1.closed is True
+    # The surfaced error wraps the SECOND attempt's failure (the first was
+    # transparently recovered from by the recycle path).
+    assert "could not open page for fetch_via_browser" in str(exc.value)
+    # The underlying message carries the dead-driver marker so callers (and
+    # the engine log) can see this was a driver crash, not a network failure.
+    assert _DEAD_DRIVER_MSG in str(exc.value)
+
+    await solver.aclose()
+
+
+def test_looks_like_dead_driver_matches_top_level_message() -> None:
+    """The detector trips on the marker substring appearing on the top-level
+    exception. Today's production raise sites (``BrowserFetchError(f"... {exc}")``)
+    embed the underlying message into the wrapper string, so this is the
+    common path the detector takes.
+    """
+    err = BrowserFetchError(
+        f"could not open page for fetch_via_browser: {_DEAD_DRIVER_MSG}"
+    )
+    assert _looks_like_dead_driver(err) is True
+
+
+def test_looks_like_dead_driver_walks_cause_chain() -> None:
+    """Regression guard: even if a future refactor stops embedding the
+    underlying message into the wrapper, the detector must still recognize
+    the dead-driver signal via ``__cause__``. Mirrors the ``raise X from Y``
+    discipline already in use throughout ``_fetch_via_browser_once``.
+    """
+    cause = RuntimeError(f"BrowserContext.new_page: {_DEAD_DRIVER_MSG}")
+    wrapper = BrowserFetchError("could not open page for fetch_via_browser")
+    wrapper.__cause__ = cause  # opaque wrapper, marker only on cause
+    assert _DEAD_DRIVER_MSG not in str(wrapper)
+    assert _looks_like_dead_driver(wrapper) is True
+
+
+def test_looks_like_dead_driver_ignores_unrelated_errors() -> None:
+    """Anything without one of the dead-driver markers must NOT trip the
+    detector — including plain TimeoutError on evaluate, plain RuntimeError
+    on a JS extract failure, and PlaywrightTimeoutError-shaped strings
+    (which the prod code translates to ``page.evaluate timed out after Xs``).
+    """
+    assert _looks_like_dead_driver(TimeoutError("evaluate timed out")) is False
+    assert _looks_like_dead_driver(RuntimeError("DOM read blew up")) is False
+    assert (
+        _looks_like_dead_driver(
+            BrowserFetchError("page.evaluate timed out after 30.0s")
+        )
+        is False
+    )
+
+
+def test_looks_like_dead_driver_handles_cyclic_cause_chain() -> None:
+    """Pathological guard: a cyclic ``__cause__`` (a → b → a) must not hang the
+    detector. The id-set in the walk terminates after one full pass.
+    """
+    a = RuntimeError("outer error")
+    b = RuntimeError("inner error")
+    a.__cause__ = b
+    b.__cause__ = a  # cycle
+    # Returns False (no marker anywhere) AND terminates — pytest would hang
+    # otherwise; a failure here means the loop guard regressed.
+    assert _looks_like_dead_driver(a) is False

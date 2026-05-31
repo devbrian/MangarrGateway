@@ -83,6 +83,47 @@ class BrowserFetchError(RuntimeError):
     """
 
 
+# Markers in Playwright/Camoufox exception messages that indicate the underlying
+# Node driver process has died — typically because the bundled Firefox handler
+# crashed (issue #54: ``coreBundle.js:49624`` reads ``pageError.location.url``
+# without a null guard; Playwright 1.60.0 maintainer rejected the defensive
+# fallback in PR #40982 so this is not getting fixed upstream). Once the driver
+# is dead, every subsequent call against ANY existing ``BrowserContext`` /
+# ``Page`` handle raises with one of these substrings — we detect by substring
+# rather than exception type because Playwright wraps driver-protocol failures
+# as plain ``Error``/``TargetClosedError`` instances whose class identity is not
+# stable across the Patchright/Camoufox engines we support.
+_DEAD_DRIVER_MARKERS: tuple[str, ...] = (
+    "Connection closed while reading from the driver",
+    "Target page, context or browser has been closed",
+    "Target closed",
+    "Browser closed",
+    "Browser has been closed",
+)
+
+
+def _looks_like_dead_driver(exc: BaseException) -> bool:
+    """True if ``exc`` or its ``__cause__`` chain carries a dead-driver marker.
+
+    ``fetch_via_browser`` already wraps the underlying Playwright exception via
+    ``raise BrowserFetchError(...) from exc``, so the marker substring lives on
+    ``exc.__cause__`` rather than on the wrapper itself. We walk the chain to
+    handle either case (and ``__context__`` is intentionally NOT walked — we
+    only care about explicitly chained causes, not incidental ones).
+
+    Guards against pathological self-referential cause cycles via an id-set.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        message = str(cur)
+        if any(marker in message for marker in _DEAD_DRIVER_MARKERS):
+            return True
+        cur = cur.__cause__
+    return False
+
+
 def _looks_like_js_predicate(text: str) -> bool:
     """Classify a ``wait_for`` string as a JS predicate vs a CSS selector.
 
@@ -243,6 +284,16 @@ class CloudflareSolver:
         fresh page; bounding them as one queue avoids unfair starvation and
         keeps the "minimize fingerprinting events" invariant (Pitfall 6).
 
+        Dead-driver recovery (#54): if the underlying Playwright/Camoufox Node
+        driver process crashes mid-fetch (Firefox handler bug — see
+        :data:`_DEAD_DRIVER_MARKERS`), the cached ``BrowserContext`` becomes a
+        zombie handle and every subsequent ``new_page`` / ``evaluate`` fails
+        with "Connection closed while reading from the driver". This method
+        catches that signal, calls :meth:`BrowserLifecycle.recycle_now` to drop
+        the dead context, and retries the fetch exactly ONCE against a freshly
+        launched context. A second crash surfaces as ``BrowserFetchError`` —
+        the retry-once cap prevents hot-loops on a persistently broken driver.
+
         Args:
             url: The full URL to navigate to. The warm browser already carries
                 cf_clearance + Laravel session for ``comix.to`` (Pitfall 1).
@@ -262,7 +313,50 @@ class CloudflareSolver:
         Raises:
             BrowserFetchError: navigation failed, ``wait_for`` timed out, the
                 JS evaluate threw, or the page could not be opened. Wraps the
-                underlying exception so the SourceContext sees one type.
+                underlying exception so the SourceContext sees one type. If a
+                dead-driver crash was detected, this is raised only after the
+                single retry attempt also failed.
+        """
+        try:
+            return await self._fetch_via_browser_once(
+                url, extract=extract, wait_for=wait_for, timeout=timeout
+            )
+        except BrowserFetchError as exc:
+            if not _looks_like_dead_driver(exc):
+                raise
+            # Driver died — drop the cached zombie context and retry once
+            # against a freshly launched one. ``recycle_now`` also clears the
+            # held Clearance (the cookies + UA are bound to the dead session),
+            # so the next solve will run a fresh Cloudflare warm — that's
+            # correct, not a regression. NEVER log the underlying exception
+            # at INFO+ here: it has already been wrapped + logged once at the
+            # call site; double-logging dead-driver crashes pollutes the
+            # signal in nightly triage.
+            _log.warning(
+                "fetch_via_browser: dead-driver signal detected — recycling "
+                "browser context and retrying once (url=%s)",
+                url,
+            )
+            await self._lifecycle.recycle_now()
+            return await self._fetch_via_browser_once(
+                url, extract=extract, wait_for=wait_for, timeout=timeout
+            )
+
+    async def _fetch_via_browser_once(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — same justification as fetch_via_browser
+    ) -> Any:
+        """One attempt of the goto + wait_for + evaluate sequence (no retry).
+
+        The body is identical to the original :meth:`fetch_via_browser` (pre-#54).
+        Split out so the public method can wrap a single retry around it after
+        detecting a dead-driver crash — the retry simply re-enters this method
+        against a freshly launched context. Holds ``_browser_lock`` so retries
+        re-serialize correctly against any concurrent ``fetch_via_browser`` call.
         """
         async with self._browser_lock:
             try:
