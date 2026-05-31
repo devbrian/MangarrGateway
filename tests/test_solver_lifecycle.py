@@ -304,6 +304,16 @@ def test_force_resolve_off_protocol() -> None:
 # ─────────────────────── Option A: fetch_via_browser primitive ──────────────────
 
 
+class _SharedConcurrency:
+    """Cross-page in-flight counter — exposed by :class:`_FetchContext` so the
+    serialization test can assert ``_browser_lock`` bounds concurrency GLOBALLY
+    (not just per-page, which is trivially 1 since each page is opened once)."""
+
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+
 class _FakeFetchPage:
     """A FakePage for ``fetch_via_browser`` — records goto/wait/evaluate/close
     and lets each test stage the return value or an error per stage."""
@@ -316,6 +326,7 @@ class _FakeFetchPage:
         wait_function_error: Exception | None = None,
         wait_selector_error: Exception | None = None,
         evaluate_error: Exception | None = None,
+        shared_concurrency: _SharedConcurrency | None = None,
     ) -> None:
         self.evaluate_result = evaluate_result
         self.goto_error = goto_error
@@ -329,6 +340,9 @@ class _FakeFetchPage:
         self.closed = False
         self.concurrent_calls = 0
         self.max_concurrent_calls = 0
+        # Optional — set by _FetchContext.new_page() so concurrent evaluates
+        # across DIFFERENT pages count against a single shared peak.
+        self._shared = shared_concurrency
 
     async def goto(self, url: str, **kwargs: object) -> None:
         if self.goto_error is not None:
@@ -350,6 +364,11 @@ class _FakeFetchPage:
         self.max_concurrent_calls = max(
             self.max_concurrent_calls, self.concurrent_calls
         )
+        if self._shared is not None:
+            self._shared.in_flight += 1
+            self._shared.max_in_flight = max(
+                self._shared.max_in_flight, self._shared.in_flight
+            )
         try:
             await asyncio.sleep(0.01)  # widen window so serialization is observable
             if self.evaluate_error is not None:
@@ -358,6 +377,8 @@ class _FakeFetchPage:
             return self.evaluate_result
         finally:
             self.concurrent_calls -= 1
+            if self._shared is not None:
+                self._shared.in_flight -= 1
 
     async def close(self) -> None:
         self.closed = True
@@ -372,6 +393,9 @@ class _FetchContext:
         self.opened: list[_FakeFetchPage] = []
         self.new_page_error: Exception | None = None
         self.closed = False
+        # Shared in-flight counter wired into every page handed out — lets the
+        # serialization test assert global cross-page bounding.
+        self.shared_concurrency = _SharedConcurrency()
 
     async def new_page(self) -> _FakeFetchPage:
         if self.new_page_error is not None:
@@ -379,6 +403,7 @@ class _FetchContext:
         if not self._pages:  # pragma: no cover — test wiring guard
             raise AssertionError("no more queued fetch pages")
         page = self._pages.pop(0)
+        page._shared = self.shared_concurrency
         self.opened.append(page)
         return page
 
@@ -518,8 +543,10 @@ async def test_fetch_via_browser_serializes_concurrent_calls() -> None:
         )
     )
     assert results == [0, 1, 2, 3, 4]
-    # Each page saw at most one in-flight evaluate (the lock serializes the
-    # whole goto+wait+evaluate path, so no two pages can race in this fake).
+    # Per-page bound is trivially 1 (each page is opened once); the meaningful
+    # check is the GLOBAL cross-page peak — ``_browser_lock`` must ensure no two
+    # pages can have an in-flight evaluate simultaneously.
+    assert ctx.shared_concurrency.max_in_flight <= 1
     assert all(p.max_concurrent_calls <= 1 for p in pages)
     assert len(ctx.opened) == 5
     assert all(p.closed for p in pages)
