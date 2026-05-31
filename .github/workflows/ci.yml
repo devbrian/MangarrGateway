@@ -1,6 +1,28 @@
 name: ci
 
-on: [push, pull_request]
+# Trigger only on PRs (covers the per-branch work) + pushes to main (covers the
+# post-merge "main is green" signal). Avoids the duplicate run that the
+# previous `[push, pull_request]` shape fired on every PR-branch push.
+#
+# `paths-ignore` skips runs whose entire diff is docs/planning metadata:
+# .planning/** (STATE.md, plans, summaries), .claude/** (agent skills,
+# instructions), top-level / nested *.md, and docs/**. Anything else — src,
+# tests, pyproject.toml, uv.lock, the OpenAPI contract, noxfile.py, the
+# workflow files themselves — still triggers.
+on:
+  pull_request:
+    paths-ignore:
+      - '.planning/**'
+      - '.claude/**'
+      - '**.md'
+      - 'docs/**'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.planning/**'
+      - '.claude/**'
+      - '**.md'
+      - 'docs/**'
 
 # Least-privilege default token (CodeRabbit/zizmor: excessive-permissions).
 permissions:
