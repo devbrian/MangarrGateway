@@ -476,6 +476,16 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert "rpage-page" in extract_body
     assert "scrollIntoView" in extract_body
     assert "sort" in extract_body
+    # Issue #45 (2026-05-31): the extractor's Step-2 walk now scrolls the
+    # inner Swiper scroll container to its midpoint then its end in two
+    # batched passes (head+tail), then falls back to per-missing-page
+    # scrollIntoView selectively. The ancestor walk that finds the inner
+    # Swiper container reads ``getComputedStyle(el).overflowY`` and
+    # ``el.scrollHeight`` — both substrings MUST appear in the extractor
+    # body so a future rewrite that loses the two-scroll strategy is
+    # caught here, not only by the live perf test.
+    assert "scrollHeight" in extract_body
+    assert "overflowY" in extract_body
     # Issue #20: wait_for is now None — the extractor's own Step-1 polls for
     # the scaffold from inside ``page.evaluate``. A Python-side wait_for_selector
     # would double-wait the same condition and add ~1 s of pure overhead.
