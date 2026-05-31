@@ -142,6 +142,39 @@ def test_resolve_deferred_tie_on_time_and_groups_lowest_numeric_id() -> None:
     assert _resolve_deferred("10", series) == "6001"
 
 
+# ────── CodeRabbit PR #50: regression tests for two tie-break helper bugs ────
+
+
+def test_resolve_deferred_zero_seconds_ago_stays_newest() -> None:
+    """CodeRabbit PR #50 bug A: `_relative_seconds("0s ago") == 0`, which the
+    old `or 10**12` fallback treated as falsy and demoted to the oldest slot —
+    inverting the "newest wins" rule. Guard on ``is None`` instead.
+
+    Without the fix this returns ``"9001"`` (the months-old row), because
+    "0s ago" → 0 → 10**12 outranks "30d ago" → 2_592_000.
+    """
+    series = [
+        _row("9001", "10", rel="30d ago", groups=[{"name": "Older"}]),
+        _row("9002", "10", rel="0s ago", groups=[{"name": "Brand-new"}]),
+    ]
+    assert _resolve_deferred("10", series) == "9002"
+
+
+def test_resolve_deferred_months_ago_ranked_correctly_vs_minutes() -> None:
+    """CodeRabbit PR #50 bug B: regex alternation `(s|m|...|mo|mos|y)\\w*`
+    captured ``"m"`` for ``"5mo ago"`` (with ``\\w*`` eating ``"o"``), so months
+    scored as minutes (43,200× under-count). A months-old row would have
+    appeared newer than a real minutes-old row and won rung-1.
+
+    Without the fix this returns ``"8001"`` (the months-old row, scored as 5m).
+    """
+    series = [
+        _row("8001", "10", rel="5mo ago", groups=[{"name": "Stale"}]),
+        _row("8002", "10", rel="6m ago", groups=[{"name": "Fresh"}]),
+    ]
+    assert _resolve_deferred("10", series) == "8002"
+
+
 # ─────────────────────── Case 5: chapter missing (strict) ───────────────────
 
 

@@ -190,8 +190,15 @@ def _relative_seconds(text: str | None) -> int | None:
     """
     if not text:
         return None
+    # CodeRabbit PR #50: `mos`/`mo` MUST precede `m` in the alternation — Python
+    # regex alternation is left-to-right with no longest-match, so the original
+    # `(s|m|h|d|w|mo|mos|y)\w*` matched `m` for "5mo ago" (with `\w*` eating "o"),
+    # making `u.startswith("mo")` below unreachable and scoring months as minutes
+    # (43,200× error). The richer `_RELATIVE_TIME_RE` below escapes this via
+    # backtracking on its surrounding context; this simpler regex needs the
+    # explicit ordering.
     m = re.match(
-        r"^\s*(\d+)\s*(s|m|h|d|w|mo|mos|y)\w*\s*ago\s*$",
+        r"^\s*(\d+)\s*(mos|mo|s|m|h|d|w|y)\w*\s*ago\s*$",
         text,
         flags=re.IGNORECASE,
     )
@@ -227,7 +234,14 @@ def _pick_among_duplicates(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return min(
         rows,
         key=lambda r: (
-            _relative_seconds(r.get("publishedAtRelative")) or 10**12,
+            # CodeRabbit PR #50: guard on `is None`, not falsy — `_relative_seconds`
+            # returns `int >= 0` and "0s ago" yields 0, which `or 10**12` would
+            # collapse to the oldest slot, inverting the "newest wins" rule.
+            (
+                s
+                if (s := _relative_seconds(r.get("publishedAtRelative"))) is not None
+                else 10**12
+            ),
             0 if r.get("groups") else 1,
             _id_sort_key(r.get("id")),
         ),
