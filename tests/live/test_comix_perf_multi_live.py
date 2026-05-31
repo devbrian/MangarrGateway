@@ -193,9 +193,12 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
     by more than ``_SUBSEQUENT_PER_PAGE_CEIL``.
 
     The serial submit (vs queueing all N then polling) keeps the per-job
-    measurement clean — ``fetch_via_browser`` is already serialized via
-    ``_browser_lock`` so concurrency would just queue the same way, but
-    interleaving status transitions would muddy the per-stage timing.
+    measurement clean — interleaving status transitions would muddy the
+    per-stage timing. (``fetch_via_browser`` is now bounded by a
+    Semaphore rather than a 1-wide Lock since debug session
+    ``comix-search-timeout``; the per-chapter download path issues only
+    one browser call at a time anyway so the bound is not load-bearing
+    for this multi-chapter test.)
     """
     chapter_count = _chapter_count()
     per_chapter_budget = _per_chapter_budget_seconds()

@@ -99,6 +99,8 @@ the extractor never snapshots a partial scaffold.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -113,6 +115,8 @@ from ..models.search import Release
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
     from ..models.search import SearchRequest
+
+_log = logging.getLogger("manga_gateway")
 
 
 # Bound a title search's candidate series; interactive widens it (mirrors MangaDex).
@@ -778,6 +782,24 @@ class ComixSource(Source):
         decrypt paths (one statically-decrypted list endpoint and one
         browser-driven pages endpoint), funnel both through the warm Patchright
         page that the SPA already drives correctly.
+
+        Concurrency (debug session ``comix-search-timeout``): the per-candidate
+        ``_series_chapters`` browser navigations are awaited CONCURRENTLY via
+        :func:`asyncio.gather` so wall-clock is bounded by ``max(individual)``
+        rather than ``sum(individual)``. The framework's 20s per-source fan-out
+        budget was being eaten by the sum (3-5 × ~5s Camoufox navs) and tipping
+        under variance; running them in parallel leaves comfortable headroom.
+        ``return_exceptions=True`` isolates per-candidate failures — if 1 of 5
+        navs raises, we still return the chapters from the others (with the
+        failure logged at WARNING), so a single stale/missing series does not
+        blank the whole search response. ``CloudflareSolver._browser_lock`` is a
+        bounded Semaphore (default 5 slots, matching ``_DEFAULT_SERIES_CANDIDATES``)
+        so the default candidate count runs fully in parallel; interactive search
+        (15 candidates) still gets 5-way parallelism, capping wall-clock at ~3
+        × max(per-nav). Per-candidate result order is preserved by
+        ``asyncio.gather`` so the returned ``releases`` list keeps the
+        relevance-sorted candidate ordering the upstream ``/api/v1/manga``
+        already provides.
         """
         _ = req.languages  # Comix is English-only (live recon); honored downstream
         count = (
@@ -787,13 +809,36 @@ class ComixSource(Source):
         )
         series = await self._search_series(req.query or "", count, ctx)
 
-        releases: list[Release] = []
         feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
-        for series_hid, series_slug, series_title in series:
-            chapters = await self._series_chapters(
-                series_hid, series_slug, feed_limit, req.offset, ctx
-            )
-            for chapter in chapters:
+
+        # Parallel fan-out across series candidates. ``return_exceptions=True``
+        # isolates per-candidate failures — a SourceError on one candidate
+        # surfaces as an item in ``results`` rather than cancelling the gather,
+        # so the other candidates still flow. Per-candidate failures are logged
+        # once at WARNING; the search response is still populated with whatever
+        # releases the surviving candidates produced (per-source isolation
+        # pattern mirrors framework/fanout.py).
+        coros = [
+            self._series_chapters(series_hid, series_slug, feed_limit, req.offset, ctx)
+            for series_hid, series_slug, _series_title in series
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+        releases: list[Release] = []
+        for (series_hid, series_slug, series_title), result in zip(
+            series, results, strict=True
+        ):
+            if isinstance(result, BaseException):
+                # Per-candidate isolation — log + skip; do not let one bad
+                # series take down the whole search response.
+                _log.warning(
+                    "comix search: candidate %r (slug=%r) failed: %s",
+                    series_hid,
+                    series_slug,
+                    result,
+                )
+                continue
+            for chapter in result:
                 # Inject the series-page-known title into the chapter dict so the
                 # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /
                 # ``series`` / ``title`` keys) does not need to know whether the

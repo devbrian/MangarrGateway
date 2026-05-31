@@ -310,11 +310,25 @@ class CloudflareSolver:
             recycle_seconds=recycle_seconds,
         )
         self._playwright: Any = None  # the started playwright instance (real path)
-        # Serializes ``fetch_via_browser`` (one fresh page per call on the warm
-        # context); browser-driven operations compete for the same context and
-        # bounding them as one queue keeps "minimize fingerprinting events"
-        # (Pitfall 6).
-        self._browser_lock = asyncio.Lock()
+        # Bounds concurrent ``fetch_via_browser`` calls on the warm context.
+        # Originally an ``asyncio.Lock`` to keep "minimize fingerprinting
+        # events" (Pitfall 6) by serializing 1-at-a-time, but that turned
+        # the per-source 20s budget into a sum-of-individual-navs ceiling
+        # and broke `comix /search` under variance (debug session
+        # ``comix-search-timeout`` — see PR for the nightly evidence).
+        # A bounded ``Semaphore`` is the right tradeoff: humans browse
+        # with multiple tabs open routinely, the warm persistent-context's
+        # driver multiplexes pages cleanly, and a small cap still keeps
+        # the simultaneous-fingerprint footprint modest. The default cap
+        # matches the search candidate ceiling (``_DEFAULT_SERIES_CANDIDATES``
+        # = 5) so the typical search fan-out runs fully in parallel; the
+        # interactive 15-candidate path still gets 5-way parallelism (the
+        # remaining 10 queue behind the slots, capping wall-clock at
+        # 3 × max(per-nav)).
+        self._browser_concurrency = 5
+        self._browser_lock: asyncio.Semaphore = asyncio.Semaphore(
+            self._browser_concurrency
+        )
 
     # ─────────────────────────── public seam (D-41) ───────────────────────────
 
@@ -373,10 +387,15 @@ class CloudflareSolver:
         (CLAUDE.md "image fetch is NEVER through the browser") — this primitive is
         only for the manifest-resolution step.
 
-        Concurrency: serialized through ``_browser_lock``. Every browser-driven
-        operation (solve, fetch_via_browser) competes for the warm context and a
-        fresh page; bounding them as one queue avoids unfair starvation and
-        keeps the "minimize fingerprinting events" invariant (Pitfall 6).
+        Concurrency: bounded by ``_browser_lock`` (an ``asyncio.Semaphore``
+        with a small cap, default 5). Multiple ``fetch_via_browser`` calls
+        can run in parallel against the same warm persistent context — the
+        Playwright driver multiplexes pages cleanly and a humans-have-tabs-
+        open fingerprint is benign — but the cap still bounds the
+        simultaneous-page footprint. Was a 1-wide ``Lock`` before debug
+        session ``comix-search-timeout`` (turned the search fan-out's 20s
+        budget into sum-of-individual-navs and broke comix /search under
+        variance).
 
         Dead-driver recovery (#54): if the underlying Playwright/Camoufox Node
         driver process crashes mid-fetch (Firefox handler bug — see
@@ -449,8 +468,9 @@ class CloudflareSolver:
         The body is identical to the original :meth:`fetch_via_browser` (pre-#54).
         Split out so the public method can wrap a single retry around it after
         detecting a dead-driver crash — the retry simply re-enters this method
-        against a freshly launched context. Holds ``_browser_lock`` so retries
-        re-serialize correctly against any concurrent ``fetch_via_browser`` call.
+        against a freshly launched context. Acquires a ``_browser_lock``
+        Semaphore slot so retries re-bound correctly against any concurrent
+        ``fetch_via_browser`` call.
         """
         async with self._browser_lock:
             try:

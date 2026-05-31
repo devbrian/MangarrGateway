@@ -563,12 +563,16 @@ async def test_fetch_via_browser_translates_wait_for_timeout() -> None:
     await solver.aclose()
 
 
-async def test_fetch_via_browser_serializes_concurrent_calls() -> None:
-    """fetch_via_browser holds ``_browser_lock`` so a concurrent burst opens a
-    fresh page per call but never runs more than one page.evaluate in parallel
-    — Patchright is not parallel-safe on a single context's pages under the
-    same fingerprint, and queueing here protects the "minimize fingerprinting
-    events" invariant (Pitfall 6)."""
+async def test_fetch_via_browser_bounds_concurrent_calls() -> None:
+    """fetch_via_browser acquires a ``_browser_lock`` Semaphore slot so a
+    concurrent burst opens a fresh page per call and bounds in-flight
+    page.evaluate calls to the Semaphore's cap (default 5). Was a 1-wide Lock
+    before debug session ``comix-search-timeout`` — turning the per-source
+    20s search budget into sum-of-individual-navs and breaking comix /search
+    under variance. The bounded-Semaphore tradeoff: humans browse with
+    multiple tabs open routinely (no novel fingerprint), the Playwright
+    driver multiplexes pages on the warm persistent context, and a small
+    cap still keeps the simultaneous-page footprint modest."""
     pages = [_FakeFetchPage(evaluate_result=i) for i in range(5)]
     ctx = _FetchContext(pages)
     solver = _solver_with_fetch_context(ctx)
@@ -579,12 +583,37 @@ async def test_fetch_via_browser_serializes_concurrent_calls() -> None:
         )
     )
     assert results == [0, 1, 2, 3, 4]
-    # Per-page bound is trivially 1 (each page is opened once); the meaningful
-    # check is the GLOBAL cross-page peak — ``_browser_lock`` must ensure no two
-    # pages can have an in-flight evaluate simultaneously.
-    assert ctx.shared_concurrency.max_in_flight <= 1
-    assert all(p.max_concurrent_calls <= 1 for p in pages)
+    # Bounded by the Semaphore cap (default 5 == _DEFAULT_SERIES_CANDIDATES).
+    # The cap is read off the solver so this assertion tracks the constant if
+    # someone tunes it; the meaningful invariant is that the cap is honored —
+    # NOT that no parallelism happens (the old Lock behavior).
+    assert ctx.shared_concurrency.max_in_flight <= solver._browser_concurrency
+    # Each fake page is opened once — its own in-flight counter is trivially 1.
+    assert all(p.max_concurrent_calls == 1 for p in pages)
     assert len(ctx.opened) == 5
+    assert all(p.closed for p in pages)
+    await solver.aclose()
+
+
+async def test_fetch_via_browser_bounded_semaphore_caps_burst_beyond_limit() -> None:
+    """A burst LARGER than the Semaphore cap (default 5) sees the cap honored —
+    the first 5 run concurrently, the next 5 queue behind released slots.
+    Verifies the bounded-Semaphore is not a free-for-all under heavy load
+    (e.g. interactive search's 15 candidates)."""
+    burst_size = 10
+    pages = [_FakeFetchPage(evaluate_result=i) for i in range(burst_size)]
+    ctx = _FetchContext(pages)
+    solver = _solver_with_fetch_context(ctx)
+    results = await asyncio.gather(
+        *(
+            solver.fetch_via_browser(f"https://x/{i}", extract=f"return {i};")
+            for i in range(burst_size)
+        )
+    )
+    assert results == list(range(burst_size))
+    # Peak in-flight MUST honor the Semaphore cap regardless of burst size.
+    assert ctx.shared_concurrency.max_in_flight <= solver._browser_concurrency
+    assert len(ctx.opened) == burst_size
     assert all(p.closed for p in pages)
     await solver.aclose()
 
