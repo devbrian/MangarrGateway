@@ -5,6 +5,15 @@ release and that — when the source returns ≥ 2 releases — the first two
 publishDate values are in descending order (newest-first, RCNT-01).
 Validates the response against the OpenAPI ``ReleaseListResponse`` schema
 via schemathesis (D-54).
+
+Issue #31 (2026-05-30): sources that legitimately have no public all-recent
+feed (e.g. Comix — its "Recently Added" UI is a series-sort, not a chapter
+feed) declare ``supports_recent = False`` and advertise
+``supportsRecent: false`` in ``/caps``. This smoke skips those sources so
+the test reflects the contract honestly: "don't assert recent works for a
+source whose caps say it doesn't". Removing the skip would force a source
+to either fake data (wrong) or fail forever (no-signal); the skip is the
+spec-conformant outcome.
 """
 
 from __future__ import annotations
@@ -41,12 +50,32 @@ async def test_recent_returns_newest_first(
 
     Asserts:
     * 200 status.
-    * At least one release returned.
+    * At least one release returned — UNLESS the source advertises
+      ``supportsRecent: false`` in ``/caps`` (Issue #31), in which case
+      the test is skipped (the source has no public recent feed by design).
     * When ≥ 2 releases: the first two ``publishDate`` values are in
       descending order (newest-first, RCNT-01).
     * D-54: response body conforms to ``ReleaseListResponse``.
     """
     async with live_client_for(profile) as client:
+        # Issue #31: respect the source's own /caps declaration. A source that
+        # declares ``supportsRecent: false`` (e.g. Comix — no public all-
+        # recent-chapters feed) cannot satisfy a non-empty assertion, and
+        # forcing it to would push the source into faking data.
+        caps_resp = await client.get("/api/v1/caps")
+        assert caps_resp.status_code == 200, (
+            f"{source_key}: GET /caps failed: {caps_resp.status_code} "
+            f"{caps_resp.text[:400]}"
+        )
+        caps = caps_resp.json().get("sources") or []
+        cap = next((s for s in caps if s.get("key") == source_key), None)
+        if cap is not None and cap.get("supportsRecent") is False:
+            pytest.skip(
+                f"{source_key}: supportsRecent=false in /caps — no public "
+                f"recent feed; per-source isolation surfaces this honestly "
+                f"rather than asserting against an empty array."
+            )
+
         resp = await client.get(
             "/api/v1/recent",
             params={"sources": source_key, "limit": 5},

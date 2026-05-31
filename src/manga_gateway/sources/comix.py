@@ -59,11 +59,30 @@ can reconstruct the full chapter URL the browser needs. The numeric chapter_id
 is the leading segment; the rest are URL-construction-only metadata. The
 framework treats chapter_id as source-opaque (engine just passes it through to
 fetch_manifest), so the composite is self-contained.
+
+Issue #30 / #31 (2026-05-30): two related contract gaps surfaced by the Phase 5
+first live-smoke run and fixed in branch ``fix/comix-publishdate-recent``:
+
+* #30 — ``Release.publishDate`` came out as the empty string. The chapter-list
+  DOM does NOT expose a machine-readable absolute timestamp — only the
+  rendered ``createdAtFormatted`` text on ``<span class="mchap-row__time">``
+  (e.g. "14h ago", "3mos ago"). The JS extractor now captures that text and
+  :meth:`_parse_relative_time` approximates it to an ISO 8601 UTC date-time
+  so the REL-01 ``format: date-time`` requirement holds. Approximate-but-
+  contract-conformant is honest: the upstream itself only renders the same
+  approximation in the UI.
+* #31 — ``/recent`` returned ``{releases: [], warnings: []}`` silently because
+  Comix has no public all-recent-chapters feed (the public "Recently Added"
+  UI is a list-mangas-sorted-by-``chapter_updated_at`` view, not a chapter
+  feed). The source now declares ``supports_recent = False`` so ``/caps``
+  advertises the gap explicitly and clients can branch on it instead of
+  guessing from the empty array.
 """
 
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -156,6 +175,89 @@ def _is_allowed_image_url(url: str) -> bool:
         and bool(_COMIX_CDN_HOST_RE.match(host))
         and bool(_COMIX_CDN_PATH_RE.match(parsed.path))
     )
+
+
+# Issue #30: relative-time → approximate-ISO parser. The chapter-list DOM only
+# exposes ``<span class="mchap-row__time">``'s rendered text (the upstream's
+# ``createdAtFormatted`` value), never an absolute timestamp. We approximate
+# the absolute date so REL-01 (``publishDate: format: date-time``) holds.
+#
+# Forms observed in live recon (2026-05-30 _recon_out/network.jsonl):
+#   "Nh ago" / "Nd ago" / "Nw ago" / "Nmo ago" / "Nmos ago" / "Ny ago"
+# We also tolerate seconds/minutes/years for forward-compatibility.
+#
+# Unit conversions are calendar-naive (1 month = 30 days, 1 year = 365 days) —
+# the upstream rendering is itself approximate ("3mos ago"), so a calendar-
+# accurate parse would overstate precision. The result is always a UTC ISO
+# 8601 string with a trailing "Z" for consistency with MangaDex's RFC 3339
+# emission.
+_RELATIVE_TIME_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<n>\d+)              # quantity
+    \s*
+    (?P<unit>
+        s(?:ec(?:ond)?s?)?              # s / sec / secs / second / seconds
+      | m(?:in(?:ute)?s?)?              # m / min / mins / minute / minutes
+      | h(?:r|rs|our|ours)?             # h / hr / hrs / hour / hours
+      | d(?:ay|ays)?                    # d / day / days
+      | w(?:eek|eeks|k|ks)?             # w / wk / wks / week / weeks
+      | mo(?:n|ns|nth|nths|s)?          # mo / mon / mons / month / months / mos
+      | y(?:r|rs|ear|ears)?             # y / yr / yrs / year / years
+    )
+    \s*
+    ago
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str | None:
+    """Convert ``"3d ago"`` / ``"2mos ago"`` etc. to an ISO 8601 UTC string.
+
+    Returns ``None`` for any input that doesn't parse (empty, whitespace,
+    unrecognised unit), so callers can pick an alternate (or leave the field
+    empty and let REL-01 validation fail loudly). The ``now`` argument is
+    test-only — production callers omit it and the parser anchors on the
+    current UTC time. Calendar-naive month/year conversion is deliberate
+    (see module docstring).
+    """
+    if not raw:
+        return None
+    match = _RELATIVE_TIME_RE.match(raw)
+    if match is None:
+        return None
+    try:
+        n = int(match.group("n"))
+    except ValueError:  # pragma: no cover - regex already requires \d+
+        return None
+    unit = match.group("unit").lower()
+    seconds: float
+    if unit.startswith("s"):
+        seconds = n
+    elif unit.startswith("mo"):  # MUST precede the bare "m" branch
+        seconds = n * 30 * 86400
+    elif unit.startswith("m"):
+        seconds = n * 60
+    elif unit.startswith("h"):
+        seconds = n * 3600
+    elif unit.startswith("d"):
+        seconds = n * 86400
+    elif unit.startswith("w"):
+        seconds = n * 7 * 86400
+    elif unit.startswith("y"):
+        seconds = n * 365 * 86400
+    else:  # pragma: no cover - regex enumerates the prefixes above
+        return None
+    base = now if now is not None else datetime.now(UTC)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=UTC)
+    when = base - timedelta(seconds=seconds)
+    # Emit ``YYYY-MM-DDTHH:MM:SSZ`` (no microseconds) so the string parses
+    # cleanly with ``datetime.fromisoformat`` AND the trailing ``Z`` matches
+    # MangaDex's RFC 3339 emission for cross-source sorting in /recent.
+    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # JS extractor that returns the rendered chapter-page image URLs in NN order.
@@ -264,12 +366,19 @@ _CHAPTER_PAGES_WAIT_FOR = ".rpage-page[data-page]"
 # JS extractor that returns the rendered chapter list off the series page DOM.
 # Selects ``<a>`` elements whose href matches the recon-pinned chapter URL
 # pattern ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and emits a
-# ``{chapter_id, number, lang, group}`` shape per chapter — match-compatible
-# with the encrypted-API ``_to_release`` consumer. Lang defaults to "en" (Comix
-# is English-only per live recon) and group is best-effort extracted from a
-# sibling ``.scanlation`` / ``.group`` element when present; absent the live-
-# smoke is allowed to refine the selector. Chapter IDs and numbers are
-# load-bearing — the rest is advisory.
+# ``{id, chapter, lang, groups, publishedAtRelative}`` shape per chapter —
+# match-compatible with the encrypted-API ``_to_release`` consumer. Lang
+# defaults to "en" (Comix is English-only per live recon) and group is best-
+# effort extracted from a sibling ``.scanlation`` / ``.group`` element when
+# present; absent the live-smoke is allowed to refine the selector. Chapter
+# IDs and numbers are load-bearing — the rest is advisory.
+#
+# Issue #30 (2026-05-30): also extract ``<span class="mchap-row__time">``'s
+# text content per row. The chapter-list DOM does NOT expose a machine-
+# readable absolute timestamp; the only public per-row date is the rendered
+# relative string ("2d ago", "3mos ago", "14h ago"). We capture it raw here
+# and parse it Python-side (:func:`_parse_relative_time`) into an approximate
+# ISO 8601 UTC date-time so the REL-01 ``publishDate`` contract holds.
 _CHAPTER_LIST_EXTRACT_JS = """
   const rx = /\\/title\\/[A-Za-z0-9_-]+\\/(\\d+)-chapter-([0-9.]+)(?:[/?#]|$)/i;
   const seen = new Set();
@@ -288,6 +397,7 @@ _CHAPTER_LIST_EXTRACT_JS = """
     // itself contains an SVG icon whose textContent is empty/whitespace).
     // A miss is still a valid chapter row (group simply omitted).
     let group = null;
+    let publishedAtRelative = null;
     const row = a.closest(
       '.mchap-row, li, tr, [data-chapter], .chapter, .chapter-item'
     );
@@ -300,12 +410,22 @@ _CHAPTER_LIST_EXTRACT_JS = """
         const text = ((span && span.textContent) || g.textContent || '').trim();
         if (text) group = text;
       }
+      // Issue #30: ``<span class="mchap-row__time">`` carries the rendered
+      // ``createdAtFormatted`` value (e.g. "14h ago", "2d ago", "3mos ago").
+      // The raw absolute timestamp is NOT exposed in the DOM — only this
+      // relative string. We capture it for Python-side approximation.
+      const t = row.querySelector('.mchap-row__time, time, [data-time]');
+      if (t) {
+        const text = (t.textContent || '').trim();
+        if (text) publishedAtRelative = text;
+      }
     }
     out.push({
       id: id,
       chapter: m[2],
       lang: 'en',
-      groups: group ? [{ name: group }] : []
+      groups: group ? [{ name: group }] : [],
+      publishedAtRelative: publishedAtRelative
     });
   }
   return out;
@@ -371,6 +491,15 @@ class ComixSource(Source):
     # this declaration stays empty (no source-supplied key material in v1).
     decrypt_scheme = "comix-v1"
     decrypt_config: dict[str, Any] = {}
+    # Issue #31 (2026-05-30): Comix has NO public all-recent-chapters feed.
+    # The public "Recently Added" UI is a list-mangas-sorted-by-
+    # ``chapter_updated_at`` view (a series feed), not a chapter feed. The
+    # ``recent`` hook returns an empty list (see the override below); this
+    # declaration is what makes ``/caps`` advertise the gap honestly so
+    # clients can branch on ``supportsRecent: false`` instead of guessing
+    # from a silently-empty release array. A per-followed-series fan-out
+    # would close this gap in a future plan; for now we tell the truth.
+    supports_recent = False
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
         """Title-search → series candidates → chapter-list enumeration (SRCH-01..07).
@@ -424,12 +553,14 @@ class ComixSource(Source):
     ) -> list[Release]:
         """Newest-first recent chapters across all series (RCNT-01/02).
 
-        The live Comix API has no public "all-recent" feed — the public site renders
-        a Recent shelf by hitting per-series chapter feeds. This hook returns an
-        empty list rather than fabricating an endpoint; recent-Comix coverage will
-        come via a per-followed-series fan-out in a future plan (deferred). The
-        framework's per-source isolation means an empty Comix recent is a no-op,
-        not a contract failure.
+        Comix has no public "all-recent-chapters" feed (the public site's
+        "Recently Added" UI is a list-mangas-sorted-by-``chapter_updated_at``
+        view, not a chapter feed). This hook returns an empty list and the
+        class declares ``supports_recent = False`` so ``/caps`` advertises
+        the gap explicitly (Issue #31). Recent-Comix coverage will come via
+        a per-followed-series fan-out in a future plan (deferred); the
+        framework's per-source isolation means an empty Comix recent is a
+        no-op, not a contract failure.
         """
         _ = (languages, limit, since, ctx)  # unused — see docstring
         return []
@@ -659,10 +790,11 @@ class ComixSource(Source):
 
         Navigates ``{base_url}/title/{hid}-{slug}`` in the warm Patchright
         browser, waits for the chapter-list anchors to hydrate, and reads
-        ``[{id, chapter, lang, groups}, …]`` off the rendered DOM. The numeric
-        chapter id (URL leading segment) and chapter number (URL trailing
-        segment after ``-chapter-``) are load-bearing — group/lang/date are
-        best-effort extracted and the live smoke pins selector refinements.
+        ``[{id, chapter, lang, groups, publishedAtRelative}, …]`` off the
+        rendered DOM. The numeric chapter id (URL leading segment) and chapter
+        number (URL trailing segment after ``-chapter-``) are load-bearing —
+        group/lang/date are best-effort extracted and the live smoke pins
+        selector refinements.
 
         We sort newest-first by chapter number and slice the
         ``offset..offset+limit`` window so the contract behaves identically to
@@ -674,6 +806,13 @@ class ComixSource(Source):
         …<span>{group_name}</span></a>``. The DOM extractor reads the name
         directly off that anchor; a row that omits the anchor simply yields
         an empty ``groups`` list (``scanlationGroup`` stays ``null``).
+
+        Publish-date extraction (Issue #30): each chapter row carries
+        ``<span class="mchap-row__time">`` whose text is the rendered relative
+        time ("14h ago", "3mos ago"). The absolute timestamp is NOT in the
+        DOM. The JS extractor captures the relative text and ``_to_release``
+        funnels it through :func:`_parse_relative_time` to approximate the
+        REL-01 ISO 8601 ``publishDate``.
         """
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
@@ -726,7 +865,15 @@ class ComixSource(Source):
         volume = self._parse_int(chapter.get("volume"))
         language = chapter.get("lang") or chapter.get("language") or "en"
         page_count = self._parse_int(chapter.get("pages") or chapter.get("pageCount"))
-        publish_date = chapter.get("publishedAt") or chapter.get("date") or ""
+        # Issue #30: prefer any absolute timestamp the source surfaces
+        # (``publishedAt`` / ``date``), then fall back to parsing the rendered
+        # relative time from ``publishedAtRelative`` ("3d ago", "2mos ago").
+        # The Comix browser-DOM read only exposes the relative form; ``""``
+        # would violate REL-01 (``publishDate`` required + ``format: date-time``).
+        publish_date_raw = chapter.get("publishedAt") or chapter.get("date")
+        if not publish_date_raw:
+            publish_date_raw = _parse_relative_time(chapter.get("publishedAtRelative"))
+        publish_date = publish_date_raw or ""
 
         series_title = self._series_title(chapter)
         group = self._scanlation_group(chapter)
