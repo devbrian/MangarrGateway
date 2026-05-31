@@ -38,6 +38,13 @@ def live(session: nox.Session) -> None:
     ``pyproject.toml`` so the live marker is NOT deselected. ``--junit-xml``
     feeds the per-source triage script Plan 05 wires into CI.
 
+    INFO-level pytest live logging is enabled by default
+    (``-o log_cli=true -o log_cli_level=INFO``) so the #54 diagnostic
+    instrumentation (``GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS=1`` ->
+    ``CloudflareSolver`` per-page pageerror/console/requestfailed listeners)
+    actually emits its evidence into the live-test output. The deterministic
+    ``gate`` session keeps its default (quiet) logging.
+
     Append ``-- -k <expr>`` etc. via posargs to scope a local run, e.g.
     ``uv run nox -s live -- -k comix``.
     """
@@ -55,5 +62,12 @@ def live(session: nox.Session) -> None:
         # `-o addopts=` overrides the `-m 'not live'` default declared in
         # pyproject.toml so the live marker is NOT deselected here.
         *("-o", "addopts="),
+        # Live-only INFO-level CLI logging: required for the #54 browser-
+        # event capture instrumentation to actually surface its evidence
+        # (the diagnostic handlers log at INFO; without log_cli=true these
+        # never reach the live-test output). Scoped to the live session —
+        # the gate stays quiet (D-12 deterministic gate).
+        *("-o", "log_cli=true"),
+        *("-o", "log_cli_level=INFO"),
         *session.posargs,
     )

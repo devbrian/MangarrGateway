@@ -140,6 +140,82 @@ def _looks_like_js_predicate(text: str) -> bool:
     return "=>" in text or "return " in text
 
 
+def _attach_browser_event_loggers(page: Any, *, nav_url: str) -> None:
+    """Wire ``page.on("pageerror" | "console" | "requestfailed")`` loggers.
+
+    Diagnostic-only — gated by ``Settings.cloudflare_log_browser_events``
+    (env: ``GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS=1``). Captures the JS throw
+    site behind the Playwright Firefox driver crash investigated in debug
+    session ``comix-pageerror-throw-site-54`` (issue #54): the upstream
+    handler reads ``pageError.location.url`` without a null guard, so we
+    log every uncaught error the page emits in the hope of correlating it
+    with a stripped-location event right before the driver dies.
+
+    Handler safety: every attribute read uses ``getattr(..., None)`` so the
+    handler itself cannot crash on the very ``location=None`` pattern under
+    investigation — a handler that throws would be both useless and a noise
+    source. The console handler filters to ``msg.type in ("error", "warning")``
+    so debug/log/info spam does not flood the log; the other two handlers
+    capture every event unconditionally (they are already rare enough). Each
+    line records BOTH the initial navigation ``url`` and ``page.url`` at event
+    time so post-redirect events are unambiguous in the captured stream.
+
+    Playwright 1.60.0 ``Page.on(...)`` expects SYNC callbacks — ``async def``
+    handlers silently no-op, so these are plain ``def``.
+    """
+
+    def _on_pageerror(error: Any) -> None:
+        try:
+            _log.info(
+                "browser-event pageerror nav_url=%s page_url=%s "
+                "name=%s message=%s stack=%s",
+                nav_url,
+                getattr(page, "url", None),
+                getattr(error, "name", None),
+                getattr(error, "message", None),
+                getattr(error, "stack", None),
+            )
+        except Exception:  # noqa: BLE001 — diagnostic handler must NEVER raise
+            pass
+
+    def _on_console(msg: Any) -> None:
+        try:
+            msg_type = getattr(msg, "type", None)
+            if msg_type not in ("error", "warning"):
+                return
+            _log.info(
+                "browser-event console nav_url=%s page_url=%s "
+                "type=%s text=%s location=%s",
+                nav_url,
+                getattr(page, "url", None),
+                msg_type,
+                getattr(msg, "text", None),
+                getattr(msg, "location", None),
+            )
+        except Exception:  # noqa: BLE001 — diagnostic handler must NEVER raise
+            pass
+
+    def _on_requestfailed(request: Any) -> None:
+        try:
+            _log.info(
+                "browser-event requestfailed nav_url=%s page_url=%s "
+                "url=%s method=%s failure=%s",
+                nav_url,
+                getattr(page, "url", None),
+                getattr(request, "url", None),
+                getattr(request, "method", None),
+                getattr(request, "failure", None),
+            )
+        except Exception:  # noqa: BLE001 — diagnostic handler must NEVER raise
+            pass
+
+    # Playwright's Page.on registers SYNC callbacks (NOT awaitables) — async
+    # handlers silently no-op. ``page.on`` itself is sync; not awaited.
+    page.on("pageerror", _on_pageerror)
+    page.on("console", _on_console)
+    page.on("requestfailed", _on_requestfailed)
+
+
 @dataclass
 class Clearance:
     """Captured anti-bot clearance: cookies + the UA they were issued for."""
@@ -203,6 +279,7 @@ class CloudflareSolver:
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         cloudflare_keys: Iterable[str] = (),
         engine: AntibotEngine = "camoufox",
+        log_browser_events: bool = False,
         lifecycle: BrowserLifecycle | None = None,
     ) -> None:
         self._user_data_dir = user_data_dir
@@ -210,6 +287,13 @@ class CloudflareSolver:
         self._challenge_url = challenge_url
         self._cloudflare_keys = frozenset(cloudflare_keys)
         self._engine: AntibotEngine = engine
+        # #54 diagnostic: when True, attach pageerror/console/requestfailed
+        # loggers to every page opened by ``_fetch_via_browser_once`` so the
+        # JS throw site behind the Playwright Firefox handler crash can be
+        # captured under nightly conditions. OFF by default — log volume
+        # and per-page overhead are too high for production. Toggled via
+        # ``GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS=1`` through Settings.
+        self._log_browser_events = log_browser_events
         # Tests inject a lifecycle wrapping a MOCKED browser; production builds one
         # wrapping the real lazy-launch/solve closures. The launch closure is
         # selected by ``engine`` (Camoufox default since #40; Patchright opt-in).
@@ -381,6 +465,14 @@ class CloudflareSolver:
                 raise BrowserFetchError(
                     f"could not open page for fetch_via_browser: {exc}"
                 ) from exc
+            # #54 diagnostic instrumentation: attach pageerror/console/
+            # requestfailed loggers BEFORE goto so we capture early errors
+            # raised during navigation itself, not just post-load. Gated on
+            # the per-solver flag (default OFF). Handlers die with the page
+            # at the ``finally: page.close()`` below — no separate cleanup
+            # needed.
+            if self._log_browser_events:
+                _attach_browser_event_loggers(page, nav_url=url)
             timeout_ms = int(timeout * 1000)
             try:
                 try:

@@ -172,6 +172,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # issue #54 surface in local repro; patchright opt-in via
         # GATEWAY_CLOUDFLARE_ENGINE=patchright). Driven by Settings.cloudflare_engine.
         "engine": settings.cloudflare_engine,
+        # #54 diagnostic: forward the per-page browser-event capture flag.
+        # OFF by default — flip to ON via GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS=1
+        # for nightly evidence-capture runs investigating the Playwright
+        # Firefox handler crash (see debug session
+        # ``comix-pageerror-throw-site-54.md``).
+        "log_browser_events": settings.cloudflare_log_browser_events,
     }
     if challenge_url is not None:
         solver_kwargs["challenge_url"] = challenge_url
