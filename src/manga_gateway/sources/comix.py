@@ -72,11 +72,13 @@ first live-smoke run and fixed in branch ``fix/comix-publishdate-recent``:
   contract-conformant is honest: the upstream itself only renders the same
   approximation in the UI.
 * #31 — ``/recent`` returned ``{releases: [], warnings: []}`` silently because
-  Comix has no public all-recent-chapters feed (the public "Recently Added"
-  UI is a list-mangas-sorted-by-``chapter_updated_at`` view, not a chapter
-  feed). The source now declares ``supports_recent = False`` so ``/caps``
-  advertises the gap explicitly and clients can branch on it instead of
-  guessing from the empty array.
+  the only known recipe was the N+1 series-page drill-down (Cloudflare
+  protected, rate-limit saturating). The initial fix declared
+  ``supports_recent = False``; issue #42 (2026-05-31) supersedes this with
+  a plaintext one-call feed (``/api/v1/manga?order[chapter_updated_at]=desc``)
+  whose chapter-id resolution is deferred to ``fetch_manifest`` at download
+  time. ``supports_recent`` is now ``True`` and ``recent()`` synthesizes
+  real Releases; see the deferred-resolver helpers near ``_CID_SEP``.
 
 Issue #32 (2026-05-31): the parallel ``scrollIntoView`` extractor introduced
 by issue #20 was structurally broken: a synchronous burst of ``scrollIntoView``
@@ -130,6 +132,160 @@ _CONTENT_RATING = "suggestive"
 # chapter URL the browser navigates to (Option A — Plan 04-04). The framework
 # treats chapter_id as source-opaque, so the composite is contained.
 _CID_SEP = "|"
+
+# Issue #42: recent-feed-minted handles carry this literal in the numeric_id
+# slot of the composite. ``fetch_manifest`` detects it and late-binds the real
+# chapter id via :func:`_resolve_deferred` + ``_series_chapters``. The
+# composite still has exactly 4 non-empty segments so the existing
+# ``_parse_composite_chapter_id`` accepts it unchanged (locked decision 8).
+_DEFERRED_SENTINEL = "DEFERRED"
+
+
+def _make_deferred_composite(hid: str, slug: str, chapter_number: str) -> str:
+    """Build a recent-feed handle's composite ``chapter_id`` (issue #42).
+
+    Shape: ``"DEFERRED|{hid}|{slug}|{chapter_number}"``. Every segment must be
+    non-empty so the existing :meth:`ComixSource._parse_composite_chapter_id`
+    accepts it unchanged (locked decision 8). The ``DEFERRED`` sentinel takes
+    the place of the numeric chapter id; ``fetch_manifest`` substitutes the
+    real id by re-fetching the series page at download time.
+    """
+    if not (hid and slug and chapter_number):
+        raise ValueError("hid, slug, chapter_number must all be non-empty")
+    return _CID_SEP.join((_DEFERRED_SENTINEL, hid, slug, chapter_number))
+
+
+class _DeferredResolutionError(Exception):
+    """Internal — translated to ``SourceError('source_unavailable', ...)`` by caller.
+
+    Raised by :func:`_resolve_deferred` when the chapter number promised by a
+    recent-feed-minted handle is no longer on the series page (the chapter was
+    deleted/replaced upstream) or when the matching row carries no id. The
+    strict-match staleness policy (locked decision 4) requires this to surface
+    as an explicit failure — never a silent rebind to a different chapter.
+    """
+
+
+def _id_sort_key(raw: Any) -> tuple[int, str]:
+    """Sort numeric ids numerically; non-numeric ids fall back to string compare.
+
+    Returns ``(category, value)`` so numeric ids always sort before string ids.
+    Lifted verbatim from spike 002 ``deferred_resolver.py`` (test-covered).
+    """
+    if raw is None:
+        return (2, "")
+    s = str(raw)
+    try:
+        return (0, str(int(s)).zfill(20))
+    except ValueError:
+        return (1, s)
+
+
+def _relative_seconds(text: str | None) -> int | None:
+    """Approximate ``"Nu ago"`` text into seconds for tie-break ordering only.
+
+    Calendar-naive; precision is not load-bearing here — only the *ordering*
+    matters. Returns ``None`` for unparseable input so the tie-break treats it
+    as "infinitely old." Lifted verbatim from spike 002 ``deferred_resolver``.
+    """
+    if not text:
+        return None
+    # CodeRabbit PR #50: `mos`/`mo` MUST precede `m` in the alternation — Python
+    # regex alternation is left-to-right with no longest-match, so the original
+    # `(s|m|h|d|w|mo|mos|y)\w*` matched `m` for "5mo ago" (with `\w*` eating "o"),
+    # making `u.startswith("mo")` below unreachable and scoring months as minutes
+    # (43,200× error). The richer `_RELATIVE_TIME_RE` below escapes this via
+    # backtracking on its surrounding context; this simpler regex needs the
+    # explicit ordering.
+    m = re.match(
+        r"^\s*(\d+)\s*(mos|mo|s|m|h|d|w|y)\w*\s*ago\s*$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    n = int(m.group(1))
+    u = m.group(2).lower()
+    if u.startswith("mo"):
+        return n * 30 * 86400
+    return {
+        "s": n,
+        "m": n * 60,
+        "h": n * 3600,
+        "d": n * 86400,
+        "w": n * 7 * 86400,
+        "y": n * 365 * 86400,
+    }.get(u)
+
+
+def _pick_among_duplicates(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Tie-break when multiple rows share the same chapter number (issue #42).
+
+    Order of preference (locked decision 6):
+      1. Smallest ``publishedAtRelative`` seconds (newest upload).
+      2. Non-empty ``groups`` over empty.
+      3. Lowest numeric ``id`` (stable, deterministic — last resort).
+
+    Choosing newest-upload first matches the ``latestChapter`` semantics the
+    recent feed already encoded — if Comix's sort key for
+    ``chapter_updated_at`` picked the newest upload of that chapter, the
+    resolver follows the same choice.
+    """
+    return min(
+        rows,
+        key=lambda r: (
+            # CodeRabbit PR #50: guard on `is None`, not falsy — `_relative_seconds`
+            # returns `int >= 0` and "0s ago" yields 0, which `or 10**12` would
+            # collapse to the oldest slot, inverting the "newest wins" rule.
+            (
+                s
+                if (s := _relative_seconds(r.get("publishedAtRelative"))) is not None
+                else 10**12
+            ),
+            0 if r.get("groups") else 1,
+            _id_sort_key(r.get("id")),
+        ),
+    )
+
+
+def _resolve_deferred(
+    chapter_number: str, series_chapters: list[dict[str, Any]]
+) -> str:
+    """Strict-match a recent-feed chapter_number against a series-page row list.
+
+    Decimal-aware (locked decision 5): ``'23'`` matches series row chapter
+    ``'23.0'`` and vice versa via :meth:`ComixSource._parse_decimal`. Multi-
+    group ties are broken by :func:`_pick_among_duplicates` (locked decision
+    6). On no-match OR a matching row without an ``id``, raises
+    :class:`_DeferredResolutionError` (the caller translates it to
+    ``SourceError('source_unavailable', ...)`` per locked decision 4 —
+    strict-match staleness; never silently rebind).
+    """
+    target = ComixSource._parse_decimal(chapter_number)
+    if target is None:
+        raise ValueError(
+            f"deferred chapter_number not Decimal-parseable: {chapter_number!r}"
+        )
+    matches: list[dict[str, Any]] = []
+    for row in series_chapters:
+        if not isinstance(row, dict):
+            continue
+        row_num = ComixSource._parse_decimal(row.get("chapter") or row.get("number"))
+        if row_num is None:
+            continue
+        if row_num == target:
+            matches.append(row)
+    if not matches:
+        raise _DeferredResolutionError(
+            f"deferred resolution: chapter {chapter_number} not present on series page"
+        )
+    chosen = matches[0] if len(matches) == 1 else _pick_among_duplicates(matches)
+    cid = chosen.get("id")
+    if not cid:
+        raise _DeferredResolutionError(
+            f"deferred resolution: matching row carries no chapter id: {chosen!r}"
+        )
+    return str(cid)
 
 
 # SSRF allowlist for image-CDN URLs returned by the browser-DOM extractor
@@ -599,15 +755,13 @@ class ComixSource(Source):
     # ``cf_clearance`` cookie. Read by the application wiring (app.py lifespan),
     # not by the framework solver itself.
     cloudflare_challenge_url = "https://comix.to/"
-    # Issue #31 (2026-05-30): Comix has NO public all-recent-chapters feed.
-    # The public "Recently Added" UI is a list-mangas-sorted-by-
-    # ``chapter_updated_at`` view (a series feed), not a chapter feed. The
-    # ``recent`` hook returns an empty list (see the override below); this
-    # declaration is what makes ``/caps`` advertise the gap honestly so
-    # clients can branch on ``supportsRecent: false`` instead of guessing
-    # from a silently-empty release array. A per-followed-series fan-out
-    # would close this gap in a future plan; for now we tell the truth.
-    supports_recent = False
+    # Issue #42: flipped from False — recent uses a plaintext one-call feed
+    # with deferred chapter-id resolution; see ``recent()`` below. Late-binding
+    # of the chapter id happens in ``fetch_manifest`` (one extra browser nav
+    # per first download), keeping the per-poll cost to one cheap plaintext
+    # call (1 of 10/min rate-limit budget) rather than the N+1 series-page
+    # drill-down PR #41 originally rejected as too expensive.
+    supports_recent = True
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
         """Title-search → series candidates → chapter-list enumeration (SRCH-01..07).
@@ -659,19 +813,99 @@ class ComixSource(Source):
         since: str | None,
         ctx: SourceContext,
     ) -> list[Release]:
-        """Newest-first recent chapters across all series (RCNT-01/02).
+        """Newest-first recent chapters via the plaintext list-mangas feed (RCNT-01/02).
 
-        Comix has no public "all-recent-chapters" feed (the public site's
-        "Recently Added" UI is a list-mangas-sorted-by-``chapter_updated_at``
-        view, not a chapter feed). This hook returns an empty list and the
-        class declares ``supports_recent = False`` so ``/caps`` advertises
-        the gap explicitly (Issue #31). Recent-Comix coverage will come via
-        a per-followed-series fan-out in a future plan (deferred); the
-        framework's per-source isolation means an empty Comix recent is a
-        no-op, not a contract failure.
+        Issue #42 (supersedes #31): synthesizes one ``Release`` per viable item
+        from a single plaintext ``GET /api/v1/manga?order[chapter_updated_at]=desc``
+        call (the same plaintext path search uses, one of 10/min rate budget).
+        Each Release carries a ``:DEFERRED`` guid suffix and a deferred
+        composite ``chapter_id`` whose numeric id is late-bound by
+        :meth:`fetch_manifest` at download time (one extra browser nav per
+        FIRST download of a recent-minted Release — not per ``/recent`` poll).
+
+        Recent and search Releases for the same chapter intentionally do not
+        dedup — they are different objects (a late-binding promise vs a
+        concrete upload). See locked decisions 1, 3, 7 in the PLAN.
+
+        ``since`` and ``languages`` are noted unused: Comix is English-only
+        (live recon) and ``since`` is enforced upstream by the route-level cut
+        already (same no-op pattern as today). Items missing ``hid``,
+        ``hasChapters: false``, an unparseable ``latestChapter``, no slug, or
+        an unparseable ``chapterUpdatedAtFormatted`` are SKIPPED rather than
+        faked (REL-01 requires ``format: date-time``).
         """
-        _ = (languages, limit, since, ctx)  # unused — see docstring
-        return []
+        _ = (languages, since)  # see docstring — both deliberately unused here
+        params: dict[str, Any] = {
+            "order[chapter_updated_at]": "desc",
+            "limit": min(limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT),
+            "page": 1,
+            "content_rating": _CONTENT_RATING,
+        }
+        data = await ctx.get_json_plain(f"{self.base_url}/api/v1/manga", **params)
+        items = self._result_items(data)
+
+        releases: list[Release] = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("hasChapters") is False:
+                continue
+            hid = item.get("hid")
+            if not hid:
+                continue
+            ch_dec = self._parse_decimal(item.get("latestChapter"))
+            if ch_dec is None:
+                continue
+            slug = self._slug_from_item(item)
+            if not slug:
+                continue
+            publish_date = _parse_relative_time(item.get("chapterUpdatedAtFormatted"))
+            if not publish_date:
+                continue  # REL-01 requires format: date-time — skip rather than fake
+            # Decimal-normalize per locked decision 5: ``Decimal('23')`` ->
+            # ``"23"`` (not ``"23.0"``), ``Decimal('1.20')`` -> ``"1.2"``.
+            ch_str = format(ch_dec.normalize(), "f")
+            series_title = str(item.get("title") or "Unknown")
+            language = "en"
+            composite = _make_deferred_composite(str(hid), slug, ch_str)
+            title = self._build_title(
+                series_title, ch_str, volume=None, language=language, group=None
+            )
+            # Locked decision 1: literal ``:DEFERRED`` suffix in the guid's
+            # chapter_id segment. NEVER rewrite this when the composite
+            # resolves at download time — recent and search intentionally do
+            # not dedup (different resolution states). The search-path guid
+            # shape ``…:{chapter_id}`` stays unchanged for D-21 multi-group
+            # uniqueness.
+            guid = f"comix:{hid}:ch-{ch_str}:{language}:DEFERRED"
+            handle = ctx.handle_store.mint(
+                ResolutionRecord(
+                    source_key=self.key,
+                    chapter_id=composite,
+                    language=language,
+                    title=title,
+                    manga_title=series_title,
+                    chapter_number=ch_dec,
+                    volume=None,
+                    scanlation_group=None,  # populated at download-resolve
+                    page_count=None,  # populated at download-resolve
+                )
+            )
+            releases.append(
+                Release(
+                    guid=guid,
+                    title=title,
+                    source_key=self.key,
+                    download_handle=handle,
+                    publish_date=publish_date,
+                    manga_title=series_title,
+                    chapter_number=ch_dec,
+                    volume=None,
+                    language=language,
+                    scanlation_group=None,
+                    page_count=None,
+                    ids={"comixSeriesId": str(hid)},
+                )
+            )
+        return releases
 
     # ───────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
 
@@ -700,6 +934,14 @@ class ComixSource(Source):
         The image-byte fetch (the next step in the engine) still runs through
         httpx (``ctx.get_bytes``) — the browser is NEVER used for bulk image
         fetch (CLAUDE.md).
+
+        Issue #42 — composites whose ``numeric_id == 'DEFERRED'`` are recent-
+        feed-minted handles that re-resolve their chapter id at download time
+        via :meth:`_series_chapters` + :func:`_resolve_deferred`; one extra
+        browser nav on the first download per recent-minted Release. The
+        resolved id is local to this call; the ``ResolutionRecord`` stored
+        under the opaque handle is NOT mutated (locked decision 1 — the
+        ``:DEFERRED`` guid suffix is permanent).
         """
         try:
             numeric_id, hid, slug, number = self._parse_composite_chapter_id(chapter_id)
@@ -707,6 +949,17 @@ class ComixSource(Source):
             raise SourceError(
                 "source_unavailable", f"malformed comix chapter id: {exc}"
             ) from None
+        # Issue #42: recent-feed handles defer chapter-id resolution to download
+        # time. One extra browser nav (re-reads the series page chapter list,
+        # the same path search uses) replaces the DEFERRED sentinel with the
+        # real numeric id. Strict-match staleness (locked decision 4): a
+        # missing chapter surfaces as SourceError, never a silent rebind.
+        if numeric_id == _DEFERRED_SENTINEL:
+            chapters = await self._series_chapters(hid, slug, _MAX_FEED_LIMIT, 0, ctx)
+            try:
+                numeric_id = _resolve_deferred(number, chapters)
+            except _DeferredResolutionError as exc:
+                raise SourceError("source_unavailable", str(exc)) from None
         solver = self._solver_from_ctx(ctx)
         chapter_url = (
             f"{self.base_url}/title/{hid}-{slug}/{numeric_id}-chapter-{number}"
