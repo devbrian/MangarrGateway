@@ -294,40 +294,68 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 # The per-div Promise.all watchers then timed out polling for an ``<img src>``
 # the observer was never triggered on. Result: only head pages (above the
 # fold) + the final 1-2 pages (where the scroll lands) were captured, every
-# Comix CBZ longer than ~4 pages silently shipped truncated. The fix below
-# walks pages SEQUENTIALLY: scroll the page into view, yield long enough for
-# the observer + lazy-load round-trip, then poll the div's <img> children for
-# a CDN-matching src. The per-page wait is tight (~200ms baseline + up to
-# ~2s poll budget per page); first-sight wins so a subsequent Swiper
-# eviction never loses a URL we already saw.
+# Comix CBZ longer than ~4 pages silently shipped truncated. The original fix
+# walked pages SEQUENTIALLY (scrollIntoView → settle → poll the div's <img>
+# for a CDN-matching src per page) which was correct but cost ~14-15s on a
+# 10-page chapter because each page paid an IntersectionObserver + lazy-load
+# round-trip serially.
 #
-# Step-1 scaffold wait is also hardened: instead of returning on FIRST div
-# we wait for COUNT STABILITY (count unchanged across 3 consecutive 100ms
-# ticks, capped at 8s) so a partial scaffold cannot race the walk.
+# Issue #45 (2026-05-31): rewrite Step 2 as a two-scroll head+tail walk on
+# the INNER Swiper scroll container. The spike
+# ``.planning/debug/comix-warm-page-no-speedup-spike.md`` empirically showed
+# that setting ``viewport_size = {800, 200000}`` loaded pages 1, 2, 13, AND
+# 14 simultaneously — meaning the inner Swiper container (an ancestor of
+# the ``.rpage-page`` divs with ``overflow:auto|scroll|hidden`` and
+# ``scrollHeight > clientHeight``) is what gates middle pages independently
+# of the window viewport. Two batched scrolls on THAT container — to
+# ``scrollHeight/2`` then ``scrollHeight`` — fire the middle-band and tail-
+# band IntersectionObservers in ~2 settle windows of ~500ms each, dropping
+# the typical wall-clock from ~14s to a predicted ~5-7s. Correctness is
+# preserved by Step 2b (selective per-missing-page ``scrollIntoView``
+# fallback — the OLD per-page slow path, applied ONLY to pages the
+# two-scroll walk failed to capture) and Step 3 (the issue #32
+# ``document.querySelectorAll('img')`` final sweep, retained verbatim). The
+# inner-container detection is dynamic (ancestor walk reading
+# ``getComputedStyle(el).overflowY``) so bundle rotations that change the
+# Swiper wrapper class do not break us; if no overflow ancestor is found we
+# fall back to ``document.scrollingElement`` (degraded path — Step 2b will
+# do most of the work in that case, but correctness still holds).
+#
+# Step-1 scaffold wait is unchanged: count-unchanged-for-3-consecutive-ticks
+# (8s cap) so a partial scaffold cannot race the walk.
 _CHAPTER_PAGES_EXTRACT_JS = """
   // Comix's chapter reader is a Swiper.js long-strip component
   // (`class="rpage rpage--long-strip rpage--ttb"`). Each page is wrapped in a
   // `<div class="rpage-page" data-page="N">` whose <img> child is LAZY-LOADED
   // by an IntersectionObserver. `window.scrollTo()` does not move the inner
-  // Swiper viewport, so a blind window scroll only renders head/tail pages.
+  // Swiper viewport — there is a NESTED scroll container (an ancestor of
+  // the `.rpage-page` divs with overflow:auto|scroll|hidden) that gates
+  // middle pages independently of the window viewport. Issue #45 spike
+  // confirmed this empirically: tall window viewport loaded only head/tail
+  // pages, never the middle band.
   //
-  // Issue #32 fix: walk pages SEQUENTIALLY — scrollIntoView, await long
-  // enough for the IntersectionObserver to fire and the lazy <img> to load,
-  // then poll the div for a CDN-matching src. Issuing all scrollIntoView
-  // calls up front (the prior parallel attempt) was structurally broken:
-  // synchronous viewport mutations cancel each other and only the FINAL
-  // scroll target ever enters view. A first-sight Map preserves chapter
-  // ordering even if Swiper later evicts a page's <img>.
+  // Strategy (issue #45):
+  //   Step 1  — wait for scaffold count stability (unchanged from #32).
+  //   Step 2  — find the inner Swiper scroll container by ancestor walk,
+  //             then scrollTo(scrollHeight/2) + scrollTo(scrollHeight) with
+  //             ~500ms settle each; capture every CDN-matching <img> after
+  //             each scroll (first-sight wins via a Map keyed on data-page
+  //             integer).
+  //   Step 2b — for every page the two-scroll walk missed, fall back to
+  //             the per-page scrollIntoView slow path (the issue #32 walk,
+  //             applied SELECTIVELY). Typical chapter → zero fallbacks.
+  //   Step 3  — final document.querySelectorAll('img') sweep (the issue
+  //             #32 silent-truncation safety net, retained verbatim).
+  //   Step 4  — sort the Map entries by NN ascending and return URLs.
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const rx = /\\/si\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
 
   // Step 1: wait for the page scaffold COUNT TO STABILIZE. Returning on the
-  // first .rpage-page[data-page] div (the prior strategy) races Swiper's
-  // incremental scaffold and snapshots a partial pageDivs list. We poll
-  // every 100ms and only declare the scaffold ready once the count has
-  // been unchanged for 3 consecutive ticks (with a minimum non-zero count
-  // so we don't accept "still zero" as stable). Cap at 8s wall-clock —
-  // beyond that the page is genuinely broken, not just slow.
+  // first .rpage-page[data-page] div would race Swiper's incremental
+  // scaffold and snapshot a partial pageDivs list. Poll every 100ms;
+  // declare the scaffold ready once the count has been unchanged for 3
+  // consecutive ticks (with a non-zero count so "still zero" isn't stable).
+  // Cap at 8s wall-clock — beyond that the page is genuinely broken.
   let stable = 0;
   let lastCount = -1;
   for (let i = 0; i < 80; i++) {
@@ -349,28 +377,86 @@ _CHAPTER_PAGES_EXTRACT_JS = """
       return an - bn;
     });
 
-  // Step 2: sequential walk. For each div: scrollIntoView, await an initial
-  // settle window so the IntersectionObserver actually fires (the observer
-  // callback is scheduled async; without a yield, the next scrollIntoView
-  // cancels the viewport position before the observer ever runs), then poll
-  // the div's <img> children for a CDN-matching src. First-sight wins.
-  //
-  // Per-page budget: ~200ms settle + up to ~2s polling at 100ms cadence.
-  // For a typical 12-page chapter that's ~2.4-26.4s in the worst case but
-  // usually <5s — the poll exits as soon as the src appears. The 8s
-  // wall-clock target from #20 still holds for the typical case; pages
-  // that genuinely take longer surface as a tail.
   const seen = new Map();
-  for (const div of pageDivs) {
+  const captureAll = () => {
+    // Sweep every .rpage-page div's <img> children, recording the first
+    // CDN-matching src per data-page. First-sight wins so a subsequent
+    // Swiper eviction never loses a URL we already saw.
+    for (const div of pageDivs) {
+      const n = parseInt(div.getAttribute('data-page') || '0', 10);
+      if (seen.has(n)) continue;
+      for (const img of div.querySelectorAll('img')) {
+        const src = img.currentSrc || img.src || '';
+        const m = src.match(rx);
+        if (m) {
+          seen.set(n, src);
+          break;
+        }
+      }
+    }
+  };
+
+  // Step 2: identify the inner Swiper scroll container and do TWO batched
+  // scrolls (midpoint then end). The spike's tall-viewport finding (pages
+  // 1, 2, 13, 14 loaded but 3-12 stayed lazy) is the empirical evidence
+  // that this container — NOT the window — is what gates middle pages.
+  //
+  // Ancestor walk: starting from the first .rpage-page div, climb parents
+  // and test each for overflowY in {auto, scroll, hidden} AND
+  // scrollHeight > clientHeight (so we pick the element that ACTUALLY
+  // gates scrolling, not a decorative overflow:hidden wrapper). The CSS
+  // class of the container is NOT pinned — bundle rotations may change
+  // it; the dynamic check protects us. Fall back to
+  // document.scrollingElement on miss (degraded path; Step 2b picks up
+  // the slack).
+  let container = null;
+  if (pageDivs.length > 0) {
+    let el = pageDivs[0].parentElement;
+    while (el && el !== document.body) {
+      const style = getComputedStyle(el);
+      const overflowY = style.overflowY;
+      const scrolls =
+        overflowY === 'auto' ||
+        overflowY === 'scroll' ||
+        overflowY === 'hidden';
+      if (scrolls && el.scrollHeight > el.clientHeight) {
+        container = el;
+        break;
+      }
+      el = el.parentElement;
+    }
+  }
+  if (!container) {
+    container = document.scrollingElement || document.documentElement;
+  }
+
+  // Two batched scrolls: midpoint then end. 500ms settle after each is
+  // the empirically-grounded budget from the spike — enough for the
+  // IntersectionObserver callback to fire AND for the lazy <img>'s src
+  // to propagate. Capture after each scroll so a Swiper eviction
+  // between the two passes can't lose a page we already saw.
+  container.scrollTo({ top: container.scrollHeight / 2, behavior: 'instant' });
+  await sleep(500);
+  captureAll();
+  container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
+  await sleep(500);
+  captureAll();
+
+  // Step 2b: for any page the two-scroll walk missed, fall back to the
+  // per-page scrollIntoView slow path (the issue #32 walk, applied
+  // SELECTIVELY). Typical chapter → empty missing list → zero fallback
+  // cost. Pathological chapter → bounded by missing × ~1.4s, comfortably
+  // under the 60s solver timeout. The `scrollIntoView` marker required
+  // by the offline slice test (test_comix_slice.py) lives in this block.
+  const missing = pageDivs.filter(
+    (div) => !seen.has(parseInt(div.getAttribute('data-page') || '0', 10))
+  );
+  for (const div of missing) {
     const n = parseInt(div.getAttribute('data-page') || '0', 10);
     div.scrollIntoView({ behavior: 'instant', block: 'center' });
-    // Initial settle — enough for the IntersectionObserver callback to fire
-    // and for the lazy <img>'s src to start propagating. 150ms covers the
-    // observer + a small network kickoff; the poll loop below catches any
-    // slower lazy-load.
     await sleep(150);
     let captured = false;
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 14; attempt++) {
       for (const img of div.querySelectorAll('img')) {
         const src = img.currentSrc || img.src || '';
         const m = src.match(rx);
@@ -383,15 +469,14 @@ _CHAPTER_PAGES_EXTRACT_JS = """
       if (captured) break;
       await sleep(100);
     }
-    // If we didn't capture, move on — the Step 4 sweep below is a final
-    // safety net. We do NOT bail the whole walk on a single miss so a
-    // genuinely-broken page does not nuke the rest of the chapter.
+    // If we still didn't capture, Step 3 below is the final safety net.
   }
 
   // Step 3 (fallback): sweep the document for any <img> the per-div walk
   // missed (covers reader-shape variants where the canonical `data-page`
   // wrapper is absent but images still match the CDN pattern, OR a page
-  // whose <img> only attached AFTER we walked past it).
+  // whose <img> only attached AFTER we walked past it). This is the
+  // issue #32 silent-truncation safety net — DO NOT remove.
   for (const img of document.querySelectorAll('img')) {
     const src = img.currentSrc || img.src || '';
     const m = src.match(rx);
