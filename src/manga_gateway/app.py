@@ -167,6 +167,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "headless": settings.cloudflare_headless,
         "solve_concurrency": settings.cloudflare_solve_concurrency,
         "cloudflare_keys": cloudflare_keys,
+        # #35: select the stealth-browser engine (patchright default for dev/
+        # Windows; camoufox for CI/Linux runners where Chromium fingerprint is
+        # flagged by Cloudflare's encrypted tier). Driven by Settings.cloudflare_engine.
+        "engine": settings.cloudflare_engine,
     }
     if challenge_url is not None:
         # Both URLs come from the same source for v1 (one cloudflare-gated source
