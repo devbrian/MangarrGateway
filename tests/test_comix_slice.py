@@ -1,33 +1,30 @@
-"""E2E Comix slice: search→handle→cleared+decrypted fetch→CBZ (04-03 Task 2).
+"""E2E Comix slice: search→handle→cleared fetch→CBZ (04-03 Task 2).
 
 Drives the SAME search→handle→download→package contract proven on MangaDex, but for a
 ``cloudflare+encrypted`` source — entirely deterministic (D-42): a fake solver supplies
 a canned ``Clearance`` (no real Patchright browser) and respx intercepts the ONE shared
-httpx client (no real Comix site). Comix's responses are *encrypted* under the
-registered ``comix-v1`` scheme, so the respx fixtures are real comix-v1 ciphertext that
-the framework decrypt seam (D-39) inverts on the way in — exercising clearance injection
-(D-40) + decrypt (D-39) + the handle/job contract + per-source warnings isolation (D-38)
-end to end.
+httpx client (no real Comix site).
 
-What is fully live here (NOT pending the D-44 smoke):
+What is exercised end-to-end:
 * clearance injection — the outbound Comix request carries ``cf_clearance`` + the exact
   captured UA (D-40);
 * the handle/job contract — a ``comix:`` handle flows through POST /downloads to a
   ``completed`` job + a CBZ of page-images-only (criterion #3);
-* the decrypt seam — every Comix body is comix-v1 ciphertext decrypted by the framework
-  before parse/packaging (D-39);
+* Option A browser-DOM resolution — ``solver.fetch_via_browser`` returns the chapter
+  list / page-URL list off the fake page (no real browser);
 * per-source isolation — a single failing Comix /search yields 200 + a comix warning
   while MangaDex's releases still flow (D-38/SRCH-03).
 
-The REAL-ciphertext → known-plaintext D-44 assertion lives in ``test_decrypt.py`` and is
-the separate gating item captured by the Plan-04 live smoke.
+Issue #46: the ``comix-v1`` browser-evaluated decrypt seam was removed (dead code on
+the current ``secure-*.js``). Comix has no live encrypted-response path — the slice
+relies on plaintext httpx (``get_json_plain``/``get_bytes_plain``) + browser-DOM, and
+the fake solver no longer needs a ``decrypt`` method.
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
-import json
 import zipfile
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -54,39 +51,22 @@ _CHAPTER_ID = "9001596"
 _CF_COOKIE = {"cf_clearance": "CF-CLEAR-TOKEN"}
 _CF_UA = "Mozilla/5.0 (Comix-Chrome) AppleWebKit/537.36"
 
-# Marker bytes the FakeSolver flips into the canned plaintext registry. The slice
-# uses CIPHERTEXT-X-Y opaque sentinels for each mock-encrypted body and the
-# FakeSolver returns the matching plaintext when ``solver.decrypt(sentinel)`` runs.
-# This mirrors D-45 (browser-evaluated decrypt) without any real browser/cipher.
-
-
 # ─────────────────────────── fakes + fixtures ───────────────────────────
 
 
 class _ComixSolver:
-    """Fake AntiBotSolver: returns a canned ``Clearance``, backs the D-45
-    browser-evaluated ``decrypt`` seam with a sentinel→plaintext registry, AND
-    backs the Plan 04-04 Option A ``fetch_via_browser`` primitive with a
-    URL→result registry.
+    """Fake AntiBotSolver: returns a canned ``Clearance`` AND backs the Plan
+    04-04 Option A ``fetch_via_browser`` primitive with a URL→result registry.
 
-    The respx fixtures emit opaque sentinel ciphertext bytes; ``decrypt`` looks
-    them up and returns the matching plaintext (mocking the warm-page
-    ``globalThis.t`` call without any real browser, D-42). The browser-fetch
-    primitive is mocked by URL: tests call ``solver.stage_browser_fetch(url,
-    result)`` and the ``fetch_via_browser`` call for that URL returns the
-    staged value (mocking ``page.evaluate`` against the rendered DOM without
-    any real browser).
+    The browser-fetch primitive is mocked by URL: tests call
+    ``solver.stage_browser_fetch(url, result)`` and the ``fetch_via_browser``
+    call for that URL returns the staged value (mocking ``page.evaluate``
+    against the rendered DOM without any real browser, D-42).
     """
 
     def __init__(self) -> None:
-        self.plaintexts: dict[bytes, bytes] = {}
         self.browser_results: dict[str, object] = {}
         self.browser_fetch_calls: list[tuple[str, str, str | None]] = []
-
-    def stage(self, ciphertext: bytes, plaintext: bytes) -> bytes:
-        """Register ``ciphertext`` → ``plaintext`` and return the ciphertext."""
-        self.plaintexts[ciphertext] = plaintext
-        return ciphertext
 
     def stage_browser_fetch(self, url: str, result: object) -> None:
         """Register the value the next ``fetch_via_browser(url, ...)`` returns."""
@@ -94,9 +74,6 @@ class _ComixSolver:
 
     async def get_clearance(self, source_key: str) -> Clearance:
         return Clearance(cookies=dict(_CF_COOKIE), user_agent=_CF_UA)
-
-    async def decrypt(self, ciphertext: bytes) -> bytes:
-        return self.plaintexts[ciphertext]
 
     async def fetch_via_browser(
         self,
@@ -122,11 +99,6 @@ def _png_bytes() -> bytes:
     buf = io.BytesIO()
     Image.new("RGB", (3, 3), (10, 20, 30)).save(buf, format="PNG")
     return buf.getvalue()
-
-
-def _json_cipher(solver: _ComixSolver, tag: bytes, payload: dict) -> bytes:
-    """Stage a sentinel ciphertext for ``payload`` JSON and return the sentinel."""
-    return solver.stage(b"CIPHERTEXT-" + tag, json.dumps(payload).encode("utf-8"))
 
 
 @pytest.fixture
@@ -230,7 +202,7 @@ def _mock_comix_pages(solver: _ComixSolver) -> None:
     respx.
 
     CDN bytes are plaintext (verified live, 04-HANDOFF): ``fetch_image`` calls
-    ``ctx.get_bytes_plain`` so the comix-v1 decrypt seam is BYPASSED on the
+    ``ctx.get_bytes_plain`` so the framework decrypt seam is BYPASSED on the
     image path — staged image bytes go straight through to the CBZ writer.
     """
     # Match the production CDN host pattern enforced by ComixSource's

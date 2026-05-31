@@ -189,7 +189,7 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
 
     The serial submit (vs queueing all N then polling) keeps the per-job
     measurement clean — ``fetch_via_browser`` is already serialized via
-    ``_decrypt_lock`` so concurrency would just queue the same way, but
+    ``_browser_lock`` so concurrency would just queue the same way, but
     interleaving status transitions would muddy the per-stage timing.
     """
     chapter_count = _chapter_count()

@@ -173,11 +173,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "engine": settings.cloudflare_engine,
     }
     if challenge_url is not None:
-        # Both URLs come from the same source for v1 (one cloudflare-gated source
-        # = Comix); when multiple cf sources land, the solver still serves them
-        # all under one warm browser, so we use the first-source URL for both.
         solver_kwargs["challenge_url"] = challenge_url
-        solver_kwargs["decrypt_url"] = challenge_url
     # Swap NoopSolver for the ONE shared CloudflareSolver (R1/BOT-01). Construction is
     # cheap (no browser yet — the lazy patchright launch happens on the first solve);
     # the eager warm() is fired NON-BLOCKING so a Patchright failure degrades only

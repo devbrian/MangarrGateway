@@ -5,15 +5,9 @@ Phase 1 uses ``NoopSolver`` (MangaDex et al. need no challenge solving); Phase 4
 fills ``CloudflareSolver`` with a real Patchright persistent-context solve behind a
 bounded :class:`~manga_gateway.framework.solver_lifecycle.BrowserLifecycle`.
 
-D-45 — browser-evaluated decrypt: ``CloudflareSolver`` exposes a ``decrypt``
-coroutine that reuses the warm Patchright context (which has already passed
-Cloudflare and loaded ``secure-*.js``) to evaluate ``globalThis.t(ciphertext)``
-on a dedicated warm comix.to page. The framework's decrypt seam delegates to
-this method for the ``comix-v1`` scheme.
-
 Option A (Plan 04-04 deviation, 2026-05-30) — browser-driven content fetch:
-``CloudflareSolver`` ALSO exposes :meth:`fetch_via_browser` — a small primitive
-that navigates a page in the warm context, optionally waits for a selector or JS
+``CloudflareSolver`` exposes :meth:`fetch_via_browser` — a small primitive that
+navigates a page in the warm context, optionally waits for a selector or JS
 condition, and runs ``page.evaluate`` to read JSON-serializable data out of the
 rendered DOM. Sources whose encrypted-API endpoints require a per-chapter token
 that we cannot mint statically (Comix ``/api/v1/chapters/{id}`` requires ``_=``
@@ -44,7 +38,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
-from .decrypt import DecryptError
 from .solver_lifecycle import BrowserLifecycle
 
 if TYPE_CHECKING:
@@ -52,14 +45,13 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger("manga_gateway")
 
-# Default URLs the solver navigates to for cf_clearance acquisition + the warm
-# decrypt page. Overridden by the application wiring (app.py lifespan) from the
-# concrete source's metadata — the framework solver itself never names a host.
-# The framework defaults exist only so unit tests can spin up a CloudflareSolver
-# without naming a host. Pinned by Plan 04-04 live recon when the application
-# supplies a real source.
+# Default URL the solver navigates to for cf_clearance acquisition. Overridden
+# by the application wiring (app.py lifespan) from the concrete source's
+# metadata — the framework solver itself never names a host. The framework
+# default exists only so unit tests can spin up a CloudflareSolver without
+# naming a host. Pinned by Plan 04-04 live recon when the application supplies
+# a real source.
 _DEFAULT_CHALLENGE_URL = "https://example.invalid/"
-_DEFAULT_DECRYPT_URL = "https://example.invalid/"
 
 # Supported anti-bot browser engines (#35). The selector lives on
 # ``Settings.cloudflare_engine`` and is forwarded into ``CloudflareSolver``.
@@ -87,9 +79,7 @@ def _belongs_to_host(cookie: dict[str, Any], host: str) -> bool:
 
 class BrowserFetchError(RuntimeError):
     """Raised when :meth:`CloudflareSolver.fetch_via_browser` cannot complete
-    (navigation failure, ``wait_for`` timeout, evaluate exception). Distinct
-    from :class:`DecryptError` so the SourceContext can classify it separately —
-    a fetch failure is a source-level read error, not a cipher failure.
+    (navigation failure, ``wait_for`` timeout, evaluate exception).
     """
 
 
@@ -160,16 +150,13 @@ class CloudflareSolver:
         solve_concurrency: int = 1,
         recycle_seconds: float | None = None,
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
-        decrypt_url: str = _DEFAULT_DECRYPT_URL,
         cloudflare_keys: Iterable[str] = (),
         engine: AntibotEngine = "patchright",
         lifecycle: BrowserLifecycle | None = None,
-        decrypt_page_factory: Any = None,
     ) -> None:
         self._user_data_dir = user_data_dir
         self._headless = headless
         self._challenge_url = challenge_url
-        self._decrypt_url = decrypt_url
         self._cloudflare_keys = frozenset(cloudflare_keys)
         self._engine: AntibotEngine = engine
         # Tests inject a lifecycle wrapping a MOCKED browser; production builds one
@@ -188,15 +175,11 @@ class CloudflareSolver:
             recycle_seconds=recycle_seconds,
         )
         self._playwright: Any = None  # the started playwright instance (real path)
-        # D-45 warm decrypt page lifecycle. Lazy-warmed on first decrypt(); shares
-        # the solver's persistent context (the same browser session that holds
-        # cf_clearance), so secure-*.js loads under the same fingerprint that
-        # passed Cloudflare. ``_decrypt_lock`` serializes page.evaluate() calls
-        # (neither engine is parallel-safe on a single page). The optional
-        # ``decrypt_page_factory`` is the test injection seam (mocked browser).
-        self._decrypt_page: Any = None
-        self._decrypt_lock = asyncio.Lock()
-        self._decrypt_page_factory = decrypt_page_factory or self._open_decrypt_page
+        # Serializes ``fetch_via_browser`` (one fresh page per call on the warm
+        # context); browser-driven operations compete for the same context and
+        # bounding them as one queue keeps "minimize fingerprinting events"
+        # (Pitfall 6).
+        self._browser_lock = asyncio.Lock()
 
     # ─────────────────────────── public seam (D-41) ───────────────────────────
 
@@ -230,61 +213,6 @@ class CloudflareSolver:
             await self.get_clearance(key)
             break
 
-    async def decrypt(self, ciphertext: bytes) -> bytes:
-        """Browser-evaluated decrypt of a ``comix-v1`` ciphertext envelope (D-45).
-
-        Calls ``await globalThis.t(ciphertext)`` on the warm comix.to page. The
-        warm page is lazy-created on first call and reused across decrypts (it
-        shares the solver's persistent context, so the cipher VM's
-        ``navigator.appCodeName`` / fingerprint checks see the same session that
-        passed Cloudflare). Decrypt calls are serialized via ``_decrypt_lock``
-        (a single page.evaluate is the bottleneck; parallel calls on one page
-        are not safe).
-
-        Self-diagnosing entry-point check: if ``globalThis.t`` is undefined we
-        scan the page's global scope for async-bound exports, surface them in
-        the raised :class:`DecryptError`, and let the first live-smoke failure
-        be self-explanatory (the entry-point identification was inferred by
-        elimination from ``secure-*.js`` — strongest candidate, unverified live).
-
-        Raises:
-            DecryptError: warm-page navigation failed (no clearance, JS bundle
-                blocked, or the entry point ``globalThis.t`` does not exist).
-        """
-        async with self._decrypt_lock:
-            page = await self._ensure_decrypt_page()
-            # ciphertext is a JSON envelope `{"e":"<base64url>"}` per live recon —
-            # globalThis.t accepts a UTF-8 string of the envelope (or the inner
-            # base64url string). We pass the envelope verbatim; the cipher VM
-            # extracts `.e` internally (live_recon: "the only .e runtime check is
-            # in the VM dispatcher").
-            text = ciphertext.decode("utf-8", errors="strict")
-            try:
-                plain_str: str = await page.evaluate(
-                    "async (b) => {"
-                    "  if (typeof globalThis.t !== 'function') {"
-                    "    const cands = Object.getOwnPropertyNames(globalThis).filter("
-                    "      n => { try { const v = globalThis[n];"
-                    "        return typeof v === 'function'"
-                    "          && v.constructor"
-                    "          && v.constructor.name === 'AsyncFunction';"
-                    "      } catch (e) { return false; } });"
-                    "    throw new Error("
-                    "      'browser-eval decrypt entry point not found; "
-                    "expected globalThis.t; async-fn candidates=' "
-                    "      + JSON.stringify(cands.slice(0, 20)));"
-                    "  }"
-                    "  return await globalThis.t(b);"
-                    "}",
-                    text,
-                )
-            except Exception as exc:  # noqa: BLE001 — translate JS error → DecryptError
-                msg = str(exc)
-                if "browser-eval decrypt entry point not found" in msg:
-                    raise DecryptError(msg) from exc
-                raise DecryptError(f"browser-eval decrypt failed: {msg}") from exc
-            return plain_str.encode("utf-8")
-
     # ``timeout`` here is the per-call Playwright operation budget (goto/
     # wait_for/evaluate each receive ``timeout`` in ms), NOT a cancellation
     # wrapper. ``asyncio.timeout`` is the wrong tool: it would cancel
@@ -310,10 +238,9 @@ class CloudflareSolver:
         (CLAUDE.md "image fetch is NEVER through the browser") — this primitive is
         only for the manifest-resolution step.
 
-        Concurrency: serialized through the SAME ``_decrypt_lock`` that bounds
-        :meth:`decrypt`. We do not add a new semaphore because every browser-driven
-        operation (solve, decrypt, fetch_via_browser) competes for the warm context
-        and a fresh page; bounding them as one queue avoids unfair starvation and
+        Concurrency: serialized through ``_browser_lock``. Every browser-driven
+        operation (solve, fetch_via_browser) competes for the warm context and a
+        fresh page; bounding them as one queue avoids unfair starvation and
         keeps the "minimize fingerprinting events" invariant (Pitfall 6).
 
         Args:
@@ -337,7 +264,7 @@ class CloudflareSolver:
                 JS evaluate threw, or the page could not be opened. Wraps the
                 underlying exception so the SourceContext sees one type.
         """
-        async with self._decrypt_lock:
+        async with self._browser_lock:
             try:
                 ctx = await self._lifecycle.get_context()
             except Exception as exc:  # noqa: BLE001
@@ -387,49 +314,8 @@ class CloudflareSolver:
                 with contextlib.suppress(Exception):
                     await page.close()
 
-    async def _ensure_decrypt_page(self) -> Any:
-        """Return the warm decrypt page; lazy-create on first call.
-
-        Reuses the lifecycle's persistent context (so the warm page lives under
-        the same browser session that holds ``cf_clearance``) — solver's
-        existing recycle watchdog and aclose() drive its lifecycle.
-        """
-        if self._decrypt_page is not None:
-            return self._decrypt_page
-        # Ensure the persistent context is up (this also drives the lazy
-        # patchright launch in the real path).
-        ctx = await self._lifecycle._ensure_context()
-        try:
-            page = await self._decrypt_page_factory(ctx, self._decrypt_url)
-        except Exception as exc:  # noqa: BLE001
-            raise DecryptError(f"decrypt page warm failed: {exc}") from exc
-        self._decrypt_page = page
-        return page
-
-    async def _open_decrypt_page(self, context: Any, url: str) -> Any:
-        """Default real-browser warm-page factory: new_page → goto → wait."""
-        page = await context.new_page()
-        await page.goto(url, wait_until="domcontentloaded")
-        # Wait briefly for secure-*.js to attach globalThis.t. Bounded so a
-        # broken bundle surfaces as a DecryptError on the first evaluate().
-        with contextlib.suppress(Exception):
-            await page.wait_for_function(
-                "() => typeof globalThis.t === 'function'", timeout=15_000
-            )
-        return page
-
     async def aclose(self) -> None:
-        """Tear the bounded lifecycle down + stop playwright (Pitfall 4).
-
-        Closes the warm decrypt page BEFORE the lifecycle's persistent context
-        (closing the context implicitly closes its pages, but explicit teardown
-        keeps cleanup auditable and works with mocked browsers in tests).
-        """
-        page = self._decrypt_page
-        self._decrypt_page = None
-        if page is not None:
-            with contextlib.suppress(Exception):
-                await page.close()
+        """Tear the bounded lifecycle down + stop playwright (Pitfall 4)."""
         await self._lifecycle.aclose()
         pw = self._playwright
         self._playwright = None

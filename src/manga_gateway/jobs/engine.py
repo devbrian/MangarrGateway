@@ -245,12 +245,6 @@ class JobEngine:
         decrypts page bytes (D-39); ``source_health.get(key)`` feeds the breaker (D-36).
         """
         key: str = source.key  # type: ignore[attr-defined]
-        # D-45: thread the warm-page solver into decrypt_config so the comix-v1
-        # browser-evaluated decrypt scheme can reach it (MangaDex / scheme=None
-        # ignores it). Source-declared keys take precedence over the framework-
-        # injected ``solver`` field (sources do not name their own ``solver`` key).
-        decrypt_config = dict(getattr(source, "decrypt_config", None) or {})
-        decrypt_config["solver"] = self._solver
         return SourceContext(
             source_key=key,
             rate_limit_per_minute=source.rate_limit_per_minute,  # type: ignore[attr-defined]
@@ -260,7 +254,7 @@ class JobEngine:
             solver=self._solver,
             antibot=getattr(source, "antibot", "none"),
             decrypt_scheme=getattr(source, "decrypt_scheme", None),
-            decrypt_config=decrypt_config,
+            decrypt_config=getattr(source, "decrypt_config", None),
             source_health=self._source_health.get(key),
         )
 

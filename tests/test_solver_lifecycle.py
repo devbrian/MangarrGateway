@@ -27,7 +27,6 @@ from manga_gateway.framework.antibot import (
     Clearance,
     CloudflareSolver,
 )
-from manga_gateway.framework.decrypt import DecryptError
 from manga_gateway.framework.solver_lifecycle import BrowserLifecycle
 
 
@@ -302,146 +301,6 @@ def test_force_resolve_off_protocol() -> None:
     assert "force_resolve" not in sig.parameters  # D-41 — Protocol unchanged
 
 
-# ─────────────────────── D-45 browser-evaluated decrypt ───────────────────────
-
-
-class _FakeDecryptPage:
-    """Mocks the warm comix.to page; ``evaluate`` returns the staged plaintext."""
-
-    def __init__(
-        self,
-        *,
-        plaintexts: dict[str, str] | None = None,
-        evaluate_error: Exception | None = None,
-    ) -> None:
-        self.plaintexts: dict[str, str] = plaintexts or {}
-        self.evaluate_error = evaluate_error
-        self.closed = False
-        self.evaluate_calls: list[str] = []
-        self.concurrent_evaluates = 0
-        self.max_concurrent_evaluates = 0
-
-    async def evaluate(self, _script: str, arg: str) -> str:
-        self.concurrent_evaluates += 1
-        self.max_concurrent_evaluates = max(
-            self.max_concurrent_evaluates, self.concurrent_evaluates
-        )
-        try:
-            await asyncio.sleep(0.01)  # widen window so serialization is observable
-            if self.evaluate_error is not None:
-                raise self.evaluate_error
-            self.evaluate_calls.append(arg)
-            return self.plaintexts.get(arg, arg + "-decrypted")
-        finally:
-            self.concurrent_evaluates -= 1
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-def _solver_with_decrypt_page(
-    page: _FakeDecryptPage | None = None,
-    *,
-    warm_error: Exception | None = None,
-) -> tuple[CloudflareSolver, FakeBrowser, _FakeDecryptPage | None]:
-    """Build a CloudflareSolver wired to a mocked browser + fake decrypt page."""
-    fake = FakeBrowser()
-    lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
-    the_page = page if page is not None else _FakeDecryptPage()
-
-    async def _factory(_context: object, _url: str) -> _FakeDecryptPage:
-        if warm_error is not None:
-            raise warm_error
-        return the_page
-
-    solver = CloudflareSolver(lifecycle=lc, decrypt_page_factory=_factory)
-    return solver, fake, the_page if warm_error is None else None
-
-
-async def test_decrypt_returns_page_evaluate_result() -> None:
-    page = _FakeDecryptPage(plaintexts={'{"e":"abc"}': '{"pages":["x"]}'})
-    solver, _, _ = _solver_with_decrypt_page(page)
-    out = await solver.decrypt(b'{"e":"abc"}')
-    assert out == b'{"pages":["x"]}'
-    assert page.evaluate_calls == ['{"e":"abc"}']
-    await solver.aclose()
-
-
-async def test_decrypt_serializes_concurrent_calls() -> None:
-    page = _FakeDecryptPage()
-    solver, _, _ = _solver_with_decrypt_page(page)
-    await asyncio.gather(
-        *(solver.decrypt(b"cipher-" + str(i).encode()) for i in range(5))
-    )
-    # page.evaluate must never be called in parallel on a single page.
-    assert page.max_concurrent_evaluates <= 1
-    await solver.aclose()
-
-
-async def test_decrypt_warm_page_failure_raises_decrypt_error() -> None:
-    solver, _, _ = _solver_with_decrypt_page(warm_error=RuntimeError("nav timeout"))
-    with pytest.raises(DecryptError) as exc:
-        await solver.decrypt(b"cipher")
-    assert "decrypt page warm failed" in str(exc.value)
-    await solver.aclose()
-
-
-async def test_decrypt_translates_js_error_to_decrypt_error() -> None:
-    page = _FakeDecryptPage(evaluate_error=RuntimeError("cipher VM threw"))
-    solver, _, _ = _solver_with_decrypt_page(page)
-    with pytest.raises(DecryptError) as exc:
-        await solver.decrypt(b"cipher")
-    assert "browser-eval decrypt failed" in str(exc.value)
-    await solver.aclose()
-
-
-async def test_decrypt_entry_point_missing_self_diagnoses() -> None:
-    """If globalThis.t is undefined the JS script throws an explicit message we
-    re-raise verbatim so the first live-smoke failure is self-diagnosing."""
-    page = _FakeDecryptPage(
-        evaluate_error=RuntimeError(
-            "browser-eval decrypt entry point not found; expected globalThis.t; "
-            'async-fn candidates=["a","b"]'
-        )
-    )
-    solver, _, _ = _solver_with_decrypt_page(page)
-    with pytest.raises(DecryptError) as exc:
-        await solver.decrypt(b"cipher")
-    assert "entry point not found" in str(exc.value)
-    assert "candidates" in str(exc.value)
-    await solver.aclose()
-
-
-async def test_aclose_closes_decrypt_page() -> None:
-    page = _FakeDecryptPage()
-    solver, _, _ = _solver_with_decrypt_page(page)
-    await solver.decrypt(b"cipher")
-    assert page.closed is False
-    await solver.aclose()
-    assert page.closed is True
-
-
-async def test_decrypt_page_reused_across_calls() -> None:
-    """The warm page is created once and reused — opening a new page per call
-    would re-load secure-*.js every time (slow + a re-fingerprinting risk)."""
-    page = _FakeDecryptPage()
-    factory_calls = 0
-
-    async def _factory(_ctx: object, _url: str) -> _FakeDecryptPage:
-        nonlocal factory_calls
-        factory_calls += 1
-        return page
-
-    fake = FakeBrowser()
-    lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
-    solver = CloudflareSolver(lifecycle=lc, decrypt_page_factory=_factory)
-    await solver.decrypt(b"a")
-    await solver.decrypt(b"b")
-    await solver.decrypt(b"c")
-    assert factory_calls == 1
-    await solver.aclose()
-
-
 # ─────────────────────── Option A: fetch_via_browser primitive ──────────────────
 
 
@@ -643,8 +502,8 @@ async def test_fetch_via_browser_translates_wait_for_timeout() -> None:
     await solver.aclose()
 
 
-async def test_fetch_via_browser_serializes_with_decrypt_lock() -> None:
-    """fetch_via_browser shares the decrypt lock so a concurrent burst opens a
+async def test_fetch_via_browser_serializes_concurrent_calls() -> None:
+    """fetch_via_browser holds ``_browser_lock`` so a concurrent burst opens a
     fresh page per call but never runs more than one page.evaluate in parallel
     — Patchright is not parallel-safe on a single context's pages under the
     same fingerprint, and queueing here protects the "minimize fingerprinting
@@ -662,8 +521,6 @@ async def test_fetch_via_browser_serializes_with_decrypt_lock() -> None:
     # Each page saw at most one in-flight evaluate (the lock serializes the
     # whole goto+wait+evaluate path, so no two pages can race in this fake).
     assert all(p.max_concurrent_calls <= 1 for p in pages)
-    # One fresh page per call (a page is opened and closed; the decrypt page
-    # is the one that's reused).
     assert len(ctx.opened) == 5
     assert all(p.closed for p in pages)
     await solver.aclose()

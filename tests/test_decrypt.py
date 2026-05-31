@@ -1,9 +1,6 @@
-"""Framework decrypt-registry tests (04-01 seam, async since 04-04 D-45).
+"""Framework decrypt-registry tests (04-01 seam, async since 04-04).
 
-Covers the scheme-dispatch decrypt seam — the placeholder stdlib XOR ``comix-v1``
-from 04-03 has been REPLACED by a browser-evaluated coroutine that delegates to
-the warm Patchright solver (D-45 — the live cipher is a jsdefender VM stream cipher
-not statically reversible in v1). The dispatch shape:
+Covers the scheme-dispatch decrypt seam:
 
 * ``decrypt(None, body, {})`` is a verbatim identity pass-through (MangaDex /
   non-encrypted sources — D-39); the dispatcher is async, but the None path is a
@@ -12,12 +9,11 @@ not statically reversible in v1). The dispatch shape:
   ``decrypt("x", body, cfg)`` dispatches to it (awaiting if a coroutine).
 * ``decrypt(<unknown>, ...)`` raises a clear ``KeyError`` — never a silent
   pass-through that would leak ciphertext toward CBZ packaging.
-* ``comix-v1`` requires ``decrypt_config["solver"]`` (D-45); a missing solver raises
-  :class:`DecryptError`.
 
-The D-44 real-ciphertext fixture (``tests/fixtures/comix/chapter_9001596.bin``) is
-exercised against a FakeSolver — proving the seam wiring; the live smoke commits
-the ``.plain`` companion that will pin the byte-exact decrypted JSON.
+The Comix browser-evaluated cipher (``comix-v1``, D-45) was removed in issue
+#46 — no live source registers a scheme today, so these tests exercise the
+seam shape via synthetic ``echo`` / ``aecho`` schemes that future sources will
+follow.
 """
 
 from __future__ import annotations
@@ -28,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from manga_gateway.framework import decrypt as decrypt_mod
-from manga_gateway.framework.decrypt import DecryptError, decrypt, register_scheme
+from manga_gateway.framework.decrypt import decrypt, register_scheme
 
 
 @pytest.fixture(autouse=True)
@@ -91,74 +87,10 @@ async def test_unknown_scheme_raises_not_silent_passthrough() -> None:
         await decrypt("nope", b"cipher", {})
 
 
-# ─────────────────────── comix-v1 (D-45 browser-evaluated) ───────────────────
-
-
-_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "comix"
-_REAL_CIPHERTEXT = _FIXTURE_DIR / "chapter_9001596.bin"
-
-
-class _FakeSolver:
-    """Captures the ciphertext handed to ``decrypt`` and returns canned plaintext."""
-
-    def __init__(self, plaintext: bytes) -> None:
-        self.plaintext = plaintext
-        self.received: list[bytes] = []
-
-    async def decrypt(self, ciphertext: bytes) -> bytes:
-        self.received.append(ciphertext)
-        return self.plaintext
-
-
-def test_comix_v1_scheme_is_registered() -> None:
-    assert "comix-v1" in decrypt_mod._SCHEMES
-
-
-@pytest.mark.asyncio
-async def test_comix_v1_requires_solver_in_config() -> None:
-    """D-45: comix-v1 delegates to ``solver.decrypt`` — a missing solver is a
-    framework wiring bug, not silently ignored."""
-    with pytest.raises(DecryptError):
-        await decrypt("comix-v1", b"cipher", {})
-
-
-@pytest.mark.asyncio
-async def test_comix_v1_delegates_to_solver_decrypt() -> None:
-    fake = _FakeSolver(plaintext=b'{"pages":["a","b"]}')
-    out = await decrypt("comix-v1", b"ciphertext", {"solver": fake})
-    assert out == b'{"pages":["a","b"]}'
-    assert fake.received == [b"ciphertext"]
-
-
-@pytest.mark.asyncio
-async def test_comix_v1_decrypt_real_ciphertext() -> None:
-    """D-44: feed the committed real ciphertext envelope through the comix-v1 seam
-    via a FakeSolver. Proves the seam wiring is correct; the live smoke commits a
-    ``.plain`` companion in a follow-up that pins the byte-exact decrypted JSON.
-
-    The stub plaintext mirrors the 12 image URLs observed in the rendered DOM
-    after decryption (CONTEXT.md live_recon) so this test also documents the
-    expected plaintext shape the live smoke will verify against.
-    """
-    ciphertext = _REAL_CIPHERTEXT.read_bytes()
-    assert ciphertext  # fixture committed
-    observed_urls = [
-        f"https://jloo.wowpic3.store/si/bEqPbYfoPT0GmlnlAkqfoBJE4oENYsQ/{n:02d}.webp"
-        for n in (1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17)
-    ]
-    import json as _json
-
-    stub_plain = _json.dumps({"pages": observed_urls}).encode("utf-8")
-    fake = _FakeSolver(plaintext=stub_plain)
-    out = await decrypt("comix-v1", ciphertext, {"solver": fake})
-    assert out == stub_plain
-    # The solver received the ciphertext envelope verbatim — no pre-processing.
-    assert fake.received == [ciphertext]
-
-
 # ─────────── plaintext-fixture regression: do NOT route plaintext through decrypt
 
 
+_FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "comix"
 _CHAPTER_INDEXES = _FIXTURE_DIR / "manga_mr3m0_chapter_indexes.json"
 _SEARCH_FIXTURE = _FIXTURE_DIR / "search_the_forgotten_field.json"
 

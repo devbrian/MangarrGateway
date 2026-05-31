@@ -8,7 +8,6 @@ advertises in ``GET /caps``:
 * ``idTypes == []`` (title-search fallback, SRCH-07).
 * ``rateLimitPerMinute == 10`` (CLAUDE.md "Comix ~10").
 * ``languages == ["en"]``.
-* ``decrypt_scheme == "comix-v1"`` on the class (the D-39 seam ComixSource declares).
 
 No network, no browser — the caps document is built from the registry's declarative
 class attributes (the reusability proof: a new cloudflare+encrypted source is just a
@@ -23,10 +22,12 @@ import pytest
 from manga_gateway.sources.comix import ComixSource
 
 
-def test_comix_class_declares_encrypted_antibot_and_scheme() -> None:
-    # criterion #1: declarative subclass — antibot level + decrypt scheme are attrs.
+def test_comix_class_declares_encrypted_antibot() -> None:
+    # criterion #1: declarative subclass — antibot level + identity attrs.
     assert ComixSource.antibot == "cloudflare+encrypted"
-    assert ComixSource.decrypt_scheme == "comix-v1"
+    # decrypt_scheme is inherited as None — Comix's live read path is browser-DOM
+    # + plaintext httpx and never reaches framework.decrypt (issue #46 Option A).
+    assert ComixSource.decrypt_scheme is None
     assert ComixSource.key == "comix"
     assert ComixSource.id_types == []  # title-search fallback (SRCH-07)
     assert ComixSource.languages == ["en"]

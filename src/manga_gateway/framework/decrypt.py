@@ -1,4 +1,4 @@
-"""Scheme-dispatch decrypt registry (D-39, async since 04-04 D-45).
+"""Scheme-dispatch decrypt registry (D-39, async since 04-04).
 
 The encrypted-response seam every source plugs into. Mirrors ``registry.py``'s
 decorator-based registration and the job engine's key-dispatch-with-default idiom
