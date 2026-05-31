@@ -40,7 +40,19 @@ packages = ["src/manga_gateway"]
 src = ["src", "tests"]
 target-version = "py312"
 # Throwaway recon scripts are not gated (one-shot live-tooling, not shipped code).
-extend-exclude = ["scripts"]
+# ``.planning/spikes`` is the same: archived spike artifacts (probes, isolated
+# resolvers, live-demo scripts) preserved for traceability after their findings
+# are lifted into production code (issue #42 was lifted from
+# ``.planning/spikes/002-comix-deferred-chapter-id-resolution`` into
+# ``src/manga_gateway/sources/comix.py`` + ``tests/test_comix_recent.py``).
+extend-exclude = [
+    "scripts",
+    ".planning/spikes",
+    # Spike-finding skill bundles a verbatim copy of the spike sources under
+    # ``.claude/skills/.../sources/`` for traceability (the production lift
+    # lives in ``src/`` + ``tests/``). Same throwaway recon classification.
+    ".claude/skills",
+]
 
 [tool.ruff.lint]
 # F=pyflakes, E=pycodestyle, I=isort, UP=pyupgrade, B=bugbear,

@@ -1,7 +1,5 @@
-"""Unit tests for Comix issues #30 (publishDate) and #31 (supportsRecent).
-
-Two narrow regressions surfaced by the Phase 5 first live-smoke run
-(2026-05-30) and fixed in branch ``fix/comix-publishdate-recent``:
+"""Unit tests for Comix issue #30 (publishDate) and the flipped issue-#31
+capability (now superseded by issue #42).
 
 * **#30** — ``Release.publishDate`` came out as the empty string because the
   Comix chapter-list DOM does NOT expose a machine-readable absolute
@@ -11,10 +9,13 @@ Two narrow regressions surfaced by the Phase 5 first live-smoke run
   tests pin the parser against the live-recon-observed string forms and
   verify ``_to_release`` populates ``publish_date`` from the relative form
   when no absolute timestamp is present.
-* **#31** — ``/recent`` silently returned an empty array because Comix has
-  no public all-recent-chapters feed. The fix declares
-  ``ComixSource.supports_recent = False`` so ``/caps`` advertises the gap
-  honestly. These tests pin the class attribute and the ``/caps`` payload.
+* **#31 was superseded by issue #42 (2026-05-31)** — Comix now exposes a
+  plaintext recent feed with deferred chapter-id resolution; see
+  ``tests/test_comix_recent.py`` for the flipped-capability tests. The
+  ``/caps`` payload assertion in this file flipped from ``False`` to
+  ``True``; the previous "empty recent array" assertion was deleted (the
+  shape test in ``test_comix_recent.py`` covers the non-empty case
+  authoritatively).
 
 No network, no browser — all assertions are deterministic against the
 declarative class and the pure parser. The unit-test ``client`` fixture
@@ -255,47 +256,32 @@ def test_to_release_carries_required_REL01_fields_with_relative_date() -> None:
     assert release.scanlation_group == "Thunderscans"
 
 
-# ─────────────────────── Issue #31: supports_recent = False ──────────────────
-
-
-def test_comix_declares_supports_recent_false() -> None:
-    """ComixSource MUST advertise ``supports_recent = False`` so ``/caps``
-    callers can branch on the field instead of guessing from an empty array."""
-    assert ComixSource.supports_recent is False
+# ───────── Issue #42 (was #31): supports_recent flipped to True ─────────────
 
 
 @pytest.mark.asyncio
-async def test_caps_route_reports_comix_supports_recent_false(
+async def test_caps_route_reports_comix_supports_recent_true(
     client: httpx.AsyncClient,
 ) -> None:
-    """``GET /caps`` surfaces ``supportsRecent: false`` for Comix (Issue #31).
+    """``GET /caps`` surfaces ``supportsRecent: true`` for Comix (Issue #42).
 
-    The contract requires this field (openapi.yaml: SourceCap.required
-    includes ``supportsRecent``), so the field is always present; the
-    value is what changed from ``true`` (the framework default) to ``false``.
+    Issue #31 declared the capability ``False`` because the only known recipe
+    was the N+1 per-followed-series drill-down. Issue #42 unblocks the cheap
+    path: a single plaintext ``/api/v1/manga?order[chapter_updated_at]=desc``
+    call with deferred chapter-id resolution (one extra browser nav per
+    first-time download of a recent Release, not per /recent poll). The
+    ``recent()`` body now returns real Releases; ``/caps`` reflects the
+    capability flip.
+
+    The unit-level assertion (``test_comix_declares_supports_recent_true``)
+    lives in ``tests/test_comix_recent.py``; this is the route-level cap.
     """
     resp = await client.get("/caps")
     assert resp.status_code == 200
     sources = resp.json()["sources"]
     comix = next((s for s in sources if s["key"] == "comix"), None)
     assert comix is not None, "comix not advertised in /caps"
-    assert comix["supportsRecent"] is False, (
-        f"comix must advertise supportsRecent=false (Issue #31); got "
+    assert comix["supportsRecent"] is True, (
+        f"comix must advertise supportsRecent=true (Issue #42); got "
         f"{comix['supportsRecent']!r}. Full cap: {comix}"
     )
-
-
-@pytest.mark.asyncio
-async def test_recent_route_returns_empty_array_for_comix(
-    client: httpx.AsyncClient,
-) -> None:
-    """``GET /recent?sources=comix`` returns an empty releases array honestly
-    (Issue #31). The empty array + ``supportsRecent: false`` in /caps is the
-    spec-conformant outcome; the per-source isolation guarantees a 200."""
-    resp = await client.get("/recent", params={"sources": "comix", "limit": "5"})
-    assert resp.status_code == 200
-    payload = resp.json()
-    assert payload.get("releases") == []
-    # No warning either — an unsupported recent feed is an advertised gap,
-    # not a per-call failure. Clients should branch on /caps.supportsRecent.
-    assert payload.get("warnings") == []
