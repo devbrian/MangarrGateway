@@ -86,6 +86,18 @@ class Settings(BaseSettings):
     cloudflare_solve_concurrency: int = Field(
         default=1, ge=1
     )  # D-33/Pattern 7: solve cap; default 1 collapses to single-flight
+    # Bound on concurrent ``fetch_via_browser`` calls within a single
+    # CloudflareSolver instance — replaces the historic Lock-style
+    # serialization (PR #58). Sized to accommodate the largest known
+    # per-call fan-out: Comix /search may issue up to 5 parallel
+    # _series_chapters() browser navs (one per series candidate, see
+    # ``ComixSource._DEFAULT_SERIES_CANDIDATES``). Bumping that constant
+    # without lifting this knob would silently re-serialize work — so
+    # this field is the documented expand point. Pitfall 6 (minimize
+    # fingerprinting events) still applies — anything above ~8-10 is
+    # likely to look bot-shaped on Cloudflare's encrypted tier; raise
+    # cautiously.
+    cloudflare_fetch_concurrency: int = Field(default=5, ge=1)
     cloudflare_headless: bool = True  # Open Q2: run the stealth browser headless
     # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at
     # the use site (Plan 04), NOT under output_root (T-04-03 — never logged).

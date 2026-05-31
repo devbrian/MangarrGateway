@@ -618,6 +618,42 @@ async def test_fetch_via_browser_bounded_semaphore_caps_burst_beyond_limit() -> 
     await solver.aclose()
 
 
+async def test_fetch_via_browser_concurrency_kwarg_caps_semaphore() -> None:
+    """``CloudflareSolver(fetch_concurrency=N)`` sizes the internal Semaphore
+    to N, overriding the default 5. Critical because the production wiring
+    drives the kwarg from ``Settings.cloudflare_fetch_concurrency`` (PR #58
+    follow-up) — if this binding regresses, an ops bump of the env var
+    silently does nothing."""
+    burst_size = 6
+    pages = [_FakeFetchPage(evaluate_result=i) for i in range(burst_size)]
+    ctx = _FetchContext(pages)
+
+    async def _launch() -> _FetchContext:
+        return ctx
+
+    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+        return Clearance(cookies={}, user_agent="ua")
+
+    lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
+    solver = CloudflareSolver(lifecycle=lc, fetch_concurrency=2)
+
+    # The plumbed value MUST land on the Semaphore — anything else is a
+    # silent regression of the ops-knob contract.
+    assert solver._browser_concurrency == 2  # type: ignore[attr-defined]
+
+    results = await asyncio.gather(
+        *(
+            solver.fetch_via_browser(f"https://x/{i}", extract=f"return {i};")
+            for i in range(burst_size)
+        )
+    )
+    assert results == list(range(burst_size))
+    # And the Semaphore actually bounds the in-flight count, not just the
+    # stored attribute — the tighter cap is observable end-to-end.
+    assert ctx.shared_concurrency.max_in_flight <= 2
+    await solver.aclose()
+
+
 async def test_fetch_via_browser_context_failure_raises_browser_fetch_error() -> None:
     """If the warm context cannot be acquired (e.g. a launch failure), the
     primitive surfaces a BrowserFetchError rather than leaking the underlying

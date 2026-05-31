@@ -166,6 +166,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "user_data_dir": settings.cloudflare_user_data_dir,
         "headless": settings.cloudflare_headless,
         "solve_concurrency": settings.cloudflare_solve_concurrency,
+        # PR #58 follow-up: per-source-shape concurrency cap for the warm
+        # browser. Defaults to 5 to match the Comix /search candidate
+        # ceiling; raise via GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY when
+        # adding a source whose fan-out exceeds that (Pitfall 6 caveat
+        # applies — see config field comment).
+        "fetch_concurrency": settings.cloudflare_fetch_concurrency,
         "cloudflare_keys": cloudflare_keys,
         # #35 / #40: select the stealth-browser engine (camoufox default
         # everywhere — dev + CI + prod — so Firefox-only failure modes like

@@ -275,6 +275,7 @@ class CloudflareSolver:
         user_data_dir: str = "cloudflare-userdata",
         headless: bool = True,
         solve_concurrency: int = 1,
+        fetch_concurrency: int = 5,
         recycle_seconds: float | None = None,
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         cloudflare_keys: Iterable[str] = (),
@@ -319,13 +320,20 @@ class CloudflareSolver:
         # A bounded ``Semaphore`` is the right tradeoff: humans browse
         # with multiple tabs open routinely, the warm persistent-context's
         # driver multiplexes pages cleanly, and a small cap still keeps
-        # the simultaneous-fingerprint footprint modest. The default cap
-        # matches the search candidate ceiling (``_DEFAULT_SERIES_CANDIDATES``
-        # = 5) so the typical search fan-out runs fully in parallel; the
-        # interactive 15-candidate path still gets 5-way parallelism (the
-        # remaining 10 queue behind the slots, capping wall-clock at
-        # 3 × max(per-nav)).
-        self._browser_concurrency = 5
+        # the simultaneous-fingerprint footprint modest.
+        #
+        # Cap is configurable via ``fetch_concurrency`` (default 5, matches
+        # the historical Comix search candidate ceiling
+        # ``_DEFAULT_SERIES_CANDIDATES``). Driven from
+        # ``Settings.cloudflare_fetch_concurrency`` in production wiring
+        # so an ops bump doesn't require touching framework code. The
+        # default-5 lets the typical /search fan-out run fully in
+        # parallel; the interactive 15-candidate path still gets 5-way
+        # parallelism (the remaining 10 queue, capping wall-clock at
+        # 3 × max(per-nav)). Raising above ~8-10 starts to look bot-shaped
+        # on Cloudflare's encrypted tier — see the config field's comment
+        # for the Pitfall 6 caveat.
+        self._browser_concurrency = fetch_concurrency
         self._browser_lock: asyncio.Semaphore = asyncio.Semaphore(
             self._browser_concurrency
         )
