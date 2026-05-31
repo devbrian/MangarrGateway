@@ -1,15 +1,16 @@
-"""Anti-bot engine selector tests (#35).
+"""Anti-bot engine selector tests (#35 / #40).
 
-The ``CloudflareSolver`` engine seam is a config flip — ``engine="patchright"``
-(default) wires the Patchright launch closure; ``engine="camoufox"`` wires the
-Camoufox closure. Both back the SAME ``BrowserLifecycle`` (orthogonal to the
-cache/single-flight logic). These tests assert the selector — they do NOT
-launch a real browser (D-42 — the deterministic gate never imports either
-browser binary).
+The ``CloudflareSolver`` engine seam is a config flip — ``engine="camoufox"``
+(default since #40) wires the Camoufox launch closure; ``engine="patchright"``
+wires the Patchright closure as an opt-in escalation. Both back the SAME
+``BrowserLifecycle`` (orthogonal to the cache/single-flight logic). These
+tests assert the selector — they do NOT launch a real browser (D-42 — the
+deterministic gate never imports either browser binary).
 
 The Settings → solver wiring is also covered: ``Settings.cloudflare_engine``
-defaults to ``"patchright"`` and ``GATEWAY_CLOUDFLARE_ENGINE=camoufox`` flips
-it. This is what the nightly-live-smoke workflow uses on ubuntu-latest.
+defaults to ``"camoufox"`` (since #40 — dev mirrors prod so Firefox-only
+failure modes like issue #54 surface in local repro). The opt-in path is
+``GATEWAY_CLOUDFLARE_ENGINE=patchright``.
 """
 
 from __future__ import annotations
@@ -30,32 +31,35 @@ def _settings(**over: object) -> Settings:
 # ──────────────────────── Settings.cloudflare_engine ────────────────────────
 
 
-def test_settings_default_engine_is_patchright(
+def test_settings_default_engine_is_camoufox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default (dev/Windows) — Patchright is the engine.
+    """Default (dev/CI/prod) — Camoufox is the engine (#40 single default).
 
-    Hermetic against an ambient ``GATEWAY_CLOUDFLARE_ENGINE`` (e.g. the
-    nightly-live-smoke workflow sets it to ``camoufox``).
+    Hermetic against an ambient ``GATEWAY_CLOUDFLARE_ENGINE`` (the workflow
+    still sets it explicitly as belt-and-braces documentation, but the
+    default no longer needs CI to override it).
     """
     monkeypatch.delenv("GATEWAY_CLOUDFLARE_ENGINE", raising=False)
-    assert _settings().cloudflare_engine == "patchright"
-
-
-def test_settings_engine_env_override_camoufox(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CI flips ``GATEWAY_CLOUDFLARE_ENGINE=camoufox`` per #35."""
-    monkeypatch.setenv("GATEWAY_CLOUDFLARE_ENGINE", "camoufox")
     assert _settings().cloudflare_engine == "camoufox"
 
 
-def test_settings_engine_env_override_patchright_explicit(
+def test_settings_engine_env_override_patchright(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An explicit ``patchright`` env value is also accepted."""
+    """``GATEWAY_CLOUDFLARE_ENGINE=patchright`` opts into the Chromium escalation
+    (#40 — Patchright is opt-in only since the dev/prod engine unification)."""
     monkeypatch.setenv("GATEWAY_CLOUDFLARE_ENGINE", "patchright")
     assert _settings().cloudflare_engine == "patchright"
+
+
+def test_settings_engine_env_override_camoufox_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``camoufox`` env value is also accepted (matches the
+    default; verifies the env override path itself, not just the absence)."""
+    monkeypatch.setenv("GATEWAY_CLOUDFLARE_ENGINE", "camoufox")
+    assert _settings().cloudflare_engine == "camoufox"
 
 
 def test_settings_engine_rejects_unknown_value(
@@ -70,24 +74,26 @@ def test_settings_engine_rejects_unknown_value(
 # ──────────────────────── CloudflareSolver(engine=...) ────────────────────────
 
 
-def test_solver_default_engine_wires_patchright_launch() -> None:
-    """Default — the lifecycle's launch closure points at the Patchright path.
+def test_solver_default_engine_wires_camoufox_launch() -> None:
+    """Default — the lifecycle's launch closure points at the Camoufox path
+    (#40 — Camoufox is the single dev/CI/prod default).
 
-    We do NOT call it (that would import patchright + start a browser) — we just
+    We do NOT call it (that would import camoufox + start a browser) — we just
     assert the right bound method was wired in. Asserts the property is exposed
     on the solver too, so tests / observability can read the engine choice.
     """
     solver = CloudflareSolver()
-    assert solver.engine == "patchright"
-    # The launch closure on the lifecycle is the patchright bound method.
+    assert solver.engine == "camoufox"
+    # The launch closure on the lifecycle is the camoufox bound method.
     assert (
         solver._lifecycle._launch  # type: ignore[attr-defined]
-        == solver._launch_patchright_context  # type: ignore[attr-defined]
+        == solver._launch_camoufox_context  # type: ignore[attr-defined]
     )
 
 
-def test_solver_engine_camoufox_wires_camoufox_launch() -> None:
-    """``engine="camoufox"`` wires the Camoufox launch closure (#35 CI escalation)."""
+def test_solver_engine_camoufox_explicit_wires_camoufox_launch() -> None:
+    """``engine="camoufox"`` (explicit) wires the Camoufox launch closure —
+    matches the default; verifies the explicit-arg path itself."""
     solver = CloudflareSolver(engine="camoufox")
     assert solver.engine == "camoufox"
     assert (
@@ -96,8 +102,9 @@ def test_solver_engine_camoufox_wires_camoufox_launch() -> None:
     )
 
 
-def test_solver_engine_explicit_patchright_wires_patchright_launch() -> None:
-    """``engine="patchright"`` (explicit) wires the Patchright launch closure."""
+def test_solver_engine_patchright_wires_patchright_launch() -> None:
+    """``engine="patchright"`` wires the Patchright launch closure (#40 opt-in
+    escalation)."""
     solver = CloudflareSolver(engine="patchright")
     assert solver.engine == "patchright"
     assert (
