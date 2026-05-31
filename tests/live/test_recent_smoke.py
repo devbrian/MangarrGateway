@@ -9,11 +9,24 @@ via schemathesis (D-54).
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from ._helpers import check_response_conforms, live_client_for
 from .conftest import REGISTERED_KEYS
 from .profiles._base import LiveSmokeProfile
+
+
+def _parse_rfc3339(value: str) -> datetime:
+    """Parse an RFC 3339 / ISO 8601 date-time as a timezone-aware ``datetime``.
+
+    ``datetime.fromisoformat`` accepts trailing ``Z`` from Python 3.11+, but
+    we substitute ``+00:00`` so the parser works the same way on older
+    fallback paths and the substitution is explicit at the call site.
+    """
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
 
 pytestmark = [
     pytest.mark.live,
@@ -53,10 +66,14 @@ async def test_recent_returns_newest_first(
                 f"{source_key}: /recent missing publishDate on first two "
                 f"releases: {releases[:2]}"
             )
-            # publishDate is RFC 3339 — lexicographic compare is correct
-            # ordering for ISO 8601 / RFC 3339 strings (date-time format
-            # is fixed-width and uses UTC offset).
-            assert first >= second, (
+            # publishDate is RFC 3339. Lexicographic compare is correct only
+            # when every source emits the same fixed-width UTC representation;
+            # the OpenAPI contract just pins ``format: date-time``, so a
+            # source emitting e.g. ``2026-05-30T08:00:00-04:00`` and another
+            # emitting ``2026-05-30T12:00:00+00:00`` (same instant) would
+            # mis-order under string compare. Parse to timezone-aware
+            # datetimes first (CodeRabbit PR #33 review).
+            assert _parse_rfc3339(first) >= _parse_rfc3339(second), (
                 f"{source_key}: /recent not newest-first — "
                 f"first={first!r} second={second!r}"
             )

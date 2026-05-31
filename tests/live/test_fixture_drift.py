@@ -116,6 +116,17 @@ async def test_fixture_drift(
             expected_set: set[Any] = set(expected)
             missing = expected_set - captured_set
             extra = captured_set - expected_set
+            # D-60 / Pitfall 6: set-equality alone misses duplicate-count
+            # drift. The docstring above promises "set-equality AND length
+            # parity" — assert length parity first so a multiplicity change
+            # (e.g. fixture has [A, B, B], capture has [A, A, B]) surfaces
+            # as a clear count diff, not a silently-equal set
+            # (CodeRabbit PR #33 review).
+            assert len(captured) == len(expected), (
+                f"D-60 drift on {fixture_path.name} ({source_key}): "
+                f"URL multiplicity changed — captured {len(captured)} URLs, "
+                f"fixture has {len(expected)}"
+            )
             assert captured_set == expected_set, (
                 f"D-60 drift on {fixture_path.name} ({source_key}): "
                 f"missing={sorted(missing)!r} extra={sorted(extra)!r} "

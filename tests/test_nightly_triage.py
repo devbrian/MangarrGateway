@@ -58,9 +58,7 @@ def test_parse_junit_mixed() -> None:
         f"passing mangadex testcase leaked into tests[]: "
         f"{per_source['mangadex']['tests']!r}"
     )
-    assert per_source["comix"]["tests"], (
-        "failing comix testcase missing from tests[]"
-    )
+    assert per_source["comix"]["tests"], "failing comix testcase missing from tests[]"
 
 
 def test_parse_junit_perf_classname_bucketing() -> None:

@@ -77,6 +77,7 @@ def check_response_conforms(
     )
     response_schema_conformance(ctx, s_response, case)
 
+
 # One canonical test-only API key for all parametrized live tests. The literal
 # self-advertises as non-prod so a leaked log line cannot be confused with a
 # real secret (Phase 5 RESEARCH Security Domain).
