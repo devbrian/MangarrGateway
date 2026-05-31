@@ -40,3 +40,8 @@ tests/fixtures/comix/CAPTURE_NOTES.txt
 # snapshots used to pin RESEARCH Open Q1/Q3 and the D-44 cipher pair. Never committed.
 _recon_out/
 _e2e_out/
+
+# Nightly live-smoke JUnit artifact written by `uv run nox -s live` (Phase 5
+# D-63). Transient — uploaded as a CI artifact in the nightly workflow, never
+# committed.
+junit.xml
