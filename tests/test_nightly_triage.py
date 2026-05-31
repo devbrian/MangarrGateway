@@ -51,6 +51,16 @@ def test_parse_junit_mixed() -> None:
     assert per_source["mangadex"]["pass"] == 1
     assert per_source["comix"]["fail"] > 0
     assert per_source["comix"]["pass"] == 0
+    # Regression: bucket["tests"] feeds _format_body's "Failing tests in
+    # this bucket" — passing testcases must NOT appear there
+    # (CodeRabbit PR #33 review).
+    assert per_source["mangadex"]["tests"] == [], (
+        f"passing mangadex testcase leaked into tests[]: "
+        f"{per_source['mangadex']['tests']!r}"
+    )
+    assert per_source["comix"]["tests"], (
+        "failing comix testcase missing from tests[]"
+    )
 
 
 def test_parse_junit_perf_classname_bucketing() -> None:

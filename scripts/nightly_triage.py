@@ -41,6 +41,12 @@ PARAM_RE = re.compile(r"\[([^\]]+)\]$")
 # but a strict character class rules out any surprises in URLs/labels.
 _SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+# Bound every ``gh`` subprocess call so a stalled CLI (network/API/runner
+# hiccup) can't hang the entire nightly job (CodeRabbit PR #33 review).
+# 30s is well above gh's typical sub-second latency, while keeping the
+# nightly's total triage budget below 5 min even if every call timed out.
+GH_TIMEOUT_SECONDS = 30
+
 
 def parse_junit(path: Path) -> dict[str, dict[str, Any]]:
     """Parse a pytest JUnit XML report and bucket testcases by source_key.
@@ -77,8 +83,11 @@ def parse_junit(path: Path) -> dict[str, dict[str, Any]]:
             continue
         failed = tc.find("failure") is not None or tc.find("error") is not None
         bucket = per_source[source_key]
-        bucket["tests"].append(name)
         if failed:
+            # ``bucket["tests"]`` is consumed by ``_format_body`` under the
+            # "Failing tests in this bucket" heading — only failing testcase
+            # names belong here (CodeRabbit PR #33 review).
+            bucket["tests"].append(name)
             bucket["fail"] += 1
         else:
             bucket["pass"] += 1
@@ -127,6 +136,7 @@ def _ensure_label(source_key: str) -> None:
             "Per-source nightly bucket",
         ],
         check=False,
+        timeout=GH_TIMEOUT_SECONDS,
     )
 
 
@@ -154,7 +164,8 @@ def upsert_sticky_issue(source_key: str, body: str, run_url: str) -> None:
             "open",
             "--json",
             "number,title",
-        ]
+        ],
+        timeout=GH_TIMEOUT_SECONDS,
     )
     existing = json.loads(out or b"[]")
     if existing:
@@ -169,6 +180,7 @@ def upsert_sticky_issue(source_key: str, body: str, run_url: str) -> None:
                 f"{run_url}\n\n{body}",
             ],
             check=True,
+            timeout=GH_TIMEOUT_SECONDS,
         )
     else:
         subprocess.run(
@@ -186,6 +198,7 @@ def upsert_sticky_issue(source_key: str, body: str, run_url: str) -> None:
                 "nightly-failure",
             ],
             check=True,
+            timeout=GH_TIMEOUT_SECONDS,
         )
 
 
@@ -205,7 +218,8 @@ def close_if_open(source_key: str, run_url: str) -> None:
             "open",
             "--json",
             "number",
-        ]
+        ],
+        timeout=GH_TIMEOUT_SECONDS,
     )
     for issue in json.loads(out or b"[]"):
         subprocess.run(
@@ -218,6 +232,7 @@ def close_if_open(source_key: str, run_url: str) -> None:
                 f"Live smoke passing again — auto-closed.\n\n{run_url}",
             ],
             check=True,
+            timeout=GH_TIMEOUT_SECONDS,
         )
 
 
