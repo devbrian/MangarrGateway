@@ -1,4 +1,4 @@
-"""Comix multi-chapter perf — sequential-download regression guard (#45 retune).
+"""Comix multi-chapter perf — sequential-download regression guard (#45).
 
 **History note.** This file was added during issue #23 to validate the
 persistent-reader-page warm-call hypothesis (second+ chapters skipping
@@ -6,51 +6,48 @@ bundle parse + Swiper init + encrypted ``/api/v1/chapters/{id}`` fetch
 ~3-3.5s/call). The hypothesis was empirically refuted by this very test
 on its first live run — ``page.goto(new_url)`` resets the JS execution
 context regardless of page reuse, so the "warm bundle" benefit across
-navigations does not exist. See ``.planning/debug/comix-warm-page-no-speedup.md``.
-Issue #23 was abandoned without merging; the persistent reader page is
-not on main. This file was kept (cherry-picked to main as commit 9adb3ab)
-as a multi-chapter regression guard for cold-path sequential downloads.
+navigations does not exist (see
+``.planning/debug/comix-warm-page-no-speedup.md``). Issue #23 was
+abandoned without merging; there is no per-page warmth in the gateway.
 
-**#45 retune (2026-05-31).** After the two-scroll inner-Swiper page-walk
-rewrite (#45) the budgets here were retuned to the empirically-observed
-post-#45 values. The "warm should be faster than cold" assertion was
-dropped because the underlying hypothesis (the warm-page win) was dead;
-replaced with a **per-page-normalized** regression guard that catches a
-real failure mode (warm-call cost-per-page diverging from cold-call
-cost-per-page) without baking in the dead hypothesis.
+The "cold vs warm" framing was vestigial after that and was removed in
+the #45 cleanup. The persistent ``BrowserLifecycle`` context still
+holds cf_clearance / HTTP cache / cookies — but it does so for EVERY
+chapter call, not just the second+ ones. Each chapter download opens a
+fresh page (``ctx.new_page()`` in ``fetch_via_browser``); there is no
+position-dependent perf characteristic, only a chapter-size-dependent
+one.
 
 What the test asserts now:
 
-* every chapter completes;
-* the FIRST chapter (cold first-call after ``warm()``) lands under the
-  cold budget (default 15.5 s — aligned with ``test_comix_perf_live.py``);
-* every SUBSEQUENT chapter (the warm calls) lands under the warm budget
-  (default 18.0 s — derived from post-#45 ``warm_max`` measurement with
-  ~18 % headroom);
-* per-page wall-clock for warm calls stays close to the cold call's
-  per-page wall-clock (``warm_per_page_avg ≤ cold_per_page × 1.30``) so
-  a regression in the warm path that adds per-page overhead is caught.
+* every chapter completes successfully;
+* every chapter lands under ``_DEFAULT_PER_CHAPTER_BUDGET_SECONDS``
+  regardless of position (default 18.0 s — sized to accommodate the
+  largest chapters observed in practice; smaller chapters land well
+  under this);
+* per-page wall-clock for chapters 2..N stays close to the first
+  chapter's per-page wall-clock (``later_per_page_avg ≤ first_per_page
+  × 1.30``) — catches a state-leak regression where the solver gets
+  cumulatively slower per page across N downloads.
 
 Like the rest of ``tests/live/``, this test:
 
 * is marked ``@pytest.mark.live`` so the nox gate excludes it
   (``-m 'not live'`` in pyproject.toml);
-* awaits ``solver.warm()`` explicitly before timing anything so the cold
-  first call covers the post-warm() download path, not the initial
-  Cloudflare solve;
-* is path-agnostic (``tmp_path``) and env-knob-driven so a future nightly
-  job reuses it unchanged.
+* awaits ``solver.warm()`` explicitly before timing anything so the
+  measured wall-clocks cover the post-warm() download path, not the
+  initial Cloudflare solve;
+* is path-agnostic (``tmp_path``) and env-knob-driven so a future
+  nightly job reuses it unchanged.
 
 Knobs:
 
-* ``COMIX_PERF_QUERY`` — search query (default: "Forgotten Field", same as
-  ``test_comix_perf_live.py``).
+* ``COMIX_PERF_QUERY`` — search query (default: "Forgotten Field",
+  same as ``test_comix_perf_live.py``).
 * ``COMIX_PERF_MULTI_CHAPTERS`` — chapter count to download serially
-  (default 3 — first cold + two warm; raise for stronger averaging).
-* ``COMIX_PERF_COLD_BUDGET_SECONDS`` — wall-clock budget for the first
-  (cold) chapter (default 15.5; aligned with the single-submit guard).
-* ``COMIX_PERF_WARM_BUDGET_SECONDS`` — wall-clock budget per subsequent
-  (warm) chapter (default 18.0; warm_max post-#45 + ~18 % headroom).
+  (default 3 — first + two more; raise for stronger averaging).
+* ``COMIX_PERF_PER_CHAPTER_BUDGET_SECONDS`` — wall-clock budget per
+  chapter (default 18.0; sized for the largest chapter we've seen).
 """
 
 from __future__ import annotations
@@ -73,40 +70,38 @@ pytestmark = pytest.mark.live  # excluded from the gate
 _DEFAULT_QUERY = "Forgotten Field"
 _TEST_API_KEY = "test-perf-comix-multi-key-DO-NOT-LOG-IN-PROD"
 
-# Cold first-call budget — aligned with test_comix_perf_live.py so a
-# single source of regression-budget truth applies to the cold path.
-# Issue #45 (2026-05-31): tightened from 14.0 to 15.5 to match the
-# post-rewrite single-submit guard; the multi-chapter cold call IS the
-# same operation as the single-submit cold call.
-_DEFAULT_COLD_BUDGET_SECONDS = 15.5
+# Per-chapter budget — applied uniformly to every chapter in the run
+# regardless of position. Post-#45 measurements: 10-page chapter
+# ~11.4 s, 15-page chapter ~15.3 s. 18.0 sits ~18 % above the largest
+# observed wall-clock and well below the 60 s outer poll budget.
+# Issue #45 (2026-05-31): replaces the dead "cold 14.0 / warm 5.0" pair
+# from the issue #23 design. Position-dependent budgets were a vestige
+# of the persistent-reader-page hypothesis — there is no perf
+# difference between chapter 1 and chapter N in the current gateway,
+# only between SMALLER and LARGER chapters. One budget for any chapter,
+# sized to the largest case, removes flakiness driven by search-result
+# ordering (a 15-page chapter happening to land in position 1 would
+# have broken the old tight cold budget).
+_DEFAULT_PER_CHAPTER_BUDGET_SECONDS = 18.0
 
-# Warm per-call budget — derived from post-#45 ``warm_max`` measurement
-# (15.21 s on a 15-page chapter) + ~18 % CI-variance headroom = 18.0.
-# Issue #45 (2026-05-31): retuned from 5.0 to 18.0. The 5.0 figure was
-# the issue #23 acceptance target, but that target was set against a
-# warm-page-reuse hypothesis the very test refuted on first live run
-# (see `.planning/debug/comix-warm-page-no-speedup.md`). #23 was
-# abandoned without merging; this budget now reflects the actual cost
-# of the cold-path per-chapter download repeated against the same warm
-# solver.
-_DEFAULT_WARM_BUDGET_SECONDS = 18.0
-
-# Per-page-normalized regression guard. cold_per_page = cold_wall /
-# cold_pages; warm_per_page_avg = mean(warm_wall / warm_pages). The
-# assertion `warm_per_page_avg <= cold_per_page * _WARM_PER_PAGE_CEIL`
-# catches a regression where the warm path inexplicably gets MORE
-# expensive per page than the cold path (e.g. a new caching bug
-# slowing every warm call). Post-#45 baseline: cold 11.40 / 10 = 1.14
-# s/page; warm avg ~ (15.21/15 + 13.05/10)/2 = 1.16 s/page — so warm
-# costs ~1.02 × cold per page. 1.30 leaves CI-variance headroom while
-# catching a real regression (~30 % per-page slowdown).
-_WARM_PER_PAGE_CEIL = 1.30
+# Per-page drift guard. ``first_per_page = first_wall / first_pages`` is
+# the baseline; ``later_per_page_avg = mean(wall / pages for chapters
+# 2..N)``. The assertion ``later_per_page_avg ≤ first_per_page *
+# _SUBSEQUENT_PER_PAGE_CEIL`` catches a state-leak regression where
+# chapters AFTER the first start costing more per page than the first
+# did (a real failure mode — solver state corruption, leaked browser
+# resources, etc.). Post-#45 baseline: first 11.46/10 = 1.15 s/page;
+# later avg (15.31/15 + 11.38/10)/2 = 1.08 s/page — so later costs
+# ~0.94 × first per page. 1.30 leaves CI-variance headroom while
+# catching a ~30 % per-page slowdown.
+_SUBSEQUENT_PER_PAGE_CEIL = 1.30
 
 _DEFAULT_CHAPTERS = 3
-_MIN_CHAPTERS = 2  # cold + at least one warm — anything less defeats the test
+_MIN_CHAPTERS = 2  # first + at least one more — anything less defeats the test
 
-# Outer poll budget — well above the warm budget so a regressed run still
-# yields a measured number to report in the assertion, not a TimeoutError.
+# Outer poll budget — well above the per-chapter budget so a regressed
+# run still yields a measured number to report in the assertion, not a
+# TimeoutError.
 _TERMINAL_TIMEOUT_S = 60.0
 
 
@@ -128,15 +123,10 @@ def _positive_float(env_var: str, default: float) -> float:
     return value
 
 
-def _cold_budget_seconds() -> float:
+def _per_chapter_budget_seconds() -> float:
     return _positive_float(
-        "COMIX_PERF_COLD_BUDGET_SECONDS", _DEFAULT_COLD_BUDGET_SECONDS
-    )
-
-
-def _warm_budget_seconds() -> float:
-    return _positive_float(
-        "COMIX_PERF_WARM_BUDGET_SECONDS", _DEFAULT_WARM_BUDGET_SECONDS
+        "COMIX_PERF_PER_CHAPTER_BUDGET_SECONDS",
+        _DEFAULT_PER_CHAPTER_BUDGET_SECONDS,
     )
 
 
@@ -187,14 +177,15 @@ async def _poll_until_terminal(
     )
 
 
-async def test_comix_multi_chapter_warm_reuse_under_budget(tmp_path: Path) -> None:
-    """Issue #23: multi-chapter download — warm calls must hit the warm budget.
+async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
+    """Sequential download of N chapters against one warm solver (#45).
 
     Search → submit the first N releases of the queried series serially →
     measure each download's wall-clock from ``POST /downloads`` to
-    ``status: completed``. Asserts the cold first call lands under the cold
-    budget AND every warm call (2..N) lands under the warm budget AND the
-    warm-call average is meaningfully faster than the cold call.
+    ``status: completed``. Asserts every chapter completes, every chapter
+    lands under the per-chapter budget, and per-page wall-clock for
+    chapters 2..N does not drift above first-chapter's per-page wall-clock
+    by more than ``_SUBSEQUENT_PER_PAGE_CEIL``.
 
     The serial submit (vs queueing all N then polling) keeps the per-job
     measurement clean — ``fetch_via_browser`` is already serialized via
@@ -202,8 +193,7 @@ async def test_comix_multi_chapter_warm_reuse_under_budget(tmp_path: Path) -> No
     interleaving status transitions would muddy the per-stage timing.
     """
     chapter_count = _chapter_count()
-    cold_budget = _cold_budget_seconds()
-    warm_budget = _warm_budget_seconds()
+    per_chapter_budget = _per_chapter_budget_seconds()
 
     output_root = tmp_path / "out"
     await asyncio.to_thread(output_root.mkdir)
@@ -218,9 +208,9 @@ async def test_comix_multi_chapter_warm_reuse_under_budget(tmp_path: Path) -> No
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        # Await warm() before timing anything — the warm budget covers the
-        # download path on a warm solver; the persistent reader page is
-        # still lazy and bootstraps on the FIRST fetch_via_browser call.
+        # Await warm() before timing anything — the per-chapter budget
+        # covers the post-warm() download path, not the initial Cloudflare
+        # solve.
         solver = app.state.solver
         await asyncio.wait_for(solver.warm(), timeout=60.0)
 
@@ -230,8 +220,8 @@ async def test_comix_multi_chapter_warm_reuse_under_budget(tmp_path: Path) -> No
             headers={"X-Api-Key": _TEST_API_KEY},
             timeout=120.0,
         ) as client:
-            # Search is OUTSIDE the timed window — the perf budgets are the
-            # per-download wall-clocks only.
+            # Search is OUTSIDE the timed window — the per-chapter budget
+            # is the per-download wall-clock only.
             search = await client.post(
                 "/api/v1/search",
                 json={
@@ -274,69 +264,60 @@ async def test_comix_multi_chapter_warm_reuse_under_budget(tmp_path: Path) -> No
                     f"{job}; wall_elapsed={wall_elapsed:.2f}s stages={stages}"
                 )
                 measurements.append((wall_elapsed, stages, job.get("totalPages")))
-                kind = "cold" if idx == 0 else "warm"
                 print(
-                    f"\n[perf #45] chapter {idx + 1}/{chapter_count} ({kind}): "
+                    f"\n[perf #45] chapter {idx + 1}/{chapter_count}: "
                     f"{wall_elapsed:.2f}s (pages={job.get('totalPages')})"
                 )
                 print(f"[perf #45] per-stage first-seen offsets: {stages}")
 
-            cold_wall, cold_stages, cold_pages = measurements[0]
-            warm_walls = [m[0] for m in measurements[1:]]
-            warm_avg = sum(warm_walls) / len(warm_walls)
-            warm_max = max(warm_walls)
+            walls = [m[0] for m in measurements]
+            walls_avg = sum(walls) / len(walls)
+            walls_max = max(walls)
             print(
-                f"\n[perf #45] summary: cold={cold_wall:.2f}s "
-                f"warm_avg={warm_avg:.2f}s warm_max={warm_max:.2f}s "
-                f"(cold_budget={cold_budget:.2f}s warm_budget={warm_budget:.2f}s)"
+                f"\n[perf #45] summary: per_chapter_avg={walls_avg:.2f}s "
+                f"per_chapter_max={walls_max:.2f}s "
+                f"(per_chapter_budget={per_chapter_budget:.2f}s)"
             )
 
-            # Cold first call must land under the cold budget — matches the
-            # single-submit guard so a regression in the cold path is also
-            # caught here.
-            assert cold_wall < cold_budget, (
-                f"cold-first chapter took {cold_wall:.2f}s "
-                f"(cold_budget {cold_budget:.2f}s, pages={cold_pages}); "
-                f"stages={cold_stages}; regression vs #45 single-submit guard"
-            )
-
-            # Every warm call must land under the warm budget. A single warm
+            # Every chapter must land under the per-chapter budget. A single
             # chapter blowing the budget is enough to fail (don't average it
-            # out). Post-#45 the warm budget is the empirically-observed
-            # warm_max plus ~18 % CI-variance headroom.
-            for idx, (wall, stages, pages) in enumerate(measurements[1:], start=2):
-                assert wall < warm_budget, (
-                    f"warm chapter {idx}/{chapter_count} took {wall:.2f}s "
-                    f"(warm_budget {warm_budget:.2f}s, pages={pages}); "
-                    f"stages={stages}; sequential-download regression (#45)"
+            # out). Same budget applies regardless of position — there is no
+            # per-page warmth in the gateway post-#23-abandonment.
+            for idx, (wall, stages, pages) in enumerate(measurements, start=1):
+                assert wall < per_chapter_budget, (
+                    f"chapter {idx}/{chapter_count} took {wall:.2f}s "
+                    f"(per_chapter_budget {per_chapter_budget:.2f}s, "
+                    f"pages={pages}); stages={stages}; "
+                    f"sequential-download regression (#45)"
                 )
 
-            # Per-page-normalized regression guard — catches a real failure
-            # mode (warm-call cost-per-page diverging from cold-call cost-
-            # per-page) without baking in the dead #23 hypothesis that warm
-            # should be faster than cold. The post-#45 baseline is
-            # warm_per_page ~= 1.02 × cold_per_page; _WARM_PER_PAGE_CEIL =
-            # 1.30 leaves CI-variance headroom while catching a ~30 % per-
-            # page slowdown.
-            assert cold_pages and cold_pages > 0, (
-                f"cold chapter reported totalPages={cold_pages!r}; "
-                f"normalization undefined"
+            # Per-page drift guard — catches a state-leak regression where
+            # chapters 2..N start costing more per page than the first did.
+            # Post-#45 baseline: first ~1.15 s/page; later avg ~1.08 s/page
+            # (later ≈ 0.94 × first). 1.30 leaves CI-variance headroom while
+            # catching a ~30 % per-page slowdown across the run.
+            first_wall, _first_stages, first_pages = measurements[0]
+            assert first_pages and first_pages > 0, (
+                f"first chapter reported totalPages={first_pages!r}; "
+                f"per-page normalization undefined"
             )
-            cold_per_page = cold_wall / cold_pages
-            warm_per_page_values: list[float] = []
+            first_per_page = first_wall / first_pages
+            later_per_page_values: list[float] = []
             for wall, _stages, pages in measurements[1:]:
                 if not pages or pages <= 0:
                     continue
-                warm_per_page_values.append(wall / pages)
-            assert warm_per_page_values, (
-                "no warm chapters reported totalPages; per-page guard cannot run"
+                later_per_page_values.append(wall / pages)
+            assert later_per_page_values, (
+                "no chapters past the first reported totalPages; "
+                "per-page drift guard cannot run"
             )
-            warm_per_page_avg = sum(warm_per_page_values) / len(warm_per_page_values)
-            per_page_threshold = cold_per_page * _WARM_PER_PAGE_CEIL
-            assert warm_per_page_avg <= per_page_threshold, (
-                f"warm per-page avg {warm_per_page_avg:.2f}s/page exceeds "
-                f"{_WARM_PER_PAGE_CEIL:.2f} × cold per-page "
-                f"({cold_per_page:.2f}s/page, threshold "
-                f"{per_page_threshold:.2f}s/page); warm path appears to be "
-                f"paying per-page overhead a cold call avoids (#45)"
+            later_per_page_avg = sum(later_per_page_values) / len(later_per_page_values)
+            drift_threshold = first_per_page * _SUBSEQUENT_PER_PAGE_CEIL
+            assert later_per_page_avg <= drift_threshold, (
+                f"later-chapter per-page avg {later_per_page_avg:.2f}s/page "
+                f"exceeds {_SUBSEQUENT_PER_PAGE_CEIL:.2f} × first-chapter "
+                f"per-page ({first_per_page:.2f}s/page, threshold "
+                f"{drift_threshold:.2f}s/page); chapters past the first "
+                f"appear to be paying per-page overhead the first chapter "
+                f"avoided — solver state may be leaking (#45)"
             )
