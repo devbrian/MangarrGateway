@@ -114,6 +114,15 @@ async def test_recent_download_full_cycle(
                 client, job_id, timeout_s=profile.download_timeout_s
             )
             if job["status"] != "completed":
+                # Log the failure reason so a transient resolve-stage flake
+                # (or a real strict-match staleness fire) is observable in the
+                # CI log instead of being silently absorbed by the retry loop.
+                print(
+                    f"\n[live recent→download {source_key}] release "
+                    f"{release.get('guid')!r} ch={release.get('chapterNumber')} "
+                    f"failed: status={job.get('status')!r} "
+                    f"error={job.get('error')!r}"
+                )
                 last_failure = job
                 continue  # next release in the recent window
 
