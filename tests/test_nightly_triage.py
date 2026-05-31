@@ -61,6 +61,21 @@ def test_parse_junit_mixed() -> None:
     assert per_source["comix"]["tests"], "failing comix testcase missing from tests[]"
 
 
+def test_parse_junit_preserves_hyphenated_source_key() -> None:
+    """CR-01 (issue #28): hyphenated parametrize IDs must bucket whole.
+
+    ``_SOURCE_KEY_RE`` permits ``-`` in source keys, so any future source
+    registered as e.g. ``manga-plus`` must reach a ``manga-plus`` bucket —
+    NOT a truncated ``manga`` bucket that would silently misroute every
+    sticky-issue lookup keyed on the full name.
+    """
+    per_source = nightly_triage.parse_junit(_FIXTURES / "hyphenated_source_key.xml")
+    assert set(per_source.keys()) == {"manga-plus"}, (
+        f"hyphenated source_key was split: {per_source!r}"
+    )
+    assert per_source["manga-plus"]["pass"] == 1
+
+
 def test_parse_junit_perf_classname_bucketing() -> None:
     """Pitfall 7: non-parametrized perf test must bucket to ``comix`` via classname."""
     per_source = nightly_triage.parse_junit(_FIXTURES / "perf_only_fail.xml")

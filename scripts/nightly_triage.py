@@ -55,9 +55,10 @@ def parse_junit(path: Path) -> dict[str, dict[str, Any]]:
     mapping. Bucketing rule (matches Phase 5 RESEARCH Code Examples §4 +
     Pitfall 7):
 
-    * If the testcase name ends in ``[paramid]``, take the first dash-separated
-      segment of ``paramid`` as the source_key (so ``[mangadex-extra]`` still
-      buckets to ``mangadex`` — defensive against double-params).
+    * If the testcase name ends in ``[paramid]``, the FULL ``paramid`` is the
+      source_key. Hyphens are preserved (``[manga-plus]`` → ``manga-plus``):
+      ``_SOURCE_KEY_RE`` permits ``-`` in source keys, so splitting on ``-``
+      would silently misbucket any hyphenated source (CR-01, issue #28).
     * Else, if the testcase ``classname`` contains ``"comix"``, bucket to
       ``"comix"`` (Pitfall 7 — the non-parametrized perf test still feeds
       the comix sticky-issue signal per D-61 + D-62).
@@ -75,7 +76,7 @@ def parse_junit(path: Path) -> dict[str, dict[str, Any]]:
         classname = tc.get("classname", "")
         m = PARAM_RE.search(name)
         if m is not None:
-            source_key = m.group(1).split("-")[0]
+            source_key = m.group(1)
         elif "comix" in classname:
             # Pitfall 7: non-parametrized perf test → bucket via classname.
             source_key = "comix"
