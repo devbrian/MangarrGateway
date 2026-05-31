@@ -51,6 +51,15 @@ jobs:
     # 60s outer budget).
     env:
       GATEWAY_CLOUDFLARE_ENGINE: camoufox
+      # Temporary: enable diagnostic browser-event capture for the #54
+      # root-cause investigation (debug session
+      # comix-pageerror-throw-site-54). Set "1" so the page.on("pageerror"
+      # | "console" | "requestfailed") handlers in CloudflareSolver fire
+      # under live traffic. REVERT this line back to default-off once we
+      # have captured one or more dead-driver pageerror events around a
+      # real crash window (see PR #57 + debug session classification
+      # protocol). Direct-to-main per ops authorization.
+      GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS: "1"
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.
