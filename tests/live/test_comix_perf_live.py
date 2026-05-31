@@ -6,30 +6,48 @@ extraction. This test is the regression guard for the parallel-watcher rewrite
 of ``_CHAPTER_PAGES_EXTRACT_JS`` (issue #20) and the related ``goto`` /
 ``wait_for`` tightening.
 
-**Budget interpretation (issue #32, 2026-05-31 revision).**
+**Budget interpretation (issue #45, 2026-05-31 revision).**
 
-The original budget was 8 s, set against a measurement that — we now know —
-was silently incorrect: the parallel-scrollIntoView extractor only captured
-2-4 of the chapter's actual pages (head + tail). Issue #32 revealed that
-``scrollIntoView`` in a tight loop is a synchronous viewport mutation; only
-the FINAL element's scroll position is honored, so intermediate pages never
-enter view, the IntersectionObserver never fires for them, and the lazy
-``<img>`` never loads. The original 8 s "perf win" was really a "shipping
-incomplete CBZs fast" bug.
+History:
 
-The fix walks pages SEQUENTIALLY again — scroll → ~150 ms settle → poll for
-the page's img with a tight per-page budget — accepting an O(pages) wall-
-clock term in exchange for correctness. Measured against a 10-page chapter
-(real Comix, warm solver) the post-fix wall-clock is ~14-15 s, dominated by
-the per-page IntersectionObserver + lazy-load round-trip (a per-page cost
-intrinsic to Comix's reader; not addressable from the extractor side without
-a persistent reader page that reuses the bootstrapped Swiper across
-downloads — tracked separately, follow-up to issue #23).
+* Original budget was 8 s, set against a measurement that — we now know —
+  was silently incorrect: the parallel-scrollIntoView extractor only
+  captured 2-4 of the chapter's actual pages (head + tail). Issue #32
+  revealed that ``scrollIntoView`` in a tight loop is a synchronous
+  viewport mutation; only the FINAL element's scroll position is honored.
+  The original 8 s "perf win" was really a "shipping incomplete CBZs
+  fast" bug.
+* Issue #32 fix walked pages SEQUENTIALLY — scroll → ~150 ms settle →
+  poll per page — accepting an O(pages) wall-clock term in exchange for
+  correctness. Measured against a 10-page chapter (real Comix, warm
+  solver) that landed at ~14-15 s. Budget was bumped to 20 s.
+* Issue #45 rewrites Step 2 of the extractor as a two-scroll head+tail
+  walk on the INNER Swiper scroll container (an ancestor of the
+  ``.rpage-page`` divs with ``overflow:auto|scroll|hidden`` and
+  ``scrollHeight > clientHeight``), with a selective per-missing-page
+  ``scrollIntoView`` fallback for any page the two-scroll walk fails to
+  capture. The empirical basis is the spike
+  ``.planning/debug/comix-warm-page-no-speedup-spike.md``: a tall window
+  viewport loaded pages 1, 2, 13, AND 14 simultaneously while pages
+  3-12 stayed lazy, proving the inner Swiper container is what gates
+  middle pages independently of the window viewport. Two batched scrolls
+  on that container — to ``scrollHeight/2`` then ``scrollHeight`` — fire
+  the middle and tail bands in ~2 settle windows of 500 ms each.
 
-New budget: **20 s** (default), comfortably above the post-fix measurement
-with ~25 % margin. This is now a correctness-respecting regression guard,
-not the < 5 s aspiration. ``COMIX_PERF_BUDGET_SECONDS`` still lets the bar
-be tightened when the persistent-reader-page follow-up lands.
+New budget: **15.5 s** (default). Three back-to-back live runs on a
+10-page chapter (real Comix, warm solver, headless) measured 11.42 s,
+12.74 s, and 11.56 s end-to-end (resolving stage ~11.0 s — the extractor
+cost; the remainder is downloading + archiving). 15.5 s is the max
+observed (12.74 s) x ~1.21 — ~21 % headroom over the worst run, still
+well below the prior 20 s ceiling. Correctness is preserved:
+``totalPages`` matched the pre-rewrite baseline (10/10 pages, no drops,
+no out-of-order) in every run, and the issue #32 final
+``document.querySelectorAll('img')`` sweep is retained verbatim in the
+extractor as the silent-truncation safety net.
+
+``COMIX_PERF_BUDGET_SECONDS`` still lets the bar be tightened when
+further optimizations land (e.g. a persistent reader page that skips
+the bundle parse — tracked separately).
 
 Like the rest of ``tests/live/``, this test:
 
@@ -44,9 +62,9 @@ Knobs:
 
 * ``COMIX_PERF_QUERY`` — search query (default: "Forgotten Field", same as
   ``test_comix_e2e_live.py``).
-* ``COMIX_PERF_BUDGET_SECONDS`` — wall-clock budget override (default 20.0,
-  the post-issue-#32 correctness-respecting regression guard; tighten as
-  further optimizations land).
+* ``COMIX_PERF_BUDGET_SECONDS`` — wall-clock budget override (default 15.5,
+  the post-issue-#45 measured-derived regression guard; tighten as further
+  optimizations land).
 """
 
 from __future__ import annotations
@@ -68,11 +86,15 @@ pytestmark = pytest.mark.live  # excluded from the gate
 
 _DEFAULT_QUERY = "Forgotten Field"
 _TEST_API_KEY = "test-perf-comix-key-DO-NOT-LOG-IN-PROD"
-# Issue #32 (2026-05-31): bumped from 8.0 → 20.0. The 8.0 figure was
-# anchored on a measurement that was silently incorrect (4-of-12 pages
-# captured); the corrected sequential-walk extractor measures ~14-15 s
-# on a 10-page chapter. 20 s leaves ~25 % headroom for CI variance.
-_DEFAULT_BUDGET_SECONDS = 20.0
+# Issue #45 (2026-05-31): tightened from 20.0 → 15.5. The 20.0 figure was
+# anchored on the issue #32 sequential walk's ~14-15 s wall-clock; the
+# issue #45 two-scroll head+tail extractor (inner Swiper container
+# scrollTo(scrollHeight/2) then scrollTo(scrollHeight) with 500 ms settles,
+# plus a selective per-missing-page scrollIntoView fallback) measured
+# 11.42 s / 12.74 s / 11.56 s over three back-to-back live runs on a
+# 10-page chapter. 15.5 s = max-observed (12.74) x ~1.21, ~21 % headroom
+# over the worst run.
+_DEFAULT_BUDGET_SECONDS = 15.5
 # Outer poll budget — well above the perf budget so a regressed run still
 # yields a measured number to report in the assertion, not a TimeoutError.
 _TERMINAL_TIMEOUT_S = 60.0
@@ -138,9 +160,10 @@ async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
 
     Search → submit first release → measure ``POST /downloads`` → first
     ``status: completed`` observation. Asserts the elapsed wall-clock is
-    under :func:`_budget_seconds` (default ``_DEFAULT_BUDGET_SECONDS`` = 20 s,
-    the post-issue-#32 correctness-respecting regression guard; tighten once
-    the persistent-reader-page follow-up lands).
+    under :func:`_budget_seconds` (default ``_DEFAULT_BUDGET_SECONDS`` =
+    15.5 s, the post-issue-#45 measured-derived regression guard for the
+    two-scroll inner-Swiper extractor; tighten further when the
+    persistent-reader-page follow-up lands).
     """
     output_root = tmp_path / "out"
     await asyncio.to_thread(output_root.mkdir)
@@ -210,10 +233,11 @@ async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
 
             budget = _budget_seconds()
             # Print the per-stage breakdown so a regression points at the
-            # bottleneck stage. With the issue #32 sequential walk the
-            # `resolving` stage is once again the dominant term, scaling
-            # roughly linearly with chapter page count; `downloading` and
-            # `archiving` are near-instant in comparison.
+            # bottleneck stage. With the issue #45 two-scroll head+tail
+            # extractor the `resolving` stage is still dominant but now
+            # roughly constant in chapter page count (two batched scrolls
+            # + ~500 ms settles, plus selective per-missing-page fallback);
+            # `downloading` and `archiving` are near-instant in comparison.
             pages = job.get("totalPages")
             print(
                 f"\n[perf #20] warm-solver download wall-clock: "
