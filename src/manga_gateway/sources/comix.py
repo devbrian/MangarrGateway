@@ -91,7 +91,7 @@ longer than ~4 pages was missing middle pages. The fix walks pages
 SEQUENTIALLY again, scroll → small await → poll for the page's img with
 a tight per-page budget, accepting an O(pages) wall-clock term in exchange
 for correctness. The Step-1 scaffold wait is also hardened to wait for
-COUNT STABILITY (count unchanged for 3 × 100ms ticks, capped at 8s) so
+COUNT STABILITY (count unchanged for 3 x 100ms ticks, capped at 8s) so
 the extractor never snapshots a partial scaffold.
 """
 
