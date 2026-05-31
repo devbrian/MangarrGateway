@@ -36,10 +36,10 @@ Additionally, the autouse ``_no_real_cloudflare_warm`` fixture in
 for the WHOLE session so the deterministic gate never launches a real
 browser. Live tests need the REAL ``warm()`` so Comix's Cloudflare
 clearance is actually solved. ``_restore_real_cloudflare_warm`` below
-re-binds ``CloudflareSolver.warm`` to the original coroutine for every
-live test — a counter-monkeypatch keyed to the live-conftest scope so
-the gate's no-op is restored automatically once the live-test session
-ends.
+re-binds ``CloudflareSolver.warm`` to the original coroutine captured at
+THIS conftest's import time — a per-test additive counter-monkeypatch
+that auto-reverts when the fixture finalizes, so the gate's no-op is
+restored automatically once the live-test session ends.
 """
 
 from __future__ import annotations
@@ -76,6 +76,16 @@ def _registered_keys() -> list[str]:
 # Type is inferred from _registered_keys' return annotation. The literal
 # assignment shape is also the contract the acceptance-criteria grep checks.
 REGISTERED_KEYS = _registered_keys()
+
+
+# CR-02 (issue #29): capture the real ``CloudflareSolver.warm`` at conftest
+# import time — BEFORE the gate-wide autouse no-op patch in
+# ``tests/conftest.py`` ever runs (autouse fixtures run per-test; conftest
+# module bodies execute at collection start). This frozen reference is what
+# ``_restore_real_cloudflare_warm`` rebinds per live test, replacing the
+# previous ``importlib.reload(antibot_mod)`` approach that wiped any
+# module-level state and produced divergent class identities.
+_ORIGINAL_CLOUDFLARE_WARM = CloudflareSolver.warm
 
 
 def _load_profile(source_key: str) -> LiveSmokeProfile:
@@ -157,12 +167,13 @@ def _restore_real_cloudflare_warm(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch of ``CloudflareSolver.warm`` so the deterministic gate
     never tries to talk to real Cloudflare. Live tests are the explicit
     opt-in to the real path — they NEED ``warm()`` to actually solve the
-    challenge. Re-import the antibot module fresh so the unmonkeypatched
-    coroutine is available, then rebind it; ``monkeypatch.undo()`` does
-    not undo a sibling MonkeyPatch instance's setattr, so the rebind is
-    the simplest restoration path (PLANNER NOTE in 05-03-PLAN.md).
+    challenge. We rebind ``CloudflareSolver.warm`` to the frozen
+    ``_ORIGINAL_CLOUDFLARE_WARM`` captured at conftest import (CR-02 /
+    issue #29). Per-test additive monkeypatch — ``monkeypatch`` auto-undoes
+    at fixture teardown, restoring the gate's no-op. No ``importlib.reload``,
+    no ``sys.modules`` mutation, no divergent ``CloudflareSolver`` class
+    object: any state on the module or class survives the test, and other
+    modules that imported ``CloudflareSolver`` keep their original class
+    reference intact.
     """
-    antibot_mod = importlib.import_module("manga_gateway.framework.antibot")
-    importlib.reload(antibot_mod)
-    fresh_solver_cls = antibot_mod.CloudflareSolver
-    monkeypatch.setattr(CloudflareSolver, "warm", fresh_solver_cls.warm)
+    monkeypatch.setattr(CloudflareSolver, "warm", _ORIGINAL_CLOUDFLARE_WARM)
