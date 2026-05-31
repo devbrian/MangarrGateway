@@ -216,6 +216,34 @@ def test_label_create_is_idempotent_no_raise(
     nightly_triage._ensure_label("comix")
 
 
+def test_ensure_label_creates_both_per_source_and_umbrella(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-nightly bootstrap: BOTH ``nightly-failure`` (umbrella) and
+    ``source:{key}`` labels must be created or the subsequent
+    ``gh issue create --label nightly-failure`` rejects the call.
+
+    First dispatch on main 2026-05-31 surfaced this:
+    ``gh issue create`` failed with
+    ``could not add label: 'nightly-failure' not found``
+    because the umbrella label had never been bootstrapped.
+    """
+    recorder = _SubprocessRecorder()
+    monkeypatch.setattr(nightly_triage.subprocess, "run", recorder)
+    nightly_triage._ensure_label("comix")
+
+    label_create_calls = [
+        c for c in recorder.calls if len(c) >= 3 and c[:3] == ["gh", "label", "create"]
+    ]
+    created_labels = [c[3] for c in label_create_calls]
+    assert "nightly-failure" in created_labels, (
+        f"umbrella label not bootstrapped — got: {created_labels!r}"
+    )
+    assert "source:comix" in created_labels, (
+        f"per-source label not bootstrapped — got: {created_labels!r}"
+    )
+
+
 def test_main_all_pass_exits_zero(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
