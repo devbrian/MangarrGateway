@@ -6,14 +6,16 @@ publishDate values are in descending order (newest-first, RCNT-01).
 Validates the response against the OpenAPI ``ReleaseListResponse`` schema
 via schemathesis (D-54).
 
-Issue #31 (2026-05-30): sources that legitimately have no public all-recent
-feed (e.g. Comix — its "Recently Added" UI is a series-sort, not a chapter
-feed) declare ``supports_recent = False`` and advertise
-``supportsRecent: false`` in ``/caps``. This smoke skips those sources so
-the test reflects the contract honestly: "don't assert recent works for a
-source whose caps say it doesn't". Removing the skip would force a source
-to either fake data (wrong) or fail forever (no-signal); the skip is the
-spec-conformant outcome.
+Issue #31 (2026-05-30) was superseded by issue #42 (2026-05-31): Comix's
+``supportsRecent`` is now ``True`` (the gateway synthesizes a recent feed
+from the plaintext ``/api/v1/manga?order[chapter_updated_at]=desc`` call
+and defers chapter-id resolution to download time). The skip below is
+preserved as a generic guard for ANY source that still declares
+``supportsRecent: false`` in its live ``/caps`` response — at the time of
+issue #42 no registered source needs the skip, but a future
+declarative-only source could re-introduce it. Removing the skip would
+force such a source to either fake data (wrong) or fail forever
+(no-signal); the skip is the spec-conformant outcome.
 """
 
 from __future__ import annotations
@@ -58,10 +60,11 @@ async def test_recent_returns_newest_first(
     * D-54: response body conforms to ``ReleaseListResponse``.
     """
     async with live_client_for(profile) as client:
-        # Issue #31: respect the source's own /caps declaration. A source that
-        # declares ``supportsRecent: false`` (e.g. Comix — no public all-
-        # recent-chapters feed) cannot satisfy a non-empty assertion, and
-        # forcing it to would push the source into faking data.
+        # Issue #31 (superseded by #42): respect the source's own /caps
+        # declaration. A source that declares ``supportsRecent: false`` cannot
+        # satisfy a non-empty assertion, and forcing it to would push the
+        # source into faking data. Comix flipped to True under #42; this
+        # skip remains for any future source that still advertises false.
         caps_resp = await client.get("/api/v1/caps")
         assert caps_resp.status_code == 200, (
             f"{source_key}: GET /caps failed: {caps_resp.status_code} "

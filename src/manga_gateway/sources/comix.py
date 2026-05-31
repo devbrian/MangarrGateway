@@ -72,11 +72,13 @@ first live-smoke run and fixed in branch ``fix/comix-publishdate-recent``:
   contract-conformant is honest: the upstream itself only renders the same
   approximation in the UI.
 * #31 — ``/recent`` returned ``{releases: [], warnings: []}`` silently because
-  Comix has no public all-recent-chapters feed (the public "Recently Added"
-  UI is a list-mangas-sorted-by-``chapter_updated_at`` view, not a chapter
-  feed). The source now declares ``supports_recent = False`` so ``/caps``
-  advertises the gap explicitly and clients can branch on it instead of
-  guessing from the empty array.
+  the only known recipe was the N+1 series-page drill-down (Cloudflare
+  protected, rate-limit saturating). The initial fix declared
+  ``supports_recent = False``; issue #42 (2026-05-31) supersedes this with
+  a plaintext one-call feed (``/api/v1/manga?order[chapter_updated_at]=desc``)
+  whose chapter-id resolution is deferred to ``fetch_manifest`` at download
+  time. ``supports_recent`` is now ``True`` and ``recent()`` synthesizes
+  real Releases; see the deferred-resolver helpers near ``_CID_SEP``.
 
 Issue #32 (2026-05-31): the parallel ``scrollIntoView`` extractor introduced
 by issue #20 was structurally broken: a synchronous burst of ``scrollIntoView``
