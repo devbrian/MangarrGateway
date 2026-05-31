@@ -19,16 +19,9 @@ Cross-references:
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import httpx
 import pytest
-import schemathesis
-from schemathesis import CheckContext
-from schemathesis.core.transport import Response as SchemathesisResponse
-from schemathesis.specs.openapi.checks import response_schema_conformance
 
-from ._helpers import live_client_for
+from ._helpers import check_response_conforms, live_client_for
 from .conftest import REGISTERED_KEYS
 from .profiles._base import LiveSmokeProfile
 
@@ -36,40 +29,6 @@ pytestmark = [
     pytest.mark.live,
     pytest.mark.parametrize("source_key", REGISTERED_KEYS),
 ]
-
-# Contract of record (D-07) — same path tests/test_contract.py:53 reads.
-_CONTRACT_PATH = Path(__file__).resolve().parents[2] / "manga-gateway.openapi.yaml"
-
-# Build the schema once at module load — the live smoke modules each own
-# their own schema view so the parametrize id seen by schemathesis cannot
-# leak across modules. ``base_url`` is purely for path resolution by the
-# check; the live HTTP traffic goes through ``live_client_for``'s ASGI
-# transport (which prepends its own ``base_url``).
-_schema = schemathesis.openapi.from_path(_CONTRACT_PATH)
-_schema.config.update(base_url="http://localhost/api/v1")
-
-
-def _check_response_conforms(
-    operation_path: str, method: str, response: httpx.Response
-) -> None:
-    """Apply schemathesis ``response_schema_conformance`` to a live response.
-
-    Mirrors ``tests/test_contract.py``'s ``CONTRACT_CHECKS`` discipline but
-    runs against a manually-issued live HTTP response (D-54). See
-    ``SPIKE-schemathesis.md`` for the locked 4.x API path.
-    """
-    op = _schema[operation_path][method]
-    case = op.Case()
-    # verify=False — the ASGITransport never establishes TLS.
-    s_response = SchemathesisResponse.from_httpx(response, verify=False)
-    ctx = CheckContext(
-        override=None,
-        auth=None,
-        headers=None,
-        config=_schema.config.checks,
-        transport_kwargs=None,
-    )
-    response_schema_conformance(ctx, s_response, case)
 
 
 async def test_caps_advertises_source(
@@ -108,4 +67,4 @@ async def test_caps_advertises_source(
 
         # D-54 / CTRT-01 live: the response body conforms to the OpenAPI
         # Capabilities schema.
-        _check_response_conforms("/caps", "GET", resp)
+        check_response_conforms("/caps", "GET", resp)

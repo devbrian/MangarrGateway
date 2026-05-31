@@ -10,16 +10,9 @@ against the OpenAPI ``ReleaseListResponse`` schema via schemathesis
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import httpx
 import pytest
-import schemathesis
-from schemathesis import CheckContext
-from schemathesis.core.transport import Response as SchemathesisResponse
-from schemathesis.specs.openapi.checks import response_schema_conformance
 
-from ._helpers import live_client_for
+from ._helpers import check_response_conforms, live_client_for
 from .conftest import REGISTERED_KEYS
 from .profiles._base import LiveSmokeProfile
 
@@ -27,28 +20,6 @@ pytestmark = [
     pytest.mark.live,
     pytest.mark.parametrize("source_key", REGISTERED_KEYS),
 ]
-
-_CONTRACT_PATH = Path(__file__).resolve().parents[2] / "manga-gateway.openapi.yaml"
-
-_schema = schemathesis.openapi.from_path(_CONTRACT_PATH)
-_schema.config.update(base_url="http://localhost/api/v1")
-
-
-def _check_response_conforms(
-    operation_path: str, method: str, response: httpx.Response
-) -> None:
-    """See ``test_caps_smoke._check_response_conforms`` — same recipe (W-04)."""
-    op = _schema[operation_path][method]
-    case = op.Case()
-    s_response = SchemathesisResponse.from_httpx(response, verify=False)
-    ctx = CheckContext(
-        override=None,
-        auth=None,
-        headers=None,
-        config=_schema.config.checks,
-        transport_kwargs=None,
-    )
-    response_schema_conformance(ctx, s_response, case)
 
 
 async def test_search_returns_releases(
@@ -112,4 +83,4 @@ async def test_search_returns_releases(
             )
 
         # D-54 / CTRT-01 live: response conforms to ReleaseListResponse.
-        _check_response_conforms("/search", "POST", resp)
+        check_response_conforms("/search", "POST", resp)

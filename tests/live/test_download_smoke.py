@@ -38,14 +38,14 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
-import schemathesis
-from schemathesis import CheckContext
-from schemathesis.core.transport import Response as SchemathesisResponse
-from schemathesis.specs.openapi.checks import response_schema_conformance
 
-from ._helpers import _assert_cbz_on_disk, _poll_until_terminal, live_client_for
+from ._helpers import (
+    _assert_cbz_on_disk,
+    _poll_until_terminal,
+    check_response_conforms,
+    live_client_for,
+)
 from .conftest import REGISTERED_KEYS
 from .profiles._base import LiveSmokeProfile
 
@@ -53,28 +53,6 @@ pytestmark = [
     pytest.mark.live,
     pytest.mark.parametrize("source_key", REGISTERED_KEYS),
 ]
-
-_CONTRACT_PATH = Path(__file__).resolve().parents[2] / "manga-gateway.openapi.yaml"
-
-_schema = schemathesis.openapi.from_path(_CONTRACT_PATH)
-_schema.config.update(base_url="http://localhost/api/v1")
-
-
-def _check_response_conforms(
-    operation_path: str, method: str, response: httpx.Response
-) -> None:
-    """See ``test_caps_smoke._check_response_conforms`` — same locked recipe (W-04)."""
-    op = _schema[operation_path][method]
-    case = op.Case()
-    s_response = SchemathesisResponse.from_httpx(response, verify=False)
-    ctx = CheckContext(
-        override=None,
-        auth=None,
-        headers=None,
-        config=_schema.config.checks,
-        transport_kwargs=None,
-    )
-    response_schema_conformance(ctx, s_response, case)
 
 
 async def test_download_full_cycle(
@@ -120,7 +98,7 @@ async def test_download_full_cycle(
                 f"{source_key}: submit failed: {submit.status_code} {submit.text[:400]}"
             )
             # D-54: submit response conforms to OpenAPI.
-            _check_response_conforms("/downloads", "POST", submit)
+            check_response_conforms("/downloads", "POST", submit)
 
             submit_json = submit.json()
             job_id = submit_json.get("jobId")
@@ -138,7 +116,7 @@ async def test_download_full_cycle(
                 f"{get_resp.status_code} {get_resp.text[:400]}"
             )
             # D-54: single-job GET response conforms to OpenAPI.
-            _check_response_conforms("/downloads/{jobId}", "GET", get_resp)
+            check_response_conforms("/downloads/{jobId}", "GET", get_resp)
 
             # 4. POLL — drive the job to terminal (timeout from D-55 marker).
             job = await _poll_until_terminal(
