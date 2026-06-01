@@ -16,9 +16,23 @@ from typing import Protocol
 
 from .errors import SourceError
 
-# Default per-source fan-out timeout (D-14 discretion). Generous enough for the
-# two-step MangaDex flow under the 5 req/s budget, tight enough to bound latency.
-_DEFAULT_TIMEOUT = 20.0
+# Default per-source fan-out timeout (D-14 discretion). Sized to comfortably
+# cover the slowest legitimate per-source operation:
+#
+# * MangaDex (httpx, rate-limited at 5 req/s): two-step search/recent flow
+#   completes in well under 5 s. The default doesn't bind here.
+# * Comix (Camoufox + 3-5 sequential ``_series_chapters`` browser navigations
+#   on the warm BrowserContext, see debug session ``comix-parallel-page-
+#   contention`` for why parallelization isn't safe): the live baseline is
+#   ~7-12 s per search call, with 15-18 s observed on slower runs. The
+#   prior 20 s ceiling sat on the edge — nightly 26726259461 (2026-05-31
+#   22:26 UTC) tipped over under variance and surfaced as 4 cascading
+#   ``source_unavailable / timed out`` test failures. 30 s gives ~100 %
+#   headroom above the typical wall-clock without becoming a stall ceiling.
+#
+# Bound by the lower of this default and the API request's overall budget at
+# the caller; ``fan_out`` accepts ``per_source_timeout`` for ad-hoc overrides.
+_DEFAULT_TIMEOUT = 30.0
 
 
 class _HasKey(Protocol):
