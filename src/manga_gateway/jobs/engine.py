@@ -188,6 +188,11 @@ class JobEngine:
         # re-resolve recovery (Pitfall 4).
         job.total_pages = len(manifest)
         job.downloaded_pages = 0
+        # WR-08: zero the byte accumulator + stamp a download-start marker so the
+        # _to_dto live byte/ETA estimate has a clean baseline (projection-only —
+        # no SQLite column, mirroring downloaded_pages above).
+        job.downloaded_bytes = 0
+        job.download_started_at = _now_iso()
         await self._transition(job, JobStatus.DOWNLOADING)
         pages = await self._fetch_all_pages(job, source, ctx, manifest)
 
@@ -209,6 +214,12 @@ class JobEngine:
         # completed → expose the host-reachable output path (JOB-03/D-26).
         job.output_path = str(final_path)
         job.completed_at = _now_iso()
+        # WR-08: pin the EXACT real total = sum of fetched page bytes, and zero
+        # the remainder. These ARE persisted columns (the _transition write-through
+        # stores them), so completed history carries the exact archive size and the
+        # _to_dto fallback projects them verbatim (with etaSeconds:null).
+        job.total_bytes = job.downloaded_bytes
+        job.remaining_bytes = 0
         await self._transition(job, JobStatus.COMPLETED)
 
     async def _fetch_all_pages(
@@ -237,6 +248,10 @@ class JobEngine:
                     ) from None
                 reresolves += 1
                 job.downloaded_pages = 0
+                # WR-08: reset the byte accumulator too so the re-resolved pass
+                # does not double-count bytes from the partially-fetched stale pass
+                # (same reasoning that resets downloaded_pages above).
+                job.downloaded_bytes = 0
                 # source duck-types the Source fetch hooks (resolved via registry).
                 manifest = await source.fetch_manifest(job.chapter_id, ctx)  # type: ignore[attr-defined]
                 if not manifest:
@@ -283,6 +298,9 @@ class JobEngine:
             # Progress lives in the projection only — no per-page SQLite write
             # (RESEARCH Pattern 2 / DL-05).
             job.downloaded_pages = (job.downloaded_pages or 0) + 1
+            # WR-08: accumulate the REAL fetched byte count alongside the page
+            # count (same projection-only treatment — no per-page SQLite write).
+            job.downloaded_bytes = (job.downloaded_bytes or 0) + len(content)
 
         try:
             async with asyncio.TaskGroup() as tg:
