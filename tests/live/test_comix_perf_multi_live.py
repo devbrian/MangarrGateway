@@ -21,10 +21,11 @@ one.
 What the test asserts now:
 
 * every chapter completes successfully;
-* every chapter lands under ``_DEFAULT_PER_CHAPTER_BUDGET_SECONDS``
-  regardless of position (default 18.0 s — sized to accommodate the
-  largest chapters observed in practice; smaller chapters land well
-  under this);
+* chapters 2..N land under ``_DEFAULT_PER_CHAPTER_BUDGET_SECONDS``
+  (default 22.0 s — the steady-state regression guard, sized for the
+  largest chapters observed); chapter 1 gets a larger cold allowance
+  (``_FIRST_CHAPTER_COLD_BUDGET_SECONDS``, default 40.0 s) for the
+  one-time headed-Chromium reader-pipeline boot;
 * per-page wall-clock for chapters 2..N stays close to the first
   chapter's per-page wall-clock (``later_per_page_avg ≤ first_per_page
   x 1.30``) — catches a state-leak regression where the solver gets
@@ -46,9 +47,12 @@ Knobs:
   same as ``test_comix_perf_live.py``).
 * ``COMIX_PERF_MULTI_CHAPTERS`` — chapter count to download serially
   (default 3 — first + two more; raise for stronger averaging).
-* ``COMIX_PERF_PER_CHAPTER_BUDGET_SECONDS`` — wall-clock budget per
-  chapter (default 22.0; sized for the largest chapter we've seen
-  plus CI variance headroom).
+* ``COMIX_PERF_PER_CHAPTER_BUDGET_SECONDS`` — steady-state wall-clock
+  budget for chapters 2..N (default 22.0; sized for the largest chapter
+  we've seen plus CI variance headroom).
+* ``COMIX_PERF_FIRST_CHAPTER_BUDGET_SECONDS`` — cold budget for the
+  first chapter under headed Chromium (default 40.0; covers the one-time
+  reader-pipeline boot — see ``_FIRST_CHAPTER_COLD_BUDGET_SECONDS``).
 """
 
 from __future__ import annotations
@@ -88,6 +92,19 @@ _TEST_API_KEY = "test-perf-comix-multi-key-DO-NOT-LOG-IN-PROD"
 # ordering (a 15-page chapter happening to land in position 1 would
 # have broken the old tight cold budget).
 _DEFAULT_PER_CHAPTER_BUDGET_SECONDS = 22.0
+
+# Cold allowance for the FIRST chapter under HEADED Chromium (the datacenter/CI
+# default since the cf-fingerprint-probe finding). Unlike the refuted #23
+# gateway-warmth hypothesis above, this is a BROWSER-side one-time cost: the
+# first chapter-reader download per browser session boots the comix reader
+# pipeline (SPA + jsdefender VM bundle) once; chapters 2..N reuse it. Measured
+# ~31s on the ubuntu-latest datacenter runner vs ~10-15s steady-state — and the
+# cf-fingerprint-probe proved it is NOT Xvfb/headed/datacenter overhead (browser
+# launch+warm 2.5s, page navs ~1s). Chapters 2..N keep the tight steady-state
+# budget, which remains the real regression guard. Headless residential dev rarely
+# trips this (the first chapter fits the 22s budget there), so this allowance only
+# matters on the heavier headed path.
+_FIRST_CHAPTER_COLD_BUDGET_SECONDS = 40.0
 
 # Per-page drift guard. ``first_per_page = first_wall / first_pages`` is
 # the baseline; ``later_per_page_avg = mean(wall / pages for chapters
@@ -132,6 +149,13 @@ def _per_chapter_budget_seconds() -> float:
     return _positive_float(
         "COMIX_PERF_PER_CHAPTER_BUDGET_SECONDS",
         _DEFAULT_PER_CHAPTER_BUDGET_SECONDS,
+    )
+
+
+def _first_chapter_cold_budget_seconds() -> float:
+    return _positive_float(
+        "COMIX_PERF_FIRST_CHAPTER_BUDGET_SECONDS",
+        _FIRST_CHAPTER_COLD_BUDGET_SECONDS,
     )
 
 
@@ -199,6 +223,7 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
     """
     chapter_count = _chapter_count()
     per_chapter_budget = _per_chapter_budget_seconds()
+    first_cold_budget = _first_chapter_cold_budget_seconds()
 
     output_root = tmp_path / "out"
     await asyncio.to_thread(output_root.mkdir)
@@ -289,9 +314,14 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
             # out). Same budget applies regardless of position — there is no
             # per-page warmth in the gateway post-#23-abandonment.
             for idx, (wall, stages, pages) in enumerate(measurements, start=1):
-                assert wall < per_chapter_budget, (
+                # Chapter 1 gets the cold allowance (one-time headed-Chromium
+                # reader-pipeline boot); chapters 2..N use the tight steady-state
+                # budget that catches real regressions.
+                budget = first_cold_budget if idx == 1 else per_chapter_budget
+                cold = " [cold first-chapter allowance]" if idx == 1 else ""
+                assert wall < budget, (
                     f"chapter {idx}/{chapter_count} took {wall:.2f}s "
-                    f"(per_chapter_budget {per_chapter_budget:.2f}s, "
+                    f"(budget {budget:.2f}s{cold}, "
                     f"pages={pages}); stages={stages}; "
                     f"sequential-download regression (#45)"
                 )
