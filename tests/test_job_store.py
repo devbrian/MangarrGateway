@@ -30,6 +30,8 @@ def _make_job(
     job_id: str,
     release_handle: str,
     status: JobStatus = JobStatus.QUEUED,
+    *,
+    manga_title: str | None = None,
 ) -> Job:
     ts = _now()
     return Job(
@@ -51,7 +53,50 @@ def _make_job(
         created_at=ts,
         updated_at=ts,
         completed_at=None,
+        manga_title=manga_title,
     )
+
+
+# OLD column-less jobs schema (pre-#16): a literal snapshot of _CREATE_SCHEMA
+# WITHOUT the manga_title column, used to seed a "production" DB and prove the
+# additive ALTER migration in open_store. Kept inline (not imported) so it stays a
+# fixed historical artifact even as _CREATE_SCHEMA evolves.
+_OLD_SCHEMA_NO_MANGA_TITLE = """
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id           TEXT PRIMARY KEY,
+  release_handle   TEXT NOT NULL,
+  source_key       TEXT NOT NULL,
+  title            TEXT NOT NULL,
+  status           TEXT NOT NULL,
+  manga_id         INTEGER,
+  output_format    TEXT NOT NULL,
+  chapter_id       TEXT,
+  language         TEXT,
+  total_pages      INTEGER,
+  downloaded_pages INTEGER,
+  total_bytes      INTEGER NOT NULL DEFAULT 0,
+  remaining_bytes  INTEGER NOT NULL DEFAULT 0,
+  output_path      TEXT,
+  message          TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL,
+  completed_at     TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_jobs_live_handle
+  ON jobs(release_handle)
+  WHERE status IN ('queued','resolving','downloading','archiving');
+"""
+
+
+async def _table_columns(db: str) -> set[str]:
+    conn = await aiosqlite.connect(db)
+    try:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("PRAGMA table_info(jobs)") as cur:
+            rows = await cur.fetchall()
+        return {row["name"] for row in rows}
+    finally:
+        await conn.close()
 
 
 async def test_open_store_creates_table_and_partial_index(tmp_path: Path) -> None:
@@ -90,6 +135,60 @@ async def test_insert_then_get_round_trips(tmp_path: Path) -> None:
         assert got.chapter_id == job.chapter_id
     finally:
         await store.close()
+
+
+async def test_insert_round_trips_manga_title(tmp_path: Path) -> None:
+    # #16: manga_title is durable submit-time data — it survives insert→get.
+    db = str(tmp_path / "jobs.db")
+    store = await open_store(db)
+    try:
+        await store.insert(_make_job("j_mt", "h-mt", manga_title="Some Series"))
+        got = await store.get("j_mt")
+        assert got is not None
+        assert got.manga_title == "Some Series"
+        # Fresh DB carries the column.
+        assert "manga_title" in await _table_columns(db)
+    finally:
+        await store.close()
+
+
+async def test_open_store_alter_migrates_columnless_db(tmp_path: Path) -> None:
+    # #16: an EXISTING production jobs.db created BEFORE the column must gain it via
+    # the idempotent additive ALTER in open_store (no migration framework).
+    db = str(tmp_path / "jobs.db")
+    seed = await aiosqlite.connect(db)
+    try:
+        await seed.executescript(_OLD_SCHEMA_NO_MANGA_TITLE)
+        await seed.commit()
+    finally:
+        await seed.close()
+    # Sanity: the seeded DB lacks the column.
+    assert "manga_title" not in await _table_columns(db)
+
+    store = await open_store(db)
+    try:
+        # open_store added the column.
+        assert "manga_title" in await _table_columns(db)
+        # ...and read/write through it round-trips.
+        await store.insert(_make_job("j_m", "h-m", manga_title="Migrated Series"))
+        got = await store.get("j_m")
+        assert got is not None
+        assert got.manga_title == "Migrated Series"
+    finally:
+        await store.close()
+
+
+async def test_open_store_alter_is_idempotent_on_reopen(tmp_path: Path) -> None:
+    # #16: re-opening an already-migrated DB must NOT raise (the guard swallows the
+    # duplicate-column case).
+    db = str(tmp_path / "jobs.db")
+    store1 = await open_store(db)
+    await store1.close()
+    store2 = await open_store(db)  # second open over the migrated DB
+    try:
+        assert "manga_title" in await _table_columns(db)
+    finally:
+        await store2.close()
 
 
 async def test_get_unknown_returns_none(tmp_path: Path) -> None:

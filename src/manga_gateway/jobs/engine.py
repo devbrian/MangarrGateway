@@ -207,6 +207,10 @@ class JobEngine:
             # source-stable chapter id so two different series with the same
             # title can't collide inside the shared manga-unknown/ bucket.
             fallback_discriminator=job.chapter_id,
+            # Issue #16: when Mangarr submits without a mangaId, bucket the output
+            # under the resolved series title (manga-{title}/) instead of the flat
+            # manga-unknown/; falls back to manga-unknown/ when the title is unusable.
+            manga_title=job.manga_title,
         )
         writer = _WRITERS.get(job.output_format, write_cbz)
         await asyncio.to_thread(writer, pages, final_path)

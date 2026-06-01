@@ -120,6 +120,26 @@ async def test_submit_mints_prefixed_id_and_returns_queued(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_submit_sets_manga_title_from_record(tmp_path: Path) -> None:
+    """#16: ``submit`` copies the resolved ``record.manga_title`` onto the Job so
+    the engine can bucket the output under ``manga-{title}/`` — asserted via the
+    store round-trip (``SubmitRequest`` carries no manga_title)."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        mgr = await _make_manager(store)
+        mgr._engine = _NoopEngine()  # type: ignore[assignment]
+
+        job_id, _ = await mgr.submit(_record(), _req())
+
+        persisted = await store.get(job_id)
+        assert persisted is not None
+        assert persisted.manga_title == "Solo Leveling"
+        await mgr.drain()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_submit_writes_store_before_projection(tmp_path: Path) -> None:
     store = await open_store(str(tmp_path / "jobs.db"))
     try:
