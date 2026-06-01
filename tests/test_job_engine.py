@@ -17,12 +17,14 @@ failure, HTML-blob validation failure, manifest-resolve failure, stale-baseUrl
 from __future__ import annotations
 
 import io
+import logging
 import os
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 from PIL import Image
 
@@ -399,7 +401,162 @@ async def test_run_does_not_reresolve_when_message_only_mentions_403(
         await store.close()
 
 
-# ────────────────────────── source-agnostic (SRC-01) ──────────────────────
+# ──────────────────── diagnosability (issue #70) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_logs_traceback_but_wire_message_stays_generic(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-SourceError escaping the engine (issue #70) must record its full
+    traceback to the INTERNAL log while the wire-visible ``job.message`` stays
+    generic — internals are never leaked over the API."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        urls = ["http://node/data/h/p1.png"]
+        secret = "the-internal-cause-not-for-the-wire"
+        src = _StubSource(
+            manifest=urls,
+            # A bare RuntimeError (NOT a SourceError) — the exact "non-SourceError
+            # exception escaped unwrapped" shape from the issue.
+            image_errors={urls[0]: RuntimeError(secret)},
+        )
+        engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
+        job = _make_job()
+        await store.insert(job)
+
+        with caplog.at_level(logging.WARNING, logger="manga_gateway.jobs.engine"):
+            await engine.run(job)
+
+        assert job.status == JobStatus.FAILED
+        # Wire-visible message is generic — the internal cause is NOT reflected.
+        assert job.message == "job failed"
+        assert secret not in (job.message or "")
+
+        # The internal log records the cause WITH a traceback (exc_info attached).
+        records = [r for r in caplog.records if r.exc_info is not None]
+        assert records, "expected an exc_info log record carrying the traceback"
+        # The captured traceback names the underlying exception type + message.
+        text = caplog.text
+        assert "RuntimeError" in text
+        assert secret in text
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_httpx_error_in_fetch_surfaces_as_structured_source_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raw httpx transport error from ``fetch_image`` (the realistic
+    ~98s-then-generic-fail escape: tenacity exhausts its reraise=True retries and
+    re-raises the httpx error) must be wrapped as a page-scoped, structured
+    ``SourceError("source_unavailable", "page N …")`` rather than degrading to the
+    generic "job failed" (issue #70, fix 3)."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        urls = ["http://node/data/h/p1.png", "http://node/data/h/p2.png"]
+        src = _StubSource(
+            manifest=urls,
+            image_map={urls[0]: _png_bytes()},
+            image_errors={urls[1]: httpx.ConnectTimeout("image host timed out")},
+        )
+        engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
+        job = _make_job()
+        await store.insert(job)
+
+        with caplog.at_level(logging.WARNING, logger="manga_gateway.jobs.engine"):
+            await engine.run(job)
+
+        assert job.status == JobStatus.FAILED
+        # Wrapped into a specific, page-scoped reason — NOT the generic fallback.
+        assert job.message is not None
+        assert job.message != "job failed"
+        assert "page 2" in job.message
+        assert "ConnectTimeout" in job.message
+        assert not _has_cbz_under(tmp_path / "out")
+        # Because the failure is now a SourceError, the engine takes the structured
+        # SourceError branch — NO unexpected-error traceback is emitted.
+        assert not [r for r in caplog.records if r.exc_info is not None]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_transition_logs_carry_release_identity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every status-transition log must carry the release identity (title +
+    chapter id + a truncated handle) so a transition can be tied to WHAT it was
+    downloading (issue #70)."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        urls = ["http://node/data/h/p1.png"]
+        src = _StubSource(manifest=urls, image_map={urls[0]: _png_bytes()})
+        engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
+        job = _make_job(release_handle="h_abcdef0123456789secrettail")
+        await store.insert(job)
+
+        with caplog.at_level(logging.INFO, logger="manga_gateway.jobs.engine"):
+            await engine.run(job)
+
+        assert job.status == JobStatus.COMPLETED
+        # At least one transition log line carries the human-readable identity.
+        transition_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "→" in r.getMessage() and "→failed" not in r.getMessage()
+        ]
+        assert transition_lines, "expected status-transition log lines"
+        joined = "\n".join(transition_lines)
+        assert "Solo Leveling - Chapter 1 (en)" in joined  # title
+        assert job.chapter_id is not None
+        assert job.chapter_id in joined  # chapter id
+        # The handle is TRUNCATED to a short prefix — never logged in full.
+        assert "h_abcd022" not in joined  # sanity: not a false match
+        assert "h_abcdef" in joined  # prefix present
+        assert "secrettail" not in joined  # full secret-like handle withheld
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_fail_log_carries_release_identity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The terminal fail log must carry the release identity so a failed job can be
+    tied to WHAT it was downloading (issue #70 — the core gap that made run
+    26774561225's failure unrecoverable)."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        urls = ["http://node/data/h/p1.png"]
+        src = _StubSource(
+            manifest=urls,
+            image_errors={urls[0]: SourceError("source_unavailable", "upstream 404")},
+        )
+        engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
+        job = _make_job(release_handle="h_abcdef0123456789secrettail")
+        await store.insert(job)
+
+        with caplog.at_level(logging.WARNING, logger="manga_gateway.jobs.engine"):
+            await engine.run(job)
+
+        assert job.status == JobStatus.FAILED
+        fail_lines = [
+            r.getMessage() for r in caplog.records if "→failed" in r.getMessage()
+        ]
+        assert fail_lines, "expected a terminal fail log line"
+        joined = "\n".join(fail_lines)
+        assert "Solo Leveling - Chapter 1 (en)" in joined  # title
+        assert job.chapter_id is not None
+        assert job.chapter_id in joined  # chapter id
+        assert "h_abcdef" in joined  # truncated handle prefix
+        assert "secrettail" not in joined  # full secret-like handle withheld
+    finally:
+        await store.close()
+
+
+# ─────────────────────────── source-agnostic (SRC-01) ──────────────────────
 
 
 def test_engine_module_contains_no_mangadex_literal() -> None:

@@ -21,6 +21,12 @@ SQLite, leaving the durable store as the source of truth if the process crashes.
 Blocking work (Pillow ``verify``, ``zipfile`` write, ``os.replace``) is offloaded via
 ``asyncio.to_thread`` so it never stalls the event loop or ``GET /downloads`` polling
 (Pitfall 2). Image bytes are fetched under a per-job ``asyncio.Semaphore`` (D-31).
+
+Diagnosability (issue #70): when a job fails the INTERNAL log records both the
+underlying exception/traceback (so an operator can tell a flaky image fetch from a
+resolve/decrypt timeout from a genuinely-bad release) and the release identity
+(title + chapter id + a truncated handle). The wire-visible ``job.message`` stays
+generic — internals never leak over the API (SSRF/info-leak discipline).
 """
 
 from __future__ import annotations
@@ -29,6 +35,8 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+
+import httpx
 
 from ..framework.context import SourceContext
 from ..framework.errors import SourceError
@@ -77,6 +85,33 @@ def _page_filename(url: str) -> str:
     return url.rsplit("/", 1)[-1] or "page"
 
 
+# Issue #70 (diagnosability): a failed/transitioning job must be tie-able to WHAT it
+# was downloading. The handle is gateway-issued and may be secret-like (it is the
+# token Mangarr re-submits to download), so it is NEVER logged in full — only a
+# short prefix for correlation. Title + chapter_id is the human-readable identity.
+_HANDLE_LOG_PREFIX = 8
+
+
+def _release_identity(job: Job) -> str:
+    """A compact, non-secret release identity for INTERNAL logs (issue #70).
+
+    Renders ``title=… chapter=… handle=…`` from fields the ``Job`` already carries
+    in memory. The release handle is TRUNCATED to a short prefix (never logged in
+    full) because it is a gateway-issued token Mangarr re-submits — treating it
+    like a secret keeps the leak surface minimal (CLAUDE.md SSRF/info-leak
+    discipline). This string is for logs only and never crosses the wire.
+    """
+    title = job.title or "?"
+    chapter = job.chapter_id or "?"
+    handle = job.release_handle or ""
+    handle_short = (
+        f"{handle[:_HANDLE_LOG_PREFIX]}…"
+        if len(handle) > _HANDLE_LOG_PREFIX
+        else (handle or "?")
+    )
+    return f"title={title!r} chapter={chapter!r} handle={handle_short!r}"
+
+
 class JobEngine:
     """Drives one job's fetch/package lifecycle (constructed once by the JobManager)."""
 
@@ -107,13 +142,26 @@ class JobEngine:
         """Drive ``job`` to ``completed`` or ``failed`` (per-job isolation, D-29).
 
         Any exception ends the job ``failed`` with a generic reason; the strict
-        all-or-nothing fetch loop never publishes a partial CBZ.
+        all-or-nothing fetch loop never publishes a partial CBZ. A non-``SourceError``
+        escape (issue #70 — e.g. an httpx transport error/5xx that exhausted tenacity
+        and was never mapped to a ``SourceError``) is recorded WITH its full traceback
+        to the internal log; the wire message stays generic so internals are never
+        leaked over the API.
         """
         try:
             await self._run_inner(job)
         except SourceError as exc:
             await self._fail(job, str(exc) or exc.code)
         except Exception:  # noqa: BLE001 — isolation: a job failure must not poison others
+            # #70: capture the cause + traceback to the INTERNAL log only. Without
+            # this the cause is swallowed entirely and a failed job has neither a
+            # cause nor (without _fail's identity) an identity in any artifact.
+            _log.exception(
+                "job=%s source=%s %s unexpected error — failing job",
+                job.job_id,
+                job.source_key,
+                _release_identity(job),
+            )
             await self._fail(job, "job failed")
 
     # ─────────────────────────── state machine ───────────────────────────
@@ -208,7 +256,26 @@ class JobEngine:
 
         async def _one(index: int, url: str) -> None:
             async with sem:
-                content = await source.fetch_image(url, ctx)  # type: ignore[attr-defined]
+                # #70 (fix 3): wrap the page fetch so a genuine transport failure
+                # (httpx timeout/connect error, or a 5xx that exhausted tenacity's
+                # reraise=True retries) surfaces as a STRUCTURED, page-scoped
+                # ``SourceError("source_unavailable", "page N …")`` instead of a
+                # bare httpx exception that escapes the TaskGroup's ``except*
+                # SourceError`` and degrades to the generic "job failed". This is
+                # the realistic ~98s-then-generic-fail escape path from issue #70:
+                # ``ctx.get_bytes_plain`` retries transport errors/5xx and then
+                # re-raises the raw httpx error. The cause is still captured by the
+                # ``except Exception`` traceback log; this just gives the failure a
+                # specific, diagnosable shape.
+                try:
+                    content = await source.fetch_image(url, ctx)  # type: ignore[attr-defined]
+                except SourceError:
+                    raise
+                except httpx.HTTPError as exc:
+                    raise SourceError(
+                        "source_unavailable",
+                        f"page {index + 1} fetch failed: {type(exc).__name__}: {exc}",
+                    ) from exc
             ok = await asyncio.to_thread(is_valid_image, content)
             if not ok:
                 raise SourceError("source_unavailable", f"page {index + 1} invalid")
@@ -268,10 +335,13 @@ class JobEngine:
         await self._store.update(job)
         # #21: one log per state transition is the operator's primary signal
         # that the gateway is actually working during a long download.
+        # #70: carry the release identity so a transition can be tied to WHAT it
+        # was downloading (the Job already holds title/chapter_id/release_handle).
         _log.info(
-            "job=%s source=%s %s→%s pages=%s",
+            "job=%s source=%s %s %s→%s pages=%s",
             job.job_id,
             job.source_key,
+            _release_identity(job),
             previous.value,
             status.value,
             job.total_pages if job.total_pages is not None else "?",
@@ -282,10 +352,14 @@ class JobEngine:
         job.status = JobStatus.FAILED
         job.message = message
         await self._store.update(job)
+        # #70: a failed job MUST carry its release identity in the log so the
+        # failure can be tied to WHAT it was downloading; the wire message stays
+        # generic (set on job.message) but the internal log is diagnosable.
         _log.warning(
-            "job=%s source=%s %s→failed reason=%r",
+            "job=%s source=%s %s %s→failed reason=%r",
             job.job_id,
             job.source_key,
+            _release_identity(job),
             previous.value,
             message,
         )
