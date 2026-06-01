@@ -12,7 +12,10 @@ client or any change to the MangaDex path (R1):
 
 * D-40 clearance injection — for a ``cloudflare*`` source with a present solver, the
   captured ``cf_clearance`` cookie + the EXACT UA it was issued for are injected per
-  request (``headers=``/``cookies=`` override the process-wide UA; Pitfall 1).
+  request as a single ``headers=`` override (the cookies ride a per-request ``Cookie``
+  header alongside ``User-Agent`` — NOT the httpx ``cookies=`` kwarg, deprecated in
+  httpx 0.28 and which would pin clearance onto the R1-shared client's jar). A
+  mismatched UA silently invalidates the cookie (Pitfall 1), so the two stay coupled.
 * D-35 403 reconciliation — for ``cloudflare*`` sources ONLY, a 403 carrying CF
   challenge markers triggers a single forced re-solve + one retry, branching BEFORE
   the permanent-4xx STOP gate; a non-challenge 403, a second challenge, or any
@@ -136,12 +139,19 @@ class SourceContext:
         return self._antibot.startswith("cloudflare") and self._solver is not None
 
     async def _clearance_kwargs(self, *, force_resolve: bool) -> dict[str, Any]:
-        """Resolve clearance and build the per-request ``headers=``/``cookies=`` kwargs.
+        """Resolve clearance and build the per-request ``headers=`` kwarg (header-only).
 
-        D-40: inject ``clearance.cookies`` + the EXACT UA the cookie was issued for
-        (Pitfall 1 — a mismatched UA silently invalidates the cookie). Returns an empty
-        dict when there is no solver, no cloudflare gate, or a ``None`` clearance — so
-        the MangaDex path stays byte-for-byte unchanged.
+        D-40: inject ``clearance.cookies`` serialized into a single per-request
+        ``Cookie`` request header, alongside the EXACT UA the cookie was issued for
+        (Pitfall 1 — a mismatched UA silently invalidates the cookie, so the two stay
+        coupled on the SAME request). The httpx ``cookies=`` kwarg is deliberately NOT
+        used: it is deprecated in httpx 0.28 ("set cookies on the client instance") and
+        the only client here is the R1-shared one — pinning ``cf_clearance`` onto its
+        jar would leak it onto MangaDex + every future source and break the per-request
+        UA coupling. A manual ``Cookie`` header reproduces the exact wire bytes httpx's
+        ``cookies=`` emitted, and the shared jar (empty for these hosts) never overwrites
+        it. Returns an empty dict when there is no solver, no cloudflare gate, or a
+        ``None`` clearance — so the MangaDex path stays byte-for-byte unchanged.
         """
         if not self._is_cloudflare:
             return {}
@@ -149,10 +159,13 @@ class SourceContext:
         clearance = await self._call_solver(force_resolve=force_resolve)
         if clearance is None:
             return {}
-        return {
-            "cookies": clearance.cookies,
-            "headers": {"User-Agent": clearance.user_agent},
-        }
+        headers = {"User-Agent": clearance.user_agent}
+        cookie_header = "; ".join(
+            f"{name}={value}" for name, value in clearance.cookies.items()
+        )
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        return {"headers": headers}
 
     async def _call_solver(self, *, force_resolve: bool) -> Any:
         """Call ``get_clearance``, passing the internal ``force_resolve`` path if the
