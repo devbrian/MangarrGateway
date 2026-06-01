@@ -60,3 +60,12 @@ scripts/diagnose_cf_warm_burst.py
 
 # Per-test scratch output from the cf-warm-burst diagnostic harness.
 .planning/debug/cf-warm-burst-timeout-harness-stdout.log
+
+# Diagnostic-only harnesses for the cf-warm-cliff-followup debug session.
+# Not production code; live in tree so they can be re-run later.
+scripts/diagnose_cf_cookie_reuse.py
+scripts/diagnose_subprocess_leak.py
+.planning/debug/_cf_cookie_reuse_scratch/
+.planning/debug/_cf_subprocess_leak_scratch/
+.planning/debug/cf-cookie-reuse-evidence.log
+.planning/debug/cf-subprocess-leak-evidence.log

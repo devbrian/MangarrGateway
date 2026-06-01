@@ -44,11 +44,18 @@ restored automatically once the live-test session ends.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import subprocess
 import sys
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
+import pytest_asyncio
 
+import manga_gateway.app as _app_module
+from manga_gateway.config import Settings
 from manga_gateway.framework.antibot import CloudflareSolver
 from manga_gateway.framework.registry import SourceRegistry
 from manga_gateway.sources import register_builtin_sources
@@ -132,7 +139,19 @@ def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
     """Attach ``pytest.mark.timeout(profile.download_timeout_s)`` to every
-    parametrized live test (D-55).
+    parametrized live test (D-55), AND pin every live test to a session-
+    scoped event loop so the shared CloudflareSolver fixture (built once
+    on the session loop) and the tests that consume it stay on the SAME
+    loop. Cross-loop sharing of asyncio primitives (Semaphore/Lock/Future)
+    inside ``BrowserLifecycle`` was the architectural blocker for the
+    prior session's first mitigation attempt (cf-warm-burst-timeout.md
+    Mitigation Attempt 1) — pinning live tests to the session loop is
+    what makes the shared solver actually viable.
+
+    Gate tests are untouched (the marker is added only on items with the
+    ``live`` keyword), so deterministic gate isolation is preserved per
+    the existing ``asyncio_default_fixture_loop_scope = "function"``
+    config in pyproject.toml.
 
     Method selection is platform-aware: ``signal`` on POSIX (interrupts
     blocking C I/O via ``SIGALRM``), ``thread`` on Windows where
@@ -149,6 +168,19 @@ def pytest_collection_modifyitems(
     for item in items:
         if "live" not in item.keywords:
             continue
+        # Pin every live test to the session-scoped event loop so the
+        # session-scoped solver fixture can share a single CloudflareSolver
+        # (and its single Camoufox browser) across all live tests without
+        # cross-loop asyncio-primitive errors.
+        #
+        # add_marker(pytest.mark.asyncio(...)) at this hook point is too
+        # late: pytest-asyncio captures ``_loop_scope`` when it transforms
+        # the test function into a ``Coroutine`` item earlier in collection.
+        # Override the attribute directly so the live ``Coroutine``s run
+        # on the session loop the ``_session_solver`` fixture lives on.
+        item.add_marker(pytest.mark.asyncio(loop_scope="session"))
+        if hasattr(item, "_loop_scope"):
+            item._loop_scope = "session"  # type: ignore[attr-defined]
         callspec = getattr(item, "callspec", None)
         source_key = callspec.params.get("source_key") if callspec else None
         if source_key is None:
@@ -177,3 +209,210 @@ def _restore_real_cloudflare_warm(monkeypatch: pytest.MonkeyPatch) -> None:
     reference intact.
     """
     monkeypatch.setattr(CloudflareSolver, "warm", _ORIGINAL_CLOUDFLARE_WARM)
+
+
+# ─────────────────────── session-shared CloudflareSolver ───────────────────────
+#
+# cf-warm-cliff-followup mitigation. Building a fresh CloudflareSolver per live
+# test (the prior baseline) spawns N Camoufox processes back-to-back from one
+# residential IP. By the 6th comix test the warm() polling loop hit the 60s
+# asyncio.wait_for ceiling 4 times in a row. Two earlier mitigations
+# (cf-warm-burst-timeout.md "Mitigation Attempts") failed because the prior
+# fixture either shared asyncio primitives across event loops or relied on
+# user_data_dir cookie reuse without first proving the cookie was being
+# honored byte-for-byte.
+#
+# This session fixture takes a third path:
+#
+#   1. The collection hook above marks every live test ``loop_scope="session"``,
+#      so all live tests + this fixture share ONE event loop. Cross-loop
+#      asyncio-primitive errors (the architectural blocker from Mitigation
+#      Attempt 1) cannot occur.
+#   2. ONE CloudflareSolver is built and warmed once for the whole live-test
+#      session. The shared Camoufox browser stays up across every test.
+#   3. The autouse ``_substitute_app_solver`` fixture below patches
+#      ``manga_gateway.app.CloudflareSolver`` so per-test ``create_app``
+#      lifespan construction returns this same session instance. The session
+#      solver's ``aclose`` is neutered per-test so per-test lifespan teardown
+#      cannot kill the shared browser; the real teardown happens once at
+#      session shutdown.
+#
+# Bytes-comparison and subprocess-leak evidence informing the design lives at
+# ``.planning/debug/cf-warm-cliff-followup.md``.
+
+
+def _build_session_solver_kwargs() -> dict[str, Any]:
+    """Mirror app.py's solver-kwargs build using a default ``Settings()``.
+
+    Kept in lockstep with ``manga_gateway.app.lifespan`` lines 165-189 — the
+    fields and source of each match. The only difference: this fixture uses
+    a default-constructed ``Settings()`` (which picks up env vars exactly as
+    production does), then derives ``cloudflare_keys`` and ``challenge_url``
+    from the same registry inspection app.py performs.
+    """
+    # ``api_key`` is a required Settings field but does not feed any solver
+    # kwarg; supply a session-internal placeholder. All cloudflare_* fields
+    # still resolve from env vars exactly as production does.
+    settings = Settings(api_key="session-solver-fixture-not-an-api-key")
+    registry = SourceRegistry()
+    register_builtin_sources(registry)
+    cf_sources = {
+        key: cls
+        for key, cls in registry.items()
+        if getattr(cls, "antibot", "none").startswith("cloudflare")
+    }
+    cloudflare_keys = frozenset(cf_sources)
+    challenge_url = next(
+        (
+            getattr(cls, "cloudflare_challenge_url", None)
+            for cls in cf_sources.values()
+            if getattr(cls, "cloudflare_challenge_url", None)
+        ),
+        None,
+    )
+    kwargs: dict[str, Any] = {
+        "user_data_dir": settings.cloudflare_user_data_dir,
+        "headless": settings.cloudflare_headless,
+        "solve_concurrency": settings.cloudflare_solve_concurrency,
+        "fetch_concurrency": settings.cloudflare_fetch_concurrency,
+        "cloudflare_keys": cloudflare_keys,
+        "engine": settings.cloudflare_engine,
+        "log_browser_events": settings.cloudflare_log_browser_events,
+    }
+    if challenge_url is not None:
+        kwargs["challenge_url"] = challenge_url
+    return kwargs
+
+
+async def _noop_aclose() -> None:
+    """No-op aclose: bound onto the session solver so per-test lifespan
+    teardown (``app.py`` line 276 ``await solver.aclose()``) does NOT
+    tear down the shared browser. The real aclose runs once at session
+    teardown in ``_session_solver``'s finalizer.
+    """
+    return None
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def _session_solver() -> AsyncIterator[CloudflareSolver]:
+    """Build ONE CloudflareSolver for the live-test session; warm it once.
+
+    The warm uses the real ``_ORIGINAL_CLOUDFLARE_WARM`` captured at conftest
+    import (before any per-test monkeypatch can interfere). On teardown, the
+    REAL aclose is restored and called so the browser + Playwright instance
+    are stopped cleanly when pytest exits — leaving no orphan Camoufox
+    behind even if the suite was interrupted.
+    """
+    kwargs = _build_session_solver_kwargs()
+    solver = CloudflareSolver(**kwargs)
+    # Warm via the original (real) coroutine — the per-test autouse
+    # _restore_real_cloudflare_warm fixture only runs at test scope, so at
+    # session-fixture setup time the gate-wide no-op patch from
+    # tests/conftest.py is still active on the class. Bind the original to
+    # this instance so warm() actually solves.
+    real_warm = _ORIGINAL_CLOUDFLARE_WARM.__get__(solver, CloudflareSolver)
+    await asyncio.wait_for(real_warm(), timeout=60.0)
+    real_aclose = solver.aclose
+    try:
+        yield solver
+    finally:
+        # Restore and run the real teardown exactly once.
+        solver.aclose = real_aclose  # type: ignore[method-assign]
+        await solver.aclose()
+
+
+@pytest.fixture(autouse=True)
+def _substitute_app_solver(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Make per-test ``create_app`` lifespans use the session-shared solver.
+
+    Patches ``manga_gateway.app.CloudflareSolver`` to a factory that ignores
+    its kwargs and returns the session solver. Each per-test ``lifespan()``
+    call still executes ``CloudflareSolver(**solver_kwargs)`` (line 195 of
+    app.py) — but that lookup resolves to this factory in the patched
+    module namespace, so every test gets the SAME solver attached to its
+    ``app.state.solver``.
+
+    The session solver's ``aclose`` is bound to a per-instance no-op so the
+    lifespan's ``await solver.aclose()`` at shutdown (app.py line 276) is a
+    harmless await that does NOT close the shared Camoufox browser. The
+    real teardown runs once in ``_session_solver``'s finalizer.
+
+    Gate scope: this fixture is autouse only within ``tests/live/``. Gate
+    tests in ``tests/`` see no substitution and build/tear down real
+    CloudflareSolvers as before — which under the gate's autouse warm
+    monkeypatch from ``tests/conftest.py`` never actually touches a browser.
+    """
+    if "live" not in request.node.keywords:
+        return
+    session_solver: CloudflareSolver = request.getfixturevalue("_session_solver")
+    # Neuter aclose on the session instance for the duration of the live
+    # test session. We restore the original method only inside the
+    # ``_session_solver`` finalizer (above). Setting on the instance does
+    # not affect the class, so other tests that build a real solver via
+    # the un-patched path are unaffected.
+    session_solver.aclose = _noop_aclose  # type: ignore[method-assign]
+
+    def _factory(**_kwargs: Any) -> CloudflareSolver:
+        return session_solver
+
+    # Substitute the import-resolved symbol in app.py's namespace. Any
+    # ``CloudflareSolver(**solver_kwargs)`` call from inside lifespan()
+    # now returns the session instance. monkeypatch auto-undoes on teardown.
+    monkeypatch.setattr(_app_module, "CloudflareSolver", _factory)
+
+
+# ─────────────────────── subprocess-count diagnostic ───────────────────────
+#
+# Cheap insurance recommended by the cf-warm-cliff-followup adversarial
+# verification (`.planning/debug/cf-warm-cliff-followup.md` "Adversarial
+# Verification" section, recommendation 3). Prints the live Camoufox /
+# firefox / node process count immediately before each live test runs, so
+# if the cliff returns we have an inline accumulation signal in the test
+# log without needing to re-spin a separate harness.
+
+_PS_SNAPSHOT_CMD = (
+    "Get-Process | Where-Object { "
+    "$_.ProcessName -match 'camoufox|firefox|node' "
+    "} | Group-Object ProcessName | Select-Object Name, Count | "
+    "ConvertTo-Json -Compress -AsArray"
+)
+
+
+def _snapshot_browser_processes() -> str:
+    """Return a compact one-liner summary of live browser-like processes.
+
+    Windows-only (uses powershell). On non-Windows hosts the snapshot
+    returns ``"n/a (non-win32)"`` so the diagnostic is a no-op there.
+    """
+    if sys.platform != "win32":
+        return "n/a (non-win32)"
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", _PS_SNAPSHOT_CMD],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"snapshot_error: {type(exc).__name__}: {exc}"
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return "camoufox=0 firefox=0 node=0"
+    return raw.replace("\n", " ")
+
+
+@pytest.fixture(autouse=True)
+def _live_browser_process_snapshot(request: pytest.FixtureRequest) -> None:
+    """Print the browser-process snapshot before each live test runs.
+
+    Inline in the pytest output so a regression of the cf-warm-cliff
+    symptom is visible without re-spinning a separate harness. Live-only
+    (gates see no extra logging).
+    """
+    if "live" not in request.node.keywords:
+        return
+    snapshot = _snapshot_browser_processes()
+    # ASCII-only — Windows cp1252 console can't encode '->' arrow glyphs.
+    print(f"\n[live procs pre-test] {request.node.nodeid} -> {snapshot}")
