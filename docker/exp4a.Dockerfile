@@ -37,6 +37,14 @@ RUN pip install --no-cache-dir patchright==1.60.0
 # command from the session directive / CLAUDE.md install notes.
 RUN patchright install chromium --with-deps
 
+# Xvfb + realistic fonts for the HEADED datacenter path: on a datacenter-IP host
+# Cloudflare blocks headless Chromium (#35), so run with
+# GATEWAY_CLOUDFLARE_HEADLESS=false — the solver auto-starts an Xvfb display
+# (pyvirtualdisplay) and only needs the xvfb binary present here.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xvfb fonts-liberation fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Only the package + the harness (build context already filtered). The package

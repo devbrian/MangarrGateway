@@ -6,13 +6,13 @@ CONCURRENTLY via :func:`asyncio.gather` so /search's wall-clock is bounded by
 entirely by the framework's existing ``CloudflareSolver._browser_lock``
 Semaphore (``cloudflare_fetch_concurrency``) — this source adds no second gate.
 
-ENGINE NOTE (debug ``comix-parallel-engine-probe``, 2026-06-01): with the
-default ``cloudflare_fetch_concurrency=1`` the Semaphore admits one nav at a
-time, so the production default behaves exactly like the historic sequential
-loop. Parallelism is OPT-IN and only safe on ``engine=patchright`` (Chromium);
-``engine=camoufox`` (Firefox) stalls concurrent CF navs and MUST stay at 1.
-These tests drive the ``search()`` gather directly through a fake solver, so
-they validate the source-level concurrency shape independently of the engine.
+ENGINE NOTE (debug ``comix-parallel-engine-probe``, 2026-06-01): the default is
+now ``engine=patchright`` (Chromium) + ``cloudflare_fetch_concurrency=3``, so
+/search fans out 3-at-a-time out of the box. ``engine=camoufox`` (Firefox)
+stalls concurrent CF navs and MUST be pinned to 1 (enforced by the Settings
+``_reject_camoufox_parallel`` validator, #64). These tests drive the
+``search()`` gather directly through a fake solver, so they validate the
+source-level concurrency shape independently of the engine.
 
 Tests:
 * (a) ALL 5 candidates' chapters are returned in candidate (relevance) order —

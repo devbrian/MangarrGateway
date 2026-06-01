@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import tomli_w
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _log = logging.getLogger("manga_gateway")
@@ -88,47 +88,61 @@ class Settings(BaseSettings):
     )  # D-33/Pattern 7: solve cap; default 1 collapses to single-flight
     # Bound on concurrent ``fetch_via_browser`` calls within a single
     # CloudflareSolver instance. Backed by an ``asyncio.Semaphore`` in
-    # ``CloudflareSolver._browser_lock``; default 1 reproduces the
-    # historic ``asyncio.Lock`` shape exactly (one nav at a time → comix
-    # /search runs sequentially, zero regression for the default).
+    # ``CloudflareSolver._browser_lock``. Default 3 → the common comix
+    # series-candidate fan-out runs 3-at-a-time (max-not-sum wall-clock); set
+    # to 1 to collapse back to the historic ``asyncio.Lock`` shape (one nav at
+    # a time, fully sequential).
     #
     # ENGINE CONSTRAINT (debug session ``comix-parallel-engine-probe``,
     # 2026-06-01 — supersedes the earlier ``comix-parallel-page-contention``
     # "CF per-IP burst" caveat, now REFUTED): ``> 1`` is ONLY safe on
-    # ``cloudflare_engine="patchright"`` (Chromium). Chromium runs N concurrent
-    # CF navigations on one shared warm context cleanly (4/4 proven on
+    # ``cloudflare_engine="patchright"`` (Chromium), which is now the DEFAULT —
+    # so the default 3 is a safe pairing. Chromium runs N concurrent CF
+    # navigations on one shared warm context cleanly (4/4 proven on
     # residential-IP Windows + Linux, and through a residential proxy). Camoufox
     # (Firefox) STALLS concurrent CF navigations at goto-commit — the
-    # chapter-list DOM never renders — so with ``engine="camoufox"`` this MUST
-    # stay at 1. The failure is engine-specific, NOT a Cloudflare per-IP burst
-    # limit (issue #59). DEPLOY NOTE: ``engine=patchright`` needs a
-    # residential-reputation egress to clear CF — a datacenter-IP host should
-    # route the Chromium egress through a residential proxy (CLAUDE.md
-    # proxy-ready transport is the seam). A fail-fast Settings guard for
-    # ``> 1 + camoufox`` is deferred — tracked in issue #64.
-    cloudflare_fetch_concurrency: int = Field(default=1, ge=1)
-    cloudflare_headless: bool = True  # Open Q2: run the stealth browser headless
+    # chapter-list DOM never renders — so ``engine="camoufox"`` REQUIRES this to
+    # be 1. That pairing is enforced by the ``_reject_camoufox_parallel`` model
+    # validator below (closes #64): camoufox + ``> 1`` fails fast at startup
+    # instead of silently returning zero results. The failure is engine-specific,
+    # NOT a Cloudflare per-IP burst limit (issue #59). DEPLOY NOTE:
+    # ``engine=patchright`` may need a residential-reputation egress to clear CF
+    # on some hosts; a datacenter-IP host may need to route the Chromium egress
+    # through a residential proxy (CLAUDE.md proxy-ready transport, issue #65).
+    cloudflare_fetch_concurrency: int = Field(default=3, ge=1)
+    # Run the stealth browser headless. Default True: headless clears CF on a
+    # residential-reputation IP (dev / residential prod) with no display needed.
+    # Set to False on a DATACENTER host (cloud / CI): Cloudflare fingerprints
+    # headless Chrome at the binary level and blocks it on datacenter IPs, but
+    # HEADED Chromium clears it (cf-fingerprint-probe, #35). When headed on a
+    # display-less Linux host the solver auto-starts an Xvfb virtual display
+    # (pyvirtualdisplay) — the host only needs the ``xvfb`` package installed.
+    cloudflare_headless: bool = True
     # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at
     # the use site (Plan 04), NOT under output_root (T-04-03 — never logged).
     cloudflare_user_data_dir: str = "cloudflare-userdata"
     # D-37: watchdog re-clearance backoff schedule (min_hours, max_hours).
     cloudflare_watchdog_backoff_hours: tuple[int, int] = (1, 6)
     # Anti-bot engine selector (#35): which stealth browser drives the
-    # CloudflareSolver. ``camoufox`` (Firefox-based, C++ fingerprint spoof)
-    # is the default everywhere — local dev, CI, and prod — so that
-    # engine-specific failure modes (e.g. issue #54: Playwright Firefox
-    # handler crash on undefined pageError.location) surface in dev rather
-    # than only in nightly triage. Originally Patchright (Chromium-based)
-    # was the dev default for residential-IP friendliness on Windows, but
-    # the dev/prod engine split meant Camoufox-only failures went unseen
-    # locally; the dev-uses-camoufox-not-patchright preference (issue #40)
-    # made Camoufox the single default and demoted Patchright to an opt-in
-    # escalation (``GATEWAY_CLOUDFLARE_ENGINE=patchright``). Both back the
-    # SAME ``AntiBotSolver`` interface — swap is a config flip, not a
-    # rewrite (CLAUDE.md "keep the browser behind an interface so this is
-    # a config flip"). Camoufox requires ``uv run camoufox fetch`` to
-    # download its Firefox binary before first use (~200 MB, one-time).
-    cloudflare_engine: Literal["patchright", "camoufox"] = "camoufox"
+    # CloudflareSolver. ``patchright`` (Chromium-based, patched CDP leaks) is
+    # the DEFAULT since the ``comix-parallel-engine-probe`` finding
+    # (2026-06-01): only Chromium can run concurrent CF navigations on one warm
+    # context, so making it the default is what lets
+    # ``cloudflare_fetch_concurrency`` > 1 work out of the box. ``camoufox``
+    # (Firefox-based, C++ fingerprint spoof) is the opt-in fallback
+    # (``GATEWAY_CLOUDFLARE_ENGINE=camoufox``) — it clears CF on some hosts where
+    # Chromium's fingerprint has been flagged (historically the GitHub Actions
+    # datacenter runner, issue #35) but CANNOT run parallel, so a camoufox deploy
+    # must also set ``cloudflare_fetch_concurrency=1`` (the
+    # ``_reject_camoufox_parallel`` validator below enforces this). NOTE: this
+    # REVERSES the #40 "camoufox everywhere" default; whether Chromium also
+    # clears CF on datacenter runners is being re-tested (the #35 conclusion
+    # predates this work — camoufox passing there proved it is a fingerprint
+    # signal, not pure IP reputation). Both back the SAME ``AntiBotSolver``
+    # interface — swap is a config flip, not a rewrite. Patchright requires
+    # ``uv run patchright install chromium``; Camoufox requires
+    # ``uv run camoufox fetch`` (~200 MB Firefox build, one-time).
+    cloudflare_engine: Literal["patchright", "camoufox"] = "patchright"
     # Diagnostic-only: when True, ``CloudflareSolver._fetch_via_browser_once``
     # attaches ``page.on("pageerror" | "console" | "requestfailed")`` listeners
     # so we can capture the JS throw site behind the Playwright Firefox driver
@@ -143,6 +157,34 @@ class Settings(BaseSettings):
     cloudflare_log_browser_events: bool = False
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
+
+    @model_validator(mode="after")
+    def _reject_camoufox_parallel(self) -> Settings:
+        """Fail fast on the camoufox + parallel-fetch misconfiguration (#64).
+
+        ``cloudflare_fetch_concurrency > 1`` is only safe under
+        ``cloudflare_engine="patchright"`` (Chromium). Camoufox/Firefox stalls
+        concurrent Cloudflare navigations at goto-commit, so the combination
+        silently returns zero results (debug session
+        ``comix-parallel-engine-probe``, issue #59). Since patchright + 3 is the
+        default, this only trips when an operator overrides the engine back to
+        camoufox (e.g. a datacenter host / CI runner) without also pinning
+        concurrency to 1 — surfacing the mistake loudly at startup instead.
+        """
+        if (
+            self.cloudflare_engine == "camoufox"
+            and self.cloudflare_fetch_concurrency > 1
+        ):
+            raise ValueError(
+                "cloudflare_fetch_concurrency="
+                f"{self.cloudflare_fetch_concurrency} requires "
+                'cloudflare_engine="patchright" (Chromium). Camoufox/Firefox '
+                "stalls concurrent Cloudflare navigations and returns zero "
+                "results. Fix via env: set GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1, "
+                "or keep parallelism with GATEWAY_CLOUDFLARE_ENGINE=patchright "
+                "(issue #59)."
+            )
+        return self
 
 
 def load_settings(path: Path | None = None) -> Settings:

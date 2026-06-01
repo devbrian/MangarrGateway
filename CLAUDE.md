@@ -87,16 +87,23 @@ single-process search→handle→download→package flow must work.
 | **schemathesis** | 4.20.2 | Contract testing against the OpenAPI file | **The headline testing win.** Point it at `manga-gateway.openapi.yaml` (it supports OpenAPI 3.1 / JSON Schema 2020-12) and it property-generates requests, asserting every response conforms to the schema. Run it against the live ASGI app in CI — this is how you prove "faithful implementation of the contract of record." Wire the API key into its auth config so it hits authenticated endpoints. |
 | **respx** | latest | Mock httpx in tests | Mock MangaDex/Comix HTTP responses so search/fetch logic is testable without the network. Pairs with httpx specifically. |
 ## Installation
+
+```bash
 # Project + deps managed by uv (pyproject.toml)
-# Stealth browser binary — Camoufox (the default everywhere since #40):
-#   uv run camoufox fetch    # downloads its bundled Firefox, ~200 MB, one-time
-# Patchright is the opt-in escalation only (GATEWAY_CLOUDFLARE_ENGINE=patchright)
+# Stealth browser binary — Patchright/Chromium (the default since
+# comix-parallel-engine-probe — the only engine that runs parallel CF navs):
+#   uv run patchright install chromium
+# Camoufox is the opt-in fallback for datacenter hosts where Chromium is
+# fingerprint-flagged (GATEWAY_CLOUDFLARE_ENGINE=camoufox; uv run camoufox fetch,
+# ~200 MB). camoufox MUST pin GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1.
 # Dev
+```
+
 ## Alternatives Considered
 | Recommended | Alternative | When to Use Alternative |
 |-------------|-------------|-------------------------|
 | **httpx** | aiohttp 3.13.5 | aiohttp is faster at *very* high concurrency (1000+ simultaneous requests). This service is per-host rate-limited (10–30/min per source), so it never approaches that regime — httpx's nicer API, HTTP/2, and test ergonomics win. Switch to aiohttp only if profiling shows the client is the bottleneck under massive parallel image fetch. |
-| **Camoufox** | Patchright 1.60.0 | Camoufox is the default everywhere since #40 (dev + CI + prod) — keeps Firefox-only failure modes like #54 visible in local repro. Patchright (Chromium) is the opt-in escalation when residential-IP Cloudflare evasion or a Chromium-specific page feature matters; flip via `GATEWAY_CLOUDFLARE_ENGINE=patchright`. Both back the same `AntiBotSolver` interface — swap is a config flip, not a rewrite. |
+| **Patchright** | Camoufox 0.4.11 | Patchright (Chromium) is the default since `comix-parallel-engine-probe` — it is the only engine that runs Comix `/search` candidates in parallel (`cloudflare_fetch_concurrency > 1`); camoufox/Firefox stalls concurrent CF navs. Camoufox is the opt-in fallback for hosts where Chromium's fingerprint is flagged (e.g. some datacenter runners, #35 — being re-tested); flip via `GATEWAY_CLOUDFLARE_ENGINE=camoufox` and pin `GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1`. Both back the same `AntiBotSolver` interface — swap is a config flip, not a rewrite. |
 | **Patchright/Camoufox (in-process)** | FlareSolverr / Byparr (sidecar solver) | A separate HTTP-API solver service. The 002 spec mentions a `CloudflareClearanceService` (FlareSolverr/Byparr client) moving into the gateway. **Generally avoid for v1**: FlareSolverr relies on undetected-chromedriver and is widely reported as no longer passing current Cloudflare (2026); it also adds a second process, contradicting R1's single-process model. Consider only as an optional pluggable backend if you later want to offload solving. |
 | **aiosqlite (raw SQL)** | SQLModel 0.0.38 / SQLAlchemy | Use SQLModel if the persisted schema grows beyond jobs+handles (e.g. per-source stats, history with rich queries) or you want Pydantic-model-as-table reuse. For v1's tiny schema, raw aiosqlite is less machinery. SQLModel is still pre-1.0 (0.0.38) — weigh that. |
 | **uv** | Poetry | Poetry if the team already standardizes on it. uv is faster and is the 2026 momentum choice; no reason to pick Poetry for greenfield. |
@@ -107,7 +114,7 @@ single-process search→handle→download→package flow must work.
 |-------|-----|-------------|
 | **Gunicorn / uvicorn with `--workers N`** | Multiple workers = multiple processes, each with its own anti-bot session, caps cache, handle store, and job queue. Breaks R1 (one shared session), idempotency on `releaseHandle` (R5), and the in-memory caches. A `downloadHandle` issued by worker A is unknown to worker B. | Single uvicorn process. Scale concurrency *within* the process via asyncio. |
 | **Celery / RQ / Dramatiq / arq** | Heavyweight distributed task queues requiring a broker (Redis/RabbitMQ) and separate worker processes. Overkill and architecturally wrong for an in-process, single-process job model that must share the browser session and report progress from the same memory. | `asyncio.TaskGroup` + bounded `asyncio.Semaphore` for the job engine; SQLite for restart persistence. |
-| **Plain Playwright (no stealth) for Cloudflare** | Current Cloudflare fingerprints and blocks vanilla Playwright/Chromium (`navigator.webdriver`, CDP leaks). It will work on MangaDex (antibot: none) but fail on Comix (`cloudflare+encrypted`). | Camoufox (primary, default everywhere since #40); Patchright opt-in escalation. |
+| **Plain Playwright (no stealth) for Cloudflare** | Current Cloudflare fingerprints and blocks vanilla Playwright/Chromium (`navigator.webdriver`, CDP leaks). It will work on MangaDex (antibot: none) but fail on Comix (`cloudflare+encrypted`). | Patchright (Chromium, default — runs parallel CF navs); Camoufox opt-in fallback for fingerprint-flagged hosts. |
 | **FlareSolverr (as the v1 anti-bot core)** | Built on undetected-chromedriver; broadly reported failing current Cloudflare in 2026; adds a second process. | In-process Patchright/Camoufox. Treat any sidecar solver as an optional pluggable backend, not the default. |
 | **Selenium / undetected-chromedriver** | Older automation stack, slower, weaker async story, same detection problems as vanilla Playwright. | Patchright/Camoufox. |
 | **requests / aiohttp-for-everything mixing** | requests is sync and would block the event loop; mixing two HTTP clients doubles the cookie/UA/session-sharing surface (the captured `cf_clearance` must live on ONE client). | One async client (httpx) for all outbound HTTP. |

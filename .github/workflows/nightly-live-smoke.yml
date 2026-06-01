@@ -10,14 +10,17 @@
 #   * D-59: artifact upload is logs-only — junit.xml + pytest-live.log. NO CBZs,
 #     NO screenshots, NO captured fixtures (RESEARCH Security Domain explicit).
 #
-# Issue #35 / #40 — Cloudflare engine: Camoufox is the single default
-# everywhere (dev + CI + prod) since #40, so engine-specific failure modes
-# (e.g. #54 — Playwright Firefox handler crash on undefined pageError.location)
-# surface in local dev rather than only here in nightly. Patchright is opt-in
-# only via ``GATEWAY_CLOUDFLARE_ENGINE=patchright``. Both engines back the
-# same AntiBotSolver interface; the swap is a single env var. Camoufox
-# requires ``uv run camoufox fetch`` to download its bundled Firefox build
-# before first use (~200 MB).
+# Cloudflare engine (#35 / #40 / comix-parallel-engine-probe): Patchright/
+# Chromium is the default since the parallel-search finding (only Chromium runs
+# concurrent CF navigations). This workflow now runs the SAME default —
+# ``GATEWAY_CLOUDFLARE_ENGINE: patchright`` — to RE-TEST whether Chromium clears
+# Comix's Cloudflare on the ubuntu-latest datacenter runner. Issue #35 recorded
+# Patchright TIMING OUT here, but camoufox passing on the same runner proved the
+# block is a fingerprint signal, not pure datacenter-IP reputation — so it is
+# worth empirically re-checking. If Chromium fails here, pin
+# ``GATEWAY_CLOUDFLARE_ENGINE: camoufox`` + ``GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY: "1"``
+# (camoufox cannot run parallel). Both engines back the same AntiBotSolver
+# interface; the swap is a single env var.
 #
 # Sibling to .github/workflows/ci.yml (the deterministic gate). D-12 invariant:
 # this workflow NEVER replaces `uv run nox -s gate` — they run independently;
@@ -42,24 +45,19 @@ permissions:
 jobs:
   live-smoke:
     runs-on: ubuntu-latest
-    # #35 / #40: Camoufox is the default everywhere (Settings.cloudflare_engine
-    # default = "camoufox"); the explicit env var below is belt-and-braces
-    # documentation so a reader of this workflow doesn't have to chase the
-    # default through the codebase. Patchright/Chromium is the opt-in
-    # escalation only — its headless fingerprint is flagged by Cloudflare's
-    # encrypted tier on cloud Linux runners (Comix warm() would hang the
-    # 60s outer budget).
+    # Patchright/Chromium is the default since comix-parallel-engine-probe; this
+    # runs the SAME engine production residential deploys use, so CI exercises the
+    # real parallel Chromium path (fetch_concurrency inherits the default 3).
+    #
+    # HEADED + Xvfb (the cf-fingerprint-probe finding, 2026-06-01): bare HEADLESS
+    # Chromium is fingerprint-flagged by Cloudflare on this datacenter runner (CF
+    # detects headless Chrome at the binary level), but HEADED Chromium under an
+    # Xvfb virtual display clears it (proven 2-4s vs headless 46s timeout). So pin
+    # GATEWAY_CLOUDFLARE_HEADLESS=false; the solver auto-starts Xvfb via
+    # pyvirtualdisplay (the ``xvfb`` apt package below provides the binary).
     env:
-      GATEWAY_CLOUDFLARE_ENGINE: camoufox
-      # Temporary: enable diagnostic browser-event capture for the #54
-      # root-cause investigation (debug session
-      # comix-pageerror-throw-site-54). Set "1" so the page.on("pageerror"
-      # | "console" | "requestfailed") handlers in CloudflareSolver fire
-      # under live traffic. REVERT this line back to default-off once we
-      # have captured one or more dead-driver pageerror events around a
-      # real crash window (see PR #57 + debug session classification
-      # protocol). Direct-to-main per ops authorization.
-      GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS: "1"
+      GATEWAY_CLOUDFLARE_ENGINE: patchright
+      GATEWAY_CLOUDFLARE_HEADLESS: "false"
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.
@@ -69,16 +67,18 @@ jobs:
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - run: uv python install 3.12
       - run: uv sync --dev
-      # Camoufox ships only the Python driver; its bundled Firefox binary must
-      # be downloaded separately (~200 MB, runner has the disk). Same role as
-      # ``patchright install chromium`` previously — without this step the
-      # solver would fail on first launch (#35).
-      - run: uv run camoufox fetch
-      # Patchright's Chromium is still installed so a re-run with
-      # ``GATEWAY_CLOUDFLARE_ENGINE=patchright`` (the opt-in escalation since
-      # #40) works on the runner too. Cheap relative to the Camoufox Firefox
-      # download.
+      # Patchright's Chromium + its system libraries — the default engine's
+      # browser. ``--with-deps`` provisions the Linux libs Chromium needs.
       - run: uv run patchright install --with-deps chromium
+      # Camoufox's Firefox build is still fetched (~200 MB, runner has the disk)
+      # so a fallback re-run with ``GATEWAY_CLOUDFLARE_ENGINE=camoufox`` +
+      # ``GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1`` works without a workflow edit
+      # if the headed-Chromium path regresses on the datacenter runner.
+      - run: uv run camoufox fetch
+      # Xvfb provides the virtual display the HEADED Chromium launch needs on this
+      # display-less runner (the solver auto-starts it via pyvirtualdisplay); the
+      # realistic fonts reduce the Linux font-fingerprint anomaly.
+      - run: sudo apt-get update && sudo apt-get install -y xvfb fonts-liberation fonts-noto-color-emoji
 
       # Live step — D-58 / Pitfall 4: `continue-on-error: true` so a per-source
       # failure does NOT short-circuit the triage step below. The job's final

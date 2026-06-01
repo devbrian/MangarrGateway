@@ -41,17 +41,23 @@ driving a stealth browser. The engine is a config flip
 (`GATEWAY_CLOUDFLARE_ENGINE`); both engines back the same `AntiBotSolver`
 interface:
 
-- **`camoufox`** (Firefox-based) — the **default everywhere** (dev, CI, prod).
-- **`patchright`** (Chromium-based) — opt-in escalation.
+- **`patchright`** (Chromium-based) — the **default**. The only engine that can
+  run Comix `/search` candidates in parallel.
+- **`camoufox`** (Firefox-based) — opt-in fallback for hosts where Chromium's
+  fingerprint is flagged (e.g. some datacenter runners, issue #35). Cannot run
+  parallel.
 
 Comix `/search` fans a series-candidate query out to one browser navigation per
 candidate. Those navigations run **concurrently** (`asyncio.gather`), bounded by
 `GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY` (the `CloudflareSolver._browser_lock`
-Semaphore). The default is **1**, which serializes the fan-out — behaviourally
-identical to a sequential loop and the safe default for every engine and host.
+Semaphore). The default is **3** — paired with the default `patchright` engine,
+the candidate fan-out runs 3-at-a-time. Set it to **1** to serialize (required
+for `engine=camoufox`).
 
-**Parallelism (`fetch_concurrency > 1`) is OPT-IN and ENGINE-SPECIFIC.** It is
-only safe on `engine=patchright` (Chromium):
+**Parallelism (`fetch_concurrency > 1`) is ENGINE-SPECIFIC** — only safe on
+`engine=patchright` (Chromium), which is why Chromium is the default. The
+combination `engine=camoufox` + `fetch_concurrency > 1` **fails fast at startup**
+(a Settings validator, #64) rather than silently returning zero results:
 
 | Engine | `fetch_concurrency > 1` | Why |
 |--------|-------------------------|-----|
@@ -63,27 +69,44 @@ earlier "never exceed 1" diagnosis (issue #59) was an artifact of testing only
 Camoufox and is refuted (debug session `comix-parallel-engine-probe`,
 2026-06-01).
 
-To enable parallel Comix search:
+Parallel Comix search is **on by default** (patchright + concurrency 3). For a
+host where Chromium is flagged, fall back to camoufox — which must pin
+concurrency to 1 (the guard above enforces it):
 
 ```bash
-GATEWAY_CLOUDFLARE_ENGINE=patchright \
-GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=5 \
+GATEWAY_CLOUDFLARE_ENGINE=camoufox \
+GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1 \
   uv run uvicorn manga_gateway.app:app
 ```
 
-### Residential-IP requirement (and the proxy mitigation)
+### Headless vs headed (residential vs datacenter)
 
-`engine=patchright` (Chromium) needs a **residential-reputation egress IP** to
-clear Comix's Cloudflare encrypted challenge. It clears cold on a residential-IP
-host (Windows or Linux). A cloud **datacenter-IP** host will likely be flagged
-by Cloudflare (the root of issue #35) — the mitigation is to route the Chromium
-egress through a **residential proxy**, which has been verified to clear CF and
-run the parallel path. CLAUDE.md's day-one proxy-ready/injectable transport is
-the seam for wiring a production proxy pool (tracked as future work).
+`engine=patchright` (Chromium) clears Comix's Cloudflare differently depending on
+the host's IP reputation:
 
-`docker/exp4a.Dockerfile` is the documented minimal basis for a residential-IP
-Linux Chromium deploy (`python:3.12-slim-bookworm` + `patchright==1.60.0` +
-`patchright install chromium --with-deps`).
+- **Residential IP** (dev box, residential prod): **headless works** — no display
+  needed. This is the default (`cloudflare_headless=true`).
+- **Datacenter IP** (cloud VPS, CI runners): Cloudflare fingerprints *headless*
+  Chrome at the binary level and blocks it (the root of issue #35). **Headed**
+  Chromium clears it — set `GATEWAY_CLOUDFLARE_HEADLESS=false`. On a display-less
+  Linux host the solver auto-starts an **Xvfb** virtual display
+  (`pyvirtualdisplay`); the host just needs the `xvfb` package installed:
+
+  ```bash
+  apt-get install -y xvfb fonts-liberation
+  GATEWAY_CLOUDFLARE_ENGINE=patchright \
+  GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=3 \
+  GATEWAY_CLOUDFLARE_HEADLESS=false \
+    uv run uvicorn manga_gateway.app:app
+  ```
+
+  (An alternative datacenter mitigation is routing the egress through a
+  **residential proxy** — tracked in issue #65 — but headed+Xvfb needs no proxy.)
+
+`docker/exp4a.Dockerfile` is the documented minimal Linux Chromium deploy basis
+(`python:3.12-slim-bookworm` + `patchright==1.60.0` + `patchright install
+chromium --with-deps` + `xvfb`); on a datacenter host run it with
+`GATEWAY_CLOUDFLARE_HEADLESS=false`.
 
 ## Development
 
