@@ -339,11 +339,19 @@ class JobManager:
         """Live byte/ETA projection from CURRENT in-memory progress (WR-08, DL-05).
 
         Returns ``(total_bytes, remaining_bytes, eta_seconds)`` computed fresh per
-        poll — no store/disk read. For a DOWNLOADING job with usable progress the
-        total is the per-page-average projection and the ETA derives from the
-        observed download rate; every other state (queued/resolving/archiving/
+        poll — no store/disk read. For a DOWNLOADING **or ARCHIVING** job with usable
+        progress the total is the per-page-average projection and the ETA derives
+        from the observed download rate; every other state (queued/resolving/
         completed/failed, or not-yet-usable progress) falls back to the STORED
         ``total_bytes``/``remaining_bytes`` with ``eta_seconds=None``.
+
+        ARCHIVING is included so the counter stays MONOTONIC: by then all pages are
+        fetched (``downloaded_pages == total_pages``) but the engine has not yet
+        pinned ``total_bytes`` (that happens on COMPLETED), so a DOWNLOADING-only
+        guard would briefly drop the live estimate back to the stored ``0/0`` and
+        then jump to the exact total — a visible glitch. With ARCHIVING included,
+        ``est_total == downloaded_bytes`` and ``remaining == 0`` there, matching the
+        exact pinned total that COMPLETED then projects (issue #10 / CodeRabbit).
 
         Invariants (LOCKED Option 2): ``remaining_bytes`` is never negative
         (``max(0, …)``) and EVERY division is guarded against zero — the per-page
@@ -355,7 +363,7 @@ class JobManager:
         downloaded_pages = job.downloaded_pages
         total_pages = job.total_pages
         if (
-            job.status is JobStatus.DOWNLOADING
+            job.status in (JobStatus.DOWNLOADING, JobStatus.ARCHIVING)
             and downloaded_pages
             and downloaded_pages > 0
             and total_pages

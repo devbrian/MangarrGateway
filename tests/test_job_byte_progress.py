@@ -212,6 +212,43 @@ async def test_downloading_projects_per_page_average_estimate_and_eta(
         await store.close()
 
 
+# ────────── 2b. archiving keeps the live estimate (monotonic, no 0 glitch) ──────
+
+
+@pytest.mark.asyncio
+async def test_archiving_projects_live_estimate_not_stored_zero(
+    tmp_path: Path,
+) -> None:
+    """ARCHIVING must not regress the counter to 0/0 (issue #10 / CodeRabbit).
+
+    By ARCHIVING all pages are fetched but the engine has not yet pinned
+    total_bytes (that is a COMPLETED-only write), so the stored value is still 0.
+    A DOWNLOADING-only guard would briefly project 0/0 here and then jump to the
+    exact total on completion. The projection must instead stay continuous:
+    est_total == downloaded_bytes, remaining == 0.
+    """
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        mgr = _manager(store)
+        job = _make_job(
+            status=JobStatus.ARCHIVING,
+            total_pages=4,
+            downloaded_pages=4,  # all fetched
+            downloaded_bytes=4000,
+            total_bytes=0,  # NOT yet pinned (pinned on COMPLETED) — must not leak
+            remaining_bytes=0,
+            download_started_at=_seconds_ago(4.0),
+        )
+        dto = mgr._to_dto(job)
+        # est_total = 4000/4*4 = 4000 (== downloaded_bytes), remaining = 0.
+        assert dto.total_bytes == 4000, "archiving must not regress to stored 0"
+        assert dto.remaining_bytes == 0
+        assert dto.eta_seconds is not None  # rate observed → not null during archiving
+        assert dto.eta_seconds >= 0
+    finally:
+        await store.close()
+
+
 # ────────────────── 3. negative-clamp (never below zero) ─────────────────────
 
 
@@ -222,20 +259,25 @@ async def test_remaining_bytes_clamps_at_zero_when_average_overcounts(
     store = await open_store(str(tmp_path / "jobs.db"))
     try:
         mgr = _manager(store)
-        # All pages fetched (3/3) → est_total == downloaded_bytes, so remaining
-        # would be 0; arrange a contrived state that would push it negative and
-        # assert the max(0, …) clamp holds.
+        # Contrive downloaded_pages > total_pages so the per-page average
+        # UNDER-counts the total (est_total < downloaded_bytes) and the un-clamped
+        # remainder would go NEGATIVE — the only arrangement that actually
+        # exercises the max(0, …) clamp (with pages == total_pages the clamp is
+        # only ever fed 0 and would pass even if removed). This state shouldn't
+        # arise in practice (the engine never advances downloaded_pages past
+        # total_pages), but the clamp is the defensive guard against exactly that.
         job = _make_job(
             status=JobStatus.DOWNLOADING,
             total_pages=3,
-            downloaded_pages=3,
+            downloaded_pages=4,  # > total_pages → est_total < downloaded_bytes
             downloaded_bytes=9000,
             total_bytes=999,  # stale stored value must not leak through
             download_started_at=_seconds_ago(3.0),
         )
         dto = mgr._to_dto(job)
-        # est_total = 9000/3*3 = 9000, remaining = max(0, 9000-9000) = 0.
-        assert dto.total_bytes == 9000
+        # est_total = round(9000/4*3) = 6750; un-clamped remaining = 6750-9000 =
+        # -2250 → clamped to 0.
+        assert dto.total_bytes == 6750
         assert dto.remaining_bytes == 0
         assert dto.remaining_bytes >= 0
     finally:
