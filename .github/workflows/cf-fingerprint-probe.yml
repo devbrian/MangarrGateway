@@ -1,0 +1,40 @@
+# EXPERIMENTAL investigation workflow (datacenter Chromium fingerprint fix).
+#
+# Manual-only. Runs scripts/cf_fingerprint_probe.py on the ubuntu-latest
+# DATACENTER runner to find which Patchright/Chromium launch config clears
+# Comix's Cloudflare encrypted challenge from a datacenter IP — the open
+# question from comix-parallel-engine-probe (#35). Bare headless Chromium is
+# blocked there; this probes real-Chrome-channel + headed-under-Xvfb (the
+# research-backed fix) alongside the headless baseline.
+#
+# TEMPORARY: remove once the winning config is wired into the solver and shipped.
+# Dispatch with: gh workflow run cf-fingerprint-probe.yml --ref <branch>
+
+name: cf-fingerprint-probe
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - run: uv python install 3.12
+      - run: uv sync --dev
+      # Bundled Chromium + its system libs (the headless baseline configs).
+      - run: uv run patchright install --with-deps chromium
+      # Real Google Chrome (the channel="chrome" configs — research says
+      # bundled Chromium is flagged where real Chrome is not).
+      - run: uv run patchright install chrome
+      # Xvfb virtual framebuffer so the HEADED configs have a display on the
+      # headless runner; realistic fonts reduce the Linux font-fingerprint anomaly.
+      - run: sudo apt-get update && sudo apt-get install -y xvfb fonts-liberation fonts-noto-color-emoji
+      # Run the whole probe under a virtual display; headless configs ignore it.
+      - run: xvfb-run -a uv run python scripts/cf_fingerprint_probe.py
