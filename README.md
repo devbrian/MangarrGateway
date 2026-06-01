@@ -24,7 +24,7 @@ The gateway is a **single-process** FastAPI app — never run it multi-worker
 process):
 
 ```bash
-uv run uvicorn manga_gateway.app:app
+uv run python -m manga_gateway
 ```
 
 Configuration is TOML-first (`config.toml`, source of truth) with
@@ -33,6 +33,76 @@ Configuration is TOML-first (`config.toml`, source of truth) with
 Every endpoint requires the configured API key — sent as the `X-Api-Key` header
 (or the `?apikey=` query parameter). The service binds `127.0.0.1` (localhost)
 by default.
+
+## Docker
+
+The gateway ships as a multi-stage image (`Dockerfile`): a uv-built venv over
+`python:3.12-slim-bookworm` with Chromium (Patchright), Xvfb, and fonts
+provisioned for the Cloudflare path. It runs a **single uvicorn process** via
+`python -m manga_gateway` (R1 — never `--workers`).
+
+### Local (compose)
+
+```bash
+docker compose up --build          # builds + runs LOCAL source (dev override merged)
+```
+
+`docker-compose.override.yml` bind-mounts `./src` for live iteration. The image
+runs a single process with no `--reload`, so the dev loop is: edit `./src`, then
+`docker compose restart gateway`. For a clean prod-parity run that **excludes**
+the dev bind-mount:
+
+```bash
+docker compose -f docker-compose.yml up --build
+```
+
+Copy `.env.example` → `.env` (git-ignored) to set operator knobs; the gateway
+also runs with no `.env` (the image bakes safe defaults).
+
+### Volumes & state
+
+Two volumes persist across container recreation:
+
+- `/state` — `config.toml` (incl. the **auto-generated API key**), `gateway.db`,
+  and the Cloudflare `cf_clearance` user-data dir.
+- `/data/manga` — packaged CBZ output.
+
+### Reading the API key
+
+The API key is auto-generated into the state volume's `config.toml` on first run
+(`GATEWAY_API_KEY` is **ignored** — D-01). Read it, then authenticate every
+request with `X-Api-Key`:
+
+```bash
+docker compose exec gateway cat /state/config.toml   # find the api_key line
+curl -H "X-Api-Key: <key>" http://127.0.0.1:9191/api/v1/version
+```
+
+**Security posture:** the container binds `0.0.0.0` so the published port is
+reachable, but the API key is still required on **every** endpoint (AUTH-01). Run
+it on a trusted network or behind a reverse proxy.
+
+### Datacenter hosts (headed Chromium)
+
+On a datacenter IP, Cloudflare blocks headless Chromium — set
+`GATEWAY_CLOUDFLARE_HEADLESS=false`. Xvfb is already in the image, so the headed
+path works with **no image change** (the solver auto-starts the virtual display).
+Routing egress through a residential proxy (`GATEWAY_CLOUDFLARE_PROXY_*`,
+issue #65) is the alternative mitigation.
+
+### GHCR image
+
+```bash
+docker pull ghcr.io/devbrian/mangarrgateway:latest   # or a :<version>
+```
+
+Releases publish automatically on a `v*` git tag (or a manual
+`workflow_dispatch`) via `.github/workflows/docker-publish.yml` — linux/amd64,
+SHA-pinned actions, independent of the `ci.yml` gate.
+
+> `docker/exp4a.Dockerfile` remains a **diagnostic harness** (the residential-IP
+> Cloudflare probe), not the production image — the productionized siblings are
+> the top-level `Dockerfile` + compose files above.
 
 ## Anti-bot engine & parallel Comix search
 
@@ -76,7 +146,7 @@ concurrency to 1 (the guard above enforces it):
 ```bash
 GATEWAY_CLOUDFLARE_ENGINE=camoufox \
 GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1 \
-  uv run uvicorn manga_gateway.app:app
+  uv run python -m manga_gateway
 ```
 
 ### Headless vs headed (residential vs datacenter)
@@ -97,7 +167,7 @@ the host's IP reputation:
   GATEWAY_CLOUDFLARE_ENGINE=patchright \
   GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=3 \
   GATEWAY_CLOUDFLARE_HEADLESS=false \
-    uv run uvicorn manga_gateway.app:app
+    uv run python -m manga_gateway
   ```
 
   (An alternative datacenter mitigation is routing the egress through a

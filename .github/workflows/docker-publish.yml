@@ -1,0 +1,66 @@
+# Build + publish the production container image to GHCR.
+#
+# LD-2 (06-TASKBRIEF, 2026-06-01):
+#   * Triggers on a `v*` git tag push (release) + `workflow_dispatch` (manual).
+#   * Publishes ghcr.io/devbrian/mangarrgateway:<version> + :latest.
+#   * linux/amd64 ONLY (browser binaries; no arm64).
+#
+# Sibling to — but INDEPENDENT of — .github/workflows/ci.yml (the deterministic
+# gate). D-12 invariant: this workflow ONLY builds/publishes the image; it NEVER
+# replaces `uv run nox -s gate`.
+#
+# Supply-chain discipline (matches ci.yml / nightly-live-smoke.yml): every
+# third-party action is pinned to a full commit SHA with a trailing # vX.Y.Z
+# comment (no floating @vN tags — zizmor/CodeRabbit: tampering-via-floating-tag);
+# checkout uses persist-credentials:false; least-privilege permissions (only
+# packages:write, which GHCR push requires, on top of contents:read).
+
+name: docker-publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+# Least-privilege workflow token: read the repo + push the package to GHCR.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      # Same pinned checkout SHA as ci.yml / nightly-live-smoke.yml.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false  # don't leak the token into the checkout
+
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/devbrian/mangarrgateway
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions layer cache blunts the large Chromium-layer build time.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
