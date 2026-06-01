@@ -82,3 +82,10 @@ class Job:
     # unaffected — dataclass requires defaulted fields after non-default ones.
     downloaded_bytes: int = 0
     download_started_at: str | None = None
+    # The resolved series title (from ``ResolutionRecord.manga_title``). Unlike the
+    # two projection-only fields above, this IS submit-time DURABLE data: it backs
+    # the per-series output folder for mangaId-less grabs (#16) and PERSISTS to its
+    # own SQLite column (store wires _CREATE_SCHEMA/_COLUMNS/_row_to_job/_job_values
+    # + an additive ALTER migration). Defaulted so existing ``Job(...)`` / test
+    # ``_make_job`` call sites that omit it still construct.
+    manga_title: str | None = None

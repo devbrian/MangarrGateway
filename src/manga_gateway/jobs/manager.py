@@ -175,6 +175,9 @@ class JobManager:
             created_at=now,
             updated_at=now,
             completed_at=None,
+            # #16: the series title lives on the resolved record (SubmitRequest has
+            # none); persist it so the engine can bucket mangaId-less grabs per-series.
+            manga_title=record.manga_title,
         )
         try:
             await self._store.insert(job)  # write-through FIRST (Pattern 2)
