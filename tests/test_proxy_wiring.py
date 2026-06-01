@@ -26,6 +26,7 @@ import httpx
 from manga_gateway.config import Settings
 from manga_gateway.framework.antibot import CloudflareSolver
 from manga_gateway.framework.proxy import build_proxy
+from manga_gateway.framework.transport import HttpxTransport
 
 TEST_API_KEY = "test-key-deterministic-0123456789"
 # Obviously-fake local-only values — NEVER a real proxy credential (T-odg-02).
@@ -254,3 +255,75 @@ def test_solver_stores_proxy_dict_verbatim() -> None:
     solver = CloudflareSolver(proxy=proxy)
     assert solver._proxy is proxy  # type: ignore[attr-defined]
     assert CloudflareSolver()._proxy is None  # type: ignore[attr-defined]
+
+
+# ─────────────── Task 3: httpx transport + lifespan single-helper ───────────────
+
+
+def test_transport_passes_proxy_to_asyncclient_when_configured(
+    monkeypatch: Any,
+) -> None:
+    """``HttpxTransport`` with a proxy configured constructs its AsyncClient with
+    the helper's httpx proxy value."""
+    captured: dict[str, Any] = {}
+    real_init = httpx.AsyncClient.__init__
+
+    def _spy_init(self: httpx.AsyncClient, *args: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _spy_init)
+
+    settings = _settings(
+        cloudflare_proxy_server=_FAKE_SERVER,
+        cloudflare_proxy_username=_FAKE_USER,
+        cloudflare_proxy_password=_FAKE_PASS,
+    )
+    HttpxTransport(settings)
+    proxy = captured.get("proxy")
+    assert isinstance(proxy, httpx.Proxy)
+    assert str(proxy.url) == _FAKE_SERVER
+
+
+def test_transport_omits_proxy_when_unconfigured(monkeypatch: Any) -> None:
+    """No proxy ⇒ AsyncClient is built with NO ``proxy`` kwarg (regression guard)."""
+    captured: dict[str, Any] = {}
+    real_init = httpx.AsyncClient.__init__
+
+    def _spy_init(self: httpx.AsyncClient, *args: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", _spy_init)
+
+    HttpxTransport(_settings())
+    assert "proxy" not in captured
+
+
+async def test_lifespan_threads_same_proxy_into_solver() -> None:
+    """The lifespan builds the proxy ONCE and feeds the Playwright dict into the
+    solver — both legs share egress by construction (cf_clearance is IP-bound)."""
+    from manga_gateway.app import create_app
+
+    app = create_app(
+        _settings(
+            cloudflare_proxy_server=_FAKE_SERVER,
+            cloudflare_proxy_username=_FAKE_USER,
+            cloudflare_proxy_password=_FAKE_PASS,
+        )
+    )
+    async with app.router.lifespan_context(app):
+        assert app.state.solver._proxy == {
+            "server": _FAKE_SERVER,
+            "username": _FAKE_USER,
+            "password": _FAKE_PASS,
+        }
+
+
+async def test_lifespan_no_proxy_leaves_solver_proxy_none() -> None:
+    """No proxy configured ⇒ solver receives no proxy (``_proxy is None``)."""
+    from manga_gateway.app import create_app
+
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        assert app.state.solver._proxy is None
