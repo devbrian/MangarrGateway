@@ -275,7 +275,7 @@ class CloudflareSolver:
         user_data_dir: str = "cloudflare-userdata",
         headless: bool = True,
         solve_concurrency: int = 1,
-        fetch_concurrency: int = 5,
+        fetch_concurrency: int = 1,
         recycle_seconds: float | None = None,
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         cloudflare_keys: Iterable[str] = (),
@@ -312,27 +312,23 @@ class CloudflareSolver:
         )
         self._playwright: Any = None  # the started playwright instance (real path)
         # Bounds concurrent ``fetch_via_browser`` calls on the warm context.
-        # Originally an ``asyncio.Lock`` to keep "minimize fingerprinting
-        # events" (Pitfall 6) by serializing 1-at-a-time, but that turned
-        # the per-source 20s budget into a sum-of-individual-navs ceiling
-        # and broke `comix /search` under variance (debug session
-        # ``comix-search-timeout`` — see PR for the nightly evidence).
-        # A bounded ``Semaphore`` is the right tradeoff: humans browse
-        # with multiple tabs open routinely, the warm persistent-context's
-        # driver multiplexes pages cleanly, and a small cap still keeps
-        # the simultaneous-fingerprint footprint modest.
+        # An ``asyncio.Semaphore`` backs the gate; ``fetch_concurrency=1``
+        # (the default) reproduces the historic ``asyncio.Lock`` shape
+        # exactly. The Semaphore-vs-Lock choice exists so an ops-side
+        # ``GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=N`` bump can experiment
+        # with N>1 without recompiling — useful when the parallel-page
+        # contention investigation lands a verified explanation (see
+        # debug session ``comix-parallel-page-contention``).
         #
-        # Cap is configurable via ``fetch_concurrency`` (default 5, matches
-        # the historical Comix search candidate ceiling
-        # ``_DEFAULT_SERIES_CANDIDATES``). Driven from
-        # ``Settings.cloudflare_fetch_concurrency`` in production wiring
-        # so an ops bump doesn't require touching framework code. The
-        # default-5 lets the typical /search fan-out run fully in
-        # parallel; the interactive 15-candidate path still gets 5-way
-        # parallelism (the remaining 10 queue, capping wall-clock at
-        # 3 × max(per-nav)). Raising above ~8-10 starts to look bot-shaped
-        # on Cloudflare's encrypted tier — see the config field's comment
-        # for the Pitfall 6 caveat.
+        # DO NOT default > 1: live testing of PR #58 v1 (default=5)
+        # showed N>1 concurrent comix.to title-page navs caused the
+        # chapter-list DOM to NEVER render — even given 60s wait_for
+        # ceilings, the selector never matched (root cause TBD —
+        # Cloudflare burst challenge, Camoufox internal page-op
+        # serialization, or same-context JS contention). Pitfall 6
+        # (minimize fingerprinting events) is the secondary reason a
+        # small cap matters even after the contention question is
+        # resolved.
         self._browser_concurrency = fetch_concurrency
         self._browser_lock: asyncio.Semaphore = asyncio.Semaphore(
             self._browser_concurrency

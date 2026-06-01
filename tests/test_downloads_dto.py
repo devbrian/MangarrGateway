@@ -150,7 +150,7 @@ def test_settings_concurrency_and_db_path_defaults(tmp_path: Path) -> None:
     settings = load_settings(cfg)
     assert settings.max_concurrent_chapters == 3  # D-30
     assert settings.image_fetch_concurrency == 6  # D-31
-    assert settings.cloudflare_fetch_concurrency == 5  # PR #58 follow-up
+    assert settings.cloudflare_fetch_concurrency == 1  # PR #58 retrospective
     assert settings.db_path == "gateway.db"
 
 

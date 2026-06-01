@@ -447,7 +447,10 @@ class _FetchContext:
 
 
 def _solver_with_fetch_context(
-    ctx: _FetchContext, *, log_browser_events: bool = False
+    ctx: _FetchContext,
+    *,
+    log_browser_events: bool = False,
+    fetch_concurrency: int = 1,
 ) -> CloudflareSolver:
     """Build a CloudflareSolver whose lifecycle yields the given fetch context.
 
@@ -455,7 +458,8 @@ def _solver_with_fetch_context(
     exercise ``fetch_via_browser`` directly), but we still supply a stub that
     would record a Clearance if called. ``log_browser_events`` toggles the
     #54 diagnostic instrumentation under test in the
-    ``test_browser_event_*`` cases below.
+    ``test_browser_event_*`` cases below. ``fetch_concurrency`` lets a single
+    test exercise an N>1 Semaphore cap without changing the production default.
     """
 
     async def _launch() -> _FetchContext:
@@ -465,7 +469,11 @@ def _solver_with_fetch_context(
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
-    return CloudflareSolver(lifecycle=lc, log_browser_events=log_browser_events)
+    return CloudflareSolver(
+        lifecycle=lc,
+        log_browser_events=log_browser_events,
+        fetch_concurrency=fetch_concurrency,
+    )
 
 
 async def test_fetch_via_browser_goto_evaluate_roundtrip() -> None:
@@ -563,16 +571,15 @@ async def test_fetch_via_browser_translates_wait_for_timeout() -> None:
     await solver.aclose()
 
 
-async def test_fetch_via_browser_bounds_concurrent_calls() -> None:
-    """fetch_via_browser acquires a ``_browser_lock`` Semaphore slot so a
-    concurrent burst opens a fresh page per call and bounds in-flight
-    page.evaluate calls to the Semaphore's cap (default 5). Was a 1-wide Lock
-    before debug session ``comix-search-timeout`` — turning the per-source
-    20s search budget into sum-of-individual-navs and breaking comix /search
-    under variance. The bounded-Semaphore tradeoff: humans browse with
-    multiple tabs open routinely (no novel fingerprint), the Playwright
-    driver multiplexes pages on the warm persistent context, and a small
-    cap still keeps the simultaneous-page footprint modest."""
+async def test_fetch_via_browser_default_serializes_concurrent_calls() -> None:
+    """At the default ``fetch_concurrency=1``, ``fetch_via_browser`` serializes
+    a concurrent burst exactly like the historic ``asyncio.Lock`` did. The
+    ``Semaphore(1)`` shape is intentional — gives ops a ``GATEWAY_CLOUDFLARE
+    _FETCH_CONCURRENCY=N`` lever for the future parallel-page contention
+    investigation (debug session ``comix-parallel-page-contention``) without
+    requiring a framework change — but the default-1 contract is that NO
+    parallel page work happens until that investigation lands a verified
+    cause."""
     pages = [_FakeFetchPage(evaluate_result=i) for i in range(5)]
     ctx = _FetchContext(pages)
     solver = _solver_with_fetch_context(ctx)
@@ -583,12 +590,10 @@ async def test_fetch_via_browser_bounds_concurrent_calls() -> None:
         )
     )
     assert results == [0, 1, 2, 3, 4]
-    # Bounded by the Semaphore cap (default 5 == _DEFAULT_SERIES_CANDIDATES).
-    # The cap is read off the solver so this assertion tracks the constant if
-    # someone tunes it; the meaningful invariant is that the cap is honored —
-    # NOT that no parallelism happens (the old Lock behavior).
-    assert ctx.shared_concurrency.max_in_flight <= solver._browser_concurrency
-    # Each fake page is opened once — its own in-flight counter is trivially 1.
+    # The meaningful invariant: at default=1, no two pages are EVER in flight.
+    # If this regresses, someone has loosened the default and the
+    # parallel-contention bug is back in production.
+    assert ctx.shared_concurrency.max_in_flight <= 1
     assert all(p.max_concurrent_calls == 1 for p in pages)
     assert len(ctx.opened) == 5
     assert all(p.closed for p in pages)
@@ -596,14 +601,16 @@ async def test_fetch_via_browser_bounds_concurrent_calls() -> None:
 
 
 async def test_fetch_via_browser_bounded_semaphore_caps_burst_beyond_limit() -> None:
-    """A burst LARGER than the Semaphore cap (default 5) sees the cap honored —
-    the first 5 run concurrently, the next 5 queue behind released slots.
-    Verifies the bounded-Semaphore is not a free-for-all under heavy load
-    (e.g. interactive search's 15 candidates)."""
+    """A burst LARGER than the Semaphore cap sees the cap honored — when an
+    operator opts into ``fetch_concurrency=2`` for experimentation, exactly 2
+    pages run in flight at peak, the remaining N-2 queue behind released slots.
+    Verifies the bounded-Semaphore is not a free-for-all under heavy load and
+    that the kwarg actually sizes the gate."""
     burst_size = 10
+    cap = 2
     pages = [_FakeFetchPage(evaluate_result=i) for i in range(burst_size)]
     ctx = _FetchContext(pages)
-    solver = _solver_with_fetch_context(ctx)
+    solver = _solver_with_fetch_context(ctx, fetch_concurrency=cap)
     results = await asyncio.gather(
         *(
             solver.fetch_via_browser(f"https://x/{i}", extract=f"return {i};")
@@ -612,7 +619,7 @@ async def test_fetch_via_browser_bounded_semaphore_caps_burst_beyond_limit() -> 
     )
     assert results == list(range(burst_size))
     # Peak in-flight MUST honor the Semaphore cap regardless of burst size.
-    assert ctx.shared_concurrency.max_in_flight <= solver._browser_concurrency
+    assert ctx.shared_concurrency.max_in_flight <= cap
     assert len(ctx.opened) == burst_size
     assert all(p.closed for p in pages)
     await solver.aclose()
@@ -620,10 +627,10 @@ async def test_fetch_via_browser_bounded_semaphore_caps_burst_beyond_limit() -> 
 
 async def test_fetch_via_browser_concurrency_kwarg_caps_semaphore() -> None:
     """``CloudflareSolver(fetch_concurrency=N)`` sizes the internal Semaphore
-    to N, overriding the default 5. Critical because the production wiring
+    to N, overriding the default 1. Critical because the production wiring
     drives the kwarg from ``Settings.cloudflare_fetch_concurrency`` (PR #58
-    follow-up) — if this binding regresses, an ops bump of the env var
-    silently does nothing."""
+    retrospective) — if this binding regresses, the future ops lever for the
+    parallel-page contention investigation silently does nothing."""
     burst_size = 6
     pages = [_FakeFetchPage(evaluate_result=i) for i in range(burst_size)]
     ctx = _FetchContext(pages)
