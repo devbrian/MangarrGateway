@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import tomli_w
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _log = logging.getLogger("manga_gateway")
@@ -155,6 +155,24 @@ class Settings(BaseSettings):
     # this flag should be turned back off (or the instrumentation removed
     # entirely) — it is NOT intended as a permanent runtime knob.
     cloudflare_log_browser_events: bool = False
+    # ── Single static residential proxy (PROXY-01, issue #65) — env-overridable
+    # ops knobs (D-11), same treatment as host/port (NOT the api_key exclusion).
+    # They ride the existing load_settings TOML->kwargs merge automatically.
+    # "Proxy configured" is defined as ``cloudflare_proxy_server is not None``;
+    # when None, NO ``proxy=`` is threaded anywhere (today's behavior unchanged).
+    # cf_clearance is IP-bound, so the SAME proxy egresses BOTH the stealth
+    # browser (CF clearance) AND the shared httpx image-fetch client — both
+    # derived from the one ``framework.proxy.build_proxy`` helper (the future
+    # pool/rotation seam). A datacenter-IP host routes Chromium egress through a
+    # residential proxy here to clear CF (CLAUDE.md proxy-ready transport).
+    cloudflare_proxy_server: str | None = None  # e.g. "http://host:port"
+    cloudflare_proxy_username: str | None = None
+    # SecretStr so repr/str/logs auto-redact (T-odg-01). The password is env-only
+    # by OPERATOR DISCIPLINE, not by mechanism — set it via
+    # GATEWAY_CLOUDFLARE_PROXY_PASSWORD; never hand-edit a real value into the
+    # TOML and never commit a real credential. get_secret_value() is unpacked
+    # ONLY inside build_proxy.
+    cloudflare_proxy_password: SecretStr | None = None
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
 

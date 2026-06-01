@@ -284,10 +284,18 @@ class CloudflareSolver:
         cloudflare_keys: Iterable[str] = (),
         engine: AntibotEngine = "patchright",
         log_browser_events: bool = False,
+        proxy: dict[str, str] | None = None,
         lifecycle: BrowserLifecycle | None = None,
     ) -> None:
         self._user_data_dir = user_data_dir
         self._headless = headless
+        # PROXY-01 / #65: optional single static proxy, already built into the
+        # Playwright dict shape by ``framework.proxy.build_proxy`` at the lifespan
+        # boundary (the solver does NOT unpack SecretStr itself). Threaded into
+        # BOTH launch closures so the CF-clearing browser egresses through the
+        # same proxy as the httpx image fetch (cf_clearance is IP-bound). None ⇒
+        # no ``proxy=`` kwarg passed at launch — today's behavior unchanged.
+        self._proxy = proxy
         self._challenge_url = challenge_url
         self._cloudflare_keys = frozenset(cloudflare_keys)
         self._engine: AntibotEngine = engine
@@ -615,10 +623,19 @@ class CloudflareSolver:
         await asyncio.to_thread(self._start_virtual_display)
 
         self._playwright = await async_playwright().start()
+        # Build kwargs conditionally: pass ``proxy=`` ONLY when configured so the
+        # no-proxy path is byte-for-byte the historic call (some launchers treat
+        # an explicit ``proxy=None`` differently — the regression contract #65
+        # requires the kwarg be ABSENT, not None).
+        launch_kwargs: dict[str, Any] = {
+            "headless": self._headless,
+            "no_viewport": True,
+        }
+        if self._proxy is not None:
+            launch_kwargs["proxy"] = self._proxy
         return await self._playwright.chromium.launch_persistent_context(
             self._user_data_dir,
-            headless=self._headless,
-            no_viewport=True,
+            **launch_kwargs,
         )
 
     async def _launch_camoufox_context(self) -> Any:
@@ -664,13 +681,18 @@ class CloudflareSolver:
         # ``user_data_dir`` through Playwright's launch_persistent_context under
         # the hood. ``no_viewport=True`` matches the Patchright launch for
         # parity — Cloudflare's encrypted tier checks viewport-derived signals.
-        return await AsyncNewBrowser(
-            self._playwright,
-            persistent_context=True,
-            user_data_dir=self._user_data_dir,
-            headless=self._headless,
-            no_viewport=True,
-        )
+        # Same conditional-proxy discipline as the patchright closure (#65): the
+        # ``proxy=`` kwarg is ABSENT when unconfigured (not ``None``) so the
+        # no-proxy launch is byte-for-byte unchanged.
+        launch_kwargs: dict[str, Any] = {
+            "persistent_context": True,
+            "user_data_dir": self._user_data_dir,
+            "headless": self._headless,
+            "no_viewport": True,
+        }
+        if self._proxy is not None:
+            launch_kwargs["proxy"] = self._proxy
+        return await AsyncNewBrowser(self._playwright, **launch_kwargs)
 
     async def _solve_real(self, context: Any) -> Clearance:
         """Solve the challenge on the live context; capture cf_clearance + UA.

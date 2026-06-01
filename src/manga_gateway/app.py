@@ -27,6 +27,7 @@ from .config import Settings
 from .errors import register_error_handlers
 from .framework.antibot import CloudflareSolver
 from .framework.health import SourceHealth
+from .framework.proxy import build_proxy
 from .framework.ratelimit import RateLimiter
 from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
@@ -123,7 +124,11 @@ async def _recovery_watchdog(
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Build the R1 singleton seams once; tear the transport down on shutdown."""
     settings: Settings = app.state.settings
-    transport = HttpxTransport(settings)  # SRC-04 injectable seam
+    # SRC-04 injectable seam. The transport derives its OWN httpx proxy from the
+    # same build_proxy(settings) helper the solver_kwargs below use for the
+    # browser leg — so both egress legs share one IP (cf_clearance is IP-bound,
+    # issue #65). No extra wiring needed here: the transport reads settings.
+    transport = HttpxTransport(settings)
     app.state.transport = transport
     app.state.session = SessionManager(transport)  # R1 shared session
     # SRC-01: build the registry first so the rest of the lifespan can inspect
@@ -187,6 +192,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     }
     if challenge_url is not None:
         solver_kwargs["challenge_url"] = challenge_url
+    # PROXY-01 / #65: build the proxy ONCE from settings. The Playwright dict
+    # (first element) threads into the solver's browser launch closures; the
+    # transport built above derives the httpx leg (second element) from the SAME
+    # helper, so both egress legs share one IP (cf_clearance is IP-bound). Gated
+    # like challenge_url: an unconfigured deploy adds no ``proxy`` key (no
+    # regression). Never log the proxy server/username/password.
+    playwright_proxy, _ = build_proxy(settings)
+    if playwright_proxy is not None:
+        solver_kwargs["proxy"] = playwright_proxy
     # Swap NoopSolver for the ONE shared CloudflareSolver (R1/BOT-01). Construction is
     # cheap (no browser yet — the lazy engine-specific launch happens on the first
     # solve); the eager warm() is fired NON-BLOCKING so a launch/solve failure

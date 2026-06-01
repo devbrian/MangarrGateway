@@ -25,3 +25,17 @@ output_root = "/data/manga"
 #   this to be 1 (the gateway fails fast at startup otherwise, #64).
 # cloudflare_engine = "patchright"
 # cloudflare_fetch_concurrency = 3
+
+# ── Single static residential proxy (PROXY-01, issue #65) ─────────────────────
+# Route BOTH the stealth browser (Cloudflare clearance) AND the shared httpx
+# image-fetch client through ONE proxy. cf_clearance is IP-bound, so both legs
+# MUST share the same egress IP — a datacenter-IP host routes Chromium through a
+# residential proxy here to clear CF. Unset ⇒ no proxy (today's behavior).
+# cloudflare_proxy_server: e.g. "http://host:port". "Configured" iff this is set.
+# cloudflare_proxy_username: optional; omit for an unauthenticated proxy.
+# cloudflare_proxy_password: SECRET. Set it via the environment
+#   (GATEWAY_CLOUDFLARE_PROXY_PASSWORD) — do NOT hand-edit a real value here and
+#   NEVER commit a real proxy credential.
+# cloudflare_proxy_server = "http://host:port"
+# cloudflare_proxy_username = "<proxy username>"
+# cloudflare_proxy_password = "<from env GATEWAY_CLOUDFLARE_PROXY_PASSWORD; do not hand-edit>"
