@@ -8,9 +8,11 @@ tests assert the selector — they do NOT launch a real browser (D-42 — the
 deterministic gate never imports either browser binary).
 
 The Settings → solver wiring is also covered: ``Settings.cloudflare_engine``
-defaults to ``"camoufox"`` (since #40 — dev mirrors prod so Firefox-only
-failure modes like issue #54 surface in local repro). The opt-in path is
-``GATEWAY_CLOUDFLARE_ENGINE=patchright``.
+defaults to ``"patchright"`` (since the comix-parallel-engine-probe finding —
+only Chromium runs concurrent CF navigations, so it is the default that makes
+``cloudflare_fetch_concurrency`` > 1 work). The opt-in fallback is
+``GATEWAY_CLOUDFLARE_ENGINE=camoufox``, which must be paired with
+``cloudflare_fetch_concurrency=1`` (enforced by a model validator, #64).
 """
 
 from __future__ import annotations
@@ -31,17 +33,20 @@ def _settings(**over: object) -> Settings:
 # ──────────────────────── Settings.cloudflare_engine ────────────────────────
 
 
-def test_settings_default_engine_is_camoufox(
+def test_settings_default_engine_is_patchright(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Default (dev/CI/prod) — Camoufox is the engine (#40 single default).
+    """Default (dev/prod) — Patchright/Chromium is the engine, and it pairs with
+    the default ``cloudflare_fetch_concurrency=3`` without tripping the guard.
 
-    Hermetic against an ambient ``GATEWAY_CLOUDFLARE_ENGINE`` (the workflow
-    still sets it explicitly as belt-and-braces documentation, but the
-    default no longer needs CI to override it).
+    Hermetic against an ambient ``GATEWAY_CLOUDFLARE_ENGINE`` (a camoufox host /
+    CI runner still sets it explicitly, but the default no longer needs that).
     """
     monkeypatch.delenv("GATEWAY_CLOUDFLARE_ENGINE", raising=False)
-    assert _settings().cloudflare_engine == "camoufox"
+    monkeypatch.delenv("GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY", raising=False)
+    settings = _settings()
+    assert settings.cloudflare_engine == "patchright"
+    assert settings.cloudflare_fetch_concurrency == 3
 
 
 def test_settings_engine_env_override_patchright(
@@ -56,10 +61,15 @@ def test_settings_engine_env_override_patchright(
 def test_settings_engine_env_override_camoufox_explicit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An explicit ``camoufox`` env value is also accepted (matches the
-    default; verifies the env override path itself, not just the absence)."""
+    """``GATEWAY_CLOUDFLARE_ENGINE=camoufox`` opts into the Firefox fallback.
+
+    Camoufox must be paired with ``fetch_concurrency=1`` (the default 3 would
+    trip the ``_reject_camoufox_parallel`` guard), so this also pins it to 1 —
+    exactly how a camoufox host / CI runner is expected to configure itself.
+    """
     monkeypatch.setenv("GATEWAY_CLOUDFLARE_ENGINE", "camoufox")
-    assert _settings().cloudflare_engine == "camoufox"
+    settings = _settings(cloudflare_fetch_concurrency=1)
+    assert settings.cloudflare_engine == "camoufox"
 
 
 def test_settings_engine_rejects_unknown_value(
@@ -71,23 +81,50 @@ def test_settings_engine_rejects_unknown_value(
         _settings()
 
 
+# ──────────── engine × fetch_concurrency guard (#64 / issue #59) ────────────
+
+
+def test_settings_camoufox_with_parallel_is_rejected() -> None:
+    """camoufox + ``fetch_concurrency > 1`` fails fast (the unsafe combo).
+
+    Camoufox/Firefox stalls concurrent Cloudflare navigations, so the pairing
+    silently returned zero results before this guard. The error message names
+    the fix (set concurrency=1 or use patchright)."""
+    with pytest.raises(ValidationError, match="requires.*patchright"):
+        _settings(cloudflare_engine="camoufox", cloudflare_fetch_concurrency=3)
+
+
+def test_settings_camoufox_with_concurrency_1_is_ok() -> None:
+    """camoufox + 1 is the supported pairing — no error."""
+    settings = _settings(cloudflare_engine="camoufox", cloudflare_fetch_concurrency=1)
+    assert settings.cloudflare_engine == "camoufox"
+    assert settings.cloudflare_fetch_concurrency == 1
+
+
+def test_settings_patchright_with_parallel_is_ok() -> None:
+    """patchright + ``> 1`` is the whole point — Chromium runs parallel CF navs."""
+    settings = _settings(cloudflare_engine="patchright", cloudflare_fetch_concurrency=5)
+    assert settings.cloudflare_engine == "patchright"
+    assert settings.cloudflare_fetch_concurrency == 5
+
+
 # ──────────────────────── CloudflareSolver(engine=...) ────────────────────────
 
 
-def test_solver_default_engine_wires_camoufox_launch() -> None:
-    """Default — the lifecycle's launch closure points at the Camoufox path
-    (#40 — Camoufox is the single dev/CI/prod default).
+def test_solver_default_engine_wires_patchright_launch() -> None:
+    """Default — the lifecycle's launch closure points at the Patchright path
+    (Chromium is the single default since comix-parallel-engine-probe).
 
-    We do NOT call it (that would import camoufox + start a browser) — we just
+    We do NOT call it (that would import patchright + start a browser) — we just
     assert the right bound method was wired in. Asserts the property is exposed
     on the solver too, so tests / observability can read the engine choice.
     """
     solver = CloudflareSolver()
-    assert solver.engine == "camoufox"
-    # The launch closure on the lifecycle is the camoufox bound method.
+    assert solver.engine == "patchright"
+    # The launch closure on the lifecycle is the patchright bound method.
     assert (
         solver._lifecycle._launch  # type: ignore[attr-defined]
-        == solver._launch_camoufox_context  # type: ignore[attr-defined]
+        == solver._launch_patchright_context  # type: ignore[attr-defined]
     )
 
 

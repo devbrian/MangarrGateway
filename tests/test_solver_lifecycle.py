@@ -572,14 +572,14 @@ async def test_fetch_via_browser_translates_wait_for_timeout() -> None:
 
 
 async def test_fetch_via_browser_default_serializes_concurrent_calls() -> None:
-    """At the default ``fetch_concurrency=1``, ``fetch_via_browser`` serializes
-    a concurrent burst exactly like the historic ``asyncio.Lock`` did. The
-    ``Semaphore(1)`` shape is intentional — gives ops a ``GATEWAY_CLOUDFLARE
-    _FETCH_CONCURRENCY=N`` lever for the future parallel-page contention
-    investigation (debug session ``comix-parallel-page-contention``) without
-    requiring a framework change — but the default-1 contract is that NO
-    parallel page work happens until that investigation lands a verified
-    cause."""
+    """At ``fetch_concurrency=1`` (the solver-constructor default and the
+    pairing every ``engine=camoufox`` deploy must use), ``fetch_via_browser``
+    serializes a concurrent burst exactly like the historic ``asyncio.Lock``
+    did. The ``Semaphore(1)`` shape is what keeps Firefox/Camoufox safe — it
+    stalls concurrent Cloudflare navigations (debug session
+    ``comix-parallel-engine-probe``). The parallel path (``> 1``) is validated
+    on the Chromium engine elsewhere; here we pin 1 and assert no two pages are
+    EVER in flight."""
     pages = [_FakeFetchPage(evaluate_result=i) for i in range(5)]
     ctx = _FetchContext(pages)
     solver = _solver_with_fetch_context(ctx)
@@ -590,9 +590,9 @@ async def test_fetch_via_browser_default_serializes_concurrent_calls() -> None:
         )
     )
     assert results == [0, 1, 2, 3, 4]
-    # The meaningful invariant: at default=1, no two pages are EVER in flight.
-    # If this regresses, someone has loosened the default and the
-    # parallel-contention bug is back in production.
+    # The meaningful invariant: at concurrency=1, no two pages are EVER in
+    # flight. If this regresses, the Semaphore(1) serialization that keeps
+    # camoufox safe has been loosened.
     assert ctx.shared_concurrency.max_in_flight <= 1
     assert all(p.max_concurrent_calls == 1 for p in pages)
     assert len(ctx.opened) == 5
