@@ -105,8 +105,7 @@ class Settings(BaseSettings):
     # residential-reputation egress to clear CF — a datacenter-IP host should
     # route the Chromium egress through a residential proxy (CLAUDE.md
     # proxy-ready transport is the seam). A fail-fast Settings guard for
-    # ``> 1 + camoufox`` is deferred — see the tracking issue referenced from
-    # debug ``comix-parallel-engine-probe``.
+    # ``> 1 + camoufox`` is deferred — tracked in issue #64.
     cloudflare_fetch_concurrency: int = Field(default=1, ge=1)
     cloudflare_headless: bool = True  # Open Q2: run the stealth browser headless
     # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at
