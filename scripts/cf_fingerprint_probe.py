@@ -63,15 +63,22 @@ async def _probe(cfg: dict[str, object], idx: int) -> dict[str, object]:
             }
             if cfg["channel"]:
                 launch_kwargs["channel"] = cfg["channel"]
-            ctx = await pw.chromium.launch_persistent_context(user_data_dir, **launch_kwargs)
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir, **launch_kwargs
+            )
             try:
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                await page.goto(CHALLENGE_URL, wait_until="commit", timeout=GOTO_TIMEOUT_MS)
+                await page.goto(
+                    CHALLENGE_URL, wait_until="commit", timeout=GOTO_TIMEOUT_MS
+                )
                 deadline = time.monotonic() + CLEAR_TIMEOUT_S
                 cleared = False
                 while time.monotonic() < deadline:
                     cookies = await ctx.cookies()
-                    if any(c.get("name") == "cf_clearance" and c.get("value") for c in cookies):
+                    if any(
+                        c.get("name") == "cf_clearance" and c.get("value")
+                        for c in cookies
+                    ):
                         cleared = True
                         break
                     await asyncio.sleep(POLL_S)
@@ -95,30 +102,74 @@ async def _probe(cfg: dict[str, object], idx: int) -> dict[str, object]:
     return out
 
 
+# A real comix /title page + its chapter-list selector — the "resolving" op the
+# perf budget (test_comix_perf_multi_live) measures. Used by the timing probe to
+# separate one-time cold cost (launch + warm + first nav) from steady-state navs.
+COMIX_TITLE_URL = "https://comix.to/title/mr3m0-the-forgotten-field"
+CHAPTER_LIST_SELECTOR = "a.mchap-row__primary"
+
+
+async def _timing_probe() -> dict[str, object]:
+    """On chrome-headed-xvfb, split cold cost from steady-state nav cost.
+
+    Times: (1) launch + cold warm (cf_clearance), then (2) three SEQUENTIAL navs
+    to a comix /title page waiting for the chapter-list selector — mirroring the
+    per-chapter "resolving" browser op the perf budget measures. If nav 1 >> navs
+    2/3, the perf overage is one-time browser/Xvfb startup (a budget concern); if
+    all navs are large and ~equal, headed comix resolving is inherently slow.
+    """
+    out: dict[str, object] = {"config": "chrome-headed-xvfb"}
+    async with async_playwright() as pw:
+        t0 = time.monotonic()
+        ctx = await pw.chromium.launch_persistent_context(
+            "/tmp/cf-timing", channel="chrome", headless=False, no_viewport=True
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await page.goto(CHALLENGE_URL, wait_until="commit", timeout=GOTO_TIMEOUT_MS)
+            deadline = time.monotonic() + CLEAR_TIMEOUT_S
+            while time.monotonic() < deadline:
+                cookies = await ctx.cookies()
+                if any(
+                    c.get("name") == "cf_clearance" and c.get("value") for c in cookies
+                ):
+                    break
+                await asyncio.sleep(POLL_S)
+            out["launch_plus_warm_s"] = round(time.monotonic() - t0, 2)
+            navs: list[object] = []
+            for _ in range(3):
+                t_nav = time.monotonic()
+                try:
+                    p = await ctx.new_page()
+                    await p.goto(
+                        COMIX_TITLE_URL, wait_until="commit", timeout=GOTO_TIMEOUT_MS
+                    )
+                    await p.wait_for_selector(
+                        CHAPTER_LIST_SELECTOR, timeout=GOTO_TIMEOUT_MS
+                    )
+                    navs.append(round(time.monotonic() - t_nav, 2))
+                    await p.close()
+                except Exception as exc:  # noqa: BLE001
+                    navs.append(f"ERR {type(exc).__name__}: {exc}"[:120])
+                await asyncio.sleep(2)
+            out["title_resolve_navs_s"] = navs
+        finally:
+            await ctx.close()
+    return out
+
+
 async def main() -> None:
     print(f"[probe] DISPLAY={os.environ.get('DISPLAY', '<unset>')}", flush=True)
-    results: list[dict[str, object]] = []
-    for idx, cfg in enumerate(CONFIGS):
-        print(f"[probe] {cfg['name']} (channel={cfg['channel']} headless={cfg['headless']}) ...", flush=True)
-        r = await _probe(cfg, idx)
-        results.append(r)
-        verdict = "PASS" if r.get("cleared") else "FAIL"
-        print(
-            f"  -> {verdict} {r.get('seconds')}s  {r.get('error') or 'title=' + str(r.get('title', ''))}",
-            flush=True,
-        )
-        await asyncio.sleep(PACE_S)
-
-    print("\n==== CF FINGERPRINT PROBE RESULTS (JSON) ====", flush=True)
-    print(json.dumps(results, indent=2), flush=True)
-    print("\n==== SUMMARY ====", flush=True)
-    for r in results:
-        verdict = "PASS" if r.get("cleared") else "FAIL"
-        print(f"  {verdict}  {str(r['name']):24} {r.get('seconds')}s  {r.get('error', '')}", flush=True)
-
-    any_cleared = any(r.get("cleared") for r in results)
-    print(f"\n[probe] any config cleared CF: {any_cleared}", flush=True)
-    sys.exit(0 if any_cleared else 1)
+    print(
+        "[probe] timing run (chrome-headed-xvfb): cold cost vs steady-state navs",
+        flush=True,
+    )
+    result = await _timing_probe()
+    print("\n==== HEADED TIMING PROBE (JSON) ====", flush=True)
+    print(json.dumps(result, indent=2), flush=True)
+    navs = result.get("title_resolve_navs_s")
+    ok = isinstance(navs, list) and any(isinstance(n, (int, float)) for n in navs)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
