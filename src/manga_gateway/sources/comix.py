@@ -99,6 +99,7 @@ the extractor never snapshots a partial scaffold.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import UTC, datetime, timedelta
@@ -782,25 +783,33 @@ class ComixSource(Source):
         browser-driven pages endpoint), funnel both through the warm Patchright
         page that the SPA already drives correctly.
 
-        Concurrency: per-candidate ``_series_chapters`` browser navigations
-        run SEQUENTIALLY. An earlier attempt (PR #58 v1) parallelized them via
-        ``asyncio.gather`` and broke the search end-to-end — pages NEVER
-        rendered the chapter list when ≥2 series pages were opened concurrently
-        on the same Camoufox BrowserContext (wait_for selector timed out at
-        15s, 60s, indefinitely; sequential cleared the same 4 candidates in
-        10.25s with 66 results). Root cause TBD — candidate explanations
-        include Cloudflare burst rate-limiting, Camoufox internal page-op
-        serialization, and same-context same-origin JS contention. Tracked in
-        debug session ``comix-parallel-page-contention`` (follow-up to
-        ``comix-search-timeout``). Until that lands, sequential is the
-        contract here — DO NOT introduce parallelism in this loop without
-        first reproducing chapter-list render under concurrent page loads.
+        Concurrency: the per-candidate ``_series_chapters`` browser
+        navigations are awaited CONCURRENTLY via :func:`asyncio.gather` so
+        /search's wall-clock is bounded by ``max(individual)`` rather than
+        ``sum(individual)``. The fan-out is bounded entirely by the framework's
+        existing ``CloudflareSolver._browser_lock`` — an
+        ``asyncio.Semaphore(cloudflare_fetch_concurrency)`` — so it self-throttles
+        to whatever the deployment configures; this source adds no second gate.
+        ``return_exceptions=True`` isolates per-candidate failures: a single
+        ``_series_chapters`` raise surfaces as an item in the result list (logged
+        at WARNING and skipped), so one stale/missing series does not blank the
+        whole search response. ``asyncio.gather`` preserves coroutine-launch
+        order, so the returned ``releases`` keep the relevance-sorted candidate
+        ordering the upstream ``/api/v1/manga`` already provides.
 
-        Per-candidate failure isolation IS preserved: a single
-        ``_series_chapters`` raise is caught + logged + skipped, so one bad
-        series does not blank the whole search response (the
-        pre-parallelization code raised through, which was strictly worse —
-        better to return 4-of-5 candidates' chapters than nothing).
+        Concurrency safety is ENGINE-specific (debug session
+        ``comix-parallel-engine-probe``, 2026-06-01). With the default
+        ``cloudflare_fetch_concurrency=1`` the Semaphore admits one nav at a
+        time, so this is behaviourally identical to the historic sequential
+        loop — zero change for the default deployment. Parallelism is OPT-IN:
+        bumping the cap is only safe on ``engine=patchright`` (Chromium), which
+        runs N concurrent CF navigations on one warm context cleanly (4/4 proven
+        on residential-IP Windows + Linux, and through a residential proxy).
+        ``engine=camoufox`` (Firefox) STALLS such navigations at goto-commit, so
+        ``cloudflare_fetch_concurrency`` MUST stay at 1 there — the earlier
+        "Cloudflare per-IP burst" diagnosis (issue #59) was an artifact of
+        testing only Camoufox and is REFUTED. See ``config.py`` and the README
+        for the engine/concurrency constraint.
         """
         _ = req.languages  # Comix is English-only (live recon); honored downstream
         count = (
@@ -812,13 +821,24 @@ class ComixSource(Source):
 
         feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
 
+        # Parallel fan-out across series candidates. ``return_exceptions=True``
+        # isolates per-candidate failures — a SourceError on one candidate
+        # surfaces as an item in ``results`` rather than cancelling the gather,
+        # so the other candidates still flow. The actual concurrency is bounded
+        # by the framework's ``CloudflareSolver._browser_lock`` Semaphore
+        # (``cloudflare_fetch_concurrency``), so the default deployment
+        # (concurrency=1) runs these one-at-a-time exactly as before.
+        coros = [
+            self._series_chapters(series_hid, series_slug, feed_limit, req.offset, ctx)
+            for series_hid, series_slug, _series_title in series
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
         releases: list[Release] = []
-        for series_hid, series_slug, series_title in series:
-            try:
-                chapters = await self._series_chapters(
-                    series_hid, series_slug, feed_limit, req.offset, ctx
-                )
-            except Exception as exc:  # noqa: BLE001 — per-candidate isolation
+        for (series_hid, series_slug, series_title), result in zip(
+            series, results, strict=True
+        ):
+            if isinstance(result, BaseException):
                 # One bad candidate must not blank the whole search response.
                 # The exception is logged at WARNING with the hid+slug so a
                 # systemic issue (Comix DOM change, regex drift) is still
@@ -827,10 +847,10 @@ class ComixSource(Source):
                     "comix search: candidate %r (slug=%r) failed: %s",
                     series_hid,
                     series_slug,
-                    exc,
+                    result,
                 )
                 continue
-            for chapter in chapters:
+            for chapter in result:
                 # Inject the series-page-known title into the chapter dict so the
                 # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /
                 # ``series`` / ``title`` keys) does not need to know whether the
