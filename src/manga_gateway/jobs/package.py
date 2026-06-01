@@ -16,13 +16,17 @@ Guarantees:
   atomically only on success (D-26); a failure mid-write removes the staging temp
   and leaves no partial CBZ (D-29). It writes page images ONLY: no metadata XML
   file is ever emitted (PKG-04). Mangarr adds metadata after hand-off.
-* ``compute_output_path`` lays out ``{output_root}/manga-{mangaId}/{title}{suffix}``
-  with the source-scraped title AND the mangaId slug run through
-  ``util/sanitize.py`` so neither can traverse out of the output root
-  (SEC-02/D-24/D-25, T-03-04). When ``manga_id`` is ``None`` it falls back to
-  ``manga-unknown/`` (D-24); a ``fallback_discriminator`` (typically the source-
-  stable chapter id) is folded into the filename as a short hash so two
-  different series with the same title cannot collide in that bucket (issue #9).
+* ``compute_output_path`` lays out ``{output_root}/manga-{slug}/{title}{suffix}``
+  with the source-scraped title AND the folder slug run through ``util/sanitize.py``
+  so neither can traverse out of the output root (SEC-02/D-24/D-25, T-03-04). The
+  folder slug is a three-tier decision (issue #16): (1) ``manga-{mangaId}`` when a
+  ``manga_id`` is present (UNCHANGED); (2) else ``manga-{sanitized manga_title}``
+  when a resolved series title is available — per-series foldering for mangaId-less
+  grabs; (3) else the flat ``manga-unknown/`` fallback (D-24). On every mangaId-less
+  path a ``fallback_discriminator`` (typically the source-stable chapter id) is
+  folded into the filename as a short hash so two different series with the same
+  chapter title cannot collide (issue #9) — this still applies in the per-series
+  folder case.
 """
 
 from __future__ import annotations
@@ -72,29 +76,48 @@ def compute_output_path(
     *,
     output_format: str = "cbz",
     fallback_discriminator: str | None = None,
+    manga_title: str | None = None,
 ) -> Path:
     """Compute the gateway-owned output path, traversal-safe (D-24/D-25, SEC-02).
 
-    Layout: ``{output_root}/manga-{mangaId}/{sanitized title}{suffix}``. Both the
-    ``mangaId`` slug and the source-scraped ``title`` pass through
+    Layout: ``{output_root}/manga-{slug}/{sanitized title}{suffix}``. The folder
+    ``slug``, the source-scraped ``title``, and the ``manga_title`` all pass through
     ``sanitize_filename`` so a malicious value (e.g. ``../../etc``) is reduced to a
     single safe path component and can never escape ``output_root`` (T-03-04).
     ``folder`` format yields a directory path (no suffix).
 
-    Missing-mangaId fallback (D-24, issue #9): when ``manga_id`` is ``None`` the
-    folder is ``manga-unknown/``. To prevent cross-series collisions in that
-    shared bucket (two unrelated mangas with the same chapter title would
-    otherwise clobber each other) the optional ``fallback_discriminator`` —
-    typically the source-stable chapter id — is folded into the filename as an
-    8-char SHA-256 prefix: ``{title}-{hash}{suffix}``. When the discriminator is
-    ``None`` (no chapter id available) the filename is left bare, preserving the
-    pre-issue-#9 layout for callers that don't have a stable id to hand.
+    Folder-slug tiers (issue #16, LOCKED Option A):
+
+    1. ``manga_id`` present → ``manga-{sanitize(mangaId)}`` (UNCHANGED).
+    2. ``manga_id`` is ``None`` but ``manga_title`` sanitizes to a NON-EMPTY string
+       → ``manga-{that slug}``. ``fallback=""`` is the signal that an empty / dots-
+       only / all-unsafe title means "no usable title" and falls through to tier 3.
+    3. otherwise → the flat ``manga-unknown/`` bucket (D-24).
+
+    Missing-mangaId filename hash (D-24, issue #9): on EVERY mangaId-less path
+    (tiers 2 and 3 both have ``manga_id is None``) the optional
+    ``fallback_discriminator`` — typically the source-stable chapter id — is folded
+    into the filename as an 8-char SHA-256 prefix: ``{title}-{hash}{suffix}``. This
+    prevents two unrelated series sharing a chapter title from clobbering each
+    other, and is preserved even in the per-series folder (tier 2). When the
+    discriminator is ``None`` the filename is left bare.
     """
-    slug = (
-        sanitize_filename(str(manga_id), fallback="unknown")
-        if manga_id is not None
-        else "unknown"
-    )
+    if manga_id is not None:
+        slug = sanitize_filename(str(manga_id), fallback="unknown")
+    else:
+        # Tier 2: a non-empty sanitized series title buckets per-series; fallback=""
+        # treats an empty/dots-only/all-unsafe title as "no usable title" → tier 3.
+        # The title MUST pass through sanitize_filename (SEC-02/T-q7x-01 traversal).
+        # Accepted theoretical case: a title sanitizing to a pure integer (e.g.
+        # "2020") could share a dir with a real mangaId=2020 — benign on this
+        # no-mangaId path; the #9 chapter-id filename hash still prevents file
+        # clobber. Do NOT add complexity for it.
+        title_slug = (
+            sanitize_filename(manga_title, fallback="")
+            if manga_title is not None
+            else ""
+        )
+        slug = title_slug or "unknown"
     folder = f"manga-{slug}"
     name = sanitize_filename(title, fallback="untitled")
     if manga_id is None and fallback_discriminator:

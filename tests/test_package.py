@@ -203,3 +203,73 @@ def test_compute_output_path_discriminator_ignored_when_mangaid_known() -> None:
     )
     without = package.compute_output_path("/data/manga", 178, "Chapter 1")
     assert with_disc == without
+
+
+# ───────────────── compute_output_path: per-series folder tier (#16) ─────────────
+
+
+def test_compute_output_path_mangaid_present_ignores_manga_title() -> None:
+    """Tier 1 regression: a present ``manga_id`` keeps the ``manga-{id}`` folder
+    byte-for-byte; a supplied ``manga_title`` does NOT change it."""
+    path = package.compute_output_path(
+        "/data/manga", 178, "Chapter 1", manga_title="Solo Leveling"
+    )
+    assert path == Path("/data/manga/manga-178/Chapter 1.cbz")
+
+
+def test_compute_output_path_per_series_folder_from_title() -> None:
+    """Tier 2 (new): mangaId absent + known title → ``manga-{sanitized title}/``,
+    and the filename STILL carries the #9 chapter-id hash."""
+    path = package.compute_output_path(
+        "/data/manga",
+        None,
+        "Chapter 1",
+        manga_title="Pokemon Pixiv Oneshots",
+        fallback_discriminator="uuid-aaa",
+    )
+    assert path.parent == Path("/data/manga/manga-Pokemon Pixiv Oneshots")
+    # #9 chapter-id hash still folded into the filename (manga_id is None branch).
+    assert path.stem.startswith("Chapter 1-")
+    # Distinct discriminator → distinct filename in the SAME per-series folder.
+    other = package.compute_output_path(
+        "/data/manga",
+        None,
+        "Chapter 1",
+        manga_title="Pokemon Pixiv Oneshots",
+        fallback_discriminator="uuid-bbb",
+    )
+    assert other.parent == path.parent
+    assert other != path
+
+
+def test_compute_output_path_per_series_folder_is_stable() -> None:
+    """HDL-02: same (manga_title, discriminator) → identical Path on repeat calls."""
+    args = ("/data/manga", None, "Chapter 1")
+    kwargs = {"manga_title": "Solo Leveling", "fallback_discriminator": "uuid-aaa"}
+    first = package.compute_output_path(*args, **kwargs)  # type: ignore[arg-type]
+    second = package.compute_output_path(*args, **kwargs)  # type: ignore[arg-type]
+    assert first == second
+
+
+@pytest.mark.parametrize("manga_title", [None, "", "../../"])
+def test_compute_output_path_unusable_title_falls_back_to_unknown(
+    manga_title: str | None,
+) -> None:
+    """Tier 3 (fallback): mangaId absent + None/empty/dots-only title (sanitizes to
+    empty) → ``manga-unknown/`` (today's behavior preserved)."""
+    path = package.compute_output_path(
+        "/data/manga", None, "Chapter 1", manga_title=manga_title
+    )
+    assert path.parent == Path("/data/manga/manga-unknown")
+
+
+def test_compute_output_path_malicious_title_cannot_escape_root() -> None:
+    """T-q7x-01 / SEC-02: a traversal ``manga_title`` is reduced to one safe folder
+    component and cannot escape the output root."""
+    path = package.compute_output_path(
+        "/data/manga", None, "Chapter 1", manga_title="../../etc/passwd"
+    )
+    assert ".." not in path.parts
+    assert path.parent.name.startswith("manga-")
+    # The folder component carries no path separator.
+    assert "/" not in path.parent.name and "\\" not in path.parent.name
