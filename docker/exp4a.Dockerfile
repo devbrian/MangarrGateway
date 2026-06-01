@@ -48,7 +48,14 @@ COPY docker/exp4a-entrypoint.sh /app/exp4a-entrypoint.sh
 
 ENV PYTHONPATH=/app/src
 
-RUN chmod +x /app/exp4a-entrypoint.sh
+# Make the entrypoint executable and drop root privileges: create an
+# unprivileged user and hand it the app tree + the Chromium install. Reduces
+# blast radius given this image is the documented residential-IP deploy basis.
+# Runtime writes go to /app/.planning/debug (chowned) and /tmp (world-writable).
+RUN chmod +x /app/exp4a-entrypoint.sh \
+    && useradd --create-home --uid 10001 app \
+    && chown -R app:app /app /ms-playwright
+USER app
 
 # Default: run the engine-probe (warm + 4-wide parallel) headless under Chromium.
 ENTRYPOINT ["/app/exp4a-entrypoint.sh"]
