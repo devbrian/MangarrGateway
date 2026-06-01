@@ -30,6 +30,10 @@ uv run uvicorn manga_gateway.app:app
 Configuration is TOML-first (`config.toml`, source of truth) with
 `GATEWAY_`-prefixed env vars overriding ops knobs. See `config.example.toml`.
 
+Every endpoint requires the configured API key — sent as the `X-Api-Key` header
+(or the `?apikey=` query parameter). The service binds `127.0.0.1` (localhost)
+by default.
+
 ## Anti-bot engine & parallel Comix search
 
 Cloudflare-gated sources (Comix) are cleared by a single shared anti-bot solver
