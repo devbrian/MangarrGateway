@@ -251,14 +251,15 @@ class CloudflareSolver:
     :class:`BrowserLifecycle` (solve cap + single-flight + recycle + cleanup-on-all-
     paths, criterion #4).
 
-    Engine selection (#35 / #40): ``engine="camoufox"`` (the default everywhere
-    since #40) uses Camoufox's Firefox build with C++ fingerprint spoofing —
-    chosen as the single dev/CI/prod default so engine-specific failure modes
-    (e.g. issue #54: Playwright Firefox handler crash on undefined
-    pageError.location) surface in local dev rather than only in nightly
-    triage. ``engine="patchright"`` is the opt-in escalation — Chromium-based,
-    historically friendlier to residential IPs but flagged by Cloudflare's
-    encrypted tier on cloud Linux runners. The choice affects ONLY which
+    Engine selection (#35 / #40 / comix-parallel-engine-probe): ``engine=
+    "patchright"`` (the default since 2026-06-01) uses Chromium with patched CDP
+    leaks — it is the ONLY engine that can run concurrent Cloudflare navigations
+    on one warm context, so it is the default that makes ``fetch_concurrency`` >
+    1 work. ``engine="camoufox"`` (Firefox build, C++ fingerprint spoofing) is
+    the opt-in fallback for hosts where Chromium's fingerprint is flagged
+    (historically the cloud-Linux datacenter runner, issue #35); it CANNOT run
+    parallel, so it must be paired with ``fetch_concurrency=1``. The choice
+    affects ONLY which
     launch closure is wired into the lifecycle — the solve closure
     (cf_clearance polling) is engine-agnostic. The heavy import happens
     inside the launch closure so the deterministic gate never imports/launches
@@ -279,7 +280,7 @@ class CloudflareSolver:
         recycle_seconds: float | None = None,
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         cloudflare_keys: Iterable[str] = (),
-        engine: AntibotEngine = "camoufox",
+        engine: AntibotEngine = "patchright",
         log_browser_events: bool = False,
         lifecycle: BrowserLifecycle | None = None,
     ) -> None:
