@@ -1,0 +1,18 @@
+# EXP-4a build-context filter (comix-parallel-engine-probe).
+# The build context transfers over the SSH docker context (local-remote), so
+# keep it SMALL. Only src/ (the manga_gateway package) + scripts/ (the harness)
+# are needed; everything heavy/irrelevant is excluded.
+*
+!src/manga_gateway/**
+!scripts/diagnose_comix_parallel_contention.py
+!docker/exp4a-entrypoint.sh
+
+# Re-exclude heavy / profile / cache artifacts that live UNDER the kept paths.
+**/__pycache__/
+**/*.pyc
+src/manga_gateway/cloudflare-userdata/
+src/manga_gateway/cloudflare-userdata-patchright/
+src/manga_gateway/comix-userdata/
+**/cloudflare-userdata/
+**/cloudflare-userdata-patchright/
+**/comix-userdata/
