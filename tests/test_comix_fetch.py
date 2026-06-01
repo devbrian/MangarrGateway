@@ -3,9 +3,10 @@
 Exercises the load-bearing ``SourceContext`` refactor (Plan 04-02) with the in-repo
 ``_SequenceTransport`` harness + a fake solver — no real Patchright browser, no network:
 
-* D-40: a ``cloudflare*`` source injects ``clearance.cookies`` + the EXACT
-  ``clearance.user_agent`` per outbound request; the injected UA equals the cookie's
-  UA (Pitfall 1). MangaDex (``antibot="none"``) sends NO Cookie/UA override.
+* D-40: a ``cloudflare*`` source injects ``clearance.cookies`` (serialized into a
+  per-request ``Cookie`` header — NOT the httpx-0.28-deprecated ``cookies=`` kwarg) +
+  the EXACT ``clearance.user_agent`` per outbound request; the injected UA equals the
+  cookie's UA (Pitfall 1). MangaDex (``antibot="none"``) sends NO Cookie/UA override.
 * D-35: a ``cloudflare*`` 403 carrying CF challenge markers triggers exactly ONE forced
   re-solve + retry; a non-challenge 403, a second challenge, or a MangaDex 403 is
   terminal (Pitfall 2).
@@ -129,8 +130,10 @@ async def test_cloudflare_get_json_injects_clearance_with_matching_ua() -> None:
     assert solver.calls == 1
     call = transport.calls[0]
     # Pitfall 1: the injected UA MUST equal the cookie's UA.
-    assert call["headers"] == {"User-Agent": _CountingSolver.USER_AGENT}
-    assert call["cookies"] == {"cf_clearance": "X"}
+    assert call["headers"]["User-Agent"] == _CountingSolver.USER_AGENT  # type: ignore[index]
+    # Clearance rides a per-request Cookie header, NOT the deprecated cookies= kwarg.
+    assert call["headers"]["Cookie"] == "cf_clearance=X"  # type: ignore[index]
+    assert "cookies" not in call
 
 
 @pytest.mark.asyncio
@@ -145,7 +148,43 @@ async def test_cloudflare_get_bytes_injects_clearance_with_matching_ua() -> None
     assert out == b"img"
     call = transport.calls[0]
     assert call["headers"]["User-Agent"] == _CountingSolver.USER_AGENT  # type: ignore[index]
-    assert call["cookies"] == {"cf_clearance": "X"}
+    assert call["headers"]["Cookie"] == "cf_clearance=X"  # type: ignore[index]
+    assert "cookies" not in call
+
+
+class _MultiCookieSolver:
+    """Solver returning a multi-cookie Clearance (cf_clearance + Laravel session).
+
+    Mirrors the real issue #71 Comix clearance, which carries cf_clearance plus the
+    Laravel ``session`` cookie — exercises the ordered ``"k=v; k2=v2"`` serialization.
+    """
+
+    USER_AGENT = "Mozilla/5.0 Chrome/cf"
+
+    async def get_clearance(
+        self, source_key: str, *, force_resolve: bool = False
+    ) -> Clearance:
+        return Clearance(
+            cookies={"cf_clearance": "X", "session": "Y"},
+            user_agent=self.USER_AGENT,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_multi_cookie_serializes_to_ordered_cookie_header() -> None:
+    # Multiple clearance cookies serialize in dict order to "k=v; k2=v2".
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [httpx.Response(200, json={"ok": True}, request=req)]
+    )
+    ctx = _ctx(transport, antibot="cloudflare+encrypted", solver=_MultiCookieSolver())
+
+    await ctx.get_json("https://comix/api")
+
+    call = transport.calls[0]
+    assert call["headers"]["Cookie"] == "cf_clearance=X; session=Y"  # type: ignore[index]
+    assert call["headers"]["User-Agent"] == _MultiCookieSolver.USER_AGENT  # type: ignore[index]
+    assert "cookies" not in call
 
 
 @pytest.mark.asyncio
