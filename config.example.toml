@@ -15,3 +15,13 @@ host = "127.0.0.1"      # AUTH-02: localhost bind by default
 port = 9191
 url_base = ""           # PLAT-01: UrlBase reverse-proxy prefix; "" = none
 output_root = "/data/manga"
+
+# ── Anti-bot / Cloudflare engine ──────────────────────────────────────────────
+# cloudflare_engine: "patchright" (Chromium, default) runs Comix /search
+#   candidates in parallel; "camoufox" (Firefox) is the fallback for hosts where
+#   Chromium's fingerprint is flagged (e.g. some datacenter runners, #35).
+# cloudflare_fetch_concurrency: parallel browser navigations per /search.
+#   Default 3. ONLY safe with engine="patchright" — engine="camoufox" REQUIRES
+#   this to be 1 (the gateway fails fast at startup otherwise, #64).
+# cloudflare_engine = "patchright"
+# cloudflare_fetch_concurrency = 3
