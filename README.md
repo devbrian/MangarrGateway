@@ -79,21 +79,34 @@ GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1 \
   uv run uvicorn manga_gateway.app:app
 ```
 
-### Residential-IP requirement (and the proxy mitigation)
+### Headless vs headed (residential vs datacenter)
 
-`engine=patchright` (Chromium) needs a **residential-reputation egress IP** to
-clear Comix's Cloudflare encrypted challenge. It clears cold on a residential-IP
-host (Windows or Linux). A cloud **datacenter-IP** host may be flagged by
-Cloudflare (the original issue #35 — being empirically re-tested now that
-Chromium is the nightly default) — the mitigation is to route the Chromium
-egress through a **residential proxy**, which has been verified to clear CF and
-run the parallel path. CLAUDE.md's day-one proxy-ready/injectable transport is
-the seam for wiring a production proxy pool (tracked in issue #65). The camoufox
-fallback is the alternative for a datacenter host without a proxy.
+`engine=patchright` (Chromium) clears Comix's Cloudflare differently depending on
+the host's IP reputation:
 
-`docker/exp4a.Dockerfile` is the documented minimal basis for a residential-IP
-Linux Chromium deploy (`python:3.12-slim-bookworm` + `patchright==1.60.0` +
-`patchright install chromium --with-deps`).
+- **Residential IP** (dev box, residential prod): **headless works** — no display
+  needed. This is the default (`cloudflare_headless=true`).
+- **Datacenter IP** (cloud VPS, CI runners): Cloudflare fingerprints *headless*
+  Chrome at the binary level and blocks it (the root of issue #35). **Headed**
+  Chromium clears it — set `GATEWAY_CLOUDFLARE_HEADLESS=false`. On a display-less
+  Linux host the solver auto-starts an **Xvfb** virtual display
+  (`pyvirtualdisplay`); the host just needs the `xvfb` package installed:
+
+  ```bash
+  apt-get install -y xvfb fonts-liberation
+  GATEWAY_CLOUDFLARE_ENGINE=patchright \
+  GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=3 \
+  GATEWAY_CLOUDFLARE_HEADLESS=false \
+    uv run uvicorn manga_gateway.app:app
+  ```
+
+  (An alternative datacenter mitigation is routing the egress through a
+  **residential proxy** — tracked in issue #65 — but headed+Xvfb needs no proxy.)
+
+`docker/exp4a.Dockerfile` is the documented minimal Linux Chromium deploy basis
+(`python:3.12-slim-bookworm` + `patchright==1.60.0` + `patchright install
+chromium --with-deps` + `xvfb`); on a datacenter host run it with
+`GATEWAY_CLOUDFLARE_HEADLESS=false`.
 
 ## Development
 
