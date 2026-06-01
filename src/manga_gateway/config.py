@@ -180,8 +180,9 @@ class Settings(BaseSettings):
                 f"{self.cloudflare_fetch_concurrency} requires "
                 'cloudflare_engine="patchright" (Chromium). Camoufox/Firefox '
                 "stalls concurrent Cloudflare navigations and returns zero "
-                "results — set cloudflare_fetch_concurrency=1 when using "
-                "engine=camoufox (issue #59)."
+                "results. Fix via env: set GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1, "
+                "or keep parallelism with GATEWAY_CLOUDFLARE_ENGINE=patchright "
+                "(issue #59)."
             )
         return self
 

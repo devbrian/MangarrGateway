@@ -81,7 +81,7 @@ def test_settings_engine_rejects_unknown_value(
         _settings()
 
 
-# ──────────── engine × fetch_concurrency guard (#64 / issue #59) ────────────
+# ──────────── engine x fetch_concurrency guard (#64 / issue #59) ────────────
 
 
 def test_settings_camoufox_with_parallel_is_rejected() -> None:
@@ -90,7 +90,7 @@ def test_settings_camoufox_with_parallel_is_rejected() -> None:
     Camoufox/Firefox stalls concurrent Cloudflare navigations, so the pairing
     silently returned zero results before this guard. The error message names
     the fix (set concurrency=1 or use patchright)."""
-    with pytest.raises(ValidationError, match="requires.*patchright"):
+    with pytest.raises(ValidationError, match=r"requires.*patchright"):
         _settings(cloudflare_engine="camoufox", cloudflare_fetch_concurrency=3)
 
 

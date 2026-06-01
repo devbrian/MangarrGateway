@@ -87,6 +87,8 @@ single-process search→handle→download→package flow must work.
 | **schemathesis** | 4.20.2 | Contract testing against the OpenAPI file | **The headline testing win.** Point it at `manga-gateway.openapi.yaml` (it supports OpenAPI 3.1 / JSON Schema 2020-12) and it property-generates requests, asserting every response conforms to the schema. Run it against the live ASGI app in CI — this is how you prove "faithful implementation of the contract of record." Wire the API key into its auth config so it hits authenticated endpoints. |
 | **respx** | latest | Mock httpx in tests | Mock MangaDex/Comix HTTP responses so search/fetch logic is testable without the network. Pairs with httpx specifically. |
 ## Installation
+
+```bash
 # Project + deps managed by uv (pyproject.toml)
 # Stealth browser binary — Patchright/Chromium (the default since
 # comix-parallel-engine-probe — the only engine that runs parallel CF navs):
@@ -95,6 +97,8 @@ single-process search→handle→download→package flow must work.
 # fingerprint-flagged (GATEWAY_CLOUDFLARE_ENGINE=camoufox; uv run camoufox fetch,
 # ~200 MB). camoufox MUST pin GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1.
 # Dev
+```
+
 ## Alternatives Considered
 | Recommended | Alternative | When to Use Alternative |
 |-------------|-------------|-------------------------|
