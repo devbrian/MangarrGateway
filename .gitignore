@@ -50,3 +50,13 @@ local-repro-*.log
 # Diagnostic-only harness for the comix-parallel-page-contention debug session.
 # Not production code; lives in tree so it can be re-run later without polluting git.
 scripts/diagnose_comix_parallel_contention.py
+
+# Diagnostic-only harness for the cf-warm-burst-timeout debug session.
+# Not production code; lives in tree so it can be re-run later without polluting git.
+scripts/diagnose_cf_warm_burst.py
+
+# Scratch dir used by diagnose_cf_warm_burst.py for per-warm user_data_dirs.
+.planning/debug/_cf_warm_burst_scratch/
+
+# Per-test scratch output from the cf-warm-burst diagnostic harness.
+.planning/debug/cf-warm-burst-timeout-harness-stdout.log
