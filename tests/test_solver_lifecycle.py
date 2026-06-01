@@ -447,7 +447,10 @@ class _FetchContext:
 
 
 def _solver_with_fetch_context(
-    ctx: _FetchContext, *, log_browser_events: bool = False
+    ctx: _FetchContext,
+    *,
+    log_browser_events: bool = False,
+    fetch_concurrency: int = 1,
 ) -> CloudflareSolver:
     """Build a CloudflareSolver whose lifecycle yields the given fetch context.
 
@@ -455,7 +458,8 @@ def _solver_with_fetch_context(
     exercise ``fetch_via_browser`` directly), but we still supply a stub that
     would record a Clearance if called. ``log_browser_events`` toggles the
     #54 diagnostic instrumentation under test in the
-    ``test_browser_event_*`` cases below.
+    ``test_browser_event_*`` cases below. ``fetch_concurrency`` lets a single
+    test exercise an N>1 Semaphore cap without changing the production default.
     """
 
     async def _launch() -> _FetchContext:
@@ -465,7 +469,11 @@ def _solver_with_fetch_context(
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
-    return CloudflareSolver(lifecycle=lc, log_browser_events=log_browser_events)
+    return CloudflareSolver(
+        lifecycle=lc,
+        log_browser_events=log_browser_events,
+        fetch_concurrency=fetch_concurrency,
+    )
 
 
 async def test_fetch_via_browser_goto_evaluate_roundtrip() -> None:
@@ -563,12 +571,15 @@ async def test_fetch_via_browser_translates_wait_for_timeout() -> None:
     await solver.aclose()
 
 
-async def test_fetch_via_browser_serializes_concurrent_calls() -> None:
-    """fetch_via_browser holds ``_browser_lock`` so a concurrent burst opens a
-    fresh page per call but never runs more than one page.evaluate in parallel
-    — Patchright is not parallel-safe on a single context's pages under the
-    same fingerprint, and queueing here protects the "minimize fingerprinting
-    events" invariant (Pitfall 6)."""
+async def test_fetch_via_browser_default_serializes_concurrent_calls() -> None:
+    """At the default ``fetch_concurrency=1``, ``fetch_via_browser`` serializes
+    a concurrent burst exactly like the historic ``asyncio.Lock`` did. The
+    ``Semaphore(1)`` shape is intentional — gives ops a ``GATEWAY_CLOUDFLARE
+    _FETCH_CONCURRENCY=N`` lever for the future parallel-page contention
+    investigation (debug session ``comix-parallel-page-contention``) without
+    requiring a framework change — but the default-1 contract is that NO
+    parallel page work happens until that investigation lands a verified
+    cause."""
     pages = [_FakeFetchPage(evaluate_result=i) for i in range(5)]
     ctx = _FetchContext(pages)
     solver = _solver_with_fetch_context(ctx)
@@ -579,13 +590,74 @@ async def test_fetch_via_browser_serializes_concurrent_calls() -> None:
         )
     )
     assert results == [0, 1, 2, 3, 4]
-    # Per-page bound is trivially 1 (each page is opened once); the meaningful
-    # check is the GLOBAL cross-page peak — ``_browser_lock`` must ensure no two
-    # pages can have an in-flight evaluate simultaneously.
+    # The meaningful invariant: at default=1, no two pages are EVER in flight.
+    # If this regresses, someone has loosened the default and the
+    # parallel-contention bug is back in production.
     assert ctx.shared_concurrency.max_in_flight <= 1
-    assert all(p.max_concurrent_calls <= 1 for p in pages)
+    assert all(p.max_concurrent_calls == 1 for p in pages)
     assert len(ctx.opened) == 5
     assert all(p.closed for p in pages)
+    await solver.aclose()
+
+
+async def test_fetch_via_browser_bounded_semaphore_caps_burst_beyond_limit() -> None:
+    """A burst LARGER than the Semaphore cap sees the cap honored — when an
+    operator opts into ``fetch_concurrency=2`` for experimentation, exactly 2
+    pages run in flight at peak, the remaining N-2 queue behind released slots.
+    Verifies the bounded-Semaphore is not a free-for-all under heavy load and
+    that the kwarg actually sizes the gate."""
+    burst_size = 10
+    cap = 2
+    pages = [_FakeFetchPage(evaluate_result=i) for i in range(burst_size)]
+    ctx = _FetchContext(pages)
+    solver = _solver_with_fetch_context(ctx, fetch_concurrency=cap)
+    results = await asyncio.gather(
+        *(
+            solver.fetch_via_browser(f"https://x/{i}", extract=f"return {i};")
+            for i in range(burst_size)
+        )
+    )
+    assert results == list(range(burst_size))
+    # Peak in-flight MUST honor the Semaphore cap regardless of burst size.
+    assert ctx.shared_concurrency.max_in_flight <= cap
+    assert len(ctx.opened) == burst_size
+    assert all(p.closed for p in pages)
+    await solver.aclose()
+
+
+async def test_fetch_via_browser_concurrency_kwarg_caps_semaphore() -> None:
+    """``CloudflareSolver(fetch_concurrency=N)`` sizes the internal Semaphore
+    to N, overriding the default 1. Critical because the production wiring
+    drives the kwarg from ``Settings.cloudflare_fetch_concurrency`` (PR #58
+    retrospective) — if this binding regresses, the future ops lever for the
+    parallel-page contention investigation silently does nothing."""
+    burst_size = 6
+    pages = [_FakeFetchPage(evaluate_result=i) for i in range(burst_size)]
+    ctx = _FetchContext(pages)
+
+    async def _launch() -> _FetchContext:
+        return ctx
+
+    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+        return Clearance(cookies={}, user_agent="ua")
+
+    lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
+    solver = CloudflareSolver(lifecycle=lc, fetch_concurrency=2)
+
+    # The plumbed value MUST land on the Semaphore — anything else is a
+    # silent regression of the ops-knob contract.
+    assert solver._browser_concurrency == 2  # type: ignore[attr-defined]
+
+    results = await asyncio.gather(
+        *(
+            solver.fetch_via_browser(f"https://x/{i}", extract=f"return {i};")
+            for i in range(burst_size)
+        )
+    )
+    assert results == list(range(burst_size))
+    # And the Semaphore actually bounds the in-flight count, not just the
+    # stored attribute — the tighter cap is observable end-to-end.
+    assert ctx.shared_concurrency.max_in_flight <= 2
     await solver.aclose()
 
 

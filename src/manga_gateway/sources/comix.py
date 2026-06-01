@@ -99,6 +99,7 @@ the extractor never snapshots a partial scaffold.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -113,6 +114,8 @@ from ..models.search import Release
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
     from ..models.search import SearchRequest
+
+_log = logging.getLogger("manga_gateway")
 
 
 # Bound a title search's candidate series; interactive widens it (mirrors MangaDex).
@@ -778,6 +781,26 @@ class ComixSource(Source):
         decrypt paths (one statically-decrypted list endpoint and one
         browser-driven pages endpoint), funnel both through the warm Patchright
         page that the SPA already drives correctly.
+
+        Concurrency: per-candidate ``_series_chapters`` browser navigations
+        run SEQUENTIALLY. An earlier attempt (PR #58 v1) parallelized them via
+        ``asyncio.gather`` and broke the search end-to-end — pages NEVER
+        rendered the chapter list when ≥2 series pages were opened concurrently
+        on the same Camoufox BrowserContext (wait_for selector timed out at
+        15s, 60s, indefinitely; sequential cleared the same 4 candidates in
+        10.25s with 66 results). Root cause TBD — candidate explanations
+        include Cloudflare burst rate-limiting, Camoufox internal page-op
+        serialization, and same-context same-origin JS contention. Tracked in
+        debug session ``comix-parallel-page-contention`` (follow-up to
+        ``comix-search-timeout``). Until that lands, sequential is the
+        contract here — DO NOT introduce parallelism in this loop without
+        first reproducing chapter-list render under concurrent page loads.
+
+        Per-candidate failure isolation IS preserved: a single
+        ``_series_chapters`` raise is caught + logged + skipped, so one bad
+        series does not blank the whole search response (the
+        pre-parallelization code raised through, which was strictly worse —
+        better to return 4-of-5 candidates' chapters than nothing).
         """
         _ = req.languages  # Comix is English-only (live recon); honored downstream
         count = (
@@ -787,12 +810,26 @@ class ComixSource(Source):
         )
         series = await self._search_series(req.query or "", count, ctx)
 
-        releases: list[Release] = []
         feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
+
+        releases: list[Release] = []
         for series_hid, series_slug, series_title in series:
-            chapters = await self._series_chapters(
-                series_hid, series_slug, feed_limit, req.offset, ctx
-            )
+            try:
+                chapters = await self._series_chapters(
+                    series_hid, series_slug, feed_limit, req.offset, ctx
+                )
+            except Exception as exc:  # noqa: BLE001 — per-candidate isolation
+                # One bad candidate must not blank the whole search response.
+                # The exception is logged at WARNING with the hid+slug so a
+                # systemic issue (Comix DOM change, regex drift) is still
+                # visible in ops dashboards. Other candidates continue to flow.
+                _log.warning(
+                    "comix search: candidate %r (slug=%r) failed: %s",
+                    series_hid,
+                    series_slug,
+                    exc,
+                )
+                continue
             for chapter in chapters:
                 # Inject the series-page-known title into the chapter dict so the
                 # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /

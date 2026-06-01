@@ -86,6 +86,24 @@ class Settings(BaseSettings):
     cloudflare_solve_concurrency: int = Field(
         default=1, ge=1
     )  # D-33/Pattern 7: solve cap; default 1 collapses to single-flight
+    # Bound on concurrent ``fetch_via_browser`` calls within a single
+    # CloudflareSolver instance. Backed by an ``asyncio.Semaphore`` in
+    # ``CloudflareSolver._browser_lock``; default 1 reproduces the
+    # historic ``asyncio.Lock`` shape exactly.
+    #
+    # CAVEAT (PR #58 retrospective): an earlier attempt set this to 5 so
+    # comix /search could fan out per-candidate browser navs in parallel.
+    # Live testing showed the parallel page loads NEVER rendered Comix's
+    # chapter-list DOM, even given 60s wait_for ceilings (sequential
+    # cleared the same 4 candidates in 10.25s with 66 results). Root
+    # cause is tracked under debug session
+    # ``comix-parallel-page-contention``. Do NOT bump this above 1
+    # for the Cloudflare path until that investigation lands a verified
+    # explanation — at minimum a local repro proving N concurrent
+    # comix.to navs all render the chapter list. Pitfall 6 (minimize
+    # fingerprinting events) also applies — bumping risks a CF
+    # encrypted-tier challenge regardless.
+    cloudflare_fetch_concurrency: int = Field(default=1, ge=1)
     cloudflare_headless: bool = True  # Open Q2: run the stealth browser headless
     # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at
     # the use site (Plan 04), NOT under output_root (T-04-03 — never logged).

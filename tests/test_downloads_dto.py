@@ -150,6 +150,7 @@ def test_settings_concurrency_and_db_path_defaults(tmp_path: Path) -> None:
     settings = load_settings(cfg)
     assert settings.max_concurrent_chapters == 3  # D-30
     assert settings.image_fetch_concurrency == 6  # D-31
+    assert settings.cloudflare_fetch_concurrency == 1  # PR #58 retrospective
     assert settings.db_path == "gateway.db"
 
 
@@ -160,9 +161,11 @@ def test_settings_env_overrides_concurrency(
     cfg.write_text('api_key = "k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n', encoding="utf-8")
     monkeypatch.setenv("GATEWAY_MAX_CONCURRENT_CHAPTERS", "9")
     monkeypatch.setenv("GATEWAY_IMAGE_FETCH_CONCURRENCY", "12")
+    monkeypatch.setenv("GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY", "8")
     monkeypatch.setenv("GATEWAY_DB_PATH", "/var/lib/gw.db")
     settings = load_settings(cfg)
     # Ops knobs honor the env override path (D-11) — same as host/port/output_root.
     assert settings.max_concurrent_chapters == 9
     assert settings.image_fetch_concurrency == 12
+    assert settings.cloudflare_fetch_concurrency == 8
     assert settings.db_path == "/var/lib/gw.db"
