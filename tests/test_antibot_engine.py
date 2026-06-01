@@ -169,3 +169,69 @@ def test_solver_engine_unchanged_when_lifecycle_injected() -> None:
     assert solver.engine == "camoufox"
     assert solver._lifecycle is lifecycle  # type: ignore[attr-defined]
     assert solver._lifecycle._launch is mock_launch  # type: ignore[attr-defined]
+
+
+# ──────────── headed-on-datacenter Xvfb virtual display (#35 fix) ────────────
+
+
+def test_virtual_display_noop_when_headless() -> None:
+    """Headless launches never start Xvfb (the residential / dev default path)."""
+    solver = CloudflareSolver(headless=True)
+    solver._start_virtual_display()  # type: ignore[attr-defined]
+    assert solver._virtual_display is None  # type: ignore[attr-defined]
+
+
+def test_virtual_display_noop_when_display_already_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headed but a DISPLAY already exists (real desktop / xvfb-run) → no-op."""
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    solver = CloudflareSolver(headless=False)
+    solver._start_virtual_display()  # type: ignore[attr-defined]
+    assert solver._virtual_display is None  # type: ignore[attr-defined]
+
+
+def test_virtual_display_noop_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Headed on Windows/mac dev → no Xvfb (a real browser window opens instead)."""
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    solver = CloudflareSolver(headless=False)
+    solver._start_virtual_display()  # type: ignore[attr-defined]
+    assert solver._virtual_display is None  # type: ignore[attr-defined]
+
+
+def test_virtual_display_starts_when_headed_linux_no_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headed + Linux + no DISPLAY → starts an Xvfb display (the datacenter path).
+
+    Injects a fake ``pyvirtualdisplay`` so the test needs no real Xvfb binary."""
+    import sys as _sys
+    import types
+
+    events: list[str] = []
+
+    class _FakeDisplay:
+        def __init__(self, **kwargs: object) -> None:
+            self._kwargs = kwargs
+
+        def start(self) -> None:
+            events.append("start")
+
+        def stop(self) -> None:
+            events.append("stop")
+
+    fake_mod = types.ModuleType("pyvirtualdisplay")
+    fake_mod.Display = _FakeDisplay  # type: ignore[attr-defined]
+    monkeypatch.setitem(_sys.modules, "pyvirtualdisplay", fake_mod)
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+
+    solver = CloudflareSolver(headless=False)
+    solver._start_virtual_display()  # type: ignore[attr-defined]
+    assert events == ["start"]
+    assert isinstance(solver._virtual_display, _FakeDisplay)  # type: ignore[attr-defined]
+    # Idempotent — a second call does not start a second display.
+    solver._start_virtual_display()  # type: ignore[attr-defined]
+    assert events == ["start"]

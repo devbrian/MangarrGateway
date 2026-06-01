@@ -110,7 +110,14 @@ class Settings(BaseSettings):
     # on some hosts; a datacenter-IP host may need to route the Chromium egress
     # through a residential proxy (CLAUDE.md proxy-ready transport, issue #65).
     cloudflare_fetch_concurrency: int = Field(default=3, ge=1)
-    cloudflare_headless: bool = True  # Open Q2: run the stealth browser headless
+    # Run the stealth browser headless. Default True: headless clears CF on a
+    # residential-reputation IP (dev / residential prod) with no display needed.
+    # Set to False on a DATACENTER host (cloud / CI): Cloudflare fingerprints
+    # headless Chrome at the binary level and blocks it on datacenter IPs, but
+    # HEADED Chromium clears it (cf-fingerprint-probe, #35). When headed on a
+    # display-less Linux host the solver auto-starts an Xvfb virtual display
+    # (pyvirtualdisplay) — the host only needs the ``xvfb`` package installed.
+    cloudflare_headless: bool = True
     # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at
     # the use site (Plan 04), NOT under output_root (T-04-03 — never logged).
     cloudflare_user_data_dir: str = "cloudflare-userdata"

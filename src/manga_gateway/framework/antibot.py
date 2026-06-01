@@ -37,6 +37,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
@@ -312,6 +314,12 @@ class CloudflareSolver:
             recycle_seconds=recycle_seconds,
         )
         self._playwright: Any = None  # the started playwright instance (real path)
+        # Virtual framebuffer (Xvfb) handle for HEADED launches on a display-less
+        # Linux host (servers / CI / datacenter). Headed Chromium clears
+        # Cloudflare on datacenter IPs where headless is fingerprint-flagged
+        # (comix-parallel-engine-probe); headed needs a display a server lacks, so
+        # we start one lazily. None until the first headed Linux launch.
+        self._virtual_display: Any = None
         # Bounds concurrent ``fetch_via_browser`` calls on the warm context.
         # An ``asyncio.Semaphore`` backs the gate; ``fetch_concurrency=1``
         # (the default) reproduces the historic ``asyncio.Lock`` shape
@@ -541,8 +549,40 @@ class CloudflareSolver:
         if pw is not None:
             with contextlib.suppress(Exception):
                 await pw.stop()
+        # Stop the Xvfb display last (after the browser using it is gone).
+        display = self._virtual_display
+        self._virtual_display = None
+        if display is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(display.stop)
 
     # ─────────────────────── real launch/solve closures ───────────────────────
+
+    def _start_virtual_display(self) -> None:
+        """Start an Xvfb virtual framebuffer for a headed launch on a display-less
+        Linux host. Idempotent; no-op when headless, off-Linux, or a ``DISPLAY``
+        already exists (a real desktop, or the operator already runs under
+        ``xvfb-run``). Lazy import so the dependency is only touched on the headed
+        Linux-server path. Blocking (spawns Xvfb) — callers offload via
+        ``asyncio.to_thread``.
+
+        Headed Chromium clears Cloudflare's encrypted challenge on datacenter IPs
+        where headless Chrome is fingerprint-flagged at the binary level
+        (comix-parallel-engine-probe / #35). ``pyvirtualdisplay`` sets ``DISPLAY``
+        on start, which the headed browser launch then inherits.
+        """
+        if self._headless or self._virtual_display is not None:
+            return
+        if sys.platform != "linux" or os.environ.get("DISPLAY"):
+            return
+        from pyvirtualdisplay import (  # type: ignore[attr-defined]  # noqa: PLC0415
+            Display,
+        )
+
+        display = Display(visible=False, size=(1920, 1080))
+        display.start()
+        self._virtual_display = display
+        _log.info("started Xvfb virtual display for headed browser launch")
 
     async def _launch_patchright_context(self) -> Any:
         """Launch a Patchright persistent context (lazy import — D-42).
@@ -569,6 +609,10 @@ class CloudflareSolver:
         await asyncio.to_thread(
             Path(self._user_data_dir).mkdir, mode=0o700, parents=True, exist_ok=True
         )
+        # Headed-on-display-less-Linux (datacenter/CI) needs an Xvfb display so
+        # the browser can launch headed — the config that clears CF where headless
+        # is flagged (comix-parallel-engine-probe). No-op when headless/off-Linux.
+        await asyncio.to_thread(self._start_virtual_display)
 
         self._playwright = await async_playwright().start()
         return await self._playwright.chromium.launch_persistent_context(
@@ -612,6 +656,7 @@ class CloudflareSolver:
         await asyncio.to_thread(
             Path(self._user_data_dir).mkdir, mode=0o700, parents=True, exist_ok=True
         )
+        await asyncio.to_thread(self._start_virtual_display)
 
         self._playwright = await async_playwright().start()
         # ``persistent_context=True`` returns a BrowserContext (same shape as
