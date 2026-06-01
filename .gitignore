@@ -29,6 +29,9 @@ gateway.db*
 # legacy "comix-userdata" entry remains for repos that were initialized before the
 # 04-04 rename.
 cloudflare-userdata/
+# Per-engine / per-experiment persistent-context dirs (e.g. cloudflare-userdata-patchright,
+# cloudflare-userdata-patchright-proxy-exp6) ALSO hold cf_clearance — same T-04-03 rule.
+cloudflare-userdata-*/
 comix-userdata/
 
 # Live-smoke (pytest -m live) runtime breadcrumb. The REAL D-44 *.bin/*.plain
@@ -47,9 +50,12 @@ _e2e_out/
 junit.xml
 local-repro-*.log
 
-# Diagnostic-only harness for the comix-parallel-page-contention debug session.
+# Diagnostic-only harness for the comix-parallel-page-contention / comix-parallel-engine-probe
+# debug sessions (EXP-1..EXP-6, incl. the EXP-6 --proxy-server extension).
 # Not production code; lives in tree so it can be re-run later without polluting git.
 scripts/diagnose_comix_parallel_contention.py
+# End-to-end results-path harness for comix-parallel-engine-probe EXP-5 (re-enabled fan-out).
+scripts/exp5_comix_parallel_search_results.py
 
 # Diagnostic-only harness for the cf-warm-burst-timeout debug session.
 # Not production code; lives in tree so it can be re-run later without polluting git.

@@ -89,20 +89,23 @@ class Settings(BaseSettings):
     # Bound on concurrent ``fetch_via_browser`` calls within a single
     # CloudflareSolver instance. Backed by an ``asyncio.Semaphore`` in
     # ``CloudflareSolver._browser_lock``; default 1 reproduces the
-    # historic ``asyncio.Lock`` shape exactly.
+    # historic ``asyncio.Lock`` shape exactly (one nav at a time → comix
+    # /search runs sequentially, zero regression for the default).
     #
-    # CAVEAT (PR #58 retrospective): an earlier attempt set this to 5 so
-    # comix /search could fan out per-candidate browser navs in parallel.
-    # Live testing showed the parallel page loads NEVER rendered Comix's
-    # chapter-list DOM, even given 60s wait_for ceilings (sequential
-    # cleared the same 4 candidates in 10.25s with 66 results). Root
-    # cause is tracked under debug session
-    # ``comix-parallel-page-contention``. Do NOT bump this above 1
-    # for the Cloudflare path until that investigation lands a verified
-    # explanation — at minimum a local repro proving N concurrent
-    # comix.to navs all render the chapter list. Pitfall 6 (minimize
-    # fingerprinting events) also applies — bumping risks a CF
-    # encrypted-tier challenge regardless.
+    # ENGINE CONSTRAINT (debug session ``comix-parallel-engine-probe``,
+    # 2026-06-01 — supersedes the earlier ``comix-parallel-page-contention``
+    # "CF per-IP burst" caveat, now REFUTED): ``> 1`` is ONLY safe on
+    # ``cloudflare_engine="patchright"`` (Chromium). Chromium runs N concurrent
+    # CF navigations on one shared warm context cleanly (4/4 proven on
+    # residential-IP Windows + Linux, and through a residential proxy). Camoufox
+    # (Firefox) STALLS concurrent CF navigations at goto-commit — the
+    # chapter-list DOM never renders — so with ``engine="camoufox"`` this MUST
+    # stay at 1. The failure is engine-specific, NOT a Cloudflare per-IP burst
+    # limit (issue #59). DEPLOY NOTE: ``engine=patchright`` needs a
+    # residential-reputation egress to clear CF — a datacenter-IP host should
+    # route the Chromium egress through a residential proxy (CLAUDE.md
+    # proxy-ready transport is the seam). A fail-fast Settings guard for
+    # ``> 1 + camoufox`` is deferred — tracked in issue #64.
     cloudflare_fetch_concurrency: int = Field(default=1, ge=1)
     cloudflare_headless: bool = True  # Open Q2: run the stealth browser headless
     # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at

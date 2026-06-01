@@ -314,21 +314,19 @@ class CloudflareSolver:
         # Bounds concurrent ``fetch_via_browser`` calls on the warm context.
         # An ``asyncio.Semaphore`` backs the gate; ``fetch_concurrency=1``
         # (the default) reproduces the historic ``asyncio.Lock`` shape
-        # exactly. The Semaphore-vs-Lock choice exists so an ops-side
-        # ``GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=N`` bump can experiment
-        # with N>1 without recompiling — useful when the parallel-page
-        # contention investigation lands a verified explanation (see
-        # debug session ``comix-parallel-page-contention``).
+        # exactly — one nav at a time, the safe default for every engine.
+        # Driven from ``Settings.cloudflare_fetch_concurrency`` so an ops-side
+        # ``GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=N`` bump needs no recompile.
         #
-        # DO NOT default > 1: live testing of PR #58 v1 (default=5)
-        # showed N>1 concurrent comix.to title-page navs caused the
-        # chapter-list DOM to NEVER render — even given 60s wait_for
-        # ceilings, the selector never matched (root cause TBD —
-        # Cloudflare burst challenge, Camoufox internal page-op
-        # serialization, or same-context JS contention). Pitfall 6
-        # (minimize fingerprinting events) is the secondary reason a
-        # small cap matters even after the contention question is
-        # resolved.
+        # ENGINE CONSTRAINT (debug session ``comix-parallel-engine-probe``,
+        # 2026-06-01): ``> 1`` is ONLY safe on ``engine="patchright"``
+        # (Chromium), which runs N concurrent CF navigations on one shared warm
+        # context cleanly. ``engine="camoufox"`` (Firefox) STALLS concurrent CF
+        # navigations at goto-commit (the chapter-list DOM never renders), so
+        # the cap MUST stay at 1 there. The failure is engine-specific, NOT a
+        # Cloudflare per-IP burst limit — the earlier "CF burst" diagnosis
+        # (issue #59 / resolved session ``comix-parallel-page-contention``) is
+        # REFUTED. See ``config.py``'s ``cloudflare_fetch_concurrency`` comment.
         self._browser_concurrency = fetch_concurrency
         self._browser_lock: asyncio.Semaphore = asyncio.Semaphore(
             self._browser_concurrency
