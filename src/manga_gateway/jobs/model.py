@@ -71,3 +71,14 @@ class Job:
     created_at: str
     updated_at: str
     completed_at: str | None
+    # Projection-only byte progress (WR-08): the in-memory running total of
+    # fetched page bytes + a download-start marker for the live ETA/rate calc.
+    # These are NOT persisted columns (mirroring how ``downloaded_pages`` is
+    # advanced in memory without a per-page SQLite write, DL-05) — the engine
+    # pins the EXACT ``total_bytes``/``remaining_bytes`` to the persisted columns
+    # on completion, but the per-page accumulation + start marker stay in memory.
+    # Defaulted (and placed last) so ``store._row_to_job`` (which does not select
+    # them) still constructs a valid ``Job`` and every keyword-arg call site is
+    # unaffected — dataclass requires defaulted fields after non-default ones.
+    downloaded_bytes: int = 0
+    download_started_at: str | None = None

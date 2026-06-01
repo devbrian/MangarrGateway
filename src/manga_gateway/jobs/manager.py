@@ -57,6 +57,31 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _eta_seconds(job: Job, remaining_bytes: int) -> int | None:
+    """ETA in seconds from the observed download rate, or ``None`` (WR-08, guarded).
+
+    ``rate = downloaded_bytes / elapsed_seconds`` where ``elapsed`` is from the
+    job's ``download_started_at`` marker to now. Returns ``None`` — never raises —
+    when the marker is unset/unparseable, ``elapsed <= 0``, ``downloaded_bytes == 0``,
+    or the rate is non-positive (no divide-by-zero on any path). ``remaining_bytes``
+    is already clamped at 0 by the caller, so the ETA is never negative.
+    """
+    started = job.download_started_at
+    if not started or job.downloaded_bytes <= 0:
+        return None
+    try:
+        start_dt = datetime.fromisoformat(started)
+    except ValueError:
+        return None
+    elapsed = (datetime.now(UTC) - start_dt).total_seconds()
+    if elapsed <= 0:
+        return None
+    rate = job.downloaded_bytes / elapsed
+    if rate <= 0:
+        return None
+    return round(remaining_bytes / rate)
+
+
 class JobManager:
     """Owns the projection, semaphores, task set, and the background engine (R1)."""
 
@@ -309,22 +334,68 @@ class JobManager:
         async with self._global_sem, source_sem:
             await self._engine.run(job)
 
+    @staticmethod
+    def _estimate_bytes_and_eta(job: Job) -> tuple[int, int, int | None]:
+        """Live byte/ETA projection from CURRENT in-memory progress (WR-08, DL-05).
+
+        Returns ``(total_bytes, remaining_bytes, eta_seconds)`` computed fresh per
+        poll — no store/disk read. For a DOWNLOADING **or ARCHIVING** job with usable
+        progress the total is the per-page-average projection and the ETA derives
+        from the observed download rate; every other state (queued/resolving/
+        completed/failed, or not-yet-usable progress) falls back to the STORED
+        ``total_bytes``/``remaining_bytes`` with ``eta_seconds=None``.
+
+        ARCHIVING is included so the counter stays MONOTONIC: by then all pages are
+        fetched (``downloaded_pages == total_pages``) but the engine has not yet
+        pinned ``total_bytes`` (that happens on COMPLETED), so a DOWNLOADING-only
+        guard would briefly drop the live estimate back to the stored ``0/0`` and
+        then jump to the exact total — a visible glitch. With ARCHIVING included,
+        ``est_total == downloaded_bytes`` and ``remaining == 0`` there, matching the
+        exact pinned total that COMPLETED then projects (issue #10 / CodeRabbit).
+
+        Invariants (LOCKED Option 2): ``remaining_bytes`` is never negative
+        (``max(0, …)``) and EVERY division is guarded against zero — the per-page
+        average needs ``downloaded_pages > 0`` and ``total_pages > 0``; the ETA
+        additionally needs a parseable ``download_started_at``, ``elapsed > 0`` and
+        a positive observed rate. Any guard failing yields the stored fallback.
+        """
+        downloaded_bytes = job.downloaded_bytes
+        downloaded_pages = job.downloaded_pages
+        total_pages = job.total_pages
+        if (
+            job.status in (JobStatus.DOWNLOADING, JobStatus.ARCHIVING)
+            and downloaded_pages
+            and downloaded_pages > 0
+            and total_pages
+            and total_pages > 0
+            and downloaded_bytes > 0
+        ):
+            est_total = round(downloaded_bytes / downloaded_pages * total_pages)
+            remaining = max(0, est_total - downloaded_bytes)
+            eta = _eta_seconds(job, remaining)
+            return est_total, remaining, eta
+        # Fallback: queued jobs project 0/0, completed jobs the exact pinned total
+        # + remaining 0, everything terminal/non-downloading gets etaSeconds:null.
+        return job.total_bytes, job.remaining_bytes, None
+
     def _to_dto(self, job: Job) -> DownloadJob:
         """Project the internal :class:`Job` onto the camelCase wire DTO (DL-04).
 
         Only contract ``DownloadJob`` fields are emitted — the manifest / page URLs /
-        baseUrl never appear (PKG-01/R6).
+        baseUrl never appear (PKG-01/R6). The byte/ETA fields are a LIVE estimate
+        computed fresh from current progress (WR-08) — no store/disk read (DL-05).
         """
+        total_bytes, remaining_bytes, eta_seconds = self._estimate_bytes_and_eta(job)
         return DownloadJob(
             job_id=job.job_id,
             title=job.title,
             source_key=job.source_key,
             status=job.status.value,
-            total_bytes=job.total_bytes,
-            remaining_bytes=job.remaining_bytes,
+            total_bytes=total_bytes,
+            remaining_bytes=remaining_bytes,
             total_pages=job.total_pages,
             downloaded_pages=job.downloaded_pages,
-            eta_seconds=None,
+            eta_seconds=eta_seconds,
             output_path=job.output_path,
             message=job.message,
             created_at=job.created_at,
