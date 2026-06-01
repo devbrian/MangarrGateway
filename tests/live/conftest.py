@@ -57,6 +57,7 @@ import pytest_asyncio
 import manga_gateway.app as _app_module
 from manga_gateway.config import Settings
 from manga_gateway.framework.antibot import CloudflareSolver
+from manga_gateway.framework.proxy import build_proxy
 from manga_gateway.framework.registry import SourceRegistry
 from manga_gateway.sources import register_builtin_sources
 
@@ -244,8 +245,9 @@ def _restore_real_cloudflare_warm(monkeypatch: pytest.MonkeyPatch) -> None:
 def _build_session_solver_kwargs() -> dict[str, Any]:
     """Mirror app.py's solver-kwargs build using a default ``Settings()``.
 
-    Kept in lockstep with ``manga_gateway.app.lifespan`` lines 165-189 — the
-    fields and source of each match. The only difference: this fixture uses
+    Kept in lockstep with ``manga_gateway.app.lifespan`` (the solver_kwargs
+    build, incl. the PROXY-01/#65 proxy gate) — the fields and source of each
+    match. The only difference: this fixture uses
     a default-constructed ``Settings()`` (which picks up env vars exactly as
     production does), then derives ``cloudflare_keys`` and ``challenge_url``
     from the same registry inspection app.py performs.
@@ -281,6 +283,16 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
     }
     if challenge_url is not None:
         kwargs["challenge_url"] = challenge_url
+    # PROXY-01 / #65: mirror the lifespan's proxy wiring so the session-shared
+    # solver egresses through the SAME proxy as the per-test HttpxTransport
+    # (which derives its own proxy from these same env-backed settings). Without
+    # this, a proxy-configured live run would clear CF from the host IP while
+    # httpx fetched images through the proxy — a split egress that cf_clearance
+    # (IP-bound) would reject, the exact failure mode #65 guards against. Reads
+    # the env-backed Settings only; no credential literal lives here.
+    playwright_proxy, _ = build_proxy(settings)
+    if playwright_proxy is not None:
+        kwargs["proxy"] = playwright_proxy
     return kwargs
 
 
