@@ -45,3 +45,8 @@ _e2e_out/
 # D-63). Transient — uploaded as a CI artifact in the nightly workflow, never
 # committed.
 junit.xml
+local-repro-*.log
+
+# Diagnostic-only harness for the comix-parallel-page-contention debug session.
+# Not production code; lives in tree so it can be re-run later without polluting git.
+scripts/diagnose_comix_parallel_contention.py
