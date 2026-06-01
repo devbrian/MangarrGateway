@@ -149,9 +149,10 @@ class SourceContext:
         the only client here is the R1-shared one — pinning ``cf_clearance`` onto its
         jar would leak it onto MangaDex + every future source and break the per-request
         UA coupling. A manual ``Cookie`` header reproduces the exact wire bytes httpx's
-        ``cookies=`` emitted, and the shared jar (empty for these hosts) never overwrites
-        it. Returns an empty dict when there is no solver, no cloudflare gate, or a
-        ``None`` clearance — so the MangaDex path stays byte-for-byte unchanged.
+        ``cookies=`` emitted, and the shared jar (empty for these hosts) never
+        overwrites it. Returns an empty dict when there is no solver, no cloudflare
+        gate, or a ``None`` clearance — so the MangaDex path stays byte-for-byte
+        unchanged.
         """
         if not self._is_cloudflare:
             return {}
