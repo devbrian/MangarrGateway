@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -377,7 +378,7 @@ async def test_parallel_fan_out_strict_fail_isolates_to_the_job(
         out_root = tmp_path / "out"
         cbz_found = any(
             name.endswith(".cbz")
-            for _dir, _subdirs, files in __import__("os").walk(out_root)
+            for _dir, _subdirs, files in os.walk(out_root)
             for name in files
         )
         assert not cbz_found
