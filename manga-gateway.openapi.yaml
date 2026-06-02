@@ -219,7 +219,7 @@ components:
       type: object
       required: [key, name, enabled, supportsSearch, supportsRecent]
       properties:
-        key:                { type: string, example: "comix.to" }
+        key:                { type: string, example: "comix" }
         name:               { type: string, example: "Comix" }
         enabled:            { type: boolean }
         supportsSearch:     { type: boolean }
