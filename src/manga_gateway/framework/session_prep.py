@@ -103,9 +103,7 @@ class _CsrfMetaParser(HTMLParser):
         super().__init__()
         self.token: str | None = None
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if self.token is not None or tag != "meta":
             return
         attr = dict(attrs)
