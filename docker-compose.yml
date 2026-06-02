@@ -35,7 +35,7 @@ services:
       # MANGARR_STATE_DIR=/opt/mangarrgateway (in .env) to bind a host dir.
       - ${MANGARR_STATE_DIR:-gateway-state}:/state
       # CBZ downloads/output. Defaults to the named `gateway-output` volume; set
-      # MANGARR_DOWNLOADS_DIR=/mnt/mangarr_dl (in .env) to bind a host dir.
+      # MANGARR_DOWNLOADS_DIR=/mnt/mediatrial/mangarr_dl (in .env) to bind a host dir.
       - ${MANGARR_DOWNLOADS_DIR:-gateway-output}:/data/manga
     restart: unless-stopped
     # NOTE: command is intentionally NOT overridden — inherit the Dockerfile's

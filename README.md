@@ -73,15 +73,15 @@ Linux server), set these in `.env`:
 
 ```dotenv
 MANGARR_STATE_DIR=/opt/mangarrgateway   # app data → /state
-MANGARR_DOWNLOADS_DIR=/mnt/mangarr_dl    # downloads → /data/manga
+MANGARR_DOWNLOADS_DIR=/mnt/mediatrial/mangarr_dl    # downloads → /data/manga
 ```
 
 The container runs **non-root (uid 10001)**, so a bound host dir must be writable
 by that uid or first-run key generation fails. On the server, once:
 
 ```bash
-sudo mkdir -p /opt/mangarrgateway /mnt/mangarr_dl
-sudo chown -R 10001:10001 /opt/mangarrgateway /mnt/mangarr_dl
+sudo mkdir -p /opt/mangarrgateway /mnt/mediatrial/mangarr_dl
+sudo chown -R 10001:10001 /opt/mangarrgateway /mnt/mediatrial/mangarr_dl
 ```
 
 ### Reading the API key
