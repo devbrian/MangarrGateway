@@ -1,19 +1,22 @@
-"""Unit tests for ``MangaBallSource.search`` (Task 1).
+"""Unit tests for ``MangaBallSource.search`` (Task 1, rebuilt for GAP-1).
 
-``search`` POSTs ``/api/v1/title/search-advanced/`` via ``ctx.post_json`` (the
-Plan-01 form-POST method), parses the standard ``{code,message,data,pagination}``
-envelope, and for each Title resolves its ``translations`` into one Release per
-translation. Each Release carries:
+The LIVE flow is TWO calls (the old fixtures fabricated a ``title["chapters"]``
+shape the API never returns — that false shape is RETIRED here):
 
-* the fully-specific guid
-  ``mangaball:{title_id}:ch-{number_float}:{language}:{translation_id}`` (D-08);
-* an opaque minted ``downloadHandle`` whose ``ResolutionRecord.chapter_id`` is the
-  ``translation_id`` (the chapter-detail/download unit);
-* ``page_count`` from ``translation.pages`` (reliable; ``size`` is not);
-* HTML-string fields (``alternateName`` / ``status``) stripped — never raw.
+1. ``POST /api/v1/title/search-advanced/`` → a TITLE-ONLY envelope (no ``chapters``
+   key). ``search`` slices the first ``_DEFAULT_TITLE_CANDIDATES`` candidates.
+2. ``POST /api/v1/chapter/chapter-listing-by-title-id/`` per candidate → the FLAT
+   ``{code,message,ALL_CHAPTERS:[…]}`` envelope whose ``translations`` are the
+   release granularity.
 
-No network: a fake ``SourceContext`` captures the POST URL + form body and serves
-a canned envelope, exactly like ``tests/test_comix_recent.py``'s recent fake.
+Each Release carries the fully-specific guid
+``mangaball:{title_id}:ch-{number_float}:{language}:{translation_id}`` (D-08), an
+opaque minted ``downloadHandle`` whose ``ResolutionRecord.chapter_id`` is the bare
+``translation_id``, ``page_count`` from ``translation.pages``, and HTML-string
+title fields stripped (never raw).
+
+No network: a fake ``SourceContext`` routes ``post_json`` by URL (search-advanced
+vs chapter-listing) and records calls for assertions.
 """
 
 from __future__ import annotations
@@ -29,30 +32,48 @@ from manga_gateway.models.search import SearchRequest
 from manga_gateway.sources.mangaball import MangaBallSource
 
 # guid contract (D-08): mangaball:{24-hex title}:ch-{float}:{lang}:{24-hex tx}
-_GUID_RE = re.compile(r"^mangaball:[0-9a-f]{24}:ch-[\d.]+:[a-z]{2,}:[0-9a-f]{24}$")
+_GUID_RE = re.compile(r"^mangaball:[0-9a-f]{24}:ch-[\d.]+:[a-z-]{2,}:[0-9a-f]{24}$")
+
+_SEARCH_ADVANCED = "https://mangaball.net/api/v1/title/search-advanced/"
+_CHAPTER_LISTING = "https://mangaball.net/api/v1/chapter/chapter-listing-by-title-id/"
 
 
 class _FakeCtxForSearch:
-    """Minimal ``SourceContext`` stand-in for the ``search`` post-path.
+    """``SourceContext`` stand-in: routes ``post_json`` by URL (two-call flow).
 
-    ``search`` reads ``ctx`` only via :meth:`post_json` (one call) and
-    ``handle_store.mint``. We capture the URL + form body for assertion and serve
-    a canned envelope. The production ``SourceContext.post_json`` is the layer
-    that touches httpx.
+    A ``search-advanced`` POST returns the title-only envelope; a
+    ``chapter-listing-by-title-id`` POST returns the flat listing keyed by the
+    posted ``title_id``. Calls are recorded for assertions. The production
+    ``SourceContext.post_json`` is the layer that touches httpx.
     """
 
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        titles: list[dict[str, Any]],
+        listings: dict[str, list[dict[str, Any]]],
+    ) -> None:
         self.handle_store = HandleStore()
-        self._payload = payload
+        self._titles = titles
+        self._listings = listings
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def post_json(self, url: str, *, data: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((url, data))
-        return self._payload
+        if url == _SEARCH_ADVANCED:
+            return _search_envelope(self._titles)
+        if url == _CHAPTER_LISTING:
+            title_id = str(data.get("title_id"))
+            return _chapter_listing(self._listings.get(title_id, []))
+        raise AssertionError(f"unexpected post_json url: {url}")
 
 
-def _ctx(payload: dict[str, Any]) -> Any:
-    return _FakeCtxForSearch(payload)
+def _ctx(
+    *,
+    titles: list[dict[str, Any]],
+    listings: dict[str, list[dict[str, Any]]] | None = None,
+) -> Any:
+    return _FakeCtxForSearch(titles=titles, listings=listings or {})
 
 
 def _translation(
@@ -84,20 +105,28 @@ def _translation(
     }
 
 
-def _title(
+def _chapter(
     *,
-    title_id: str,
-    name: str = "One Piece",
     number: str = "Ch. 1184.1",
     number_float: Any = 1184.1,
     translations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """One Title with an embedded chapter+translations block.
+    """One flat ``ALL_CHAPTERS`` row (chapter-listing-by-title-id, §3)."""
+    return {
+        "number": number,
+        "number_float": number_float,
+        "title": "",
+        "translations": translations
+        or [_translation(tx_id="6a1e164ac01e2cf095f75b1a")],
+    }
 
-    The search-advanced envelope returns Title objects; the per-chapter
-    granularity is the ``translations`` list. Where a Title surfaces multiple
-    chapters this test keeps it to one chapter with N translations (the
-    multi-translation case that drives the per-translation guid mint).
+
+def _title(*, title_id: str, name: str = "One Piece") -> dict[str, Any]:
+    """A TITLE-ONLY search-advanced hit — explicitly NO ``chapters`` key (GAP-1).
+
+    The live ``search-advanced`` returns titles only; chapters/translations exist
+    ONLY in ``chapter-listing-by-title-id``. HTML-string fields
+    (``alternateName``/``status``/``last_chapter``) must be stripped, never raw.
     """
     return {
         "_id": title_id,
@@ -107,19 +136,11 @@ def _title(
         "status": '<span class="badge">Ongoing</span>',
         "last_chapter": '<div class="lc"><a href="/x">Ch. 1184.1</a></div>',
         "url": f"http://mangaball.net/title-detail/one-piece-{title_id}/",
-        "chapters": [
-            {
-                "number": number,
-                "number_float": number_float,
-                "title": "",
-                "translations": translations
-                or [_translation(tx_id="6a1e164ac01e2cf095f75b1a")],
-            }
-        ],
+        "updated_at": "2026-06-01 23:33:42",
     }
 
 
-def _envelope(titles: list[dict[str, Any]]) -> dict[str, Any]:
+def _search_envelope(titles: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "code": 200,
         "message": "ok",
@@ -133,43 +154,92 @@ def _envelope(titles: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _chapter_listing(chapters: list[dict[str, Any]]) -> dict[str, Any]:
+    """The FLAT chapter-listing envelope (NOT the standard ``data`` envelope)."""
+    return {
+        "code": 200,
+        "message": "ok",
+        "TOTAL_CHAPTERS": len(chapters),
+        "ALL_CHAPTERS": chapters,
+        "ALL_LANGUAGES": ["en", "vi", "es"],
+    }
+
+
 @pytest.mark.asyncio
-async def test_search_posts_search_advanced_with_keyword() -> None:
-    payload = _envelope([_title(title_id="68515540702284f8341784c8")])
-    ctx = _ctx(payload)
+async def test_search_posts_search_advanced_then_one_listing_per_candidate() -> None:
+    title_id = "68515540702284f8341784c8"
+    ctx = _ctx(
+        titles=[_title(title_id=title_id)],
+        listings={title_id: [_chapter()]},
+    )
     source = MangaBallSource()
     await source.search(SearchRequest(type="manga", query="one piece"), ctx)
 
-    assert len(ctx.calls) == 1
-    url, body = ctx.calls[0]
-    assert url == "https://mangaball.net/api/v1/title/search-advanced/"
-    # The keyword rides the recon-observed form field ``search_input``.
-    assert body["search_input"] == "one piece"
-    # The observed default filters are present (recon §1).
-    assert body["filters[page]"] == 1
-    assert body["filters[sort]"] == "updated_chapters_desc"
+    # One search-advanced POST + one chapter-listing POST for the single candidate.
+    assert len(ctx.calls) == 2
+    url0, body0 = ctx.calls[0]
+    assert url0 == _SEARCH_ADVANCED
+    assert body0["search_input"] == "one piece"
+    assert body0["filters[page]"] == 1
+    assert body0["filters[sort]"] == "updated_chapters_desc"
+    url1, body1 = ctx.calls[1]
+    assert url1 == _CHAPTER_LISTING
+    assert body1["title_id"] == title_id
+
+
+@pytest.mark.asyncio
+async def test_search_caps_candidates_to_five() -> None:
+    """At most 5 candidates are deep-enumerated, regardless of search-hit count."""
+    titles = [_title(title_id=f"{i:024x}") for i in range(8)]
+    listings = {f"{i:024x}": [_chapter()] for i in range(8)}
+    ctx = _ctx(titles=titles, listings=listings)
+    source = MangaBallSource()
+    await source.search(SearchRequest(type="manga", query="x"), ctx)
+
+    listing_calls = [c for c in ctx.calls if c[0] == _CHAPTER_LISTING]
+    assert len(listing_calls) == 5  # _DEFAULT_TITLE_CANDIDATES
+
+
+@pytest.mark.asyncio
+async def test_search_interactive_does_not_change_candidate_count() -> None:
+    """GAP-1 lock: interactive=True and =False yield the SAME candidate count."""
+    titles = [_title(title_id=f"{i:024x}") for i in range(8)]
+    listings = {f"{i:024x}": [_chapter()] for i in range(8)}
+
+    ctx_a = _ctx(titles=titles, listings=listings)
+    await MangaBallSource().search(
+        SearchRequest(type="manga", query="x", interactive=False), ctx_a
+    )
+    ctx_b = _ctx(titles=titles, listings=listings)
+    await MangaBallSource().search(
+        SearchRequest(type="manga", query="x", interactive=True), ctx_b
+    )
+
+    n_a = len([c for c in ctx_a.calls if c[0] == _CHAPTER_LISTING])
+    n_b = len([c for c in ctx_b.calls if c[0] == _CHAPTER_LISTING])
+    assert n_a == n_b == 5
 
 
 @pytest.mark.asyncio
 async def test_search_mints_fully_specific_guid_and_opaque_handle() -> None:
     title_id = "68515540702284f8341784c8"
     tx_id = "6a1e164ac01e2cf095f75b1a"
-    payload = _envelope(
-        [
-            _title(
-                title_id=title_id,
-                number_float=1184.1,
-                translations=[_translation(tx_id=tx_id, language="vi")],
-            )
-        ]
+    ctx = _ctx(
+        titles=[_title(title_id=title_id)],
+        listings={
+            title_id: [
+                _chapter(
+                    number_float=1184.1,
+                    translations=[_translation(tx_id=tx_id, language="vi")],
+                )
+            ]
+        },
     )
-    ctx = _ctx(payload)
     source = MangaBallSource()
     releases = await source.search(SearchRequest(type="manga", query="one piece"), ctx)
 
     assert len(releases) == 1
     rel = releases[0]
-    # D-08 guid shape.
     assert _GUID_RE.match(rel.guid), rel.guid
     assert rel.guid == f"mangaball:{title_id}:ch-1184.1:vi:{tx_id}"
     # Opaque, non-empty handle.
@@ -189,40 +259,129 @@ async def test_search_mints_fully_specific_guid_and_opaque_handle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_one_chapter_many_translations_mints_one_release_each() -> None:
-    """A single number_float with N translations → N Releases, one per tx_id."""
+async def test_search_multi_group_same_language_yields_two_releases() -> None:
+    """GAP-1 lock: a chapter with TWO ``en`` translations (distinct ids/groups)
+    → TWO distinct releases with TWO distinct guids."""
     title_id = "68515540702284f8341784c8"
-    txs = [
-        _translation(tx_id="aaaaaaaaaaaaaaaaaaaaaaaa", language="en"),
-        _translation(tx_id="bbbbbbbbbbbbbbbbbbbbbbbb", language="vi"),
-        _translation(tx_id="cccccccccccccccccccccccc", language="es"),
-    ]
-    payload = _envelope([_title(title_id=title_id, translations=txs)])
-    ctx = _ctx(payload)
+    ctx = _ctx(
+        titles=[_title(title_id=title_id)],
+        listings={
+            title_id: [
+                _chapter(
+                    number_float=7.0,
+                    translations=[
+                        _translation(
+                            tx_id="aaaaaaaaaaaaaaaaaaaaaaaa",
+                            language="en",
+                            group_name="Comick",
+                        ),
+                        _translation(
+                            tx_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+                            language="en",
+                            group_name="Mangahub",
+                        ),
+                    ],
+                )
+            ]
+        },
+    )
+    source = MangaBallSource()
+    releases = await source.search(SearchRequest(type="manga", query="x"), ctx)
+
+    assert len(releases) == 2
+    assert {rel.language for rel in releases} == {"en"}
+    guids = {rel.guid for rel in releases}
+    assert len(guids) == 2  # distinct translation ids → distinct guids
+    assert {rel.scanlation_group for rel in releases} == {"Comick", "Mangahub"}
+
+
+@pytest.mark.asyncio
+async def test_search_one_chapter_many_translations_mints_one_release_each() -> None:
+    title_id = "68515540702284f8341784c8"
+    ctx = _ctx(
+        titles=[_title(title_id=title_id)],
+        listings={
+            title_id: [
+                _chapter(
+                    translations=[
+                        _translation(tx_id="aaaaaaaaaaaaaaaaaaaaaaaa", language="en"),
+                        _translation(tx_id="bbbbbbbbbbbbbbbbbbbbbbbb", language="vi"),
+                        _translation(tx_id="cccccccccccccccccccccccc", language="es"),
+                    ]
+                )
+            ]
+        },
+    )
     source = MangaBallSource()
     releases = await source.search(SearchRequest(type="manga", query="x"), ctx)
 
     assert len(releases) == 3
-    langs = {rel.language for rel in releases}
-    assert langs == {"en", "vi", "es"}
-    # Every guid is distinct (per-translation uniqueness, D-08).
-    guids = {rel.guid for rel in releases}
-    assert len(guids) == 3
+    assert {rel.language for rel in releases} == {"en", "vi", "es"}
+    assert len({rel.guid for rel in releases}) == 3
     for rel in releases:
         assert _GUID_RE.match(rel.guid), rel.guid
 
 
 @pytest.mark.asyncio
+async def test_search_language_filter_drops_unrequested_languages() -> None:
+    title_id = "68515540702284f8341784c8"
+    ctx = _ctx(
+        titles=[_title(title_id=title_id)],
+        listings={
+            title_id: [
+                _chapter(
+                    translations=[
+                        _translation(tx_id="aaaaaaaaaaaaaaaaaaaaaaaa", language="en"),
+                        _translation(tx_id="bbbbbbbbbbbbbbbbbbbbbbbb", language="vi"),
+                    ]
+                )
+            ]
+        },
+    )
+    source = MangaBallSource()
+    releases = await source.search(
+        SearchRequest(type="manga", query="x", languages=["vi"]), ctx
+    )
+    assert len(releases) == 1
+    assert releases[0].language == "vi"
+
+
+@pytest.mark.asyncio
+async def test_search_per_candidate_slice_respects_limit_newest_first() -> None:
+    """Per-candidate releases are sliced to ``req.limit``, newest-first by date."""
+    title_id = "68515540702284f8341784c8"
+    chapters = [
+        _chapter(
+            number_float=float(n),
+            translations=[
+                _translation(
+                    tx_id=f"{n:024x}",
+                    language="en",
+                    date=f"2026-06-{n:02d} 00:00:00",
+                )
+            ],
+        )
+        for n in range(1, 6)  # 5 chapters: dates 2026-06-01 .. 2026-06-05
+    ]
+    ctx = _ctx(titles=[_title(title_id=title_id)], listings={title_id: chapters})
+    source = MangaBallSource()
+    releases = await source.search(SearchRequest(type="manga", query="x", limit=2), ctx)
+    assert len(releases) == 2
+    # Newest-first: the two latest dates (06-05, 06-04) survive the slice.
+    assert releases[0].publish_date == "2026-06-05 00:00:00"
+    assert releases[1].publish_date == "2026-06-04 00:00:00"
+
+
+@pytest.mark.asyncio
 async def test_search_strips_html_string_fields() -> None:
     """``alternateName`` / ``status`` HTML never reaches an emitted field value."""
-    payload = _envelope([_title(title_id="68515540702284f8341784c8")])
-    ctx = _ctx(payload)
+    title_id = "68515540702284f8341784c8"
+    ctx = _ctx(titles=[_title(title_id=title_id)], listings={title_id: [_chapter()]})
     source = MangaBallSource()
     releases = await source.search(SearchRequest(type="manga", query="x"), ctx)
 
     assert releases
     for rel in releases:
-        # The title is composed from stripped fields — no raw HTML survives.
         assert "<" not in rel.title
         assert ">" not in rel.title
         assert "<" not in (rel.manga_title or "")
@@ -230,7 +389,9 @@ async def test_search_strips_html_string_fields() -> None:
 
 @pytest.mark.asyncio
 async def test_search_empty_results_returns_no_releases() -> None:
-    ctx = _ctx(_envelope([]))
+    ctx = _ctx(titles=[])
     source = MangaBallSource()
     releases = await source.search(SearchRequest(type="manga", query="nothing"), ctx)
     assert releases == []
+    # Only the search-advanced POST fired — no candidate to deep-enumerate.
+    assert len(ctx.calls) == 1
