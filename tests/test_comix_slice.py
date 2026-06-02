@@ -413,7 +413,7 @@ async def test_comix_fetch_manifest_routes_through_browser(
     """ComixSource.fetch_manifest navigates the chapter HTML page in the warm
     browser (Plan 04-04 Option A pivot) — NOT the encrypted ``/api/v1/chapters/
     {id}`` endpoint. Asserts the recon-pinned URL pattern + that the extract
-    body filters /si/ image URLs."""
+    body filters CDN image URLs by the wildcarded-segment regex."""
     _mock_comix_search(solver)
     _mock_comix_pages(solver)
 
@@ -438,10 +438,19 @@ async def test_comix_fetch_manifest_routes_through_browser(
     fetched_url, extract_body, wait_for = chapter_calls[0]
     expected = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales/{_CHAPTER_ID}-chapter-1"
     assert fetched_url == expected
-    # The extractor filters by the /si/{token}/{NN}.{ext} CDN pattern.
-    # The pattern is embedded as a JS regex literal (backslashes are escaped
-    # at the Python string layer, so the JS source sees ``/\/si\//``).
-    assert "/si" in extract_body
+    # The extractor filters by the /{seg}/{token}/{NN}.{ext} CDN pattern,
+    # where {seg} is a WILDCARDED short path segment (Comix rotates it:
+    # /si/ historically, /i3/ live 2026-06-02 — debug comix-malformed-
+    # manifest). The pattern is embedded as a JS regex literal, so the JS
+    # source sees the segment class ``/\/[a-z0-9]{2,4}\//`` and the token
+    # shape ``[A-Za-z0-9_-]{16,}``.
+    assert "[a-z0-9]{2,4}" in extract_body
+    assert "[A-Za-z0-9_-]{16,}" in extract_body
+    # Regression guard: the OLD pinned regex SEGMENT (the escaped JS-regex
+    # literal ``\/si\/``) must not return. Match the escaped form — NOT the
+    # plain substring ``/si`` — so a docstring/comment mentioning the historical
+    # ``/si/`` path can never false-fail this (CodeRabbit PR #92).
+    assert "\\/si\\/" not in extract_body
     # NN-order sort over the page-number-keyed Map, gaps preserved (Comix's
     # reader scaffolds .rpage-page[data-page=N] divs and the extractor walks
     # them with scrollIntoView to trigger the lazy loader per-page).

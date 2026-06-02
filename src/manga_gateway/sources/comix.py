@@ -42,10 +42,12 @@ The shapes below come from real Comix traffic captured via the Plan 04-04 recon
   reachable source for the group name.)
 * chapter pages (Option A — browser-DOM): navigate
   ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and read the rendered
-  ``<img src="https://{cdn}.store/si/{token}/{NN}.webp">`` tags off the DOM.
+  ``<img src="https://{cdn}.store/{seg}/{token}/{NN}.webp">`` tags off the
+  DOM (``{seg}`` is a rotating short path segment — ``si``/``i3``/…; see
+  ``_COMIX_CDN_PATH_RE``).
   The page's own JS handles token-mint + encrypted-API call + decrypt + render;
   we just read the result.
-* image CDN: ``https://{cdn}.store/si/{32-char-token}/{NN}.webp`` — fetched via
+* image CDN: ``https://{cdn}.store/{seg}/{32-char-token}/{NN}.webp`` — fetched via
   httpx (NOT through the browser, CLAUDE.md). The browser only resolves the URL
   list; the bulk byte fetch is the cleared httpx client.
 
@@ -294,16 +296,25 @@ def _resolve_deferred(
 
 # SSRF allowlist for image-CDN URLs returned by the browser-DOM extractor
 # (CLAUDE.md: never fetch client-supplied / DOM-supplied URLs blindly). The JS
-# regex in the extractor already enforces the `/si/{token}/{NN}.{ext}` path
+# regex in the extractor already enforces the `/{seg}/{token}/{NN}.{ext}` path
 # shape, but it cannot tell us anything about the *host* — a poisoned DOM
 # response (or a future extractor regression) could still surface a path of
 # the right shape on an off-domain host. Restrict the manifest to the
-# observed Comix CDN: ``https://{sub}.wowpic\d+.store/si/{token}/{NN}.{ext}``.
+# observed Comix CDN: ``https://{sub}.wowpic\d+.store/{seg}/{token}/{NN}.{ext}``.
 # Subdomains seen live across recon: ``jdpw``, ``jloo``, etc. The pattern
 # tolerates any non-empty alphanumeric subdomain and any wowpic shard digit.
+#
+# Path segment (2026-06-02): Comix ROTATES the leading path segment — observed
+# ``/si/`` historically, then ``/i3/`` live (e.g.
+# ``https://jloo.wowpic5.store/i3/bEqPbYfoMT0GmyXlE2KfoBZAzoUdauw/01.webp``).
+# Pinning a new literal would just re-break on the next rotation, so the
+# segment is WILDCARDED to a short alphanumeric run (``[a-z0-9]{2,4}``). The
+# real security anchor stays the ``*.wowpic{N}.store`` HOST pin + the
+# token/filename shape; the segment carries no trust. HTTPS-only, anchored
+# ``^…$`` (no path traversal), image extensions only.
 _COMIX_CDN_HOST_RE = re.compile(r"^[a-z0-9-]+\.wowpic\d+\.store$", re.IGNORECASE)
 _COMIX_CDN_PATH_RE = re.compile(
-    r"^/si/[A-Za-z0-9_-]{16,}/\d+\.(webp|jpg|jpeg|png)$", re.IGNORECASE
+    r"^/[a-z0-9]{2,4}/[A-Za-z0-9_-]{16,}/\d+\.(webp|jpg|jpeg|png)$", re.IGNORECASE
 )
 
 
@@ -312,7 +323,8 @@ def _is_allowed_image_url(url: str) -> bool:
 
     Belt-and-suspenders defense atop the JS extractor's path filter: rejects
     cross-domain hosts, non-HTTPS schemes, and anything whose path does not
-    match the expected ``/si/{token}/{NN}.{ext}`` shape. Called on every URL
+    match the expected ``/{seg}/{token}/{NN}.{ext}`` shape (``{seg}`` is a
+    rotating short path segment, e.g. ``si``/``i3``). Called on every URL
     returned by the browser-DOM page-list extractor before the framework
     fetches it.
     """
@@ -412,7 +424,8 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 
 
 # JS extractor that returns the rendered chapter-page image URLs in NN order.
-# Matches the live-recon-observed pattern ``/si/{token}/{NN}.{ext}`` and filters
+# Matches the live-recon-observed pattern ``/{seg}/{token}/{NN}.{ext}`` (``{seg}``
+# is a rotating short path segment — ``si``/``i3``/…, wildcarded) and filters
 # out cross-site ad imagery (gravatar, postimg, etc.) so the manifest is the
 # chapter pages ONLY. Numbering may have gaps (01,02,04,05,07,…) — the recon
 # shows real chapter pages with gaps, NOT lazy-load artifacts; we sort by
@@ -480,7 +493,10 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   //             #32 silent-truncation safety net, retained verbatim).
   //   Step 4  — sort the Map entries by NN ascending and return URLs.
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const rx = /\\/si\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
+  // Path segment (`si`/`i3`/…) is wildcarded — Comix rotates it; live
+  // 2026-06-02: https://jloo.wowpic5.store/i3/<token>/01.webp. The host pin +
+  // token/filename shape (and the _COMIX_CDN_PATH_RE allowlist) carry the trust.
+  const rx = /\\/[a-z0-9]{2,4}\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
 
   // Step 1: wait for the page scaffold COUNT TO STABILIZE. Returning on the
   // first .rpage-page[data-page] div would race Swiper's incremental
@@ -982,7 +998,8 @@ class ComixSource(Source):
         encoded into the handle's ``ResolutionRecord.chapter_id``. We decode
         here, construct the live chapter URL, and call
         :meth:`solver.fetch_via_browser` with a JS extractor that returns the
-        rendered ``/si/{token}/{NN}.{ext}`` image URLs in NN order. A malformed
+        rendered ``/{seg}/{token}/{NN}.{ext}`` image URLs in NN order (``{seg}``
+        is a rotating short path segment — ``si``/``i3``). A malformed
         composite or an empty page list raises
         ``SourceError("source_unavailable")`` so it surfaces as a contract
         warning, never a raw KeyError (WR-06). The manifest is consumed only by
@@ -1060,7 +1077,8 @@ class ComixSource(Source):
 
         Delegates to ``ctx.get_bytes_plain`` — cleared by the framework seam
         (D-40) but the decrypt seam is opted out: the Comix CDN
-        (``https://{cdn}.store/si/{token}/{NN}.webp``) serves plaintext WebP.
+        (``https://{cdn}.store/{seg}/{token}/{NN}.webp``, ``{seg}`` rotating —
+        ``si``/``i3``) serves plaintext WebP.
         The browser is NEVER used for image fetch (CLAUDE.md): the cleared
         httpx client does the bulk fetch, bounded by the per-job semaphore.
         The host + token come from the browser-DOM page-list (Option A pivot —
@@ -1466,7 +1484,8 @@ class ComixSource(Source):
     def _page_url(page: Any) -> str | None:
         """Extract a page URL from a manifest entry (str or ``{"url": ...}`` object).
 
-        Image CDN pattern: ``https://{cdn}.store/si/{token}/{NN}.webp``.
+        Image CDN pattern: ``https://{cdn}.store/{seg}/{token}/{NN}.webp``
+        (``{seg}`` is a rotating short path segment — ``si``/``i3``).
         """
         if isinstance(page, str) and page:
             return page
