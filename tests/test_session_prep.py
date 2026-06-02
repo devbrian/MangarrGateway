@@ -304,6 +304,50 @@ async def test_plain_403_does_not_refresh_or_retry() -> None:
     assert prep.prepare_calls.count(True) == 0  # no forced refresh
 
 
+class _UnconfiguredPrep:
+    """SessionPrep stand-in for a NON-csrf source under the ONE shared provider.
+
+    Mirrors ``CsrfBootstrap.prepare`` returning ``None`` for an unconfigured key
+    (e.g. MangaDex/Comix when the shared CsrfBootstrap is threaded everywhere):
+    the provider is present, but this source is not a csrf-bootstrap source.
+    """
+
+    def __init__(self) -> None:
+        self.prepare_calls: list[bool] = []
+
+    async def prepare(
+        self, source_key: str, *, force_refresh: bool = False
+    ) -> SessionCredentials | None:
+        self.prepare_calls.append(force_refresh)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_csrf_403_on_non_csrf_source_does_not_refresh_or_retry() -> None:
+    """WR-03: a non-csrf source's 403 carrying the CSRF marker must NOT trigger a
+    forced session-prep refresh + retry, even though the ONE shared provider is
+    present (it returns None for this source). Preserves the MangaDex/Comix
+    byte-for-byte-unchanged invariant."""
+    from manga_gateway.framework.errors import SourceError
+
+    req = httpx.Request("POST", _API_URL)
+    transport = _RecordingTransport(
+        [
+            httpx.Response(
+                403, json={"error": "CSRF token validation failed"}, request=req
+            )
+        ]
+    )
+    prep = _UnconfiguredPrep()
+    ctx = _ctx(transport, session_prep=prep)
+    with pytest.raises(SourceError) as ei:
+        await ctx.post_json(_API_URL, data={"q": "x"})
+    assert ei.value.status == 403
+    posts = [r for r in transport.requests if r[0] == "POST"]
+    assert len(posts) == 1  # no retry — this source is not a csrf source
+    assert prep.prepare_calls.count(True) == 0  # never forced a refresh
+
+
 @pytest.mark.asyncio
 async def test_session_prep_none_contributes_no_headers() -> None:
     # MangaDex path byte-for-byte unchanged: no Cookie / X-CSRF-Token injected.

@@ -217,6 +217,22 @@ class SourceContext:
             headers["Cookie"] = "; ".join(cookie_parts)
         return {"headers": headers} if headers else {}
 
+    async def _session_prep_active(self) -> bool:
+        """True iff session-prep yields credentials for THIS source (WR-03).
+
+        The shared ``CsrfBootstrap`` is threaded into every source's context, so
+        ``self._session_prep is not None`` is true even for MangaDex/Comix. The
+        provider returns ``None`` for an unconfigured key, so a non-``None``
+        ``prepare(source_key)`` result is the precise signal that this source is a
+        real csrf-bootstrap source — the analog of ``_is_cloudflare`` requiring a
+        present solver. Called only on the CSRF-403 reconcile path; the credentials
+        are cached by the provider, so this does not add a network round-trip on the
+        subsequent forced refresh.
+        """
+        if self._session_prep is None:
+            return False
+        return await self._call_session_prep(force_refresh=False) is not None
+
     async def _call_session_prep(self, *, force_refresh: bool) -> Any:
         """Call ``prepare``, passing the internal ``force_refresh`` path if supported.
 
@@ -428,10 +444,22 @@ class SourceContext:
         cf_stale = (
             self._is_cloudflare and resp.status_code == 403 and is_cf_challenge(resp)
         )
+        # WR-03: gate the CSRF branch on THIS source actually being a csrf-bootstrap
+        # source — not merely on a shared provider being present. In app.py the one
+        # shared CsrfBootstrap is threaded into EVERY source's context (incl.
+        # MangaDex/Comix), so ``self._session_prep is not None`` is true for all of
+        # them; gating on it alone would fire a forced refresh + retry on a
+        # non-CSRF source's 403 that happens to contain the marker bytes, breaking
+        # the "MangaDex/Comix byte-for-byte unchanged" invariant. ``prepare`` returns
+        # ``None`` for an unconfigured key, so an active-credentials check couples the
+        # branch to real csrf sources, mirroring how ``_is_cloudflare`` couples the
+        # antibot level with solver presence. Evaluated ONLY inside the 403+marker
+        # path so the non-CSRF happy path issues no extra prepare() call.
         csrf_stale = (
             self._session_prep is not None
             and resp.status_code == 403
             and is_csrf_failure(resp)
+            and await self._session_prep_active()
         )
         if cf_stale or csrf_stale:
             # D-35 / D-03: stale credential → ONE forced refresh + single retry.
