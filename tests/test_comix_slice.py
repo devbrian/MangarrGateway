@@ -446,7 +446,11 @@ async def test_comix_fetch_manifest_routes_through_browser(
     # shape ``[A-Za-z0-9_-]{16,}``.
     assert "[a-z0-9]{2,4}" in extract_body
     assert "[A-Za-z0-9_-]{16,}" in extract_body
-    assert "/si" not in extract_body
+    # Regression guard: the OLD pinned regex SEGMENT (the escaped JS-regex
+    # literal ``\/si\/``) must not return. Match the escaped form — NOT the
+    # plain substring ``/si`` — so a docstring/comment mentioning the historical
+    # ``/si/`` path can never false-fail this (CodeRabbit PR #92).
+    assert "\\/si\\/" not in extract_body
     # NN-order sort over the page-number-keyed Map, gaps preserved (Comix's
     # reader scaffolds .rpage-page[data-page=N] divs and the extractor walks
     # them with scrollIntoView to trigger the lazy loader per-page).
