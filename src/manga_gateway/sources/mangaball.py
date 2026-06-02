@@ -3,8 +3,7 @@
 MangaBall (``https://mangaball.net``) is a **MangaDex-class** source: a clean
 JSON-REST backend with no response encryption and plain-CDN ``.jpg`` images
 (RECON TL;DR). ~90% of this module is the MangaDex shape (guid/mint,
-``_parse_decimal``, the manifest-integrity guard) plus the Comix ``:DEFERRED``
-machinery for ``/recent`` (D-10/D-11).
+``_parse_decimal``, the manifest-integrity guard).
 
 The one genuinely-new framework capability MangaBall exercises is an
 **HTML→CSRF/session bootstrap**: its ``POST /api/v1/...`` form endpoints reject
@@ -24,14 +23,19 @@ challenge; the escalation path is the existing Patchright clearance seam (flip
 ``rate_limit_per_minute = 30`` is a conservative start (real ceiling unprobed —
 live-tune, RECON Open Q3).
 
-ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md``):
+ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md`` / GAP-1 probe):
 
 * base: ``https://mangaball.net``
 * search: ``POST /api/v1/title/search-advanced/`` (form) →
-  ``{code,message,data:[Title…],pagination}``; each Title embeds a
-  ``chapters`` list whose ``translations`` are the release granularity.
+  ``{code,message,data:[Title…],pagination}``. **TITLE-ONLY** — a Title carries
+  NO ``chapters`` key (GAP-1 ground truth). Chapters/translations live ONLY in
+  ``chapter-listing-by-title-id``; ``search`` deep-enumerates each candidate.
 * recent: ``POST /api/v1/title/search/`` (form,
-  ``search_type=getRecentlyUpdatedChapter``) → same Title shape, newest-first.
+  ``search_type=getRecentlyUpdatedChapter``) → same TITLE-ONLY shape, newest-first.
+  The newest chapter is an HTML blob in each title's ``last_chapter`` field — it
+  carries the real ``translation_id`` (``href=".../chapter-detail/{id}/"``),
+  number, language flag, and group anchor. ``recent`` parses it and mints DIRECT
+  releases (no deferral — MangaBall exposes the stable id, unlike Comix).
 * chapter listing: ``POST /api/v1/chapter/chapter-listing-by-title-id/`` (form,
   ``title_id``) → the FLAT ``{code,message,ALL_CHAPTERS:[…],…}`` envelope (NOT
   the standard ``data`` envelope — :func:`_items_and_pagination` dispatches both,
@@ -44,9 +48,10 @@ ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md``):
 
 guid (D-08): ``mangaball:{title_id}:ch-{number_float}:{language}:{translation_id}``
 — the language + translation id are required because one chapter number maps to N
-translations (one per language/group). The search-path
-``ResolutionRecord.chapter_id`` is the ``translation_id``; the ``/recent`` path
-mints a ``:DEFERRED`` composite resolved at ``fetch_manifest`` time (D-10).
+translations (one per language/group). Both ``search`` and ``recent`` now mint a
+real ``translation_id`` into ``ResolutionRecord.chapter_id`` (DIRECT). The
+``:DEFERRED`` late-bind pattern remains a **Comix-only** technique (see comix.py);
+MangaBall does not need it because its recent feed exposes the translation_id.
 """
 
 from __future__ import annotations
@@ -54,7 +59,7 @@ from __future__ import annotations
 import asyncio
 import posixpath
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any
@@ -87,16 +92,36 @@ _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
     "filters[userSettingsEnabled]": "false",
 }
 
-# Composite chapter-id separator + DEFERRED sentinel for the /recent late-bind
-# (D-10), mirroring comix.py's ``_CID_SEP`` / ``_DEFERRED_SENTINEL``. MangaBall's
-# composite is simpler than Comix's 4-field one: ``DEFERRED|{title_id}|{number}|
-# {language}`` (translation_id is dropped — it is what fetch_manifest resolves).
-_CID_SEP = "|"
-_DEFERRED_SENTINEL = "DEFERRED"
+# search() ALWAYS deep-enumerates this many title candidates (GAP-1 lock). The
+# MangaDex 15-interactive escalation is intentionally DROPPED for MangaBall —
+# ``req.interactive`` does NOT change the candidate count (each candidate is a full
+# chapter-listing fan-out, so the count is held fixed regardless of interactivity).
+_DEFAULT_TITLE_CANDIDATES = 5
 
 # Floor for empty/malformed timestamps so they sort oldest and never crash the
 # `since` comparison (mirrors recent.py:_TS_FLOOR / _parse_ts).
 _TS_FLOOR = datetime.min.replace(tzinfo=UTC)
+
+# Relative-time parse for the recent feed's ``last_chapter`` dates ("1d ago",
+# "3h ago", "5m ago"). Best-effort → absolute ISO publishDate (see
+# :func:`_relative_to_iso`). Dates in the recent feed are RELATIVE (GAP-1 probe).
+_RELATIVE_AGO_RE = re.compile(r"(\d+)\s*(mo|[smhdwy])\b", re.IGNORECASE)
+_RELATIVE_UNIT_SECONDS: dict[str, int] = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+    "mo": 2592000,  # ~30d
+    "y": 31536000,  # ~365d
+}
+
+# ``last_chapter`` HTML: the chapter-detail anchor carries the real translation_id.
+# Extract it, NEVER reconstruct (CLAUDE.md SSRF) — fetch_manifest re-uses it as the
+# chapter-detail path segment, then SSRF-allowlists every resulting image URL.
+_CHAPTER_DETAIL_HREF_RE = re.compile(r"/chapter-detail/([^/?#]+)/?")
+# Chapter number after a ``Ch.`` / ``Chapter`` label in the anchor text.
+_CHAPTER_NUMBER_RE = re.compile(r"(?:ch(?:apter)?\.?)\s*([\d.]+)", re.IGNORECASE)
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -157,150 +182,107 @@ def _items_and_pagination(
     return (data if isinstance(data, list) else []), body.get("pagination")
 
 
-# ─────────────────────── deferred /recent resolution (D-10/D-11) ─────────────
+# ─────────────────────── recent() last_chapter HTML parse (GAP-1) ────────────
 
 
-class _DeferredResolutionError(Exception):
-    """Internal — translated to ``SourceError('source_unavailable', …)`` by caller.
+def _relative_to_iso(raw: str) -> str | None:
+    """Best-effort convert a relative ``last_chapter`` date → absolute ISO-8601.
 
-    Raised by :func:`_resolve_deferred` when the chapter number+language promised
-    by a ``/recent``-minted DEFERRED handle is no longer present in the title's
-    chapter listing at download time (deleted/replaced upstream), or when the
-    matching translation carries no id. The strict-match staleness policy (D-10,
-    mirror comix locked decision 4) requires this to surface as an explicit
-    failure — never a silent rebind to a different chapter.
+    The recent feed renders chapter dates RELATIVE ("1d ago", "3h ago", "5m ago",
+    "2mo ago"; GAP-1 probe), so there is no absolute timestamp to read. We subtract
+    the parsed offset from ``now(UTC)`` to get an APPROXIMATE absolute publishDate
+    — close enough for the route's newest-first sort + ``since`` cut (which is the
+    authoritative filter). Returns ``None`` when no relative token is found so the
+    caller can fall back to the title's ``updated_at`` or ``now``. The approximation
+    is intentional and documented (units are coarse, e.g. "mo" ≈ 30d).
     """
+    if not raw:
+        return None
+    match = _RELATIVE_AGO_RE.search(raw)
+    if match is None:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    seconds = _RELATIVE_UNIT_SECONDS.get(unit)
+    if seconds is None:
+        return None
+    moment = datetime.now(UTC) - timedelta(seconds=amount * seconds)
+    return moment.isoformat()
 
 
-def _make_deferred_composite(title_id: str, number: str, language: str) -> str:
-    """Build a ``/recent`` handle's composite ``chapter_id`` (D-10).
+def _parse_last_chapter(html: str) -> dict[str, Any] | None:
+    """Parse ONE recent-feed ``last_chapter`` HTML blob → release fields (GAP-1).
 
-    Shape ``DEFERRED|{title_id}|{number}|{language}`` — simpler than Comix's
-    4-field composite because MangaBall's translation_id is exactly what
-    :func:`_resolve_deferred` re-discovers at download time (so it is dropped
-    here). Every segment must be non-empty so :func:`_decode_deferred_composite`
-    accepts it unchanged. The framework treats ``chapter_id`` as source-opaque.
+    Blocking (lxml C-parse) by design — the caller offloads it via
+    ``asyncio.to_thread`` (RESEARCH Pitfall 6 / ruff ASYNC), mirroring
+    :func:`_extract_data_src_urls`. Extracts, defensively:
 
-    DEFERRED-RESOLUTION FIDELITY (WR-02 — intended, locked decision, NOT a bug):
-    dropping the ``translation_id`` means the handle binds to a
-    *(number, language)* pair, not to a specific translation/scanlation group. At
-    download time :func:`_resolve_deferred` re-discovers the match with the D-11
-    tie-break (newest ``date`` → non-empty group → lowest id), so a DEFERRED handle
-    MAY resolve to a NEWER same-number/same-language translation by a DIFFERENT
-    scanlation group than the one shown in ``/recent`` (e.g. another group
-    re-translated the chapter between the feed and the grab). This deliberately
-    mirrors Comix's locked deferred-resolution design
-    (spike-findings ``comix-recent-deferred-resolution`` — the number+language
-    match + tie-break is the locked contract). Only an ENTIRELY-ABSENT chapter
-    (no matching number+language at all) fails closed; a same-number rebind is
-    intended fidelity, not silent corruption.
+    * ``translation_id`` — the trailing path segment of the ``chapter-detail/{id}/``
+      anchor href (regex-captured, NEVER reconstructed — CLAUDE.md SSRF). REQUIRED;
+      returns ``None`` when absent.
+    * ``number`` — the digits/decimal after ``Ch.``/``Chapter`` in the anchor text.
+      REQUIRED; returns ``None`` when absent (a chapter without a number cannot mint
+      a sane guid).
+    * ``language`` — the ``alt``/``title`` of the flag ``<img>``; falls back to
+      ``"en"``.
+    * ``group`` — the ``title`` (or text) of the ``/group/{slug}/`` anchor; ``None``
+      when absent.
+    * ``date_raw`` — the raw relative date text (e.g. "1d ago"), for
+      :func:`_relative_to_iso`.
+
+    Returns the field dict, or ``None`` when the blob has no resolvable
+    chapter-detail id or no parseable chapter number.
     """
-    if not (title_id and number and language):
-        raise ValueError("title_id, number, language must all be non-empty")
-    return _CID_SEP.join((_DEFERRED_SENTINEL, title_id, number, language))
-
-
-def _decode_deferred_composite(composite: str) -> tuple[str, str, str, str]:
-    """Unpack ``{sentinel}|{title_id}|{number}|{language}``.
-
-    Raises ``ValueError`` for a malformed composite (wrong segment count or any
-    empty segment) so :meth:`MangaBallSource.fetch_manifest` can translate it to a
-    typed :class:`SourceError` (WR-06).
-    """
-    parts = composite.split(_CID_SEP)
-    if len(parts) != 4 or not all(parts):
-        raise ValueError(
-            f"expected 4 non-empty segments separated by {_CID_SEP!r}, "
-            f"got {len(parts)}: {composite!r}"
-        )
-    return parts[0], parts[1], parts[2], parts[3]
-
-
-def _id_sort_key(raw: Any) -> tuple[int, str]:
-    """Sort numeric ids numerically; fall back to string compare otherwise.
-
-    Lifted from ``comix._id_sort_key`` (test-covered). MangaBall ids are Mongo
-    ObjectId hex strings (non-numeric), so they take the string branch — stable
-    and deterministic, which is all the last-resort tie-break needs.
-    """
-    if raw is None:
-        return (2, "")
-    s = str(raw)
+    if not html:
+        return None
     try:
-        return (0, str(int(s)).zfill(20))
-    except ValueError:
-        return (1, s)
+        doc = lxml.html.fragment_fromstring(html, create_parent="div")
+    except Exception:
+        return None
 
+    translation_id: str | None = None
+    number: str | None = None
+    group: str | None = None
+    date_raw = ""
+    language = "en"
 
-def _has_group(row: dict[str, Any]) -> bool:
-    """True when the translation carries a non-empty scanlation group name."""
-    group = row.get("group")
-    name = group.get("name") if isinstance(group, dict) else None
-    return bool(_strip_html(name)) if name else False
+    for anchor in doc.iter("a"):
+        href = anchor.get("href") or ""
+        detail = _CHAPTER_DETAIL_HREF_RE.search(href)
+        if detail is not None and translation_id is None:
+            translation_id = detail.group(1)
+            # The chapter number rides the chapter-detail anchor's text.
+            num_match = _CHAPTER_NUMBER_RE.search(anchor.text_content())
+            if num_match is not None:
+                number = num_match.group(1)
+        elif "/group/" in href and group is None:
+            group = _strip_html(anchor.get("title")) or _strip_html(
+                anchor.text_content()
+            )
 
+    if translation_id is None or number is None:
+        return None
 
-def _pick_translation(translations: list[dict[str, Any]]) -> dict[str, Any]:
-    """Tie-break duplicate translations for one chapter+language (D-11).
+    # Language flag: alt/title on a flag <img>.
+    for img in doc.iter("img"):
+        flag = (img.get("alt") or img.get("title") or "").strip().lower()
+        if flag:
+            language = flag
+            break
 
-    Order of preference:
-      1. newest absolute ``date`` (MangaBall dates are ``"YYYY-MM-DD HH:MM:SS"``,
-         lexically sortable — so NO relative-time parse is needed, unlike Comix);
-      2. among rows sharing that newest date, non-empty ``group.name`` over empty;
-      3. then lowest ``id`` (deterministic last resort via :func:`_id_sort_key`).
-    """
-    newest_date = max(str(t.get("date") or "") for t in translations)
-    newest = [t for t in translations if str(t.get("date") or "") == newest_date]
-    return min(
-        newest,
-        key=lambda r: (
-            0 if _has_group(r) else 1,  # non-empty group beats empty
-            _id_sort_key(r.get("id")),  # lowest id last resort
-        ),
-    )
+    # Best-effort relative date text anywhere in the blob.
+    text = doc.text_content()
+    ago = _RELATIVE_AGO_RE.search(text)
+    if ago is not None:
+        date_raw = ago.group(0)
 
-
-def _resolve_deferred(
-    number: str, language: str, all_chapters: list[Any]
-) -> dict[str, Any]:
-    """Strict-match a DEFERRED handle against the FLAT ``ALL_CHAPTERS`` listing.
-
-    Decimal-aware (D-11): a ``"23"``-keyed handle matches a chapter whose
-    ``number_float`` is ``23.0`` and vice versa, via
-    :meth:`MangaBallSource._parse_decimal`. Only translations whose ``language``
-    matches the promised language are eligible. Among the eligible translations,
-    :func:`_pick_translation` applies the newest-date → non-empty-group →
-    lowest-id tie-break. On zero matching chapters OR zero eligible translations
-    OR a chosen translation without an ``id``, raises
-    :class:`_DeferredResolutionError` (fail closed, D-10 — never silently rebind).
-    Returns the chosen translation dict.
-    """
-    target = MangaBallSource._parse_decimal(number)
-    if target is None:
-        raise ValueError(f"deferred number not Decimal-parseable: {number!r}")
-    eligible: list[dict[str, Any]] = []
-    for chapter in all_chapters:
-        if not isinstance(chapter, dict):
-            continue
-        ch_num = MangaBallSource._parse_decimal(chapter.get("number_float"))
-        if ch_num is None or ch_num != target:
-            continue
-        for translation in chapter.get("translations") or []:
-            if (
-                isinstance(translation, dict)
-                and str(translation.get("language") or "") == language
-            ):
-                eligible.append(translation)
-    if not eligible:
-        raise _DeferredResolutionError(
-            f"deferred resolution: chapter {number} ({language}) not present "
-            "in title chapter listing"
-        )
-    chosen = eligible[0] if len(eligible) == 1 else _pick_translation(eligible)
-    if not chosen.get("id"):
-        raise _DeferredResolutionError(
-            f"deferred resolution: matching translation carries no id: {chosen!r}"
-        )
-    return chosen
+    return {
+        "translation_id": translation_id,
+        "number": number,
+        "language": language,
+        "group": group,
+        "date_raw": date_raw,
+    }
 
 
 class _TextExtractor(HTMLParser):
@@ -443,14 +425,21 @@ class MangaBallSource(Source):
     supports_recent = True
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
-        """Keyword search → one Release per translation (SRCH-01..07, D-08).
+        """Keyword search → per-(chapter×translation) Releases (SRCH-01..07, D-08).
 
-        POSTs ``/api/v1/title/search-advanced/`` with the recon-observed form body
-        (``search_input`` + default filters), parses the standard envelope via
-        :func:`_items_and_pagination`, and for each Title's chapters resolves each
-        ``translation`` into a Release carrying the fully-specific D-08 guid and an
-        opaque minted handle. ZERO networking glue — ``ctx.post_json`` owns the
-        form encode, CSRF injection, rate limit, retry, and health feed (SRC-02).
+        Two-call live flow (GAP-1 lock): ``search-advanced`` is TITLE-ONLY, so
+        ``search`` ALWAYS deep-enumerates the first ``_DEFAULT_TITLE_CANDIDATES``
+        title candidates via a per-candidate ``chapter-listing-by-title-id`` POST.
+        The MangaDex 15-interactive escalation is DROPPED — ``req.interactive``
+        does NOT change the candidate count for MangaBall.
+
+        For each candidate the flat ``ALL_CHAPTERS`` listing is walked and ONE
+        Release is minted per ``(chapter × translation)`` via :meth:`_to_release`
+        (preserving multi-group-same-language: two ``en`` translations of one
+        chapter → two distinct guids). Releases are language-filtered by
+        ``req.languages``, ordered NEWEST-FIRST by translation ``date``, and sliced
+        to ``req.limit`` PER candidate (mirror MangaDex's per-candidate feed bound).
+        ZERO networking glue — both POSTs are ``ctx.post_json`` (SRC-01/02).
         """
         form: dict[str, Any] = {
             "search_input": req.query or "",
@@ -461,12 +450,67 @@ class MangaBallSource(Source):
         )
         titles, _pagination = _items_and_pagination(body)
 
+        candidates = [t for t in titles if isinstance(t, dict)][
+            :_DEFAULT_TITLE_CANDIDATES
+        ]
+        wanted_langs = set(req.languages) if req.languages else None
+        per_candidate_limit = req.limit or 50
+
         releases: list[Release] = []
-        for title in titles:
-            if not isinstance(title, dict):
+        for title in candidates:
+            title_id = title.get("_id")
+            if not title_id:
                 continue
-            releases.extend(self._title_to_releases(title, ctx))
+            title_id = str(title_id)
+            manga_title = _strip_html(title.get("name")) or "Unknown"
+            listing = await ctx.post_json(
+                f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id/",
+                data={"title_id": title_id, "userSettingsEnabled": "false"},
+            )
+            all_chapters, _ = _items_and_pagination(listing)
+            releases.extend(
+                self._chapters_to_releases(
+                    all_chapters,
+                    title_id,
+                    manga_title,
+                    wanted_langs,
+                    per_candidate_limit,
+                    ctx,
+                )
+            )
         return releases
+
+    def _chapters_to_releases(
+        self,
+        all_chapters: list[Any],
+        title_id: str,
+        manga_title: str,
+        wanted_langs: set[str] | None,
+        limit: int,
+        ctx: SourceContext,
+    ) -> list[Release]:
+        """Walk one candidate's flat ``ALL_CHAPTERS`` → per-translation Releases.
+
+        Language-filtered, NEWEST-FIRST by translation ``date`` (parsed via
+        :func:`_parse_ts`), sliced to ``limit``. Multi-group-same-language is
+        preserved: distinct translation ids → distinct guids.
+        """
+        rows: list[tuple[datetime, Release]] = []
+        for chapter in all_chapters:
+            if not isinstance(chapter, dict):
+                continue
+            number = self._parse_decimal(chapter.get("number_float"))
+            for translation in chapter.get("translations") or []:
+                if not isinstance(translation, dict):
+                    continue
+                language = str(translation.get("language") or "en")
+                if wanted_langs is not None and language not in wanted_langs:
+                    continue
+                rel = self._to_release(title_id, manga_title, number, translation, ctx)
+                if rel is not None:
+                    rows.append((_parse_ts(str(translation.get("date") or "")), rel))
+        rows.sort(key=lambda pair: pair[0], reverse=True)  # newest-first
+        return [rel for _ts, rel in rows[:limit]]
 
     async def recent(
         self,
@@ -476,22 +520,24 @@ class MangaBallSource(Source):
         since: str | None,
         ctx: SourceContext,
     ) -> list[Release]:
-        """Newest-first recent chapters via deferred resolution (RCNT-01/02, D-10).
+        """Newest-first recent chapters → DIRECT releases (RCNT-01/02, GAP-1 lock).
 
         POSTs ``/api/v1/title/search/`` with ``search_type=getRecentlyUpdatedChapter``
-        and, for each promised chapter, mints a DEFERRED Release keyed on
-        ``title_id`` + the normalized ``number_float`` + ``language`` — the
-        ``translation_id`` is intentionally dropped and re-discovered at
-        :meth:`fetch_manifest` time (D-10). Because the id is dropped, a DEFERRED
-        handle may resolve to a NEWER same-number/same-language translation (a
-        different scanlation group) than the one listed here — intended Comix-parity
-        fidelity, NOT a bug; see :func:`_make_deferred_composite` (WR-02). The guid
-        carries the literal ``:DEFERRED`` suffix; it is NEVER rewritten when it
-        resolves (mirror comix locked decision 1). ``since`` cuts older items at the
-        source (RCNT-02) by comparing PARSED datetimes (WR-01) — MangaBall dates are
-        space-separated ``"YYYY-MM-DD HH:MM:SS"`` while ``since`` is ISO-`T`, so a
-        raw string compare would silently drop genuinely-newer chapters.
-        ``languages`` filters the eligible translations when supplied. Zero
+        (TITLE-ONLY shape — no ``chapters`` key). For each title the newest chapter
+        is an HTML blob in ``last_chapter`` carrying the real ``translation_id``,
+        number, language flag, and group anchor; :func:`_parse_last_chapter` (lxml,
+        offloaded via ``asyncio.to_thread`` per ruff ASYNC) extracts them and we mint
+        a DIRECT Release whose ``ResolutionRecord.chapter_id`` is the bare
+        translation_id (NOT a ``:DEFERRED`` composite — MangaBall does not need the
+        Comix late-bind because the recent feed exposes the stable id).
+
+        Dates in the recent feed are RELATIVE ("1d ago") so the absolute
+        ``publishDate`` is a best-effort approximation (:func:`_relative_to_iso`,
+        falling back to the title's ``updated_at`` then ``now``). The route applies
+        the authoritative newest-first sort + ``since`` cut (recent.py); the
+        source-side ``since`` comparison is therefore best-effort and is left to the
+        route (a release always carries a parseable publishDate so the route keeps
+        it). ``languages`` filters by the parsed flag language when supplied. Zero
         networking glue — ``ctx.post_json`` owns the transport (SRC-02).
         """
         form: dict[str, Any] = {"search_type": "getRecentlyUpdatedChapter", "page": 1}
@@ -499,150 +545,62 @@ class MangaBallSource(Source):
         titles, _pagination = _items_and_pagination(body)
 
         wanted_langs = set(languages) if languages else None
-        # WR-01: parse `since` ONCE to an aware datetime so the source-side cut
-        # compares datetimes (not raw strings across a `T`/space format mismatch).
-        since_dt = _parse_ts(since) if since else None
         releases: list[Release] = []
         for title in titles:
             if not isinstance(title, dict):
                 continue
-            releases.extend(
-                self._title_to_deferred_releases(title, wanted_langs, since_dt, ctx)
+            title_id = title.get("_id")
+            if not title_id:
+                continue
+            title_id = str(title_id)
+            manga_title = _strip_html(title.get("name")) or "Unknown"
+            last = await asyncio.to_thread(
+                _parse_last_chapter, str(title.get("last_chapter") or "")
             )
+            if last is None:
+                continue
+            language = last["language"]
+            if wanted_langs is not None and language not in wanted_langs:
+                continue
+            publish_date = (
+                _relative_to_iso(last["date_raw"])
+                or self._title_updated_iso(title)
+                or datetime.now(UTC).isoformat()
+            )
+            translation = {
+                "id": last["translation_id"],
+                "language": language,
+                "group": {"name": last["group"]} if last["group"] else None,
+                "date": publish_date,
+                "pages": None,
+            }
+            number = self._parse_decimal(last["number"])
+            rel = self._to_release(title_id, manga_title, number, translation, ctx)
+            if rel is not None:
+                releases.append(rel)
             if len(releases) >= limit:
                 break
         return releases[:limit]
 
-    def _title_to_deferred_releases(
-        self,
-        title: dict[str, Any],
-        wanted_langs: set[str] | None,
-        since_dt: datetime | None,
-        ctx: SourceContext,
-    ) -> list[Release]:
-        """Mint a DEFERRED Release per promised chapter+translation of one Title."""
-        title_id = title.get("_id")
-        if not title_id:
-            return []
-        title_id = str(title_id)
-        manga_title = _strip_html(title.get("name")) or "Unknown"
-
-        out: list[Release] = []
-        for chapter in title.get("chapters") or []:
-            if not isinstance(chapter, dict):
-                continue
-            number = self._parse_decimal(chapter.get("number_float"))
-            if number is None:
-                continue
-            ch_str = format(number.normalize(), "f")
-            for translation in chapter.get("translations") or []:
-                if not isinstance(translation, dict):
-                    continue
-                language = str(translation.get("language") or "en")
-                if wanted_langs is not None and language not in wanted_langs:
-                    continue
-                publish_date = str(translation.get("date") or "")
-                # WR-01: datetime compare (not lexical) so a genuinely-newer
-                # space-separated date is not dropped against an ISO-`T` `since`.
-                if (
-                    since_dt is not None
-                    and publish_date
-                    and _parse_ts(publish_date) <= since_dt
-                ):
-                    continue  # RCNT-02: cut older items at the source
-                rel = self._mint_deferred_release(
-                    title_id, manga_title, ch_str, number, language, publish_date, ctx
-                )
-                out.append(rel)
-        return out
-
-    def _mint_deferred_release(
-        self,
-        title_id: str,
-        manga_title: str,
-        ch_str: str,
-        number: Decimal,
-        language: str,
-        publish_date: str,
-        ctx: SourceContext,
-    ) -> Release:
-        """Mint one ``:DEFERRED`` Release + its composite handle (D-10)."""
-        composite = _make_deferred_composite(title_id, ch_str, language)
-        title = self._build_title(manga_title, ch_str, language=language, group=None)
-        # D-10: literal :DEFERRED suffix — never rewritten when the composite
-        # resolves at download time (recent + search intentionally do not dedup).
-        guid = f"mangaball:{title_id}:ch-{ch_str}:{language}:DEFERRED"
-        handle = ctx.handle_store.mint(
-            ResolutionRecord(
-                source_key=self.key,
-                chapter_id=composite,
-                language=language,
-                title=title,
-                manga_title=manga_title,
-                chapter_number=number,
-                volume=None,
-                scanlation_group=None,  # populated at download-resolve
-                page_count=None,  # populated at download-resolve
-            )
-        )
-        return Release(
-            guid=guid,
-            title=title,
-            source_key=self.key,
-            download_handle=handle,
-            publish_date=publish_date,
-            manga_title=manga_title,
-            chapter_number=number,
-            volume=None,
-            language=language,
-            scanlation_group=None,
-            page_count=None,
-            ids={"mangaballTitleId": title_id},
-        )
+    @staticmethod
+    def _title_updated_iso(title: dict[str, Any]) -> str | None:
+        """Best-effort absolute publishDate from the title's ``updated_at``."""
+        parsed = _parse_ts(str(title.get("updated_at") or ""))
+        return None if parsed == _TS_FLOOR else parsed.isoformat()
 
     # ───────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
 
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
         """Resolve a chapter id → ordered page-image URLs, INTERNALLY (PKG-01/R6).
 
-        Two entry shapes share one manifest tail:
-
-        * search-path: ``chapter_id`` is a bare ``translation_id`` (minted by
-          :meth:`search`) → straight to the manifest tail.
-        * ``/recent`` DEFERRED: ``chapter_id`` is the
-          ``DEFERRED|{title_id}|{number}|{language}`` composite (D-10). Detect the
-          sentinel FIRST, POST ``chapter-listing-by-title-id`` for the title, parse
-          the FLAT ``ALL_CHAPTERS`` envelope (D-09), Decimal strict-match the
-          promised number+language with the D-11 tie-break, and late-bind the
-          resolved ``translation_id``. Zero matches → ``SourceError`` (fail closed,
-          D-10 — never silently rebind, never rewrite the ``:DEFERRED`` guid).
-
-        The HTML ``img[data-src]`` extract + SSRF allowlist + pages-count guard
-        live in :meth:`_manifest_for_translation` (Task 3).
+        Both ``search`` and ``recent`` now mint a BARE ``translation_id`` as the
+        ``chapter_id`` (GAP-1 lock — recent no longer defers), so this is a straight
+        ``translation_id`` → chapter-detail HTML → ordered allowlisted img URLs
+        resolve. The HTML ``img[data-src]`` extract + SSRF allowlist + pages-count
+        guard live in :meth:`_manifest_for_translation`. (The Comix-only
+        ``:DEFERRED`` late-bind pattern does not apply to MangaBall.)
         """
-        translation_id = chapter_id
-        pages: int | None = None
-        if chapter_id.startswith(_DEFERRED_SENTINEL + _CID_SEP):
-            try:
-                _sentinel, title_id, number, language = _decode_deferred_composite(
-                    chapter_id
-                )
-            except ValueError as exc:
-                raise SourceError(
-                    "source_unavailable", f"malformed mangaball chapter id: {exc}"
-                ) from None
-            body = await ctx.post_json(
-                f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id/",
-                data={"title_id": title_id, "userSettingsEnabled": "false"},
-            )
-            all_chapters, _pagination = _items_and_pagination(body)
-            try:
-                chosen = _resolve_deferred(number, language, all_chapters)
-            except _DeferredResolutionError as exc:
-                raise SourceError("source_unavailable", str(exc)) from None
-            translation_id = str(chosen["id"])
-            pages = self._parse_int(chosen.get("pages"))
-        return await self._manifest_for_translation(translation_id, pages, ctx)
+        return await self._manifest_for_translation(chapter_id, None, ctx)
 
     async def _manifest_for_translation(
         self, translation_id: str, pages: int | None, ctx: SourceContext
@@ -694,35 +652,6 @@ class MangaBallSource(Source):
         return await ctx.get_bytes(url)
 
     # ─────────────────────────── Release normalization ───────────────────────────
-
-    def _title_to_releases(
-        self, title: dict[str, Any], ctx: SourceContext
-    ) -> list[Release]:
-        """Resolve one Title's chapters/translations into Releases (D-08).
-
-        Each ``translation`` of each chapter is one grabbable unit → one Release.
-        HTML-string Title fields (``alternateName``/``status``/``last_chapter``) are
-        stripped via :func:`_strip_html`; only the plain ``name`` is the manga title.
-        """
-        title_id = title.get("_id")
-        if not title_id:
-            return []
-        manga_title = _strip_html(title.get("name")) or "Unknown"
-
-        releases: list[Release] = []
-        for chapter in title.get("chapters") or []:
-            if not isinstance(chapter, dict):
-                continue
-            number = self._parse_decimal(chapter.get("number_float"))
-            for translation in chapter.get("translations") or []:
-                if not isinstance(translation, dict):
-                    continue
-                rel = self._to_release(
-                    str(title_id), manga_title, number, translation, ctx
-                )
-                if rel is not None:
-                    releases.append(rel)
-        return releases
 
     def _to_release(
         self,
