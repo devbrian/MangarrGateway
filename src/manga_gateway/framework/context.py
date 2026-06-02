@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from .health import SourceHealth
     from .ratelimit import RateLimiter
     from .session import SessionManager
+    from .session_prep import SessionPrep
 
 # Permanent (non-retryable) upstream statuses — STOP, do not retry (Pattern 3).
 _PERMANENT_STATUSES = (401, 403, 404)
@@ -69,6 +70,22 @@ def is_cf_challenge(resp: httpx.Response) -> bool:
         return True
     body = resp.content
     return b"challenge-platform" in body or b"cf_chl" in body
+
+
+def is_csrf_failure(resp: httpx.Response) -> bool:
+    """True when ``resp`` is a stale-CSRF-token rejection (D-03, MangaBall seam).
+
+    The httpx-form-POST analog of :func:`is_cf_challenge`: a 403 whose body carries
+    the CSRF-validation marker means the gateway's held token went stale (the token
+    is session-bound, no assumed TTL — RECON §"Session / CSRF bootstrap"), so the
+    session-prep provider should refresh + retry ONCE before the permanent-4xx STOP.
+    A plain 403 (no marker) is NOT a CSRF failure — it stays terminal (D-03: the CF
+    and CSRF branches are independent; a non-marker 403 retries on neither path).
+    The marker may widen later if live-verify (Plan 04) reveals another phrasing.
+    """
+    if resp.status_code != 403:
+        return False
+    return b"CSRF token validation failed" in resp.content
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -101,6 +118,7 @@ class SourceContext:
         decrypt_scheme: str | None = None,
         decrypt_config: dict[str, Any] | None = None,
         source_health: SourceHealth | None = None,
+        session_prep: SessionPrep | None = None,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -116,6 +134,10 @@ class SourceContext:
         self._decrypt_scheme = decrypt_scheme
         self._decrypt_config = decrypt_config
         self._source_health = source_health
+        # Phase-7 session-prep seam (D-01, default-off → MangaDex/Comix unchanged).
+        # Contributes a PHPSESSID cookie + X-CSRF-Token into the SAME per-request
+        # header dict the cf_clearance half builds (D-02/D-04 union path).
+        self._session_prep = session_prep
 
     @property
     def handle_store(self) -> HandleStore:
@@ -139,34 +161,66 @@ class SourceContext:
         return self._antibot.startswith("cloudflare") and self._solver is not None
 
     async def _clearance_kwargs(self, *, force_resolve: bool) -> dict[str, Any]:
-        """Resolve clearance and build the per-request ``headers=`` kwarg (header-only).
+        """Build the per-request ``headers=`` kwarg from BOTH credential seams.
 
-        D-40: inject ``clearance.cookies`` serialized into a single per-request
-        ``Cookie`` request header, alongside the EXACT UA the cookie was issued for
-        (Pitfall 1 — a mismatched UA silently invalidates the cookie, so the two stay
-        coupled on the SAME request). The httpx ``cookies=`` kwarg is deliberately NOT
-        used: it is deprecated in httpx 0.28 ("set cookies on the client instance") and
-        the only client here is the R1-shared one — pinning ``cf_clearance`` onto its
-        jar would leak it onto MangaDex + every future source and break the per-request
-        UA coupling. A manual ``Cookie`` header reproduces the exact wire bytes httpx's
-        ``cookies=`` emitted, and the shared jar (empty for these hosts) never
-        overwrites it. Returns an empty dict when there is no solver, no cloudflare
-        gate, or a ``None`` clearance — so the MangaDex path stays byte-for-byte
-        unchanged.
+        D-02/D-04 union: the cf_clearance half (D-40, browser) and the session-prep
+        half (D-01, httpx CSRF) compose into ONE per-request ``headers`` dict and ONE
+        ``Cookie`` header. Each half independently returns nothing when it does not
+        apply, so:
+
+        * MangaDex (``antibot="none"``, ``session_prep=None``) → ``{}`` (byte-for-byte
+          unchanged);
+        * Comix (``cloudflare*``, ``session_prep=None``) → the cf half only;
+        * MangaBall (``antibot="none"``, ``session_prep="csrf-bootstrap"``) → the CSRF
+          half only — but the UNION path runs (D-04 built now, not special-cased).
+
+        D-40 / R1 discipline (extended to the CSRF cookie): cookies ride a single
+        per-request ``Cookie`` request header, NEVER the httpx ``cookies=`` kwarg
+        (deprecated in httpx 0.28, would pin credentials onto the R1-shared client's
+        jar and leak them onto every other source). Both halves' cookies join into the
+        SAME ``Cookie`` string with ``"; "``. The cf half also pins the EXACT UA the
+        cookie was issued for (Pitfall 1 — a mismatched UA silently invalidates it).
+        ``force_resolve`` forces a fresh solve (D-35) AND a session-prep refresh
+        (D-03/D-05) on the retry path.
         """
-        if not self._is_cloudflare:
-            return {}
-        assert self._solver is not None  # guarded by _is_cloudflare
-        clearance = await self._call_solver(force_resolve=force_resolve)
-        if clearance is None:
-            return {}
-        headers = {"User-Agent": clearance.user_agent}
-        cookie_header = "; ".join(
-            f"{name}={value}" for name, value in clearance.cookies.items()
-        )
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-        return {"headers": headers}
+        headers: dict[str, str] = {}
+        cookie_parts: list[str] = []
+
+        # cf_clearance half (D-40) — browser-issued cookie + its bound UA.
+        if self._is_cloudflare:
+            assert self._solver is not None  # guarded by _is_cloudflare
+            clearance = await self._call_solver(force_resolve=force_resolve)
+            if clearance is not None:
+                headers["User-Agent"] = clearance.user_agent
+                cookie_parts.extend(
+                    f"{name}={value}" for name, value in clearance.cookies.items()
+                )
+
+        # session-prep half (D-01) — CSRF token header + session cookie.
+        if self._session_prep is not None:
+            creds = await self._call_session_prep(force_refresh=force_resolve)
+            if creds is not None:
+                headers["X-CSRF-Token"] = creds.csrf_token
+                cookie_parts.extend(
+                    f"{name}={value}" for name, value in creds.cookies.items()
+                )
+
+        if cookie_parts:
+            headers["Cookie"] = "; ".join(cookie_parts)
+        return {"headers": headers} if headers else {}
+
+    async def _call_session_prep(self, *, force_refresh: bool) -> Any:
+        """Call ``prepare``, passing the internal ``force_refresh`` path if supported.
+
+        ``force_refresh`` is an internal escalation kwarg kept OFF the ``SessionPrep``
+        Protocol (mirror the antibot ``force_resolve`` discipline, D-41). A provider
+        that does not accept it (``NoSessionPrep``) is called with ``source_key`` only.
+        """
+        assert self._session_prep is not None
+        prepare = self._session_prep.prepare
+        if force_refresh and "force_refresh" in inspect.signature(prepare).parameters:
+            return await prepare(self._source_key, force_refresh=True)  # type: ignore[call-arg]
+        return await prepare(self._source_key)
 
     async def _call_solver(self, *, force_resolve: bool) -> Any:
         """Call ``get_clearance``, passing the internal ``force_resolve`` path if the
@@ -210,6 +264,35 @@ class SourceContext:
         """
         try:
             body = await self._request_bytes(url, params=params, limited=True)
+        except SourceError:
+            self._feed_failure()
+            raise
+        result: dict[str, Any] = json.loads(body)
+        self._feed_success()
+        return result
+
+    @tenacity.retry(
+        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
+        stop=tenacity.stop_after_attempt(4),
+        retry=tenacity.retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+    async def post_json(self, url: str, *, data: dict[str, Any]) -> dict[str, Any]:
+        """POST ``data`` as a form body → parsed JSON, rate-limited + retried.
+
+        The form-POST twin of :meth:`get_json` for PHP/Laravel/Django backends whose
+        API is entirely ``POST /api/v1/...`` with ``application/x-www-form-urlencoded``
+        bodies (MangaBall, RECON §"Endpoint map"). httpx form-encodes ``data=dict``
+        automatically. Routed through the SAME ONE shared transport, call-site limiter,
+        tenacity retry, credential merge (the session-prep CSRF token + cookie ride the
+        per-request headers, D-02/D-04), CSRF-403 refresh-once-and-retry (D-03), the
+        permanent-4xx STOP, and ``_feed_success``/``_feed_failure`` health calls (D-36)
+        as ``get_json``. Sources add ZERO networking glue (SRC-02).
+        """
+        try:
+            body = await self._request_bytes(
+                url, params=None, limited=True, method="POST", data=data
+            )
         except SourceError:
             self._feed_failure()
             raise
@@ -305,23 +388,52 @@ class SourceContext:
         params: dict[str, Any] | None,
         limited: bool,
         decrypt: bool = True,
+        method: str = "GET",
+        data: dict[str, Any] | None = None,
     ) -> bytes:
-        """Single GET → optionally-decrypted body, with clearance + 403 reconciliation.
+        """Single request → optionally-decrypted body, with clearance + 403 reconcile.
 
-        Branches BEFORE the permanent-4xx gate (Pitfall 2): for ``cloudflare*`` sources
-        ONLY, a challenge 403 forces ONE re-solve + retry; everything else (a
-        non-challenge 403, a second challenge after re-solve, or any MangaDex 403) hits
-        the unchanged strict 401/403/404 STOP. Returns the DECRYPTED bytes (D-39) when
-        ``decrypt`` is True (the default); ``get_json_plain`` opts out for the source's
-        plaintext endpoints.
+        Branches BEFORE the permanent-4xx gate (Pitfall 2). Two INDEPENDENT reconcile
+        branches (D-03), each forcing exactly ONE refresh + ONE retry:
+
+        * ``cloudflare*`` sources ONLY: a challenge 403 (``is_cf_challenge``) forces one
+          re-solve + retry (D-35, T-04-07);
+        * session-prep sources ONLY: a CSRF-marker 403 (``is_csrf_failure``) forces one
+          token refresh + retry (D-03/D-05).
+
+        Everything else — a non-challenge/non-CSRF 403, a second 403 after a reconcile,
+        or any MangaDex 403 — hits the unchanged strict 401/403/404 STOP. The forced
+        retry passes ``force_resolve=True`` which refreshes WHICHEVER seam applies (the
+        union in ``_clearance_kwargs``). ``method``/``data`` thread a form-POST through
+        the SAME machinery as GET; httpx form-encodes ``data=dict`` as
+        ``application/x-www-form-urlencoded``. Returns DECRYPTED bytes (D-39) when
+        ``decrypt`` is True (the default); ``*_plain`` opts out for plaintext endpoints.
         """
         resp = await self._send(
-            url, params=params, limited=limited, force_resolve=False
+            url,
+            params=params,
+            limited=limited,
+            force_resolve=False,
+            method=method,
+            data=data,
         )
-        if self._is_cloudflare and resp.status_code == 403 and is_cf_challenge(resp):
-            # D-35: stale clearance → ONE forced re-solve + single retry (T-04-07).
+        cf_stale = (
+            self._is_cloudflare and resp.status_code == 403 and is_cf_challenge(resp)
+        )
+        csrf_stale = (
+            self._session_prep is not None
+            and resp.status_code == 403
+            and is_csrf_failure(resp)
+        )
+        if cf_stale or csrf_stale:
+            # D-35 / D-03: stale credential → ONE forced refresh + single retry.
             resp = await self._send(
-                url, params=params, limited=limited, force_resolve=True
+                url,
+                params=params,
+                limited=limited,
+                force_resolve=True,
+                method=method,
+                data=data,
             )
         if resp.status_code in _PERMANENT_STATUSES:
             raise SourceError(
@@ -341,15 +453,24 @@ class SourceContext:
         params: dict[str, Any] | None,
         limited: bool,
         force_resolve: bool,
+        method: str = "GET",
+        data: dict[str, Any] | None = None,
     ) -> httpx.Response:
-        """Inject clearance (D-40) and issue ONE GET (gated iff ``limited``)."""
+        """Inject credentials (D-02/D-40) and issue ONE request (gated iff ``limited``).
+
+        ``method`` defaults to ``"GET"`` (the unchanged search/image path). For
+        ``method="POST"`` the ``data=dict`` form body is attached and httpx
+        form-encodes it as ``application/x-www-form-urlencoded`` (A2).
+        """
         kwargs = await self._clearance_kwargs(force_resolve=force_resolve)
         if params is not None:
             kwargs["params"] = params
+        if data is not None:
+            kwargs["data"] = data
         if limited:
             async with self._limiter:  # gate at CALL SITE (aiolimiter caveat)
-                return await self._session.transport.request("GET", url, **kwargs)
-        return await self._session.transport.request("GET", url, **kwargs)
+                return await self._session.transport.request(method, url, **kwargs)
+        return await self._session.transport.request(method, url, **kwargs)
 
     def _feed_failure(self) -> None:
         if self._source_health is not None:

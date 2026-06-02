@@ -47,6 +47,13 @@ class Source(ABC):
     # and passes it to ``CloudflareSolver`` so the framework solver itself need
     # not know any source-specific URL by name.
     cloudflare_challenge_url: str | None = None
+    # D-01: the httpx session-prep style the framework resolves into a SessionPrep
+    # provider (framework/session_prep.py). ``None`` = no bootstrap (MangaDex/Comix
+    # byte-for-byte unchanged); ``"csrf-bootstrap"`` = GET an HTML page, harvest the
+    # meta csrf-token + PHPSESSID, and inject X-CSRF-Token + a Cookie on every
+    # /api/v1 POST (MangaBall). The app wiring (app.py lifespan) maps this name onto
+    # a CsrfBootstrap instance, mirroring how cloudflare_challenge_url feeds the solver.
+    session_prep: str | None = None
     supports_search: bool = True
     supports_recent: bool = True
 

@@ -84,7 +84,12 @@ class _RecordingTransport:
                 headers={"Set-Cookie": f"PHPSESSID={self._session_cookie}; Path=/"},
                 request=req,
             )
-        return self._responses.pop(0)
+        resp = self._responses.pop(0)
+        # Ensure raise_for_status has a request bound (queued responses built
+        # without an explicit request= still work through the real machinery).
+        if resp._request is None:  # noqa: SLF001 — test fixture binding
+            resp.request = req
+        return resp
 
     async def aclose(self) -> None:  # pragma: no cover - interface completeness
         pass
@@ -196,12 +201,10 @@ def test_is_csrf_failure_predicate() -> None:
     # A plain 403 (no marker) is NOT a CSRF failure → terminal STOP.
     assert is_csrf_failure(httpx.Response(403, text="forbidden", request=req)) is False
     # A 200 carrying the words is not a 403 → not a CSRF failure.
-    assert (
-        is_csrf_failure(
-            httpx.Response(200, json={"error": "CSRF token validation failed"}, request=req)
-        )
-        is False
+    ok_200 = httpx.Response(
+        200, json={"error": "CSRF token validation failed"}, request=req
     )
+    assert is_csrf_failure(ok_200) is False
 
 
 class _CredsPrep:
@@ -250,7 +253,9 @@ async def test_post_json_refreshes_once_on_csrf_403_then_retries() -> None:
             httpx.Response(
                 403, json={"error": "CSRF token validation failed"}, request=req
             ),
-            httpx.Response(200, json={"code": 200, "data": [{"ok": True}]}, request=req),
+            httpx.Response(
+                200, json={"code": 200, "data": [{"ok": True}]}, request=req
+            ),
         ]
     )
     prep = _CredsPrep()
@@ -296,9 +301,7 @@ async def test_session_prep_none_contributes_no_headers() -> None:
 
 @pytest.mark.asyncio
 async def test_get_json_still_works_unchanged() -> None:
-    transport = _RecordingTransport(
-        [httpx.Response(200, json={"data": "ok"})]
-    )
+    transport = _RecordingTransport([httpx.Response(200, json={"data": "ok"})])
     ctx = _ctx(transport, session_prep=None)
     result = await ctx.get_json("https://x/api")
     assert result == {"data": "ok"}
@@ -312,13 +315,11 @@ async def test_post_form_body_round_trips_as_urlencoded() -> None:
     captured: dict[str, Any] = {}
 
     class _EncodingTransport:
-        async def request(
-            self, method: str, url: str, **kwargs: Any
-        ) -> httpx.Response:
+        async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
             built = httpx.Request(method, url, **kwargs)
             captured["content_type"] = built.headers.get("content-type")
             captured["body"] = built.content
-            return httpx.Response(200, json={"code": 200})
+            return httpx.Response(200, json={"code": 200}, request=built)
 
         async def aclose(self) -> None:  # pragma: no cover
             pass
