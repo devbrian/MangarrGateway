@@ -274,8 +274,19 @@ class MangadotSource(Source):
         """
         body = await ctx.get_json(f"{self.base_url}/api/chapters/{chapter_id}/images")
         images = body.get("images")
+        # WR-01: guard the nested ``images`` shape explicitly. ``get_json`` only
+        # validates the top-level object; a non-list ``images`` (string/dict/null)
+        # would otherwise iterate wrongly (or as ``[]``) and surface as the
+        # misleading "no page images found" below. A clear shape error is
+        # diagnosable; mirrors ``_parse_json_array``'s non-list guard discipline.
+        if not isinstance(images, list):
+            raise SourceError(
+                "source_unavailable",
+                f"malformed manifest for chapter {chapter_id}: "
+                f"'images' is not a list (got {type(images).__name__})",
+            )
         urls: list[str] = []
-        for entry in images or []:
+        for entry in images:
             if not isinstance(entry, dict):
                 continue
             raw = entry.get("url")

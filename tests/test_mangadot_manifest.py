@@ -71,6 +71,16 @@ async def test_fetch_manifest_missing_images_key_raises() -> None:
         await MangadotSource().fetch_manifest("388872", ctx)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("bad_images", ["/chapters/m/c/001.webp", {"0": "x"}, 5])
+@pytest.mark.asyncio
+async def test_fetch_manifest_non_list_images_raises(bad_images: Any) -> None:
+    # WR-01: a non-list ``images`` (string/dict/number) must raise a clear shape
+    # error, NOT iterate wrongly into the misleading "no page images found" path.
+    ctx = _FakeCtxForManifest({"chapter": {}, "images": bad_images})
+    with pytest.raises(SourceError, match="not a list"):
+        await MangadotSource().fetch_manifest("388872", ctx)  # type: ignore[arg-type]
+
+
 @pytest.mark.asyncio
 async def test_fetch_manifest_off_host_url_raises_ssrf() -> None:
     # An absolute off-host url (e.g. a poisoned response) must fail the allowlist.
