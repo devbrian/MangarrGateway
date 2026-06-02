@@ -365,7 +365,15 @@ async def test_recent_skips_titles_with_unparseable_last_chapter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recent_respects_limit() -> None:
+async def test_recent_returns_all_parseable_limit_left_to_route() -> None:
+    """WR-03: the source no longer self-trims to ``limit`` in raw FEED order.
+
+    Truncating in feed order before the route's authoritative newest-first sort
+    would hide a genuinely-newer title sitting past position ``limit``, and —
+    combined with skip-on-unparseable — could shrink the result below ``limit``.
+    The source now returns every parseable release from the single page; the route
+    (recent.py) sorts by publishDate + applies the merged ``limit``.
+    """
     payload = _recent_envelope(
         [
             _recent_title(
@@ -379,4 +387,5 @@ async def test_recent_respects_limit() -> None:
     ctx = _ctx(payload)
     source = MangaBallSource()
     releases = await source.recent(languages=None, limit=2, since=None, ctx=ctx)
-    assert len(releases) == 2
+    # All 5 parseable titles are returned; the route enforces the merged limit.
+    assert len(releases) == 5

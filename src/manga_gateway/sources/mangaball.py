@@ -600,9 +600,15 @@ class MangaBallSource(Source):
             rel = self._to_release(title_id, manga_title, number, translation, ctx)
             if rel is not None:
                 releases.append(rel)
-            if len(releases) >= limit:
-                break
-        return releases[:limit]
+            # WR-03: do NOT break at ``limit`` over raw feed order. The route
+            # (recent.py) applies the authoritative newest-first sort + ``since``
+            # cut, then re-trims to the merged limit — an in-loop break in FEED
+            # order would (a) hide a genuinely-newer title sitting past position
+            # ``limit`` from that sort, and (b) combined with skip-on-unparseable
+            # (the ``continue`` above), shrink the result below ``limit`` even when
+            # more parseable titles exist further down. Consume the whole page;
+            # ``since`` is intentionally ignored source-side (IN-01).
+        return releases
 
     @staticmethod
     def _title_updated_iso(title: dict[str, Any]) -> str | None:
