@@ -295,6 +295,25 @@ async def test_caps_advertises_live_mangadex_source(client: httpx.AsyncClient) -
 
 
 @pytest.mark.asyncio
+async def test_caps_advertises_mangaball_antibot_none(
+    client: httpx.AsyncClient,
+) -> None:
+    # 07-03: registering MangaBallSource auto-advertises it via registry.caps()
+    # (CAPS-02). MangaBall is antibot none (passive Cloudflare only, D-07/D-12).
+    resp = await client.get("/caps")
+    assert resp.status_code == 200
+    sources = resp.json()["sources"]
+    mb = next((s for s in sources if s["key"] == "mangaball"), None)
+    assert mb is not None, "mangaball not advertised in /caps"
+    assert mb["antibot"] == "none"
+    assert mb["enabled"] is True
+    assert mb["rateLimitPerMinute"] > 0
+    assert mb["languages"]  # non-empty ALL_LANGUAGES set
+    assert mb["supportsSearch"] is True
+    assert mb["supportsRecent"] is True
+
+
+@pytest.mark.asyncio
 async def test_caps_served_read_through_cache(client: httpx.AsyncClient, app) -> None:
     # First call populates the 12h STATIC skeleton cache (D-38: the per-source
     # sources[] is rebuilt live each call so a breaker trip is never masked by the
