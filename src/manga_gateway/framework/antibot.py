@@ -281,6 +281,7 @@ class CloudflareSolver:
         fetch_concurrency: int = 1,
         recycle_seconds: float | None = None,
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
+        challenge_urls: dict[str, str] | None = None,
         cloudflare_keys: Iterable[str] = (),
         engine: AntibotEngine = "patchright",
         log_browser_events: bool = False,
@@ -296,7 +297,15 @@ class CloudflareSolver:
         # same proxy as the httpx image fetch (cf_clearance is IP-bound). None ⇒
         # no ``proxy=`` kwarg passed at launch — today's behavior unchanged.
         self._proxy = proxy
+        # Per-domain challenge URLs (#88): map ``source_key`` -> challenge URL so
+        # each cloudflare-gated source solves against its OWN host and captures
+        # only that host's cookies. ``challenge_url`` is RETAINED as the
+        # fallback default for any cf key lacking an explicit ``challenge_urls``
+        # entry (keeps single-CF tests + the _DEFAULT_CHALLENGE_URL placeholder
+        # working). With exactly one entry this is byte-for-byte the old
+        # single-domain behavior.
         self._challenge_url = challenge_url
+        self._challenge_urls = dict(challenge_urls or {})
         self._cloudflare_keys = frozenset(cloudflare_keys)
         self._engine: AntibotEngine = engine
         # #54 diagnostic: when True, attach pageerror/console/requestfailed
@@ -317,7 +326,7 @@ class CloudflareSolver:
         )
         self._lifecycle = lifecycle or BrowserLifecycle(
             launch=launch,
-            solve=self._solve_real,
+            solve=self._solve_keyed,
             solve_concurrency=solve_concurrency,
             recycle_seconds=recycle_seconds,
         )
@@ -366,20 +375,32 @@ class CloudflareSolver:
         """
         if source_key not in self._cloudflare_keys:
             return None  # MangaDex et al. — no clearance needed
-        return await self._lifecycle.solve(force=force_resolve)
+        return await self._lifecycle.solve(source_key, force=force_resolve)
 
-    async def warm(self) -> None:
+    async def warm(self) -> list[str]:
         """Best-effort eager solve at startup (D-33) + start the recycle watchdog.
 
         Called as a fire-and-forget task by the lifespan so a slow/failed solve never
-        blocks startup. Exceptions are swallowed here — the caller (the lifespan's
-        non-blocking launch) owns the force_disabled fallback on failure (D-33).
+        blocks startup. Returns the list of cloudflare source keys whose eager solve
+        FAILED so the lifespan can disable ONLY those (D-33, per-domain isolation).
+
+        #88 / PR#90 review: eager-warm ALL cloudflare-gated sources (LOCKED decision
+        — no early break), each on its OWN per-domain challenge URL. A per-domain
+        solve failure must isolate to THAT source — with several cloudflare domains
+        now sharing one solver, one bad domain at startup must NOT take the healthy
+        ones down. Each key's solve is therefore wrapped in its own try/except and
+        only the failing keys are returned; a TOTAL failure (e.g. the browser never
+        launches) naturally surfaces as every key failing.
         """
         self._lifecycle.start_recycle_watchdog()
-        # Trigger one solve so the clearance is ready before the first request.
+        failed: list[str] = []
         for key in self._cloudflare_keys:
-            await self.get_clearance(key)
-            break
+            try:
+                await self.get_clearance(key)
+            except Exception:  # noqa: BLE001 — isolate per-domain warm failures
+                _log.warning("CloudflareSolver warm failed for source %r (D-33)", key)
+                failed.append(key)
+        return failed
 
     # ``timeout`` here is the per-call Playwright operation budget (goto/
     # wait_for/evaluate each receive ``timeout`` in ms), NOT a cancellation
@@ -694,8 +715,24 @@ class CloudflareSolver:
             launch_kwargs["proxy"] = self._proxy
         return await AsyncNewBrowser(self._playwright, **launch_kwargs)
 
-    async def _solve_real(self, context: Any) -> Clearance:
+    async def _solve_keyed(self, context: Any, key: str) -> Clearance:
+        """Resolve ``key`` to its per-domain challenge URL and solve there (#88).
+
+        The lifecycle's solve closure is this method (not ``_solve_real``) so the
+        per-key challenge URL is bound at solve time. ``key`` is the
+        ``source_key``; its URL comes from the ``challenge_urls`` map, falling
+        back to the constructor ``challenge_url`` default when absent.
+        """
+        url = self._challenge_urls.get(key) or self._challenge_url
+        return await self._solve_real(context, url)
+
+    async def _solve_real(self, context: Any, challenge_url: str) -> Clearance:
         """Solve the challenge on the live context; capture cf_clearance + UA.
+
+        ``challenge_url`` is supplied by :meth:`_solve_keyed` from the per-domain
+        ``challenge_urls`` map (#88), so each cloudflare-gated source solves
+        against its OWN host and the cookie scoping (``_belongs_to_host``)
+        captures only that host's cookies.
 
         Engine-agnostic: the polling-cookies + capture-UA logic depends only on
         Playwright's ``BrowserContext`` API surface, which both Patchright (Chromium)
@@ -705,7 +742,7 @@ class CloudflareSolver:
         """
         page = await context.new_page()
         try:
-            await page.goto(self._challenge_url, wait_until="domcontentloaded")
+            await page.goto(challenge_url, wait_until="domcontentloaded")
             # Wait for the challenge to clear: poll context.cookies() until the
             # cf_clearance cookie appears. We CANNOT use page.wait_for_function on
             # ``document.cookie.includes('cf_clearance')`` because Cloudflare sets
@@ -715,10 +752,23 @@ class CloudflareSolver:
             # we poll that from Python instead.
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 60.0
+            # Scope the wait to THIS challenge's host (#88, PR#90 review). The ONE
+            # shared warm context can now hold cf_clearance cookies for SEVERAL
+            # domains at once (each cloudflare-gated source solves on the same
+            # context). A host-agnostic ``any(name == "cf_clearance")`` would let
+            # solving domain B return the instant domain A's cookie is present in
+            # the jar — capturing an EMPTY host-scoped cookie set for B and handing
+            # B a clearance it never actually solved. Gate the break on a
+            # cf_clearance that ``_belongs_to_host`` the host we navigated.
+            challenge_host = (urlparse(challenge_url).hostname or "").lower()
             jar: list[dict[str, Any]] = []
             while True:
                 jar = await context.cookies()
-                if any(c.get("name") == "cf_clearance" for c in jar):
+                if any(
+                    c.get("name") == "cf_clearance"
+                    and _belongs_to_host(c, challenge_host)
+                    for c in jar
+                ):
                     break
                 if loop.time() > deadline:
                     raise TimeoutError(
@@ -736,7 +786,6 @@ class CloudflareSolver:
             # (empirically verified 2026-05-30 — passing only cf_clearance returns
             # 403). Scoping by domain naturally excludes cross-site ad-tracking
             # cookies the solver may pick up incidentally.
-            challenge_host = (urlparse(self._challenge_url).hostname or "").lower()
             cookies = {
                 c["name"]: c["value"]
                 for c in jar

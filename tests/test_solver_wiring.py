@@ -41,6 +41,19 @@ async def test_lifespan_swaps_in_cloudflare_solver() -> None:
         assert isinstance(app.state.source_health["comix"], SourceHealth)
 
 
+async def test_lifespan_wires_per_domain_challenge_urls() -> None:
+    """#88: the lifespan builds the per-domain ``challenge_urls`` map and passes
+    it onto the solver. With only comix registered the map is
+    ``{"comix": "https://comix.to/"}`` — guards the app mapping against silent
+    drift back to the old single-``challenge_url`` single-pick.
+    """
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, CloudflareSolver)
+        assert solver._challenge_urls == {"comix": "https://comix.to/"}
+
+
 async def test_mangadex_resolves_no_clearance_with_real_solver() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):

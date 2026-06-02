@@ -33,6 +33,13 @@ from manga_gateway.framework.antibot import (
 )
 from manga_gateway.framework.solver_lifecycle import BrowserLifecycle
 
+# The deterministic suite's autouse ``_no_real_cloudflare_warm`` fixture
+# (tests/conftest.py) patches ``CloudflareSolver.warm`` to a no-op so the lifespan's
+# fire-and-forget warm never touches the network. Capture the REAL warm at import
+# (before any per-test patch) so the #88 warm-all tests can drive the genuine
+# eager-warm loop and assert it solves EVERY cf key (no early break).
+_REAL_CLOUDFLARE_WARM = CloudflareSolver.warm
+
 
 class FakeContext:
     """A fake Patchright persistent context capturing the cf_clearance + UA."""
@@ -95,7 +102,7 @@ class FakeBrowser:
         self.contexts.append(ctx)
         return ctx
 
-    async def solve(self, ctx: FakeContext) -> Clearance:
+    async def solve(self, ctx: FakeContext, key: str = "__t__") -> Clearance:
         self.concurrent_solves += 1
         self.max_concurrent_solves = max(
             self.max_concurrent_solves, self.concurrent_solves
@@ -121,7 +128,7 @@ class FakeBrowser:
 async def test_single_flight_collapses_concurrent_callers() -> None:
     fake = FakeBrowser()
     lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=4)
-    results = await asyncio.gather(*(lc.solve() for _ in range(8)))
+    results = await asyncio.gather(*(lc.solve("k") for _ in range(8)))
     # 8 concurrent callers → exactly ONE underlying solve (Pitfall 6).
     assert fake.solve_count == 1
     assert all(r.cookies["cf_clearance"] == "TOKEN" for r in results)
@@ -131,8 +138,8 @@ async def test_single_flight_collapses_concurrent_callers() -> None:
 async def test_distinct_solves_after_first_completes() -> None:
     fake = FakeBrowser()
     lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
-    await lc.solve()
-    await lc.solve(force=True)  # a forced re-solve runs again
+    await lc.solve("k")
+    await lc.solve("k", force=True)  # a forced re-solve runs again
     assert fake.solve_count == 2
     await lc.aclose()
 
@@ -148,9 +155,9 @@ async def test_sequential_nonforced_solves_reuse_held_clearance() -> None:
     `comix-cf-solver-loop`)."""
     fake = FakeBrowser()
     lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
-    first = await lc.solve()
-    second = await lc.solve()
-    third = await lc.solve()
+    first = await lc.solve("k")
+    second = await lc.solve("k")
+    third = await lc.solve("k")
     assert fake.solve_count == 1
     # All three callers see the EXACT same Clearance instance — the cache is
     # by-reference, not a re-issued copy.
@@ -163,10 +170,10 @@ async def test_force_resolve_replaces_held_clearance() -> None:
     caller sees the freshly-issued Clearance (D-35 reactive re-solve)."""
     fake = FakeBrowser()
     lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
-    first = await lc.solve()
-    second = await lc.solve(force=True)
+    first = await lc.solve("k")
+    second = await lc.solve("k", force=True)
     # held updated → next non-forced returns the FORCED clearance, not the first.
-    third = await lc.solve()
+    third = await lc.solve("k")
     assert fake.solve_count == 2
     assert third is second
     assert third is not first
@@ -181,10 +188,10 @@ async def test_recycle_invalidates_held_clearance() -> None:
     lc = BrowserLifecycle(
         launch=fake.launch, solve=fake.solve, solve_concurrency=1, recycle_seconds=0.05
     )
-    await lc.solve()  # solve #1, held populated, launch #1
+    await lc.solve("k")  # solve #1, held populated, launch #1
     lc.start_recycle_watchdog()
     await asyncio.sleep(0.12)  # let the watchdog fire at least once
-    await lc.solve()  # held was cleared by _close_context → real re-solve
+    await lc.solve("k")  # held was cleared by _close_context → real re-solve
     assert fake.solve_count >= 2
     assert fake.launch_count >= 2
     await lc.aclose()
@@ -197,7 +204,7 @@ async def test_solve_semaphore_bounds_concurrency() -> None:
     fake = FakeBrowser()
     lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=2)
     # Force distinct solves so the semaphore (not single-flight) gates concurrency.
-    await asyncio.gather(*(lc.solve(force=True) for _ in range(6)))
+    await asyncio.gather(*(lc.solve("k", force=True) for _ in range(6)))
     assert fake.max_concurrent_solves <= 2
     await lc.aclose()
 
@@ -210,11 +217,11 @@ async def test_recycle_restarts_persistent_context() -> None:
     lc = BrowserLifecycle(
         launch=fake.launch, solve=fake.solve, solve_concurrency=1, recycle_seconds=0.05
     )
-    await lc.solve()  # launch #1
+    await lc.solve("k")  # launch #1
     first_ctx = fake.contexts[0]
     lc.start_recycle_watchdog()
     await asyncio.sleep(0.12)  # let the watchdog fire at least once
-    await lc.solve()
+    await lc.solve("k")
     assert fake.launch_count >= 2  # the context was recycled
     assert first_ctx.closed  # old context torn down on recycle (no orphan)
     await lc.aclose()
@@ -226,7 +233,7 @@ async def test_recycle_restarts_persistent_context() -> None:
 async def test_aclose_tears_down_browser() -> None:
     fake = FakeBrowser()
     lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
-    await lc.solve()
+    await lc.solve("k")
     await lc.aclose()
     assert all(c.closed for c in fake.contexts)
 
@@ -234,7 +241,7 @@ async def test_aclose_tears_down_browser() -> None:
 async def test_aclose_under_cancellederror_still_closes() -> None:
     fake = FakeBrowser()
     lc = BrowserLifecycle(launch=fake.launch, solve=fake.solve, solve_concurrency=1)
-    await lc.solve()
+    await lc.solve("k")
 
     # Simulate aclose() being invoked while a CancelledError is propagating
     # (lifespan teardown / drain-timeout cancellation). The browser MUST still
@@ -251,7 +258,7 @@ async def test_recycle_watchdog_cancelled_by_aclose() -> None:
     lc = BrowserLifecycle(
         launch=fake.launch, solve=fake.solve, solve_concurrency=1, recycle_seconds=0.05
     )
-    await lc.solve()
+    await lc.solve("k")
     lc.start_recycle_watchdog()
     await lc.aclose()  # must cancel the watchdog task, not leak it
     assert lc._recycle_task is None or lc._recycle_task.done()
@@ -303,6 +310,162 @@ def test_force_resolve_off_protocol() -> None:
 
     sig = inspect.signature(AntiBotSolver.get_clearance)
     assert "force_resolve" not in sig.parameters  # D-41 — Protocol unchanged
+
+
+# ───────────────────────── #88 per-domain clearance (multi-key) ─────────────────────
+
+
+class _KeyAwareBrowser:
+    """A FakeBrowser whose ``solve`` records the per-key call count + binds the
+    captured cf_clearance to the key, so the multi-key tests can prove each key
+    drives its OWN single-flight and held clearance.
+
+    ``solve_count`` is the TOTAL number of underlying solves across all keys
+    (the warm-all test asserts ``solve_count == len(keys)``); ``per_key_solves``
+    breaks it down so the same-key-collapse assertion is unambiguous.
+    """
+
+    def __init__(self, *, solve_delay: float = 0.02) -> None:
+        self.launch_count = 0
+        self.contexts: list[FakeContext] = []
+        self.solve_count = 0
+        self.per_key_solves: dict[str, int] = {}
+        self._solve_delay = solve_delay
+
+    async def launch(self) -> FakeContext:
+        self.launch_count += 1
+        ctx = FakeContext()
+        self.contexts.append(ctx)
+        return ctx
+
+    async def solve(self, ctx: FakeContext, key: str) -> Clearance:
+        self.solve_count += 1
+        self.per_key_solves[key] = self.per_key_solves.get(key, 0) + 1
+        # Widen the window so concurrent same-key callers can collapse onto the
+        # in-flight future before this leader publishes its result.
+        await asyncio.sleep(self._solve_delay)
+        # Bind the clearance value to the key so distinct keys yield distinct
+        # clearances (proves the per-key cache is not cross-contaminated).
+        return Clearance(
+            cookies={"cf_clearance": f"TOKEN-{key}"}, user_agent=f"UA-{key}"
+        )
+
+
+async def test_two_keys_yield_independent_clearances_each_own_single_flight() -> None:
+    """Two distinct cf keys → two independent clearances, each with its OWN
+    single-flight: concurrent callers of the SAME key collapse to one solve,
+    while a different key solves independently (#88)."""
+    browser = _KeyAwareBrowser()
+    lc = BrowserLifecycle(
+        launch=browser.launch, solve=browser.solve, solve_concurrency=4
+    )
+    # 5 concurrent callers of "a" + 5 of "b" → exactly ONE solve per key.
+    results = await asyncio.gather(
+        *(lc.solve("a") for _ in range(5)),
+        *(lc.solve("b") for _ in range(5)),
+    )
+    assert browser.per_key_solves == {"a": 1, "b": 1}
+    assert browser.solve_count == 2
+    a_results = results[:5]
+    b_results = results[5:]
+    # Same-key callers all see the EXACT same held instance (by-reference cache).
+    assert all(r is a_results[0] for r in a_results)
+    assert all(r is b_results[0] for r in b_results)
+    # The two keys' clearances are distinct (no cross-contamination).
+    assert a_results[0].cookies["cf_clearance"] == "TOKEN-a"
+    assert b_results[0].cookies["cf_clearance"] == "TOKEN-b"
+    assert a_results[0] is not b_results[0]
+    await lc.aclose()
+
+
+async def test_warm_solves_all_cloudflare_keys() -> None:
+    """``warm()`` solves EVERY cloudflare key — no early break (#88, LOCKED).
+    With a two-key CloudflareSolver + a two-entry challenge_urls map, one warm
+    yields exactly ``len(cloudflare_keys)`` underlying solves."""
+    browser = _KeyAwareBrowser()
+    lc = BrowserLifecycle(
+        launch=browser.launch, solve=browser.solve, solve_concurrency=1
+    )
+    solver = CloudflareSolver(
+        lifecycle=lc,
+        cloudflare_keys=("a", "b"),
+        challenge_urls={"a": "https://a.test/", "b": "https://b.test/"},
+    )
+    # Drive the REAL warm (the autouse fixture no-ops the bound method).
+    await _REAL_CLOUDFLARE_WARM(solver)
+    assert browser.solve_count == len(solver._cloudflare_keys) == 2
+    assert browser.per_key_solves == {"a": 1, "b": 1}
+    await solver.aclose()
+
+
+async def test_warm_isolates_per_domain_failures() -> None:
+    """``warm()`` returns ONLY the cf keys whose eager solve failed — one bad
+    domain must NOT take the healthy ones down (#88, PR#90 review). The healthy
+    key is still solved + held; the failing key is reported for per-source
+    disable by the lifespan."""
+
+    class _OneBadKeyBrowser(_KeyAwareBrowser):
+        async def solve(self, ctx: FakeContext, key: str) -> Clearance:
+            if key == "bad":
+                self.solve_count += 1
+                self.per_key_solves[key] = self.per_key_solves.get(key, 0) + 1
+                raise RuntimeError("cloudflare escalated on this domain")
+            return await super().solve(ctx, key)
+
+    browser = _OneBadKeyBrowser()
+    lc = BrowserLifecycle(
+        launch=browser.launch, solve=browser.solve, solve_concurrency=1
+    )
+    solver = CloudflareSolver(
+        lifecycle=lc,
+        cloudflare_keys=("ok", "bad"),
+        challenge_urls={"ok": "https://ok.test/", "bad": "https://bad.test/"},
+    )
+    failed = await _REAL_CLOUDFLARE_WARM(solver)
+    # ONLY the failing domain is reported — the healthy one is unaffected.
+    assert failed == ["bad"]
+    # The healthy key was solved and its clearance is held (warm did not abort
+    # before reaching it / after the failing one).
+    assert browser.per_key_solves.get("ok") == 1
+    assert (await solver.get_clearance("ok")).cookies["cf_clearance"] == "TOKEN-ok"
+    await solver.aclose()
+
+
+async def test_single_cf_key_collapses_to_old_single_value_path() -> None:
+    """Comix-unaffected proof (#88): with exactly ONE cf key, the per-key
+    ``_held``/``_inflight``/warm behave exactly as the old single-value path —
+    sequential non-forced solves reuse the held clearance, a force replaces it,
+    and one warm == one solve."""
+    browser = _KeyAwareBrowser()
+    lc = BrowserLifecycle(
+        launch=browser.launch, solve=browser.solve, solve_concurrency=1
+    )
+    # Sequential non-forced solves of the one key reuse the held clearance.
+    first = await lc.solve("only")
+    second = await lc.solve("only")
+    assert browser.solve_count == 1
+    assert first is second
+    # A forced re-solve replaces the held value; the next non-forced sees it.
+    forced = await lc.solve("only", force=True)
+    third = await lc.solve("only")
+    assert browser.solve_count == 2
+    assert third is forced
+    assert third is not first
+    await lc.aclose()
+
+    # One warm over a single-key solver == exactly one solve (old behavior).
+    browser2 = _KeyAwareBrowser()
+    lc2 = BrowserLifecycle(
+        launch=browser2.launch, solve=browser2.solve, solve_concurrency=1
+    )
+    solver = CloudflareSolver(
+        lifecycle=lc2,
+        cloudflare_keys=("only",),
+        challenge_urls={"only": "https://only.test/"},
+    )
+    await _REAL_CLOUDFLARE_WARM(solver)
+    assert browser2.solve_count == 1
+    await solver.aclose()
 
 
 # ─────────────────────── Option A: fetch_via_browser primitive ──────────────────
@@ -465,7 +628,7 @@ def _solver_with_fetch_context(
     async def _launch() -> _FetchContext:
         return ctx
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
@@ -638,7 +801,7 @@ async def test_fetch_via_browser_concurrency_kwarg_caps_semaphore() -> None:
     async def _launch() -> _FetchContext:
         return ctx
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
@@ -669,7 +832,7 @@ async def test_fetch_via_browser_context_failure_raises_browser_fetch_error() ->
     async def _bad_launch() -> object:
         raise RuntimeError("patchright failed to start")
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_bad_launch, solve=_solve, solve_concurrency=1)
@@ -702,22 +865,22 @@ async def test_lifecycle_recycle_now_closes_and_clears_held_clearance() -> None:
     lc = BrowserLifecycle(launch=browser.launch, solve=browser.solve)
 
     # Drive one full solve so the lifecycle caches both a context and a Clearance.
-    first = await lc.solve()
+    first = await lc.solve("k")
     assert isinstance(first, Clearance)
     assert browser.launch_count == 1
-    assert lc._held is first  # cached for subsequent non-forced callers
+    assert lc._held["k"] is first  # cached for subsequent non-forced callers
 
     await lc.recycle_now()
 
     # Cached context cleared (next get_context relaunches), held Clearance cleared
-    # (next solve runs a fresh one).
+    # (next solve runs a fresh one). recycle_now clears the WHOLE _held dict (#88).
     assert lc._context is None
-    assert lc._held is None
+    assert lc._held == {}
     assert browser.contexts[0].closed is True
 
     # Re-solving relaunches a fresh context (verifies recycle_now actually
     # invalidated the cache rather than just looking like it did).
-    second = await lc.solve()
+    second = await lc.solve("k")
     assert isinstance(second, Clearance)
     assert browser.launch_count == 2
 
@@ -740,7 +903,7 @@ async def test_lifecycle_recycle_now_is_noop_when_no_context_live() -> None:
 
     assert browser.launch_count == 0
     assert lc._context is None
-    assert lc._held is None
+    assert lc._held == {}
 
     await lc.aclose()
 
@@ -791,7 +954,7 @@ async def test_fetch_via_browser_recycles_on_dead_driver_and_retries_once() -> N
         launch_count += 1
         return contexts_to_launch.pop(0)
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
@@ -833,7 +996,7 @@ async def test_fetch_via_browser_recycles_on_dead_driver_via_evaluate_error() ->
     async def _launch() -> object:
         return contexts_to_launch.pop(0)
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
@@ -875,7 +1038,7 @@ async def test_fetch_via_browser_does_not_retry_on_plain_timeout() -> None:
         launch_count += 1
         return ctx
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
@@ -909,7 +1072,7 @@ async def test_fetch_via_browser_does_not_retry_on_non_dead_driver_error() -> No
         launch_count += 1
         return ctx
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
@@ -942,7 +1105,7 @@ async def test_fetch_via_browser_second_dead_driver_surfaces_as_fetch_error() ->
         launch_count += 1
         return contexts.pop(0)
 
-    async def _solve(_ctx: object) -> Clearance:  # pragma: no cover — unused
+    async def _solve(_ctx: object, _key: str) -> Clearance:  # pragma: no cover — unused
         return Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
