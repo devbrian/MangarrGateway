@@ -10,8 +10,12 @@
 #     docker compose -f docker-compose.yml up --build
 #
 # The auto-generated API key, the SQLite DB, and cf_clearance all live on the
-# named `gateway-state` volume so they survive container recreation
-# (verified_facts #3). CBZ output lives on `gateway-output`.
+# app-data mount (`/state`); CBZ output lives on the downloads mount
+# (`/data/manga`). Both default to Docker NAMED volumes (portable, work on any
+# host incl. the Windows dev box). To land them on specific HOST directories
+# (e.g. a Linux server), set MANGARR_STATE_DIR / MANGARR_DOWNLOADS_DIR in .env —
+# see .env.example. When a host path is used, it must be writable by the
+# container's non-root uid 10001 (chown 10001:10001 <dir>).
 
 services:
   gateway:
@@ -26,11 +30,13 @@ services:
       - path: .env
         required: false
     volumes:
-      # State (config.toml + the auto-generated API key, gateway.db, cf_clearance).
-      - gateway-state:/state
-      # CBZ output. A named volume is portable; to land output on the host
-      # instead, replace the line below with a bind, e.g.  - ./output:/data/manga
-      - gateway-output:/data/manga
+      # App data (config.toml + the auto-generated API key, gateway.db,
+      # cf_clearance). Defaults to the named `gateway-state` volume; set
+      # MANGARR_STATE_DIR=/opt/mangarrgateway (in .env) to bind a host dir.
+      - ${MANGARR_STATE_DIR:-gateway-state}:/state
+      # CBZ downloads/output. Defaults to the named `gateway-output` volume; set
+      # MANGARR_DOWNLOADS_DIR=/mnt/mangarr_dl (in .env) to bind a host dir.
+      - ${MANGARR_DOWNLOADS_DIR:-gateway-output}:/data/manga
     restart: unless-stopped
     # NOTE: command is intentionally NOT overridden — inherit the Dockerfile's
     # single-process `python -m manga_gateway` CMD. NEVER add --workers (R1).

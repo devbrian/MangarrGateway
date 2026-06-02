@@ -61,11 +61,28 @@ also runs with no `.env` (the image bakes safe defaults).
 
 ### Volumes & state
 
-Two volumes persist across container recreation:
+Two mounts persist across container recreation:
 
 - `/state` — `config.toml` (incl. the **auto-generated API key**), `gateway.db`,
   and the Cloudflare `cf_clearance` user-data dir.
 - `/data/manga` — packaged CBZ output.
+
+Both default to Docker **named volumes** (portable — work on any host, including a
+Windows dev box). To land them on specific **host directories** instead (e.g. a
+Linux server), set these in `.env`:
+
+```dotenv
+MANGARR_STATE_DIR=/opt/mangarrgateway   # app data → /state
+MANGARR_DOWNLOADS_DIR=/mnt/mangarr_dl    # downloads → /data/manga
+```
+
+The container runs **non-root (uid 10001)**, so a bound host dir must be writable
+by that uid or first-run key generation fails. On the server, once:
+
+```bash
+sudo mkdir -p /opt/mangarrgateway /mnt/mangarr_dl
+sudo chown -R 10001:10001 /opt/mangarrgateway /mnt/mangarr_dl
+```
 
 ### Reading the API key
 
