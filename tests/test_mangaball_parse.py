@@ -25,7 +25,6 @@ from manga_gateway.sources.mangaball import (
     _strip_html,
 )
 
-
 # ─────────────────── _items_and_pagination (D-07 / D-09) ────────────────────
 
 

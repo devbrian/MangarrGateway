@@ -29,9 +29,7 @@ from manga_gateway.models.search import SearchRequest
 from manga_gateway.sources.mangaball import MangaBallSource
 
 # guid contract (D-08): mangaball:{24-hex title}:ch-{float}:{lang}:{24-hex tx}
-_GUID_RE = re.compile(
-    r"^mangaball:[0-9a-f]{24}:ch-[\d.]+:[a-z]{2,}:[0-9a-f]{24}$"
-)
+_GUID_RE = re.compile(r"^mangaball:[0-9a-f]{24}:ch-[\d.]+:[a-z]{2,}:[0-9a-f]{24}$")
 
 
 class _FakeCtxForSearch:
@@ -114,7 +112,8 @@ def _title(
                 "number": number,
                 "number_float": number_float,
                 "title": "",
-                "translations": translations or [_translation(tx_id="6a1e164ac01e2cf095f75b1a")],
+                "translations": translations
+                or [_translation(tx_id="6a1e164ac01e2cf095f75b1a")],
             }
         ],
     }
@@ -166,9 +165,7 @@ async def test_search_mints_fully_specific_guid_and_opaque_handle() -> None:
     )
     ctx = _ctx(payload)
     source = MangaBallSource()
-    releases = await source.search(
-        SearchRequest(type="manga", query="one piece"), ctx
-    )
+    releases = await source.search(SearchRequest(type="manga", query="one piece"), ctx)
 
     assert len(releases) == 1
     rel = releases[0]
