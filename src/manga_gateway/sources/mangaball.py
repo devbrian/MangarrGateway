@@ -51,11 +51,14 @@ mints a ``:DEFERRED`` composite resolved at ``fetch_manifest`` time (D-10).
 
 from __future__ import annotations
 
+import asyncio
 import re
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+import lxml.html
 
 from ..framework.base import Source
 from ..framework.errors import SourceError
@@ -311,6 +314,27 @@ def _is_allowed_image_url(url: str) -> bool:
     )
 
 
+def _extract_data_src_urls(html: bytes) -> list[str]:
+    """Parse chapter-detail HTML → absolute ``img[data-src]`` URLs in document order.
+
+    Blocking (lxml C-parse) by design — the caller offloads it via
+    ``asyncio.to_thread`` (RESEARCH Pitfall 6 / ruff ASYNC). Returns ONLY the
+    ``data-src`` attribute values verbatim (the absolute CDN URL the reader
+    server-rendered, RECON §4); the host is NEVER reconstructed. Falls back to an
+    ``src`` attribute only when ``data-src`` is absent (defensive — the live
+    scaffolds use ``data-src``). The SSRF allowlist filters these downstream.
+    """
+    # lxml.html.fromstring tolerates a fragment or full document; a parse failure
+    # on garbage input yields no <img> nodes (→ empty list, guarded by the caller).
+    doc = lxml.html.fromstring(html)
+    out: list[str] = []
+    for img in doc.iter("img"):
+        url = img.get("data-src") or img.get("src")
+        if url:
+            out.append(url.strip())
+    return out
+
+
 class MangaBallSource(Source):
     """MangaBall (mangaball.net) — antibot none + csrf-bootstrap session prep.
 
@@ -550,9 +574,38 @@ class MangaBallSource(Source):
     ) -> list[str]:
         """HTML ``img[data-src]`` extract + SSRF allowlist + pages guard (PKG-01).
 
-        Implemented in Task 3.
+        GETs ``/chapter-detail/{translation_id}/`` (HTML) via ``ctx.get_bytes``,
+        parses the absolute ``img[data-src]`` URLs in document order, and returns
+        them. The CDN host is taken from the DOM, NEVER reconstructed (RECON §4 /
+        CLAUDE.md SSRF) — the host varies per content. Every extracted URL is
+        SSRF-allowlisted (:func:`_is_allowed_image_url`) before return; a
+        non-allowlisted URL raises ``SourceError`` (no blind fetch, T-07-07). The
+        extracted count is guarded against the chapter's ``pages`` when known
+        (integrity guard, mirror ``mangadex.fetch_manifest``). The large HTML parse
+        is offloaded via ``asyncio.to_thread`` so it never blocks the event loop
+        (RESEARCH Pitfall 6; ruff ASYNC).
         """
-        raise NotImplementedError  # pragma: no cover - Task 3
+        html = await ctx.get_bytes(f"{self.base_url}/chapter-detail/{translation_id}/")
+        urls = await asyncio.to_thread(_extract_data_src_urls, html)
+        if not urls:
+            raise SourceError(
+                "source_unavailable",
+                f"no page images found in chapter-detail for {translation_id}",
+            )
+        for url in urls:
+            if not _is_allowed_image_url(url):
+                # Never fetch a non-allowlisted (off-host / off-shape) URL.
+                raise SourceError(
+                    "source_unavailable",
+                    "chapter-detail image URL failed the SSRF allowlist",
+                )
+        if pages is not None and len(urls) != pages:
+            raise SourceError(
+                "source_unavailable",
+                f"manifest integrity: extracted {len(urls)} images, "
+                f"chapter declares {pages} pages",
+            )
+        return urls
 
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's raw bytes via the shared session (PKG-02).

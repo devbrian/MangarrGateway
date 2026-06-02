@@ -48,6 +48,10 @@ from .conftest import BASE_URL, TEST_API_KEY
 # ``warnings[]`` entry instantly (no retry, no real network), keeping the gate
 # deterministic (D-42) while still exercising both sources' contract paths.
 _COMIX_HOST = "comix.to"
+# 07-03: MangaBall is now registered too, so every generated search/getRecent case
+# also fans out to mangaball.net. Stub it to a fast permanent 403 for the same
+# reason as Comix — a per-source warnings[] entry, no retry, no real network.
+_MANGABALL_HOST = "mangaball.net"
 
 # Contract of record lives at the repo root (D-07), copied from .handoff/.
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "manga-gateway.openapi.yaml"
@@ -114,6 +118,7 @@ def _stub_source_hosts() -> Iterator[None]:
             )
         )
         mock.route(host=_COMIX_HOST).mock(return_value=httpx.Response(403))
+        mock.route(host=_MANGABALL_HOST).mock(return_value=httpx.Response(403))
         yield
 
 
