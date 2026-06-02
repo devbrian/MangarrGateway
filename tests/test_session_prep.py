@@ -363,6 +363,19 @@ async def test_session_prep_none_contributes_no_headers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_json_rejects_non_object_body() -> None:
+    """IN-01: a top-level JSON array/scalar body raises a typed SourceError rather
+    than slipping through mis-typed as a ``dict`` and blowing up downstream."""
+    from manga_gateway.framework.errors import SourceError
+
+    transport = _RecordingTransport([httpx.Response(200, json=[1, 2, 3])])
+    ctx = _ctx(transport, session_prep=None)
+    with pytest.raises(SourceError) as ei:
+        await ctx.post_json(_API_URL, data={"q": "x"})
+    assert ei.value.code == "source_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_get_json_still_works_unchanged() -> None:
     transport = _RecordingTransport([httpx.Response(200, json={"data": "ok"})])
     ctx = _ctx(transport, session_prep=None)

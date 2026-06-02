@@ -269,6 +269,24 @@ class SourceContext:
         """
         return await decrypt(self._decrypt_scheme, body, self._decrypt_config or {})
 
+    @staticmethod
+    def _parse_json_object(body: bytes) -> dict[str, Any]:
+        """Parse ``body`` to a JSON object, raising a typed error on a non-object.
+
+        IN-01: the ``get_json``/``post_json``/``get_json_plain`` return type is
+        ``dict[str, Any]``, but ``json.loads`` of a top-level array/scalar body
+        would satisfy that annotation at runtime and only blow up later as an
+        ``AttributeError`` inside ``body.get(...)``. Validate the decoded type here
+        so a malformed envelope surfaces as a typed ``SourceError`` instead.
+        """
+        result = json.loads(body)
+        if not isinstance(result, dict):
+            raise SourceError(
+                "source_unavailable",
+                f"non-object JSON body (got {type(result).__name__})",
+            )
+        return result
+
     # ─────────────────────────── HTTP ───────────────────────────
 
     @tenacity.retry(
@@ -291,7 +309,7 @@ class SourceContext:
         except SourceError:
             self._feed_failure()
             raise
-        result: dict[str, Any] = json.loads(body)
+        result = self._parse_json_object(body)
         self._feed_success()
         return result
 
@@ -320,7 +338,7 @@ class SourceContext:
         except SourceError:
             self._feed_failure()
             raise
-        result: dict[str, Any] = json.loads(body)
+        result = self._parse_json_object(body)
         self._feed_success()
         return result
 
@@ -348,7 +366,7 @@ class SourceContext:
         except SourceError:
             self._feed_failure()
             raise
-        result: dict[str, Any] = json.loads(body)
+        result = self._parse_json_object(body)
         self._feed_success()
         return result
 
