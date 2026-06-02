@@ -9,6 +9,7 @@ dependencies = [
     "camoufox[geoip]==0.4.11",
     "fastapi==0.136.3",
     "httpx==0.28.1",
+    "lxml==6.1.1",
     "patchright==1.60.0",
     "pillow==12.2.0",
     "pydantic==2.13.4",

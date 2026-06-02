@@ -31,6 +31,7 @@ from .framework.proxy import build_proxy
 from .framework.ratelimit import RateLimiter
 from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
+from .framework.session_prep import CsrfBootstrap
 from .framework.transport import HttpxTransport
 from .handles.store import HandleStore
 from .jobs.manager import JobManager
@@ -154,6 +155,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for key in cloudflare_keys
     }
     app.state.source_health = source_health
+    # D-01 session-prep provider: derive the csrf-bootstrap source keys from the
+    # registry the SAME way cf_sources is derived above — anything declaring
+    # ``session_prep == "csrf-bootstrap"`` (MangaBall, Plan 03) needs the framework
+    # CSRF/session-bootstrap seam. Each such source's bootstrap HTML page is its
+    # ``base_url`` (RECON §"Session / CSRF bootstrap": GET any HTML page → harvest the
+    # meta csrf-token + PHPSESSID). Construct ONE shared CsrfBootstrap over the ONE
+    # R1 session (never a second httpx client); construction is cheap and synchronous
+    # — the bootstrap GET is lazy on first use (mirrors the solver's lazy launch).
+    # Before MangaBall registers the key set is empty: prepare() returns None for
+    # every key, so MangaDex/Comix are byte-for-byte unchanged.
+    csrf_bootstrap_keys: dict[str, type] = {
+        key: cls
+        for key, cls in registry.items()
+        if getattr(cls, "session_prep", None) == "csrf-bootstrap"
+    }
+    session_prep = CsrfBootstrap(
+        keys=frozenset(csrf_bootstrap_keys),
+        session=app.state.session,
+        bootstrap_urls={
+            key: cls.base_url for key, cls in csrf_bootstrap_keys.items()
+        },
+    )
+    app.state.session_prep = session_prep
     # Resolve the Cloudflare clearance URL from the first cloudflare-gated source's
     # ``cloudflare_challenge_url`` metadata — the framework solver itself never
     # names a host. If multiple cloudflare sources are registered, the first
@@ -234,6 +258,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings=settings,
         solver=solver,
         source_health=source_health,
+        session_prep=session_prep,
     )
     await job_manager.rehydrate()  # flip in-flight->failed + project rows (PLAT-03)
     # Restart staging sweep (PLAT-03 / T-03-13): clear orphan *.tmp archives left by a

@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from ..framework.ratelimit import RateLimiter
     from ..framework.registry import SourceRegistry
     from ..framework.session import SessionManager
+    from ..framework.session_prep import SessionPrep
     from ..handles.store import HandleStore
     from .store import JobStore
 
@@ -126,6 +127,7 @@ class JobEngine:
         settings: Settings,
         solver: AntiBotSolver | None = None,
         source_health: dict[str, SourceHealth] | None = None,
+        session_prep: SessionPrep | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -137,6 +139,11 @@ class JobEngine:
         # still constructs; a cloudflare* download injects clearance + decrypts).
         self._solver = solver
         self._source_health = source_health or {}
+        # Phase-7 session-prep seam (D-01): the shared CsrfBootstrap provider threaded
+        # from the lifespan so a csrf-bootstrap download (MangaBall) carries the CSRF
+        # token + session cookie on its /api/v1 POSTs. None for the pre-Plan-03 app
+        # (every prepare() returns None → MangaDex/Comix unchanged).
+        self._session_prep = session_prep
 
     async def run(self, job: Job) -> None:
         """Drive ``job`` to ``completed`` or ``failed`` (per-job isolation, D-29).
