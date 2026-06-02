@@ -173,10 +173,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for key, cls in registry.items()
         if getattr(cls, "session_prep", None) == "csrf-bootstrap"
     }
+    # Rate-limit seam — created here (before CsrfBootstrap) so the bootstrap GET can
+    # share the SAME per-source limiter the SourceContext data path uses. One shared
+    # RateLimiter instance for the whole lifespan (CsrfBootstrap + contexts + jobs).
+    app.state.ratelimiter = RateLimiter()
     session_prep = CsrfBootstrap(
         keys=frozenset(csrf_bootstrap_keys),
         session=app.state.session,
         bootstrap_urls={key: cls.base_url for key, cls in csrf_bootstrap_keys.items()},
+        ratelimiter=app.state.ratelimiter,
+        # Same rate the SourceContext keys its limiter on → one shared AsyncLimiter
+        # per source, so the bootstrap/refresh GET counts against the source budget.
+        rates={
+            key: cls.rate_limit_per_minute for key, cls in csrf_bootstrap_keys.items()
+        },
     )
     app.state.session_prep = session_prep
     # Resolve the Cloudflare clearance URL from the first cloudflare-gated source's
@@ -245,7 +255,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
 
     warm_task = asyncio.create_task(_warm_solver())  # non-blocking (Pitfall 3)
-    app.state.ratelimiter = RateLimiter()  # rate-limit seam
+    # (app.state.ratelimiter is created earlier, before CsrfBootstrap, so the
+    # bootstrap GET shares the per-source limiter — see above.)
     app.state.caps_cache = TTLCache(maxsize=1, ttl=_CAPS_TTL_SECONDS)  # PLAT-04
     app.state.handle_store = HandleStore()  # opaque downloadHandle store (HDL-01/02)
     # Download surface: aiosqlite job store + lifespan-owned JobManager (PLAT-03).

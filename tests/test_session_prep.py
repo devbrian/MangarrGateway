@@ -120,6 +120,8 @@ async def test_csrf_bootstrap_captures_token_and_phpsessid() -> None:
         keys={"mangaball"},
         session=SessionManager(transport),  # type: ignore[arg-type]
         bootstrap_urls={"mangaball": _HTML_URL},
+        ratelimiter=RateLimiter(),
+        rates={"mangaball": 6000},
     )
     creds = await prep.prepare("mangaball")
     assert isinstance(creds, SessionCredentials)
@@ -134,6 +136,8 @@ async def test_csrf_bootstrap_caches_until_force_refresh() -> None:
         keys={"mangaball"},
         session=SessionManager(transport),  # type: ignore[arg-type]
         bootstrap_urls={"mangaball": _HTML_URL},
+        ratelimiter=RateLimiter(),
+        rates={"mangaball": 6000},
     )
     first = await prep.prepare("mangaball")
     assert transport.html_gets == 1
@@ -155,6 +159,8 @@ async def test_csrf_bootstrap_returns_none_for_unconfigured_key() -> None:
         keys={"mangaball"},
         session=SessionManager(transport),  # type: ignore[arg-type]
         bootstrap_urls={"mangaball": _HTML_URL},
+        ratelimiter=RateLimiter(),
+        rates={"mangaball": 6000},
     )
     assert await prep.prepare("mangadex") is None
     assert transport.html_gets == 0  # no HTML GET for an unconfigured source
@@ -176,6 +182,8 @@ async def test_csrf_bootstrap_never_logs_token_or_cookie(
         keys={"mangaball"},
         session=SessionManager(transport),  # type: ignore[arg-type]
         bootstrap_urls={"mangaball": _HTML_URL},
+        ratelimiter=RateLimiter(),
+        rates={"mangaball": 6000},
     )
     with caplog.at_level(logging.DEBUG, logger="manga_gateway"):
         await prep.prepare("mangaball")
@@ -183,6 +191,60 @@ async def test_csrf_bootstrap_never_logs_token_or_cookie(
     blob = " ".join(r.getMessage() for r in caplog.records)
     assert _TOKEN not in blob
     assert "secret-sess" not in blob
+
+
+class _SpyLimiter:
+    """Stand-in AsyncLimiter that records how many times it was acquired."""
+
+    def __init__(self) -> None:
+        self.entered = 0
+
+    async def __aenter__(self) -> _SpyLimiter:
+        self.entered += 1
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+class _SpyRateLimiter:
+    """Stand-in RateLimiter recording for_source(key, rate) and serving the spy."""
+
+    def __init__(self, limiter: _SpyLimiter) -> None:
+        self._limiter = limiter
+        self.calls: list[tuple[str, int]] = []
+
+    def for_source(self, source_key: str, rate_per_minute: int) -> _SpyLimiter:
+        self.calls.append((source_key, rate_per_minute))
+        return self._limiter
+
+
+@pytest.mark.asyncio
+async def test_csrf_bootstrap_get_is_gated_by_the_source_limiter() -> None:
+    """The bootstrap/refresh GET must ride the source's per-source AsyncLimiter (the
+    SAME instance the data path uses), not bypass it straight through the transport
+    — otherwise cold-start bootstrap + every CSRF refresh escape the rate-limit
+    contract and can burst under concurrent traffic (CodeRabbit PR#86 finding)."""
+    transport = _RecordingTransport(html_token=_TOKEN, session_cookie="abc123")
+    spy = _SpyLimiter()
+    ratelimiter = _SpyRateLimiter(spy)
+    prep = CsrfBootstrap(
+        keys={"mangaball"},
+        session=SessionManager(transport),  # type: ignore[arg-type]
+        bootstrap_urls={"mangaball": _HTML_URL},
+        ratelimiter=ratelimiter,  # type: ignore[arg-type]
+        rates={"mangaball": 30},
+    )
+    await prep.prepare("mangaball")
+    assert transport.html_gets == 1
+    # The GET was acquired under the limiter, keyed on the source's own rate.
+    assert spy.entered == 1
+    assert ratelimiter.calls == [("mangaball", 30)]
+
+    # A force_refresh GET is ALSO gated (the CSRF-403 refresh path).
+    await prep.prepare("mangaball", force_refresh=True)
+    assert transport.html_gets == 2
+    assert spy.entered == 2
 
 
 def test_session_prep_protocol_is_runtime_checkable() -> None:

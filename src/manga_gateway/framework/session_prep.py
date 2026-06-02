@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
+    from .ratelimit import RateLimiter
     from .session import SessionManager
 
 _log = logging.getLogger("manga_gateway")
@@ -146,10 +147,16 @@ class CsrfBootstrap:
         keys: Iterable[str],
         session: SessionManager,
         bootstrap_urls: Mapping[str, str],
+        ratelimiter: RateLimiter,
+        rates: Mapping[str, int],
     ) -> None:
         self._keys = frozenset(keys)
         self._session = session
         self._bootstrap_urls = dict(bootstrap_urls)
+        # The SAME per-source RateLimiter the SourceContext uses (one shared
+        # instance) so the bootstrap/refresh GET shares the source's token budget.
+        self._ratelimiter = ratelimiter
+        self._rates = dict(rates)
         self._cache: dict[str, SessionCredentials] = {}
 
     async def prepare(
@@ -169,13 +176,23 @@ class CsrfBootstrap:
         return creds
 
     async def _acquire(self, source_key: str) -> SessionCredentials:
-        """GET the bootstrap HTML page → parse the token + harvest the cookie."""
+        """GET the bootstrap HTML page → parse the token + harvest the cookie.
+
+        The GET is gated by the source's per-source ``AsyncLimiter`` (the SAME
+        instance the data-call path uses), so the cold-start bootstrap and every
+        CSRF refresh count against the source's rate budget instead of bursting
+        straight through the transport. The framework's rate-limit contract is
+        "gate at the call site, not via a transport hook" (aiolimiter caveat) — this
+        is that call site for the bootstrap path.
+        """
         url = self._bootstrap_urls.get(source_key)
         if url is None:
             # Defensive: a configured key with no URL is a wiring bug, not a
             # runtime condition — surface it loudly (no credential value leak).
             raise KeyError(f"no bootstrap URL configured for source {source_key!r}")
-        resp = await self._session.transport.request("GET", url)
+        limiter = self._ratelimiter.for_source(source_key, self._rates[source_key])
+        async with limiter:  # gate at CALL SITE (mirror context.py:_request_bytes)
+            resp = await self._session.transport.request("GET", url)
         token = _parse_csrf_token(resp.text)
         if not token:
             raise ValueError(
