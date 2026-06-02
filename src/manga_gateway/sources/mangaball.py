@@ -120,8 +120,11 @@ _RELATIVE_UNIT_SECONDS: dict[str, int] = {
 # Extract it, NEVER reconstruct (CLAUDE.md SSRF) — fetch_manifest re-uses it as the
 # chapter-detail path segment, then SSRF-allowlists every resulting image URL.
 _CHAPTER_DETAIL_HREF_RE = re.compile(r"/chapter-detail/([^/?#]+)/?")
-# Chapter number after a ``Ch.`` / ``Chapter`` label in the anchor text.
-_CHAPTER_NUMBER_RE = re.compile(r"(?:ch(?:apter)?\.?)\s*([\d.]+)", re.IGNORECASE)
+# Chapter number after a ``Ch.`` / ``Chapter`` label in the anchor text. Anchored to
+# a clean ``N`` / ``N.M`` shape (WR-04): a greedy ``[\d.]+`` accepted ``"1.2.3"`` /
+# trailing dots, which ``_parse_decimal`` then rejects → a ``ch-?`` guid or a silent
+# title drop. ``\d+(?:\.\d+)?`` guarantees a ``_parse_decimal``-clean capture.
+_CHAPTER_NUMBER_RE = re.compile(r"(?:ch(?:apter)?\.?)\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 # Flag-image language token: a BCP-47-ish ``xx`` / ``xx-yy`` code (WR-01). The
 # ``last_chapter`` blob is NOT guaranteed to hold only a flag <img> — a preceding
 # group-icon img (``alt="Rayquaza Group"``) would otherwise poison ``language``

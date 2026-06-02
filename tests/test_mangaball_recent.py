@@ -176,6 +176,35 @@ def test_parse_last_chapter_region_subtag_language_accepted() -> None:
     assert parsed["language"] == "pt-br"
 
 
+def test_parse_last_chapter_rejects_trailing_double_dot_number() -> None:
+    """WR-04: a malformed ``Ch. 1.2.3`` must not yield an off-shape number.
+
+    The anchored ``\\d+(?:\\.\\d+)?`` capture stops at ``"1.2"`` rather than greedily
+    grabbing ``"1.2.3"`` (which ``_parse_decimal`` would reject → a ``ch-?`` guid /
+    silent drop). A clean ``N``/``N.M`` capture is guaranteed.
+    """
+    tx_id = "6a1e164ac01e2cf095f75b1a"
+    html = (
+        f'<div><a href="https://mangaball.net/chapter-detail/{tx_id}/">'
+        "Ch. 1.2.3</a></div>"
+    )
+    parsed = _parse_last_chapter(html)
+    assert parsed is not None
+    assert parsed["number"] == "1.2"
+
+
+def test_parse_last_chapter_trailing_dot_number_clean() -> None:
+    """WR-04: ``Ch. 23.`` captures a clean ``"23"`` (no trailing dot)."""
+    tx_id = "6a1e164ac01e2cf095f75b1a"
+    html = (
+        f'<div><a href="https://mangaball.net/chapter-detail/{tx_id}/">'
+        "Ch. 23.</a></div>"
+    )
+    parsed = _parse_last_chapter(html)
+    assert parsed is not None
+    assert parsed["number"] == "23"
+
+
 # ───────────────────────────────── recent() shape ───────────────────────────
 
 
