@@ -89,3 +89,13 @@ class Job:
     # + an additive ALTER migration). Defaulted so existing ``Job(...)`` / test
     # ``_make_job`` call sites that omit it still construct.
     manga_title: str | None = None
+    # The resolved record's declared page count (``ResolutionRecord.page_count``),
+    # forwarded to ``fetch_manifest`` as an integrity hint (#83 / IN-03) so a source
+    # can assert the extracted manifest length matches what search declared. Unlike
+    # ``manga_title`` this is PROJECTION-ONLY (NOT a persisted column, mirroring
+    # ``downloaded_bytes``): the guard is best-effort, so a job rehydrated from SQLite
+    # after a restart carries ``None`` here and the source simply skips the check —
+    # exactly the pre-#83 behavior, no worse — avoiding a schema migration for an
+    # Info-severity guard. Defaulted + placed last so ``store._row_to_job`` (which
+    # does not select it) still constructs a valid ``Job``.
+    page_count: int | None = None

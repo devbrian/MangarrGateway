@@ -181,6 +181,9 @@ class JobManager:
             # #16: the series title lives on the resolved record (SubmitRequest has
             # none); persist it so the engine can bucket mangaId-less grabs per-series.
             manga_title=record.manga_title,
+            # #83/IN-03: carry the record's declared page count so the engine can
+            # forward it to fetch_manifest as an integrity hint (projection-only).
+            page_count=record.page_count,
         )
         try:
             await self._store.insert(job)  # write-through FIRST (Pattern 2)

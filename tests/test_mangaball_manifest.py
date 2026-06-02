@@ -36,20 +36,26 @@ from manga_gateway.sources.mangaball import (
 
 
 class _FakeCtxForManifest:
-    """``SourceContext`` stand-in: serves chapter-detail HTML via get_bytes."""
+    """``SourceContext`` stand-in: serves chapter-detail HTML via get_bytes.
 
-    def __init__(self, detail_html: bytes) -> None:
+    ``expected_pages`` mirrors the real ``SourceContext.expected_pages`` integrity
+    hint the engine forwards on the download path (#83/IN-03); ``None`` (the default)
+    matches the search/recent-without-a-count case where the guard is a no-op.
+    """
+
+    def __init__(self, detail_html: bytes, expected_pages: int | None = None) -> None:
         self.handle_store = HandleStore()
         self._detail_html = detail_html
         self.get_calls: list[str] = []
+        self.expected_pages = expected_pages
 
     async def get_bytes(self, url: str) -> bytes:
         self.get_calls.append(url)
         return self._detail_html
 
 
-def _ctx(detail_html: bytes) -> Any:
-    return _FakeCtxForManifest(detail_html)
+def _ctx(detail_html: bytes, expected_pages: int | None = None) -> Any:
+    return _FakeCtxForManifest(detail_html, expected_pages)
 
 
 def _page_url(host: str, tx_id: str, n: int, lang: str = "en") -> str:
@@ -254,6 +260,43 @@ async def test_fetch_manifest_pages_count_mismatch_raises() -> None:
     with pytest.raises(SourceError) as excinfo:
         await source._manifest_for_translation(tx_id, 5, ctx)
     assert excinfo.value.code == "source_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_engages_pages_guard_via_expected_pages() -> None:
+    """#83/IN-03: ``fetch_manifest`` (the search/recent entry) now engages the
+    integrity guard from ``ctx.expected_pages`` — a mismatch raises. Before the fix
+    ``fetch_manifest`` passed ``pages=None`` so a truncated/over-stuffed
+    chapter-detail DOM on a search-grabbed chapter was never caught."""
+    tx_id = "6a1e164ac01e2cf095f75b1a"
+    # The engine forwards the record's declared 5 pages; the DOM only has 3.
+    ctx = _ctx(_detail_html("chikorita.red-and-blue.net", tx_id, 3), expected_pages=5)
+    source = MangaBallSource()
+    with pytest.raises(SourceError) as excinfo:
+        await source.fetch_manifest(tx_id, ctx)
+    assert excinfo.value.code == "source_unavailable"
+    assert "integrity" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_expected_pages_match_passes() -> None:
+    """The guard is satisfied when ``ctx.expected_pages`` equals the extracted count."""
+    tx_id = "6a1e164ac01e2cf095f75b1a"
+    ctx = _ctx(_detail_html("chikorita.red-and-blue.net", tx_id, 3), expected_pages=3)
+    source = MangaBallSource()
+    urls = await source.fetch_manifest(tx_id, ctx)
+    assert len(urls) == 3
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_expected_pages_none_skips_guard() -> None:
+    """``expected_pages=None`` (search recorded no count, or a post-restart rehydrated
+    job) degrades the guard to a no-op — extraction still succeeds."""
+    tx_id = "6a1e164ac01e2cf095f75b1a"
+    ctx = _ctx(_detail_html("chikorita.red-and-blue.net", tx_id, 3))  # expected=None
+    source = MangaBallSource()
+    urls = await source.fetch_manifest(tx_id, ctx)
+    assert len(urls) == 3
 
 
 @pytest.mark.asyncio
