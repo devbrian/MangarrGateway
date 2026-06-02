@@ -17,7 +17,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cachetools import TTLCache
 from fastapi import Depends, FastAPI
@@ -38,6 +38,9 @@ from .jobs.manager import JobManager
 from .jobs.store import open_store
 from .security import require_api_key
 from .sources import register_builtin_sources
+
+if TYPE_CHECKING:
+    from .framework.base import Source
 
 # 12h caps TTL (PLAT-04).
 _CAPS_TTL_SECONDS = 43_200
@@ -165,7 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # — the bootstrap GET is lazy on first use (mirrors the solver's lazy launch).
     # Before MangaBall registers the key set is empty: prepare() returns None for
     # every key, so MangaDex/Comix are byte-for-byte unchanged.
-    csrf_bootstrap_keys: dict[str, type] = {
+    csrf_bootstrap_keys: dict[str, type[Source]] = {
         key: cls
         for key, cls in registry.items()
         if getattr(cls, "session_prep", None) == "csrf-bootstrap"
@@ -173,9 +176,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     session_prep = CsrfBootstrap(
         keys=frozenset(csrf_bootstrap_keys),
         session=app.state.session,
-        bootstrap_urls={
-            key: cls.base_url for key, cls in csrf_bootstrap_keys.items()
-        },
+        bootstrap_urls={key: cls.base_url for key, cls in csrf_bootstrap_keys.items()},
     )
     app.state.session_prep = session_prep
     # Resolve the Cloudflare clearance URL from the first cloudflare-gated source's

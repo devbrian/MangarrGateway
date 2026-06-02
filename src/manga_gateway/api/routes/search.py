@@ -21,6 +21,7 @@ from ...deps import (
     get_ratelimiter,
     get_registry,
     get_session,
+    get_session_prep,
     get_solver,
     get_source_health,
 )
@@ -36,6 +37,7 @@ from ...framework.health import SourceHealth
 from ...framework.ratelimit import RateLimiter
 from ...framework.registry import SourceRegistry
 from ...framework.session import SessionManager
+from ...framework.session_prep import SessionPrep
 from ...handles.store import HandleStore
 from ...models.search import (
     Release,
@@ -98,6 +100,7 @@ async def search(
     handle_store: Annotated[HandleStore, Depends(get_handle_store)],
     solver: Annotated[AntiBotSolver, Depends(get_solver)],
     health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
+    session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
 ) -> ReleaseListResponse | JSONResponse:
     """Fan out the search across selected sources; isolate failures into warnings[]."""
     # SRCH-05 / D-23: neither query nor a usable id → 400 bad_request.
@@ -130,6 +133,7 @@ async def search(
             decrypt_scheme=src.decrypt_scheme,
             decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
             source_health=health_map.get(src.key),
+            session_prep=session_prep,
         )
         started = time.perf_counter()
         releases = await src.search(req, ctx)

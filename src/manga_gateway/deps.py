@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from .framework.ratelimit import RateLimiter
     from .framework.registry import SourceRegistry
     from .framework.session import SessionManager
+    from .framework.session_prep import SessionPrep
     from .framework.transport import Transport
     from .handles.store import HandleStore
     from .jobs.manager import JobManager
@@ -55,6 +56,22 @@ def get_source_health(request: Request) -> dict[str, SourceHealth]:
     """
     health: dict[str, SourceHealth] = getattr(request.app.state, "source_health", {})
     return health
+
+
+def get_session_prep(request: Request) -> SessionPrep:
+    """The lifespan-owned shared session-prep provider (D-01, Phase 7).
+
+    Mirrors ``get_solver`` but tolerates the pre-Plan-02 app: until the lifespan
+    wires ``app.state.session_prep`` (the shared ``CsrfBootstrap``) this falls back
+    to a ``NoSessionPrep`` so every ``prepare(key)`` returns ``None`` — MangaDex/
+    Comix contribute no CSRF header and stay byte-for-byte unchanged.
+    """
+    from .framework.session_prep import NoSessionPrep  # noqa: PLC0415
+
+    provider: SessionPrep = (
+        getattr(request.app.state, "session_prep", None) or NoSessionPrep()
+    )
+    return provider
 
 
 def get_ratelimiter(request: Request) -> RateLimiter:

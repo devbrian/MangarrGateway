@@ -21,16 +21,22 @@ from ...deps import (
     get_ratelimiter,
     get_registry,
     get_session,
+    get_session_prep,
+    get_solver,
+    get_source_health,
 )
-from ...framework.context import SourceContext
-from ...framework.fanout import fan_out
 
 # Runtime imports: FastAPI resolves the route's Annotated[T, Depends(...)] types at
 # import time (``from __future__ import annotations`` makes them strings), so the
 # dependency types cannot live under TYPE_CHECKING (Plan 01 deviation precedent).
+from ...framework.antibot import AntiBotSolver
+from ...framework.context import SourceContext
+from ...framework.fanout import fan_out
+from ...framework.health import SourceHealth
 from ...framework.ratelimit import RateLimiter
 from ...framework.registry import SourceRegistry
 from ...framework.session import SessionManager
+from ...framework.session_prep import SessionPrep
 from ...handles.store import HandleStore
 from ...models.search import Release, ReleaseListResponse, SourceWarning
 
@@ -115,6 +121,9 @@ async def get_recent(
     ratelimiter: Annotated[RateLimiter, Depends(get_ratelimiter)],
     registry: Annotated[SourceRegistry, Depends(get_registry)],
     handle_store: Annotated[HandleStore, Depends(get_handle_store)],
+    solver: Annotated[AntiBotSolver, Depends(get_solver)],
+    health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
+    session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
     sources: Annotated[str | None, Query(description="CSV of source keys")] = None,
     languages: Annotated[str | None, Query(description="CSV of BCP-47 codes")] = None,
     limit: Annotated[str | None, Query(description="Max items; clamped <=100")] = None,
@@ -129,12 +138,25 @@ async def get_recent(
     selected = _select_sources(registry, source_keys)
 
     async def _run_one(src: Source) -> list[Release]:
+        # RESEARCH Pitfall 3: this build was previously DROPPING solver/antibot/
+        # decrypt_scheme/decrypt_config/source_health — a cloudflare* or csrf-bootstrap
+        # /recent fan-out went out with no credentials → 403. Bring it to FULL kwarg
+        # parity with search.py:_run_one and engine._build_context. Copy decrypt_config
+        # per request so a scheme mutating its config cannot leak state across
+        # concurrent requests via the source CLASS attribute (search.py discipline).
+        src_decrypt_config = getattr(src, "decrypt_config", None)
         ctx = SourceContext(
             source_key=src.key,
             rate_limit_per_minute=src.rate_limit_per_minute,
             session=session,
             ratelimiter=ratelimiter,
             handle_store=handle_store,
+            solver=solver,
+            antibot=src.antibot,
+            decrypt_scheme=src.decrypt_scheme,
+            decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
+            source_health=health_map.get(src.key),
+            session_prep=session_prep,
         )
         return await src.recent(
             languages=language_list,
