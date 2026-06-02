@@ -346,10 +346,12 @@ class _KeyAwareBrowser:
         await asyncio.sleep(self._solve_delay)
         # Bind the clearance value to the key so distinct keys yield distinct
         # clearances (proves the per-key cache is not cross-contaminated).
-        return Clearance(cookies={"cf_clearance": f"TOKEN-{key}"}, user_agent=f"UA-{key}")
+        return Clearance(
+            cookies={"cf_clearance": f"TOKEN-{key}"}, user_agent=f"UA-{key}"
+        )
 
 
-async def test_two_keys_yield_two_independent_clearances_each_own_single_flight() -> None:
+async def test_two_keys_yield_independent_clearances_each_own_single_flight() -> None:
     """Two distinct cf keys → two independent clearances, each with its OWN
     single-flight: concurrent callers of the SAME key collapse to one solve,
     while a different key solves independently (#88)."""
