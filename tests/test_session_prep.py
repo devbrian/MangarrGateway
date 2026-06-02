@@ -207,6 +207,25 @@ def test_is_csrf_failure_predicate() -> None:
     assert is_csrf_failure(ok_200) is False
 
 
+def test_is_csrf_failure_broadened_marker_tolerant() -> None:
+    """WR-04: the marker match is case-insensitive and tolerant of casing /
+    escaping / localized wording (lowercased ``csrf`` + ``token``/``validation``)."""
+    req = httpx.Request("POST", _API_URL)
+    # Differently-cased / re-worded.
+    assert is_csrf_failure(
+        httpx.Response(403, text="The CSRF Token is invalid", request=req)
+    )
+    # JSON-escaped with extra whitespace.
+    assert is_csrf_failure(
+        httpx.Response(403, json={"detail": "csrf  validation error"}, request=req)
+    )
+    # A 403 mentioning csrf but with NEITHER token nor validation does not match
+    # (avoids over-matching unrelated bodies).
+    assert not is_csrf_failure(
+        httpx.Response(403, text="see our csrf docs", request=req)
+    )
+
+
 class _CredsPrep:
     """Minimal SessionPrep returning fixed credentials (no HTML GET)."""
 

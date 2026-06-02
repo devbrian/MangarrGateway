@@ -76,16 +76,24 @@ def is_csrf_failure(resp: httpx.Response) -> bool:
     """True when ``resp`` is a stale-CSRF-token rejection (D-03, MangaBall seam).
 
     The httpx-form-POST analog of :func:`is_cf_challenge`: a 403 whose body carries
-    the CSRF-validation marker means the gateway's held token went stale (the token
+    a CSRF-validation marker means the gateway's held token went stale (the token
     is session-bound, no assumed TTL — RECON §"Session / CSRF bootstrap"), so the
     session-prep provider should refresh + retry ONCE before the permanent-4xx STOP.
     A plain 403 (no marker) is NOT a CSRF failure — it stays terminal (D-03: the CF
     and CSRF branches are independent; a non-marker 403 retries on neither path).
-    The marker may widen later if live-verify (Plan 04) reveals another phrasing.
+
+    WR-04: the marker phrasing is not yet live-verified, so match defensively —
+    case-insensitive, and tolerant of escaping/casing/localized wording — by
+    requiring a lowercased ``csrf`` co-occurring with ``token`` or ``validation``.
+    This catches the JSON-escaped / differently-cased / whitespace-padded variants
+    a lexical ``b"CSRF token validation failed"`` substring match would miss, while
+    the two-term co-occurrence avoids matching unrelated 403 bodies that merely
+    mention "csrf" in passing.
     """
     if resp.status_code != 403:
         return False
-    return b"CSRF token validation failed" in resp.content
+    body = resp.content.lower()
+    return b"csrf" in body and (b"token" in body or b"validation" in body)
 
 
 def _is_retryable(exc: BaseException) -> bool:
