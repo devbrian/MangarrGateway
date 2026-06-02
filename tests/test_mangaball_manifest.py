@@ -88,6 +88,29 @@ def test_is_allowed_image_url_rejects_empty_host() -> None:
     assert not _is_allowed_image_url("https:///storage/t/0/23/g/vi/x-001.jpg")
 
 
+def test_is_allowed_image_url_rejects_path_traversal() -> None:
+    """CR-01: a raw ``/storage/..`` path matches the regex but httpx fetches the
+    NORMALIZED path off-shape — the guard must reject the traversal vector."""
+    # Raw path matches _MANGABALL_IMG_PATH_RE; httpx would fetch /etc/passwd-001.jpg.
+    assert not _is_allowed_image_url(
+        "https://cdn.example.net/storage/../../../etc/passwd-001.jpg"
+    )
+    # A single-segment traversal that still ends in the allowed shape after the
+    # ``..`` is also rejected (normalized path escapes /storage/).
+    assert not _is_allowed_image_url(
+        "https://cdn.example.net/storage/a/b/../../../../x-001.jpg"
+    )
+
+
+def test_is_allowed_image_url_rejects_internal_metadata_hosts() -> None:
+    """CR-01: the broad host regex matches ``metadata.google.internal`` and the
+    like — internal/metadata namespaces must be rejected (cloud-metadata SSRF)."""
+    base = "/storage/t/0/23/g/vi/6a1e164ac01e2cf095f75b1a-001.jpg"
+    assert not _is_allowed_image_url(f"https://metadata.google.internal{base}")
+    assert not _is_allowed_image_url(f"https://internal.corp.local{base}")
+    assert not _is_allowed_image_url(f"https://foo.localhost{base}")
+
+
 # ───────────────────────────── fetch_manifest (search path) ─────────────────
 
 

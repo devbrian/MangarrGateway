@@ -52,6 +52,7 @@ mints a ``:DEFERRED`` composite resolved at ``fetch_manifest`` time (D-10).
 from __future__ import annotations
 
 import asyncio
+import posixpath
 import re
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
@@ -103,6 +104,10 @@ _MANGABALL_IMG_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _MANGABALL_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECASE)
+# Internal/metadata host suffixes that the broad host regex would otherwise accept
+# (``metadata.google.internal``, ``foo.local`` etc.). The host is NOT pinned to a
+# literal, so we must reject the non-public namespaces explicitly (CR-01 / SSRF).
+_MANGABALL_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
 
 
 def _items_and_pagination(
@@ -300,17 +305,32 @@ def _is_allowed_image_url(url: str) -> bool:
 
     Belt-and-suspenders defence on every DOM-extracted manifest URL before the
     framework fetches it (T-07-07/T-07-09). Rejects non-HTTPS schemes, empty /
-    malformed hosts, and any path that does not match the observed
-    ``/storage/.../{id}-{NNN}.jpg`` shape. The host is NOT pinned to a literal —
-    the MangaBall CDN host varies per content (RECON §4) — so the path shape +
-    ``https`` carry the guard.
+    malformed hosts, internal/metadata hostnames, path-traversal, and any path
+    that does not match the observed ``/storage/.../{id}-{NNN}.jpg`` shape. The
+    host is NOT pinned to a literal — the MangaBall CDN host varies per content
+    (RECON §4) — so the path shape + ``https`` + host-namespace guard carry it.
+
+    CR-01: validate the path httpx will ACTUALLY fetch, not the raw one. httpx
+    normalizes ``..`` segments before issuing the request, so a raw path like
+    ``/storage/../../etc/passwd-001.jpg`` would match the allowlist regex yet
+    fetch ``/etc/passwd-001.jpg`` on that host. We reject any literal ``..``
+    segment outright AND validate the ``posixpath.normpath``-resolved path. We
+    also reject internal/non-public host namespaces (``.internal``/``.local``/
+    ``.localhost``) and bare dotless hostnames (no public-TLD shape), which the
+    broad host regex alone would accept (e.g. ``metadata.google.internal``).
     """
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
+    if host.endswith(_MANGABALL_INTERNAL_HOST_SUFFIXES):
+        return False
+    # Reject traversal outright; validate the NORMALIZED path httpx will fetch.
+    if ".." in parsed.path.split("/"):
+        return False
+    norm_path = posixpath.normpath(parsed.path)
     return (
         parsed.scheme == "https"
         and bool(_MANGABALL_HOST_RE.match(host))
-        and bool(_MANGABALL_IMG_PATH_RE.match(parsed.path))
+        and bool(_MANGABALL_IMG_PATH_RE.match(norm_path))
     )
 
 
