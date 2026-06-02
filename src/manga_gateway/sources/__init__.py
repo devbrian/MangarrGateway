@@ -20,7 +20,9 @@ def register_builtin_sources(registry: SourceRegistry) -> None:
     from .comix import ComixSource
     from .mangaball import MangaBallSource
     from .mangadex import MangaDexSource
+    from .mangadot import MangadotSource
 
     registry.register("mangadex")(MangaDexSource)
     registry.register("comix")(ComixSource)
     registry.register("mangaball")(MangaBallSource)
+    registry.register("mangadot")(MangadotSource)
