@@ -287,6 +287,27 @@ class SourceContext:
             )
         return result
 
+    @staticmethod
+    def _parse_json_array(body: bytes) -> list[Any]:
+        """Parse ``body`` to a top-level JSON array, raising on a non-array.
+
+        The list-bodied twin of :meth:`_parse_json_object` (IN-01): the
+        ``get_json_array`` return type is ``list[Any]``, but ``json.loads`` of a
+        top-level object/scalar body would satisfy that annotation at runtime and
+        only blow up later as a ``TypeError`` when the source iterates the rows.
+        Validate the decoded type here so a malformed body surfaces as a typed
+        ``SourceError`` instead. Used for bare-array endpoints like mangadot's
+        ``GET /api/manga/{id}/chapters/list`` which return ``[{…}, …]`` rather
+        than the ``{data:[…]}`` envelope every other JSON method expects.
+        """
+        result = json.loads(body)
+        if not isinstance(result, list):
+            raise SourceError(
+                "source_unavailable",
+                f"non-array JSON body (got {type(result).__name__})",
+            )
+        return result
+
     # ─────────────────────────── HTTP ───────────────────────────
 
     @tenacity.retry(
@@ -310,6 +331,36 @@ class SourceContext:
             self._feed_failure()
             raise
         result = self._parse_json_object(body)
+        self._feed_success()
+        return result
+
+    @tenacity.retry(
+        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
+        stop=tenacity.stop_after_attempt(4),
+        retry=tenacity.retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+    async def get_json_array(self, url: str, **params: Any) -> list[Any]:
+        """GET ``url`` with ``params`` → parsed top-level JSON ARRAY, like
+        :meth:`get_json` but parsing a bare list body rather than an object.
+
+        Some endpoints return a bare top-level JSON array (mangadot's
+        ``GET /api/manga/{id}/chapters/list`` → ``[{…}, …]``) which
+        :meth:`_parse_json_object` rejects. This method is byte-for-byte the
+        ``get_json`` transport path — the SAME call-site rate limit
+        (``_request_bytes(..., limited=True)``), clearance injection (D-40),
+        challenge-403 single re-solve + retry (D-35), tenacity retry, decrypt
+        seam (D-39; identity for plaintext sources), and health feed (D-36) —
+        differing ONLY in the final parse (:meth:`_parse_json_array`, which
+        raises ``SourceError`` on a non-array body). Additive: the existing
+        object-bodied call paths (comix/mangadex/mangaball) are untouched.
+        """
+        try:
+            body = await self._request_bytes(url, params=params, limited=True)
+        except SourceError:
+            self._feed_failure()
+            raise
+        result = self._parse_json_array(body)
         self._feed_success()
         return result
 
