@@ -265,7 +265,11 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     yields 3 releases AND mints exactly 3 handles, all of which still resolve.
     """
     rows = [
-        _row(chapter_id=f"c{n}", chapter_number=n, date_added=f"2026-05-01 {n:02d}:00:00+00")
+        _row(
+            chapter_id=f"c{n}",
+            chapter_number=n,
+            date_added=f"2026-05-01 {n:02d}:00:00+00",
+        )
         for n in range(1, 41)
     ]
     ctx = _ctx(manga_list=[_manga(manga_id="20277")], listings={"20277": rows})
@@ -293,8 +297,6 @@ async def test_search_empty_results_returns_no_releases() -> None:
 @pytest.mark.asyncio
 async def test_recent_is_noop() -> None:
     ctx = _ctx(manga_list=[])
-    out = await MangadotSource().recent(
-        languages=None, limit=50, since=None, ctx=ctx
-    )
+    out = await MangadotSource().recent(languages=None, limit=50, since=None, ctx=ctx)
     assert out == []
     assert MangadotSource.supports_recent is False

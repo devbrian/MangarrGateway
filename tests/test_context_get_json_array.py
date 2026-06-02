@@ -185,9 +185,7 @@ async def test_get_json_array_permanent_403_stops_and_feeds_failure() -> None:
     transport = _RecordingTransport([httpx.Response(403, request=req)])  # no CF markers
     solver = _CountingSolver()
     health = SourceHealth(threshold=3)
-    ctx = _ctx(
-        transport, antibot="cloudflare", solver=solver, source_health=health
-    )
+    ctx = _ctx(transport, antibot="cloudflare", solver=solver, source_health=health)
 
     with pytest.raises(SourceError):
         await ctx.get_json_array(_LIST_URL)
