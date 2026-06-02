@@ -9,6 +9,7 @@ dependencies = [
     "camoufox[geoip]==0.4.11",
     "fastapi==0.136.3",
     "httpx==0.28.1",
+    "lxml==6.1.1",
     "patchright==1.60.0",
     "pillow==12.2.0",
     "pydantic==2.13.4",
@@ -71,6 +72,13 @@ packages = ["manga_gateway"]
 # schemathesis ships partial stubs; relax strictness for the contract harness.
 module = ["tests.test_contract"]
 disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+# lxml (6.1.1) ships no type stubs and lxml-stubs is not a project dependency;
+# the MangaBall manifest parse (sources/mangaball.py) is the only consumer.
+# Treat the import as untyped rather than pulling a stubs package into the tree.
+module = ["lxml.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

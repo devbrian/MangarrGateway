@@ -17,7 +17,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cachetools import TTLCache
 from fastapi import Depends, FastAPI
@@ -31,12 +31,16 @@ from .framework.proxy import build_proxy
 from .framework.ratelimit import RateLimiter
 from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
+from .framework.session_prep import CsrfBootstrap
 from .framework.transport import HttpxTransport
 from .handles.store import HandleStore
 from .jobs.manager import JobManager
 from .jobs.store import open_store
 from .security import require_api_key
 from .sources import register_builtin_sources
+
+if TYPE_CHECKING:
+    from .framework.base import Source
 
 # 12h caps TTL (PLAT-04).
 _CAPS_TTL_SECONDS = 43_200
@@ -154,6 +158,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for key in cloudflare_keys
     }
     app.state.source_health = source_health
+    # D-01 session-prep provider: derive the csrf-bootstrap source keys from the
+    # registry the SAME way cf_sources is derived above — anything declaring
+    # ``session_prep == "csrf-bootstrap"`` (MangaBall, Plan 03) needs the framework
+    # CSRF/session-bootstrap seam. Each such source's bootstrap HTML page is its
+    # ``base_url`` (RECON §"Session / CSRF bootstrap": GET any HTML page → harvest the
+    # meta csrf-token + PHPSESSID). Construct ONE shared CsrfBootstrap over the ONE
+    # R1 session (never a second httpx client); construction is cheap and synchronous
+    # — the bootstrap GET is lazy on first use (mirrors the solver's lazy launch).
+    # Before MangaBall registers the key set is empty: prepare() returns None for
+    # every key, so MangaDex/Comix are byte-for-byte unchanged.
+    csrf_bootstrap_keys: dict[str, type[Source]] = {
+        key: cls
+        for key, cls in registry.items()
+        if getattr(cls, "session_prep", None) == "csrf-bootstrap"
+    }
+    # Rate-limit seam — created here (before CsrfBootstrap) so the bootstrap GET can
+    # share the SAME per-source limiter the SourceContext data path uses. One shared
+    # RateLimiter instance for the whole lifespan (CsrfBootstrap + contexts + jobs).
+    app.state.ratelimiter = RateLimiter()
+    session_prep = CsrfBootstrap(
+        keys=frozenset(csrf_bootstrap_keys),
+        session=app.state.session,
+        bootstrap_urls={key: cls.base_url for key, cls in csrf_bootstrap_keys.items()},
+        ratelimiter=app.state.ratelimiter,
+        # Same rate the SourceContext keys its limiter on → one shared AsyncLimiter
+        # per source, so the bootstrap/refresh GET counts against the source budget.
+        rates={
+            key: cls.rate_limit_per_minute for key, cls in csrf_bootstrap_keys.items()
+        },
+    )
+    app.state.session_prep = session_prep
     # Resolve the Cloudflare clearance URL from the first cloudflare-gated source's
     # ``cloudflare_challenge_url`` metadata — the framework solver itself never
     # names a host. If multiple cloudflare sources are registered, the first
@@ -220,7 +255,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
 
     warm_task = asyncio.create_task(_warm_solver())  # non-blocking (Pitfall 3)
-    app.state.ratelimiter = RateLimiter()  # rate-limit seam
+    # (app.state.ratelimiter is created earlier, before CsrfBootstrap, so the
+    # bootstrap GET shares the per-source limiter — see above.)
     app.state.caps_cache = TTLCache(maxsize=1, ttl=_CAPS_TTL_SECONDS)  # PLAT-04
     app.state.handle_store = HandleStore()  # opaque downloadHandle store (HDL-01/02)
     # Download surface: aiosqlite job store + lifespan-owned JobManager (PLAT-03).
@@ -234,6 +270,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings=settings,
         solver=solver,
         source_health=source_health,
+        session_prep=session_prep,
     )
     await job_manager.rehydrate()  # flip in-flight->failed + project rows (PLAT-03)
     # Restart staging sweep (PLAT-03 / T-03-13): clear orphan *.tmp archives left by a
