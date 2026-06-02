@@ -39,7 +39,7 @@ class _LaunchFn(Protocol):
 
 
 class _SolveFn(Protocol):
-    def __call__(self, context: Any) -> Awaitable[Clearance]: ...
+    def __call__(self, context: Any, key: str) -> Awaitable[Clearance]: ...
 
 
 class BrowserLifecycle:
@@ -47,8 +47,11 @@ class BrowserLifecycle:
 
     Args:
         launch: async ``() -> context`` — launches the persistent context.
-        solve: async ``(context) -> Clearance`` — drives the challenge solve and
-            captures the cf_clearance cookie + UA from that same session.
+        solve: async ``(context, key) -> Clearance`` — drives the challenge solve
+            for ``key`` and captures the cf_clearance cookie + UA from that same
+            session. The ``key`` (a ``source_key``) selects the per-domain
+            challenge URL so each cloudflare-gated source captures only its own
+            host-scoped cookies (#88).
         solve_concurrency: max simultaneous solves (the solve-cap semaphore).
         recycle_seconds: cadence for the recycle watchdog; ``None`` disables it.
     """
@@ -57,7 +60,7 @@ class BrowserLifecycle:
         self,
         *,
         launch: Callable[[], Awaitable[Any]],
-        solve: Callable[[Any], Awaitable[Clearance]],
+        solve: Callable[[Any, str], Awaitable[Clearance]],
         solve_concurrency: int = 1,
         recycle_seconds: float | None = None,
     ) -> None:
@@ -67,8 +70,12 @@ class BrowserLifecycle:
         self._recycle_seconds = recycle_seconds
         self._context: Any = None
         self._context_lock = asyncio.Lock()  # guards launch/recycle of the context
-        self._inflight: asyncio.Future[Clearance] | None = None  # single-flight
-        self._held: Clearance | None = None  # D-35: reuse last-good until challenged
+        # Per-key single-flight + held clearance (#88): N cloudflare-gated sources
+        # each get their OWN in-flight future and held Clearance, keyed by
+        # ``source_key``. With exactly one cf key (comix today) these dicts
+        # collapse to the historic single-value behavior.
+        self._inflight: dict[str, asyncio.Future[Clearance]] = {}  # single-flight/key
+        self._held: dict[str, Clearance] = {}  # D-35: reuse last-good until challenged
         self._recycle_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -94,13 +101,16 @@ class BrowserLifecycle:
     async def _close_context(self) -> None:
         """Close the persistent context if one is live (idempotent, error-tolerant).
 
-        Also clears the held :class:`Clearance` — the cached cookies + UA are
-        bound to the torn-down browser session, so the next caller must re-solve
-        against the freshly launched context (D-35).
+        Also clears EVERY held :class:`Clearance` — every cached clearance's
+        cookies + UA are bound to the torn-down shared browser session, so the
+        next caller of any key must re-solve against the freshly launched
+        context (D-35 / #88). Clears the dict in place (NOT ``= None``): a
+        half-cleared ``_held`` would hand a torn-down session's cookies to the
+        next caller (RESEARCH Pitfall 3).
         """
         ctx = self._context
         self._context = None
-        self._held = None
+        self._held.clear()
         if ctx is not None:
             with contextlib.suppress(Exception):
                 await ctx.close()
@@ -125,57 +135,66 @@ class BrowserLifecycle:
 
     # ─────────────────────────── solve ───────────────────────────
 
-    async def solve(self, *, force: bool = False) -> Clearance:
-        """Return a :class:`Clearance`, collapsing concurrent callers (single-flight).
+    async def solve(self, key: str, *, force: bool = False) -> Clearance:
+        """Return a :class:`Clearance` for ``key``, collapsing concurrent callers.
 
-        Non-``force`` callers reuse the last-good :class:`Clearance` if one is
-        held (D-35: hold until a request returns a CF challenge or the cookie is
-        rejected; no proactive TTL). If no clearance is held, non-``force``
-        callers that arrive while a solve is already in flight await that SAME
-        solve (Pitfall 6). A ``force``ed solve (the D-35 re-solve) always runs
-        its own solve under the solve-cap semaphore and replaces the held
-        clearance on success.
+        Per-key single-flight (#88): N cloudflare-gated sources each get their
+        OWN held clearance + in-flight future, keyed by ``source_key``.
+        Concurrent callers of the SAME key collapse to ONE underlying solve;
+        distinct keys solve independently.
+
+        Non-``force`` callers reuse the last-good :class:`Clearance` for ``key``
+        if one is held (D-35: hold until a request returns a CF challenge or the
+        cookie is rejected; no proactive TTL). If no clearance is held for
+        ``key``, non-``force`` callers that arrive while a solve for that key is
+        already in flight await that SAME solve (Pitfall 6). A ``force``ed solve
+        (the D-35 re-solve) always runs its own solve under the (shared)
+        solve-cap semaphore and replaces the held clearance for ``key`` on
+        success.
         """
         if not force:
-            # Fast path: reuse the last-good clearance until a caller forces a
-            # re-solve or _close_context() (recycle/aclose) invalidates it.
-            held = self._held
+            # Fast path: reuse the last-good clearance for this key until a
+            # caller forces a re-solve or _close_context() (recycle/aclose)
+            # invalidates the whole dict.
+            held = self._held.get(key)
             if held is not None:
                 return held
             # Snapshot the inflight future BEFORE awaiting so the leader's
-            # ``finally`` cannot clear it to ``None`` between the .done()
-            # check and the await (single-flight race).
-            inflight = self._inflight
+            # ``finally`` cannot pop it between the .done() check and the await
+            # (single-flight race), scoped per-key.
+            inflight = self._inflight.get(key)
             if inflight is not None and not inflight.done():
                 return await inflight
 
         if force:
-            clearance = await self._run_solve()
-            self._held = clearance  # D-35 re-solve replaces the cached value
+            clearance = await self._run_solve(key)
+            self._held[key] = clearance  # D-35 re-solve replaces the cached value
             return clearance
 
-        # Become the single-flight leader: publish a Future others can await.
+        # Become the single-flight leader for this key: publish a Future others
+        # awaiting the same key can collapse onto.
         loop = asyncio.get_running_loop()
-        self._inflight = loop.create_future()
+        future = loop.create_future()
+        self._inflight[key] = future
         try:
-            clearance = await self._run_solve()
+            clearance = await self._run_solve(key)
         except BaseException as exc:  # propagate to every awaiter, then re-raise
-            if self._inflight is not None and not self._inflight.done():
-                self._inflight.set_exception(exc)
+            if not future.done():
+                future.set_exception(exc)
             raise
         else:
-            self._held = clearance  # cache for subsequent non-forced callers
-            if self._inflight is not None and not self._inflight.done():
-                self._inflight.set_result(clearance)
+            self._held[key] = clearance  # cache for subsequent non-forced callers
+            if not future.done():
+                future.set_result(clearance)
             return clearance
         finally:
-            self._inflight = None
+            self._inflight.pop(key, None)
 
-    async def _run_solve(self) -> Clearance:
-        """Acquire the solve-cap semaphore, ensure a context, and solve."""
+    async def _run_solve(self, key: str) -> Clearance:
+        """Acquire the solve-cap semaphore, ensure a context, and solve ``key``."""
         async with self._sem:
             ctx = await self._ensure_context()
-            return await self._solve(ctx)
+            return await self._solve(ctx, key)
 
     # ─────────────────────────── recycle watchdog ───────────────────────────
 
