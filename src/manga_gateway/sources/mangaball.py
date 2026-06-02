@@ -105,10 +105,19 @@ _TS_FLOOR = datetime.min.replace(tzinfo=UTC)
 # Relative-time parse for the recent feed's ``last_chapter`` dates ("1d ago",
 # "3h ago", "5m ago"). Best-effort → absolute ISO publishDate (see
 # :func:`_relative_to_iso`). Dates in the recent feed are RELATIVE (GAP-1 probe).
-_RELATIVE_AGO_RE = re.compile(r"(\d+)\s*(mo|[smhdwy])\b", re.IGNORECASE)
+# WR-02: the unit alternation tries the LONGER tokens first (``mo``/``min`` before
+# the bare ``m``) so ``"2mo ago"`` → months and ``"5min ago"`` → minutes regardless
+# of the bare-``m`` mapping. OBSERVED convention (GAP-1 recon TL;DR sampled
+# ``1d/3h/5m``): a bare ``m`` is MINUTES on MangaBall, months render as ``mo``. If a
+# live re-run shows MangaBall rendering months as a bare ``2m`` instead, remap the
+# bare ``"m"`` below to months — the explicit ``min`` token already covers minutes
+# so the swap is isolated to one entry. The approximation is intentional and coarse
+# (units like ``mo`` ≈ 30d); the route's ``since`` cut is the authoritative filter.
+_RELATIVE_AGO_RE = re.compile(r"(\d+)\s*(mo|min|[smhdwy])\b", re.IGNORECASE)
 _RELATIVE_UNIT_SECONDS: dict[str, int] = {
     "s": 1,
-    "m": 60,
+    "m": 60,  # OBSERVED: bare ``m`` = minutes on MangaBall (recon ``5m``); see WR-02
+    "min": 60,
     "h": 3600,
     "d": 86400,
     "w": 604800,

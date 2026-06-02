@@ -21,14 +21,18 @@ No network: a fake ``SourceContext`` serves the canned recent envelope via
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from manga_gateway.handles.store import HandleStore
-from manga_gateway.sources.mangaball import MangaBallSource, _parse_last_chapter
+from manga_gateway.sources.mangaball import (
+    MangaBallSource,
+    _parse_last_chapter,
+    _relative_to_iso,
+)
 
 # DIRECT guid: mangaball:{24-hex title}:ch-{float}:{lang}:{24-hex tx} — NOT :DEFERRED
 _DIRECT_GUID_RE = re.compile(
@@ -203,6 +207,26 @@ def test_parse_last_chapter_trailing_dot_number_clean() -> None:
     parsed = _parse_last_chapter(html)
     assert parsed is not None
     assert parsed["number"] == "23"
+
+
+# ──────────────────────────────── _relative_to_iso ──────────────────────────
+
+
+def _ago_seconds(raw: str) -> float:
+    """How many seconds ago ``_relative_to_iso`` resolved ``raw`` to."""
+    iso = _relative_to_iso(raw)
+    assert iso is not None
+    return (datetime.now(UTC) - datetime.fromisoformat(iso)).total_seconds()
+
+
+def test_relative_to_iso_disambiguates_months_minutes() -> None:
+    """WR-02: ``mo``/``min`` win over the bare ``m`` (longer-token-first regex)."""
+    # bare ``m`` = minutes (observed MangaBall convention) → ~2 min, not ~2 months.
+    assert _ago_seconds("2m ago") == pytest.approx(120, abs=5)
+    # ``min`` is also minutes.
+    assert _ago_seconds("5min ago") == pytest.approx(300, abs=5)
+    # ``mo`` = months (~30d), NOT minutes.
+    assert _ago_seconds("2mo ago") == pytest.approx(2 * 2592000, abs=5)
 
 
 # ───────────────────────────────── recent() shape ───────────────────────────
