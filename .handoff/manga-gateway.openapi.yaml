@@ -119,7 +119,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DownloadJob" }
-        "404": { description: Unknown job id }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
     delete:
       summary: Remove job (and optionally its files) — maps to RemoveItem
       operationId: removeDownload
@@ -127,7 +128,8 @@ paths:
         - { name: deleteData, in: query, schema: { type: boolean, default: false } }
       responses:
         "204": { description: Removed }
-        "404": { description: Unknown job id }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /status:
     get:
@@ -157,6 +159,7 @@ paths:
                 properties:
                   version: { type: string }
                   status:  { type: string, enum: [ok, degraded] }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
 components:
   securitySchemes:
@@ -169,6 +172,9 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     BadRequest:
       description: Malformed request
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Resource not found
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     RateLimited:
       description: Too many requests
@@ -185,7 +191,7 @@ components:
           type: object
           required: [code, message]
           properties:
-            code:    { type: string, enum: [auth, rate_limited, source_unavailable, bad_request, internal] }
+            code:    { type: string, enum: [auth, rate_limited, source_unavailable, bad_request, not_found, internal] }
             message: { type: string }
 
     Capabilities:
@@ -213,7 +219,7 @@ components:
       type: object
       required: [key, name, enabled, supportsSearch, supportsRecent]
       properties:
-        key:                { type: string, example: "comix.to" }
+        key:                { type: string, example: "comix" }
         name:               { type: string, example: "Comix" }
         enabled:            { type: boolean }
         supportsSearch:     { type: boolean }
@@ -270,14 +276,14 @@ components:
         downloadHandle:  { type: string, description: "opaque; submitted back to POST /downloads. TTL >= 30 min." }
         infoUrl:         { type: string, nullable: true }
         publishDate:     { type: string, format: date-time }
-        mangaTitle:      { type: string, nullable: true }
-        chapterNumber:   { type: number, nullable: true, description: "decimal; advisory hint" }
-        volume:          { type: integer, nullable: true }
-        language:        { type: string, nullable: true, description: "BCP-47 -> ReleaseInfo.TranslatedLanguage" }
-        scanlationGroup: { type: string, nullable: true }
-        pageCount:       { type: integer, nullable: true }
+        mangaTitle:      { type: string, nullable: true, description: "Structured series title. Fully populated when known; the intended primary path for a future Mangarr (parsing title is then optional). null only when genuinely unknown." }
+        chapterNumber:   { type: number, nullable: true, description: "Decimal chapter number, first-class data. Fully populated when known (>=3 decimal places preserved) and the intended primary path for a future Mangarr; parsing the title becomes optional. null only when genuinely unknown." }
+        volume:          { type: integer, nullable: true, description: "Structured volume number. Populated when known; first-class data alongside chapterNumber. null only when genuinely unknown." }
+        language:        { type: string, nullable: true, description: "BCP-47 translated language -> ReleaseInfo.TranslatedLanguage. First-class data; fully populated when known. null only when genuinely unknown." }
+        scanlationGroup: { type: string, nullable: true, description: "Structured scanlation/translation group. Populated when known; first-class data the future Mangarr reads directly. null only when genuinely unknown." }
+        pageCount:       { type: integer, nullable: true, description: "Page count for the chapter. Populated when known; first-class structured data. null only when genuinely unknown." }
         sizeBytes:       { type: integer, default: 0 }
-        ids:             { type: object, additionalProperties: true, nullable: true }
+        ids:             { type: object, additionalProperties: true, nullable: true, description: "Cross-reference source ids (e.g. mangadexChapterId/mangadexMangaId). First-class structured data; populated when known." }
 
     SubmitRequest:
       type: object
