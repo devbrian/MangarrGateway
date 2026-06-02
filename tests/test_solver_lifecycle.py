@@ -398,6 +398,39 @@ async def test_warm_solves_all_cloudflare_keys() -> None:
     await solver.aclose()
 
 
+async def test_warm_isolates_per_domain_failures() -> None:
+    """``warm()`` returns ONLY the cf keys whose eager solve failed — one bad
+    domain must NOT take the healthy ones down (#88, PR#90 review). The healthy
+    key is still solved + held; the failing key is reported for per-source
+    disable by the lifespan."""
+
+    class _OneBadKeyBrowser(_KeyAwareBrowser):
+        async def solve(self, ctx: FakeContext, key: str) -> Clearance:
+            if key == "bad":
+                self.solve_count += 1
+                self.per_key_solves[key] = self.per_key_solves.get(key, 0) + 1
+                raise RuntimeError("cloudflare escalated on this domain")
+            return await super().solve(ctx, key)
+
+    browser = _OneBadKeyBrowser()
+    lc = BrowserLifecycle(
+        launch=browser.launch, solve=browser.solve, solve_concurrency=1
+    )
+    solver = CloudflareSolver(
+        lifecycle=lc,
+        cloudflare_keys=("ok", "bad"),
+        challenge_urls={"ok": "https://ok.test/", "bad": "https://bad.test/"},
+    )
+    failed = await _REAL_CLOUDFLARE_WARM(solver)
+    # ONLY the failing domain is reported — the healthy one is unaffected.
+    assert failed == ["bad"]
+    # The healthy key was solved and its clearance is held (warm did not abort
+    # before reaching it / after the failing one).
+    assert browser.per_key_solves.get("ok") == 1
+    assert (await solver.get_clearance("ok")).cookies["cf_clearance"] == "TOKEN-ok"
+    await solver.aclose()
+
+
 async def test_single_cf_key_collapses_to_old_single_value_path() -> None:
     """Comix-unaffected proof (#88): with exactly ONE cf key, the per-key
     ``_held``/``_inflight``/warm behave exactly as the old single-value path —

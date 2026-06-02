@@ -377,21 +377,30 @@ class CloudflareSolver:
             return None  # MangaDex et al. — no clearance needed
         return await self._lifecycle.solve(source_key, force=force_resolve)
 
-    async def warm(self) -> None:
+    async def warm(self) -> list[str]:
         """Best-effort eager solve at startup (D-33) + start the recycle watchdog.
 
         Called as a fire-and-forget task by the lifespan so a slow/failed solve never
-        blocks startup. Exceptions are swallowed here — the caller (the lifespan's
-        non-blocking launch) owns the force_disabled fallback on failure (D-33).
+        blocks startup. Returns the list of cloudflare source keys whose eager solve
+        FAILED so the lifespan can disable ONLY those (D-33, per-domain isolation).
+
+        #88 / PR#90 review: eager-warm ALL cloudflare-gated sources (LOCKED decision
+        — no early break), each on its OWN per-domain challenge URL. A per-domain
+        solve failure must isolate to THAT source — with several cloudflare domains
+        now sharing one solver, one bad domain at startup must NOT take the healthy
+        ones down. Each key's solve is therefore wrapped in its own try/except and
+        only the failing keys are returned; a TOTAL failure (e.g. the browser never
+        launches) naturally surfaces as every key failing.
         """
         self._lifecycle.start_recycle_watchdog()
-        # Eager-warm ALL cloudflare-gated sources (#88, LOCKED decision — no
-        # early break). Each domain gets its own clearance solved sequentially
-        # under the shared solve-cap semaphore; a per-domain solve failure
-        # isolates to THAT source via the lifespan's ``_warm_solver`` loop, never
-        # the whole gateway.
+        failed: list[str] = []
         for key in self._cloudflare_keys:
-            await self.get_clearance(key)
+            try:
+                await self.get_clearance(key)
+            except Exception:  # noqa: BLE001 — isolate per-domain warm failures
+                _log.warning("CloudflareSolver warm failed for source %r (D-33)", key)
+                failed.append(key)
+        return failed
 
     # ``timeout`` here is the per-call Playwright operation budget (goto/
     # wait_for/evaluate each receive ``timeout`` in ms), NOT a cancellation
@@ -743,10 +752,23 @@ class CloudflareSolver:
             # we poll that from Python instead.
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 60.0
+            # Scope the wait to THIS challenge's host (#88, PR#90 review). The ONE
+            # shared warm context can now hold cf_clearance cookies for SEVERAL
+            # domains at once (each cloudflare-gated source solves on the same
+            # context). A host-agnostic ``any(name == "cf_clearance")`` would let
+            # solving domain B return the instant domain A's cookie is present in
+            # the jar — capturing an EMPTY host-scoped cookie set for B and handing
+            # B a clearance it never actually solved. Gate the break on a
+            # cf_clearance that ``_belongs_to_host`` the host we navigated.
+            challenge_host = (urlparse(challenge_url).hostname or "").lower()
             jar: list[dict[str, Any]] = []
             while True:
                 jar = await context.cookies()
-                if any(c.get("name") == "cf_clearance" for c in jar):
+                if any(
+                    c.get("name") == "cf_clearance"
+                    and _belongs_to_host(c, challenge_host)
+                    for c in jar
+                ):
                     break
                 if loop.time() > deadline:
                     raise TimeoutError(
@@ -764,7 +786,6 @@ class CloudflareSolver:
             # (empirically verified 2026-05-30 — passing only cf_clearance returns
             # 403). Scoping by domain naturally excludes cross-site ad-tracking
             # cookies the solver may pick up incidentally.
-            challenge_host = (urlparse(challenge_url).hostname or "").lower()
             cookies = {
                 c["name"]: c["value"]
                 for c in jar

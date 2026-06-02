@@ -244,13 +244,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.solver = solver
 
     async def _warm_solver() -> None:
+        # #88 / PR#90 review: per-domain warm isolation. ``solver.warm()`` returns
+        # the cloudflare keys whose eager solve FAILED; disable ONLY those. With
+        # several cloudflare domains now sharing one solver, a single bad domain at
+        # startup must not force-disable the healthy ones. A catastrophic warm()
+        # raise (e.g. the recycle-watchdog/launch path itself) still falls back to
+        # disabling every cloudflare source (D-33/Pitfall 3 — gateway lives).
         try:
-            await solver.warm()  # eager best-effort solve + recycle watchdog (D-33)
-        except Exception:  # noqa: BLE001 — cloudflare sources boot disabled, gateway lives
-            for key in cloudflare_keys:
-                source_health[key].force_disabled = True
+            failed = await solver.warm()  # eager best-effort solve + recycle watchdog
+        except Exception:  # noqa: BLE001 — total failure: cloudflare sources boot disabled, gateway lives
+            failed = list(cloudflare_keys)
             _log.warning(
                 "CloudflareSolver warm failed; cloudflare-gated sources disabled (D-33)"
+            )
+        for key in failed:
+            source_health[key].force_disabled = True
+        if failed:
+            _log.warning(
+                "Cloudflare warm failed for %d source(s) [%s] — those disabled (D-33)",
+                len(failed),
+                ", ".join(sorted(failed)),
             )
 
     warm_task = asyncio.create_task(_warm_solver())  # non-blocking (Pitfall 3)
