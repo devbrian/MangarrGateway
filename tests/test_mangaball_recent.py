@@ -311,11 +311,32 @@ async def test_recent_since_cuts_older_items() -> None:
     )
     ctx = _FakeCtxForRecent(payload)
     source = MangaBallSource()
-    # Both translations carry date 2026-06-01; a future `since` cuts everything.
+    # Both translations carry date 2026-06-01 (space-separated); an ISO-`T` `since`
+    # far in the future cuts everything (WR-01: parsed-datetime compare, not lexical).
     releases = await source.recent(
-        languages=None, limit=20, since="2027-01-01 00:00:00", ctx=ctx
+        languages=None, limit=20, since="2027-01-01T00:00:00+00:00", ctx=ctx
     )
     assert releases == []
+
+
+@pytest.mark.asyncio
+async def test_recent_since_keeps_genuinely_newer_space_separated_date() -> None:
+    """WR-01 regression: a genuinely-newer space-separated chapter date must NOT
+    be dropped against an ISO-`T` `since`.
+
+    The chapter date ``"2026-06-01 23:33:42"`` is LATER than the ISO `since`
+    ``"2026-06-01T20:00:00+00:00"``, but the space byte (0x20) sorts before `T`
+    (0x54), so a raw lexical ``date <= since`` compare would wrongly drop it. The
+    parsed-datetime compare keeps it."""
+    payload = _recent_envelope(
+        [_recent_title(title_id="a" * 24, name="A", number_float=1.0)]
+    )
+    ctx = _FakeCtxForRecent(payload)
+    source = MangaBallSource()
+    releases = await source.recent(
+        languages=None, limit=20, since="2026-06-01T20:00:00+00:00", ctx=ctx
+    )
+    assert len(releases) == 1, "a chapter genuinely newer than `since` was dropped"
 
 
 # ──────────────────── fetch_manifest DEFERRED late-bind branch ───────────────

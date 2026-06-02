@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import posixpath
 import re
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any
@@ -92,6 +93,32 @@ _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
 # {language}`` (translation_id is dropped — it is what fetch_manifest resolves).
 _CID_SEP = "|"
 _DEFERRED_SENTINEL = "DEFERRED"
+
+# Floor for empty/malformed timestamps so they sort oldest and never crash the
+# `since` comparison (mirrors recent.py:_TS_FLOOR / _parse_ts).
+_TS_FLOOR = datetime.min.replace(tzinfo=UTC)
+
+
+def _parse_ts(raw: str) -> datetime:
+    """Parse a timestamp to an aware datetime (WR-01), mirroring ``recent.py``.
+
+    The source-side ``since`` cut (RCNT-02) must compare PARSED datetimes, never
+    raw strings: MangaBall translation dates are space-separated
+    (``"2026-06-01 23:33:42"``) while Mangarr's ``since`` is normally ISO-8601
+    with a ``T`` separator (``"2026-06-01T20:00:00+00:00"``). A lexical compare
+    sorts the space byte (0x20) before ``T`` (0x54), so a genuinely-newer
+    space-separated date would compare ``<= since`` and be silently dropped.
+    ``datetime.fromisoformat`` accepts BOTH separators (Python 3.11+), so parsing
+    both sides removes the mismatch. Empty/malformed values floor to epoch-min so
+    they compare as oldest rather than raising.
+    """
+    if not raw:
+        return _TS_FLOOR
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return _TS_FLOOR
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 # SSRF allowlist for the DOM-extracted page-image URLs (T-07-07/T-07-09,
 # CLAUDE.md). The CDN host VARIES per content (RECON §4) so — unlike Comix — it
@@ -443,22 +470,26 @@ class MangaBallSource(Source):
         :meth:`fetch_manifest` time (D-10). The guid carries the literal
         ``:DEFERRED`` suffix; it is NEVER rewritten when the composite resolves
         (mirror comix locked decision 1). ``since`` cuts older items at the source
-        (RCNT-02) by comparing the translation ``date`` lexically (MangaBall dates
-        are absolute ``"YYYY-MM-DD HH:MM:SS"``). ``languages`` filters the eligible
-        translations when supplied. Zero networking glue — ``ctx.post_json`` owns
-        the transport (SRC-02).
+        (RCNT-02) by comparing PARSED datetimes (WR-01) — MangaBall dates are
+        space-separated ``"YYYY-MM-DD HH:MM:SS"`` while ``since`` is ISO-`T`, so a
+        raw string compare would silently drop genuinely-newer chapters.
+        ``languages`` filters the eligible translations when supplied. Zero
+        networking glue — ``ctx.post_json`` owns the transport (SRC-02).
         """
         form: dict[str, Any] = {"search_type": "getRecentlyUpdatedChapter", "page": 1}
         body = await ctx.post_json(f"{self.base_url}/api/v1/title/search/", data=form)
         titles, _pagination = _items_and_pagination(body)
 
         wanted_langs = set(languages) if languages else None
+        # WR-01: parse `since` ONCE to an aware datetime so the source-side cut
+        # compares datetimes (not raw strings across a `T`/space format mismatch).
+        since_dt = _parse_ts(since) if since else None
         releases: list[Release] = []
         for title in titles:
             if not isinstance(title, dict):
                 continue
             releases.extend(
-                self._title_to_deferred_releases(title, wanted_langs, since, ctx)
+                self._title_to_deferred_releases(title, wanted_langs, since_dt, ctx)
             )
             if len(releases) >= limit:
                 break
@@ -468,7 +499,7 @@ class MangaBallSource(Source):
         self,
         title: dict[str, Any],
         wanted_langs: set[str] | None,
-        since: str | None,
+        since_dt: datetime | None,
         ctx: SourceContext,
     ) -> list[Release]:
         """Mint a DEFERRED Release per promised chapter+translation of one Title."""
@@ -493,7 +524,13 @@ class MangaBallSource(Source):
                 if wanted_langs is not None and language not in wanted_langs:
                     continue
                 publish_date = str(translation.get("date") or "")
-                if since and publish_date and publish_date <= since:
+                # WR-01: datetime compare (not lexical) so a genuinely-newer
+                # space-separated date is not dropped against an ISO-`T` `since`.
+                if (
+                    since_dt is not None
+                    and publish_date
+                    and _parse_ts(publish_date) <= since_dt
+                ):
                     continue  # RCNT-02: cut older items at the source
                 rel = self._mint_deferred_release(
                     title_id, manga_title, ch_str, number, language, publish_date, ctx
