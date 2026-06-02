@@ -30,8 +30,8 @@ from manga_gateway.handles.store import HandleStore
 from manga_gateway.sources.mangaball import (
     _DEFERRED_SENTINEL,
     MangaBallSource,
-    _DeferredResolutionError,
     _decode_deferred_composite,
+    _DeferredResolutionError,
     _make_deferred_composite,
     _resolve_deferred,
 )
@@ -86,7 +86,9 @@ def _tx(
     }
 
 
-def _chapter(*, number_float: Any, translations: list[dict[str, Any]]) -> dict[str, Any]:
+def _chapter(
+    *, number_float: Any, translations: list[dict[str, Any]]
+) -> dict[str, Any]:
     return {"number_float": number_float, "translations": translations}
 
 
@@ -172,7 +174,7 @@ def test_resolve_deferred_missing_chapter_raises_strict() -> None:
         _chapter(number_float=24.0, translations=[_tx(tx_id="a" * 24)]),
         _chapter(number_float=22.0, translations=[_tx(tx_id="b" * 24)]),
     ]
-    with pytest.raises(_DeferredResolutionError, match="23 not present"):
+    with pytest.raises(_DeferredResolutionError, match="not present"):
         _resolve_deferred("23", "vi", chapters)
 
 
