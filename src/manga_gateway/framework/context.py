@@ -323,14 +323,16 @@ class SourceContext:
         injects clearance (D-40) and reconciles a challenge 403 with a single re-solve +
         retry (D-35); a permanent 4xx raises ``SourceError`` (no retry); transport
         errors / 5xx bubble to tenacity. The plaintext body is decrypted (D-39) before
-        parse, and health is fed on the terminal outcome (D-36).
+        parse, and health is fed on the terminal outcome (D-36) — the parse runs INSIDE
+        the failure-feeding ``try`` so a malformed-shape ``200`` (a non-object body →
+        ``SourceError`` from :meth:`_parse_json_object`) also trips ``_feed_failure``.
         """
         try:
             body = await self._request_bytes(url, params=params, limited=True)
+            result = self._parse_json_object(body)
         except SourceError:
             self._feed_failure()
             raise
-        result = self._parse_json_object(body)
         self._feed_success()
         return result
 
@@ -352,15 +354,17 @@ class SourceContext:
         challenge-403 single re-solve + retry (D-35), tenacity retry, decrypt
         seam (D-39; identity for plaintext sources), and health feed (D-36) —
         differing ONLY in the final parse (:meth:`_parse_json_array`, which
-        raises ``SourceError`` on a non-array body). Additive: the existing
+        raises ``SourceError`` on a non-array body). The parse runs INSIDE the
+        failure-feeding ``try`` (byte-for-byte parity with :meth:`get_json`) so a
+        non-array ``200`` body also trips ``_feed_failure``. Additive: the existing
         object-bodied call paths (comix/mangadex/mangaball) are untouched.
         """
         try:
             body = await self._request_bytes(url, params=params, limited=True)
+            result = self._parse_json_array(body)
         except SourceError:
             self._feed_failure()
             raise
-        result = self._parse_json_array(body)
         self._feed_success()
         return result
 
@@ -380,16 +384,18 @@ class SourceContext:
         tenacity retry, credential merge (the session-prep CSRF token + cookie ride the
         per-request headers, D-02/D-04), CSRF-403 refresh-once-and-retry (D-03), the
         permanent-4xx STOP, and ``_feed_success``/``_feed_failure`` health calls (D-36)
-        as ``get_json``. Sources add ZERO networking glue (SRC-02).
+        as ``get_json`` — including the parse running INSIDE the failure-feeding
+        ``try`` so a non-object ``200`` body also trips ``_feed_failure``. Sources add
+        ZERO networking glue (SRC-02).
         """
         try:
             body = await self._request_bytes(
                 url, params=None, limited=True, method="POST", data=data
             )
+            result = self._parse_json_object(body)
         except SourceError:
             self._feed_failure()
             raise
-        result = self._parse_json_object(body)
         self._feed_success()
         return result
 
@@ -407,17 +413,18 @@ class SourceContext:
         are plaintext while ``/api/v1/manga/{hid}/chapters`` and
         ``/api/v1/chapters/{id}`` are encrypted (live recon, Plan 04-04). The source
         chooses this method per-call when the endpoint is plaintext; everything else
-        (clearance injection, rate limit, retry, 403 reconciliation, health feed)
-        stays identical to ``get_json``.
+        (clearance injection, rate limit, retry, 403 reconciliation, health feed —
+        including the parse running INSIDE the failure-feeding ``try`` so a non-object
+        ``200`` body also trips ``_feed_failure``) stays identical to ``get_json``.
         """
         try:
             body = await self._request_bytes(
                 url, params=params, limited=True, decrypt=False
             )
+            result = self._parse_json_object(body)
         except SourceError:
             self._feed_failure()
             raise
-        result = self._parse_json_object(body)
         self._feed_success()
         return result
 
