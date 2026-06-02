@@ -127,6 +127,7 @@ class SourceContext:
         decrypt_config: dict[str, Any] | None = None,
         source_health: SourceHealth | None = None,
         session_prep: SessionPrep | None = None,
+        expected_pages: int | None = None,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -146,6 +147,13 @@ class SourceContext:
         # Contributes a PHPSESSID cookie + X-CSRF-Token into the SAME per-request
         # header dict the cf_clearance half builds (D-02/D-04 union path).
         self._session_prep = session_prep
+        # #83/IN-03 manifest-integrity hint. On the DOWNLOAD path the engine builds
+        # this context with ``expected_pages`` = the resolved record's declared page
+        # count, so a source's ``fetch_manifest`` can assert the extracted manifest
+        # length matches what search declared. ``None`` on the SEARCH path (search
+        # never resolves a manifest) and for sources that do not opt in — a source
+        # reads ``ctx.expected_pages`` only if it wants the check (MangaBall does).
+        self.expected_pages = expected_pages
 
     @property
     def handle_store(self) -> HandleStore:

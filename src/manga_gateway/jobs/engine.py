@@ -179,7 +179,9 @@ class JobEngine:
             await self._fail(job, f"unknown source {job.source_key}")
             return
         source = cls()
-        ctx = self._build_context(source)
+        # #83/IN-03: forward the record's declared page count (carried on the job) so
+        # ``fetch_manifest`` can integrity-check the extracted manifest length.
+        ctx = self._build_context(source, expected_pages=job.page_count)
 
         # resolving → fetch the page manifest INTERNALLY (PKG-01/R6).
         await self._transition(job, JobStatus.RESOLVING)
@@ -333,12 +335,17 @@ class JobEngine:
 
     # ─────────────────────────── helpers ───────────────────────────
 
-    def _build_context(self, source: object) -> SourceContext:
+    def _build_context(
+        self, source: object, *, expected_pages: int | None = None
+    ) -> SourceContext:
         """Build a SourceContext exactly like the search route (Pattern 4).
 
         Threads the same anti-bot seams as ``search.py:_run_one`` so a cloudflare*
         download injects clearance (D-40), reconciles a challenge 403 (D-35), and
         decrypts page bytes (D-39); ``source_health.get(key)`` feeds the breaker (D-36).
+        ``expected_pages`` (the resolved record's declared page count) is forwarded to
+        ``fetch_manifest`` as a manifest-integrity hint (#83/IN-03) — ``None`` on the
+        search route, which never resolves a manifest.
         """
         key: str = source.key  # type: ignore[attr-defined]
         # Copy ``decrypt_config`` per request so a scheme that mutates its
@@ -356,6 +363,7 @@ class JobEngine:
             decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
             source_health=self._source_health.get(key),
             session_prep=self._session_prep,
+            expected_pages=expected_pages,
         )
 
     async def _transition(self, job: Job, status: JobStatus) -> None:

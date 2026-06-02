@@ -675,9 +675,18 @@ class MangaBallSource(Source):
         ``translation_id`` → chapter-detail HTML → ordered allowlisted page URLs
         resolve. The ``chapterImages`` JSON-array extract + SSRF allowlist +
         pages-count guard live in :meth:`_manifest_for_translation`. (The Comix-only
-        ``:DEFERRED`` late-bind pattern does not apply to MangaBall.)
+        ``:DEFERRED`` late-bind pattern does not apply to MangaBall — the chapter id
+        stays a bare ``translation_id``, never a composite.)
+
+        #83/IN-03: the page-count integrity guard runs on BOTH the search and recent
+        paths. The chapter's declared ``pages`` is captured at search/recent time on
+        the ``ResolutionRecord`` and forwarded here by the engine as
+        ``ctx.expected_pages`` (``None`` only when search never recorded a count, or
+        for a job rehydrated post-restart — the guard then degrades to a no-op). This
+        keeps the chapter id bare while still mirroring ``mangadex.fetch_manifest``'s
+        length check, closing the gap where a search-grabbed chapter skipped it.
         """
-        return await self._manifest_for_translation(chapter_id, None, ctx)
+        return await self._manifest_for_translation(chapter_id, ctx.expected_pages, ctx)
 
     async def _manifest_for_translation(
         self, translation_id: str, pages: int | None, ctx: SourceContext

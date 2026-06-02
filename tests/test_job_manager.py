@@ -140,6 +140,27 @@ async def test_submit_sets_manga_title_from_record(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_carries_page_count_from_record(tmp_path: Path) -> None:
+    """#83/IN-03: ``submit`` copies the resolved ``record.page_count`` onto the Job so
+    the engine can forward it to ``fetch_manifest`` as an integrity hint. Asserted via
+    the in-memory projection (``mgr.get``) — page_count is PROJECTION-ONLY, so it does
+    NOT round-trip through the store (deliberate; see Job.page_count)."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        mgr = await _make_manager(store)
+        mgr._engine = _NoopEngine()  # type: ignore[assignment]
+
+        job_id, _ = await mgr.submit(_record(), _req())
+
+        job = mgr.get(job_id)
+        assert job is not None
+        assert job.page_count == 42  # from _record()
+        await mgr.drain()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_submit_writes_store_before_projection(tmp_path: Path) -> None:
     store = await open_store(str(tmp_path / "jobs.db"))
     try:
