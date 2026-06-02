@@ -109,8 +109,12 @@ def _is_allowed_image_url(url: str) -> bool:
     """
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    host_ok = host == "mangadot.net" or host.endswith(".mangadot.net")
-    if not host_ok:
+    # Pin to the EXACT origin (review WR/CR): mangadot serves page images
+    # same-origin and ``fetch_manifest`` rewrites every relative ``/chapters/…``
+    # url onto ``base_url`` (mangadot.net), so no subdomain is ever a legitimate
+    # image host. A wildcard ``*.mangadot.net`` only widens the SSRF surface for
+    # zero real coverage.
+    if host != "mangadot.net":
         return False
     # Reject traversal outright; validate the NORMALIZED path httpx will fetch.
     if ".." in parsed.path.split("/"):

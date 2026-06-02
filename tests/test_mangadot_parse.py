@@ -44,16 +44,21 @@ def test_normalize_publish_date_space_separated_offset() -> None:
 
 
 def test_normalize_publish_date_empty_falls_back_to_now() -> None:
+    # Assert the fallback lands within the call window (not just the year) so a
+    # wrong future/past timestamp can't slip through (review).
+    before = datetime.now(UTC)
     out = MangadotSource._normalize_publish_date("")
-    # A real, recent UTC timestamp (not the year-1 floor).
+    after = datetime.now(UTC)
     parsed = datetime.fromisoformat(out)
-    assert parsed.year >= datetime.now(UTC).year
+    assert before <= parsed <= after
 
 
 def test_normalize_publish_date_malformed_falls_back_to_now() -> None:
+    before = datetime.now(UTC)
     out = MangadotSource._normalize_publish_date("garbage")
+    after = datetime.now(UTC)
     parsed = datetime.fromisoformat(out)
-    assert parsed.year >= datetime.now(UTC).year
+    assert before <= parsed <= after
 
 
 # ───────────────────────── SSRF allowlist matrix ───────────────────────────
@@ -70,8 +75,6 @@ def test_ssrf_accepts_same_origin_chapters_image() -> None:
     # All allowed image extensions.
     for ext in ("webp", "jpg", "jpeg", "png"):
         assert _is_allowed_image_url(f"https://mangadot.net/chapters/m/c/01.{ext}")
-    # A subdomain of mangadot.net is allowed.
-    assert _is_allowed_image_url("https://cdn.mangadot.net/chapters/m/c/01.webp")
 
 
 def test_ssrf_rejects_http_scheme() -> None:
@@ -82,11 +85,14 @@ def test_ssrf_rejects_http_scheme() -> None:
 
 def test_ssrf_rejects_off_host() -> None:
     assert not _is_allowed_image_url("https://evil.com/chapters/m/c/01.webp")
-    # A host that merely CONTAINS mangadot.net is not a subdomain of it.
+    # A host that merely CONTAINS mangadot.net is not the exact origin.
     assert not _is_allowed_image_url(
         "https://mangadot.net.evil.com/chapters/m/c/01.webp"
     )
     assert not _is_allowed_image_url("https://notmangadot.net/chapters/m/c/01.webp")
+    # Host is pinned to the EXACT origin (review): even a real subdomain is
+    # rejected — mangadot serves page images same-origin, never off a subdomain.
+    assert not _is_allowed_image_url("https://cdn.mangadot.net/chapters/m/c/01.webp")
 
 
 def test_ssrf_rejects_traversal() -> None:
