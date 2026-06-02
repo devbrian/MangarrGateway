@@ -1,0 +1,40 @@
+# Manga Gateway — local-dev / prod-parity compose (base).
+#
+# `docker compose up --build` builds the image from LOCAL source (this repo as
+# the build context) and runs it prod-parity, single-process (R1). A
+# docker-compose.override.yml sits alongside and is AUTO-MERGED by a plain
+# `docker compose up` — it adds a ./src bind-mount for live iteration.
+#
+# For a CLEAN prod-parity run that EXCLUDES the dev override, pass the base file
+# explicitly:
+#     docker compose -f docker-compose.yml up --build
+#
+# The auto-generated API key, the SQLite DB, and cf_clearance all live on the
+# named `gateway-state` volume so they survive container recreation
+# (verified_facts #3). CBZ output lives on `gateway-output`.
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "9191:9191"
+    # Tolerate a missing .env so `docker compose up --build` works out of the box
+    # (the Dockerfile bakes the env defaults). Copy .env.example → .env to set
+    # operator knobs. The long form `required: false` is the Compose-spec way to
+    # make the env_file optional.
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # State (config.toml + the auto-generated API key, gateway.db, cf_clearance).
+      - gateway-state:/state
+      # CBZ output. A named volume is portable; to land output on the host
+      # instead, replace the line below with a bind, e.g.  - ./output:/data/manga
+      - gateway-output:/data/manga
+    restart: unless-stopped
+    # NOTE: command is intentionally NOT overridden — inherit the Dockerfile's
+    # single-process `python -m manga_gateway` CMD. NEVER add --workers (R1).
+
+volumes:
+  gateway-state:
+  gateway-output:

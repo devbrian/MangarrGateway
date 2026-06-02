@@ -1,0 +1,56 @@
+# Build-context filter for the production Dockerfile.
+#
+# Two jobs (both load-bearing):
+#   1. SECURITY (T-06-01): keep every secret/runtime-state family OUT of the
+#      image. config.toml carries the auto-generated API key (D-01); *.db,
+#      cloudflare-userdata*/, and *.env carry runtime/secret state. These live
+#      ONLY on the /state + /data/manga volumes — never baked into a layer.
+#   2. Keep the context small/fast (the Chromium layer is already large).
+#
+# The build NEEDS pyproject.toml, uv.lock, src/, and README.md — those are NOT
+# excluded. Mirrors the secret/state families already in .gitignore.
+
+# ── Secrets / runtime state — MUST NOT be baked (T-06-01) ────────────────────
+config.toml
+*.db
+gateway.db*
+cloudflare-userdata/
+cloudflare-userdata-*/
+comix-userdata/
+.env
+*.env
+.proxytest.env
+
+# ── Python / build caches ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── Virtual env / tooling caches ─────────────────────────────────────────────
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.nox/
+.hypothesis/
+
+# ── Dev / CI / planning trees not needed in the prod image ───────────────────
+.git/
+.github/
+.claude/
+.planning/
+tests/
+docker/
+
+# ── Throwaway diagnostic / recon output ──────────────────────────────────────
+_recon_out/
+_e2e_out/
+local-repro-*.log
+junit.xml
+
+# ── Docs not needed at build time (README.md IS needed → re-included below) ──
+*.md
+!README.md

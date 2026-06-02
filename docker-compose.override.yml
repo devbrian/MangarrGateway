@@ -1,0 +1,19 @@
+# Manga Gateway — DEV override (auto-merged by plain `docker compose up`).
+#
+# Bind-mounts ./src over the image's /app/src so you can iterate on application
+# code WITHOUT rebuilding the image. This file is merged automatically; to run a
+# CLEAN prod-parity image WITHOUT this bind-mount, invoke the base file alone:
+#     docker compose -f docker-compose.yml up --build
+#
+# Hot-reload note: the image runs `python -m manga_gateway` (single process, NO
+# --reload, to match prod exactly — R1). A bind-mount alone does not hot-reload,
+# so the dev loop is: edit ./src → `docker compose restart gateway`. We
+# deliberately do NOT add uvicorn --reload/dev flags here (it would diverge from
+# the single-process prod CMD and is not worth the scope).
+
+services:
+  gateway:
+    volumes:
+      # Live application source — merged with the base service's state/output
+      # volumes (Compose merges the `volumes` lists; only the ./src bind is added).
+      - ./src:/app/src

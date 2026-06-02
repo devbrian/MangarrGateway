@@ -19,6 +19,10 @@ dist/
 # Local runtime config (bears the auto-generated API key — D-01/D-10)
 config.toml
 
+# Local docker-compose env (operator knobs incl. the proxy SECRET, #65). The
+# committed template is .env.example; a real .env must NEVER be committed.
+.env
+
 # SQLite job store (runtime persistence — PLAT-03) + WAL/SHM sidecars.
 # Scoped to the runtime DB only so unrelated *.db fixtures aren't ignored (CR).
 gateway.db*
