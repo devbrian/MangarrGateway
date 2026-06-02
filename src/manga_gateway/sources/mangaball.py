@@ -40,10 +40,11 @@ ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md`` / GAP-1 probe):
   ``title_id``) → the FLAT ``{code,message,ALL_CHAPTERS:[…],…}`` envelope (NOT
   the standard ``data`` envelope — :func:`_items_and_pagination` dispatches both,
   D-09).
-* manifest: ``GET /chapter-detail/{translation_id}/`` (HTML) → absolute
-  ``<img data-src="…">`` URLs in document order. The CDN host VARIES per content
+* manifest: ``GET /chapter-detail/{translation_id}/`` (HTML) → the ordered page
+  URLs in the client-side ``const chapterImages = JSON.parse(`[…]`)`` array (GAP-3,
+  live — NOT ``<img>`` tags). The CDN host VARIES per content
   (``chikorita.red-and-blue.net``, ``bulbasaur.poke-black-and-white.net``, …) —
-  the host is read from the DOM, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF).
+  the host is read from that array, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF).
 * image: plain httpx ``GET`` of each absolute CDN ``.jpg``.
 
 guid (D-08): ``mangaball:{title_id}:ch-{number_float}:{language}:{translation_id}``
@@ -57,6 +58,7 @@ MangaBall does not need it because its recent feed exposes the translation_id.
 from __future__ import annotations
 
 import asyncio
+import json
 import posixpath
 import re
 from datetime import UTC, datetime, timedelta
@@ -164,14 +166,24 @@ def _parse_ts(raw: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
-# SSRF allowlist for the DOM-extracted page-image URLs (T-07-07/T-07-09,
-# CLAUDE.md). The CDN host VARIES per content (RECON §4) so — unlike Comix — it
-# cannot be pinned to one literal; we allowlist the ``https`` scheme + the
-# observed ``/storage/.../{id}-{NNN}.jpg`` path shape only. A poisoned DOM (or a
-# future extractor regression) surfacing an off-shape path is rejected before any
-# fetch. ``[a-z0-9.-]`` host guard rejects empty / userinfo-bearing hosts.
+# SSRF allowlist for the extracted page-image URLs (T-07-07/T-07-09, CLAUDE.md).
+# The CDN host VARIES per content (RECON §4, live e.g. ``chikorita.red-and-blue.net``,
+# ``bulbasaur.poke-black-and-white.net``, ``jigglypuff.poke-black-and-white.net``) so
+# — unlike Comix — it cannot be pinned to one literal. GAP-3 (live W-04): the PAGE
+# FILENAME also varies per upload source and CANNOT be pinned either — the live array
+# carries ``01.jpg`` (zero-padded), ``{translationId}-001.jpg`` (id-prefixed),
+# ``HRK0MmP.png`` (opaque token), ``…-001.webp``, etc. across the ``daomeoden`` /
+# ``comick`` / ``mangadex`` group dirs. Pinning a filename shape only false-rejects
+# real pages and adds NO real SSRF protection (a host-compromise attacker controls the
+# filename too). The meaningful, stable invariants are what we enforce: ``https`` +
+# public host (host regex + internal-suffix reject + no traversal, see
+# :func:`_is_allowed_image_url`) + the ``/storage/`` namespace + an image extension.
+# The site logo (``/public/.../logo.svg`` — not ``/storage/``) and covers
+# (``/covers/...``) still fail the ``/storage/`` prefix; group icons under
+# ``/storage/`` are same-origin and harmless (and never reach here — extraction scopes
+# to the ``chapterImages`` array, this is defense-in-depth).
 _MANGABALL_IMG_PATH_RE = re.compile(
-    r"^/storage/[A-Za-z0-9_/.-]+/[A-Za-z0-9]+-\d{3,}\.(jpg|jpeg|png|webp)$",
+    r"^/storage/[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp)$",
     re.IGNORECASE,
 )
 _MANGABALL_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECASE)
@@ -179,6 +191,16 @@ _MANGABALL_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECA
 # (``metadata.google.internal``, ``foo.local`` etc.). The host is NOT pinned to a
 # literal, so we must reject the non-public namespaces explicitly (CR-01 / SSRF).
 _MANGABALL_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
+
+# Page images are injected client-side as a JS template-literal JSON array (GAP-3,
+# live W-04): ``const chapterImages = JSON.parse(`["https://<cdn>/.../01.jpg", …]`)``.
+# Capture the bracketed JSON array — page-image URLs never contain ``]``, so the
+# non-greedy ``\[.*?\]`` stops exactly at the array close. DOTALL so a multi-line
+# array still matches. See :func:`_extract_chapter_image_urls`.
+_CHAPTER_IMAGES_RE = re.compile(
+    r"chapterImages\s*=\s*JSON\.parse\(\s*`(?P<json>\[.*?\])`",
+    re.DOTALL,
+)
 
 
 def _items_and_pagination(
@@ -233,7 +255,7 @@ def _parse_last_chapter(html: str) -> dict[str, Any] | None:
 
     Blocking (lxml C-parse) by design — the caller offloads it via
     ``asyncio.to_thread`` (RESEARCH Pitfall 6 / ruff ASYNC), mirroring
-    :func:`_extract_data_src_urls`. Extracts, defensively:
+    :func:`_extract_chapter_image_urls`. Extracts, defensively:
 
     * ``translation_id`` — the trailing path segment of the ``chapter-detail/{id}/``
       anchor href (regex-captured, NEVER reconstructed — CLAUDE.md SSRF). REQUIRED;
@@ -380,25 +402,36 @@ def _is_allowed_image_url(url: str) -> bool:
     )
 
 
-def _extract_data_src_urls(html: bytes) -> list[str]:
-    """Parse chapter-detail HTML → absolute ``img[data-src]`` URLs in document order.
+def _extract_chapter_image_urls(html: bytes) -> list[str]:
+    """Extract the ordered page-image URLs from chapter-detail HTML (GAP-3, live).
 
-    Blocking (lxml C-parse) by design — the caller offloads it via
-    ``asyncio.to_thread`` (RESEARCH Pitfall 6 / ruff ASYNC). Returns ONLY the
-    ``data-src`` attribute values verbatim (the absolute CDN URL the reader
-    server-rendered, RECON §4); the host is NEVER reconstructed. Falls back to an
-    ``src`` attribute only when ``data-src`` is absent (defensive — the live
-    scaffolds use ``data-src``). The SSRF allowlist filters these downstream.
+    The reader is rendered CLIENT-SIDE: the page images are NOT ``<img>`` tags
+    (live W-04 — the recon ``img[data-src]`` assumption was wrong; the only ``<img>``
+    on the page are the site logo + a group icon). The real page URLs live in a JS
+    template-literal JSON array::
+
+        const chapterImages = JSON.parse(`["https://<cdn>/storage/.../en/01.jpg", …]`);
+
+    We capture that array and ``json.loads`` it — the array order IS the page order,
+    so no DOM/document-order walk is needed. The host is taken verbatim from the CDN
+    URL, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF); every URL is allowlisted
+    downstream by :func:`_is_allowed_image_url`. Blocking-free string work, but kept
+    behind ``asyncio.to_thread`` at the call site for parity with the prior lxml path
+    and to stay future-proof if a larger parse is reintroduced. Returns ``[]`` on any
+    miss (no marker / malformed JSON), which the caller turns into a clear
+    ``source_unavailable``.
     """
-    # lxml.html.fromstring tolerates a fragment or full document; a parse failure
-    # on garbage input yields no <img> nodes (→ empty list, guarded by the caller).
-    doc = lxml.html.fromstring(html)
-    out: list[str] = []
-    for img in doc.iter("img"):
-        url = img.get("data-src") or img.get("src")
-        if url:
-            out.append(url.strip())
-    return out
+    text = html.decode("utf-8", "replace") if isinstance(html, bytes) else html
+    match = _CHAPTER_IMAGES_RE.search(text)
+    if match is None:
+        return []
+    try:
+        parsed = json.loads(match.group("json"))
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [u.strip() for u in parsed if isinstance(u, str) and u.strip()]
 
 
 class MangaBallSource(Source):
@@ -516,8 +549,17 @@ class MangaBallSource(Source):
         Language-filtered, NEWEST-FIRST by translation ``date`` (parsed via
         :func:`_parse_ts`), sliced to ``limit``. Multi-group-same-language is
         preserved: distinct translation ids → distinct guids.
+
+        GAP-2 (live): mint handles ONLY for the post-slice survivors. A long-running
+        title (One Piece ≈ 1382 chapters × thousands of translations) would otherwise
+        mint tens of thousands of handles per candidate — blowing past the
+        ``HandleStore`` ``maxsize`` (10_000) so the TTLCache EVICTS the very handles
+        attached to the releases we return, and a later ``POST /downloads`` for
+        ``releases[0]`` resolves to a miss ("release no longer resolvable"). Collect
+        sort keys first, slice to ``limit``, THEN mint — handle count per candidate is
+        bounded by ``limit`` and the returned releases' handles always survive.
         """
-        rows: list[tuple[datetime, Release]] = []
+        rows: list[tuple[datetime, Decimal | None, dict[str, Any]]] = []
         for chapter in all_chapters:
             if not isinstance(chapter, dict):
                 continue
@@ -525,14 +567,21 @@ class MangaBallSource(Source):
             for translation in chapter.get("translations") or []:
                 if not isinstance(translation, dict):
                     continue
+                if not translation.get("id"):
+                    continue  # no resolve unit → _to_release would drop it anyway
                 language = str(translation.get("language") or "en")
                 if wanted_langs is not None and language not in wanted_langs:
                     continue
-                rel = self._to_release(title_id, manga_title, number, translation, ctx)
-                if rel is not None:
-                    rows.append((_parse_ts(str(translation.get("date") or "")), rel))
-        rows.sort(key=lambda pair: pair[0], reverse=True)  # newest-first
-        return [rel for _ts, rel in rows[:limit]]
+                rows.append(
+                    (_parse_ts(str(translation.get("date") or "")), number, translation)
+                )
+        rows.sort(key=lambda row: row[0], reverse=True)  # newest-first
+        releases: list[Release] = []
+        for _ts, number, translation in rows[:limit]:  # mint AFTER slice (GAP-2)
+            rel = self._to_release(title_id, manga_title, number, translation, ctx)
+            if rel is not None:
+                releases.append(rel)
+        return releases
 
     async def recent(
         self,
@@ -623,9 +672,9 @@ class MangaBallSource(Source):
 
         Both ``search`` and ``recent`` now mint a BARE ``translation_id`` as the
         ``chapter_id`` (GAP-1 lock — recent no longer defers), so this is a straight
-        ``translation_id`` → chapter-detail HTML → ordered allowlisted img URLs
-        resolve. The HTML ``img[data-src]`` extract + SSRF allowlist + pages-count
-        guard live in :meth:`_manifest_for_translation`. (The Comix-only
+        ``translation_id`` → chapter-detail HTML → ordered allowlisted page URLs
+        resolve. The ``chapterImages`` JSON-array extract + SSRF allowlist +
+        pages-count guard live in :meth:`_manifest_for_translation`. (The Comix-only
         ``:DEFERRED`` late-bind pattern does not apply to MangaBall.)
         """
         return await self._manifest_for_translation(chapter_id, None, ctx)
@@ -633,12 +682,13 @@ class MangaBallSource(Source):
     async def _manifest_for_translation(
         self, translation_id: str, pages: int | None, ctx: SourceContext
     ) -> list[str]:
-        """HTML ``img[data-src]`` extract + SSRF allowlist + pages guard (PKG-01).
+        """``chapterImages`` JSON extract + SSRF allowlist + pages guard (PKG-01).
 
         GETs ``/chapter-detail/{translation_id}/`` (HTML) via ``ctx.get_bytes``,
-        parses the absolute ``img[data-src]`` URLs in document order, and returns
-        them. The CDN host is taken from the DOM, NEVER reconstructed (RECON §4 /
-        CLAUDE.md SSRF) — the host varies per content. Every extracted URL is
+        extracts the ordered page URLs from the client-side ``chapterImages`` JSON
+        array (GAP-3 — NOT ``<img>`` tags), and returns them. The CDN host is taken
+        from that array, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF) — the host
+        varies per content. Every extracted URL is
         SSRF-allowlisted (:func:`_is_allowed_image_url`) before return; a
         non-allowlisted URL raises ``SourceError`` (no blind fetch, T-07-07). The
         extracted count is guarded against the chapter's ``pages`` when known
@@ -647,7 +697,7 @@ class MangaBallSource(Source):
         (RESEARCH Pitfall 6; ruff ASYNC).
         """
         html = await ctx.get_bytes(f"{self.base_url}/chapter-detail/{translation_id}/")
-        urls = await asyncio.to_thread(_extract_data_src_urls, html)
+        urls = await asyncio.to_thread(_extract_chapter_image_urls, html)
         if not urls:
             raise SourceError(
                 "source_unavailable",
@@ -655,10 +705,12 @@ class MangaBallSource(Source):
             )
         for url in urls:
             if not _is_allowed_image_url(url):
-                # Never fetch a non-allowlisted (off-host / off-shape) URL.
+                # Never fetch a non-allowlisted (off-host / off-shape) URL. Name the
+                # offending URL so an allowlist/CDN-shape divergence is diagnosable
+                # rather than opaque (live W-04 — the recon path shape was wrong).
                 raise SourceError(
                     "source_unavailable",
-                    "chapter-detail image URL failed the SSRF allowlist",
+                    f"chapter-detail image URL failed the SSRF allowlist: {url!r}",
                 )
         if pages is not None and len(urls) != pages:
             raise SourceError(
@@ -697,7 +749,7 @@ class MangaBallSource(Source):
 
         language = str(translation.get("language") or "en")
         page_count = self._parse_int(translation.get("pages"))  # reliable; size is not
-        publish_date = str(translation.get("date") or "")
+        publish_date = self._normalize_publish_date(translation.get("date"))
         group = translation.get("group")
         group_name = _strip_html(group.get("name")) if isinstance(group, dict) else None
 
@@ -760,6 +812,25 @@ class MangaBallSource(Source):
         if group:
             parts.append(f"[{group}]")
         return " ".join(parts)
+
+    @staticmethod
+    def _normalize_publish_date(raw: Any) -> str:
+        """Normalize a translation ``date`` → RFC3339 ``date-time`` (REL-03, GAP-2).
+
+        The contract's ``Release.publishDate`` is ``format: date-time`` (RFC3339, ``T``
+        separator). The live ``chapter-listing-by-title-id`` ``date`` is
+        space-separated (``"2026-06-01 23:33:42"``) which fails schema conformance, so
+        search emitted an invalid ``publishDate`` (live W-04). :func:`_parse_ts` accepts
+        both separators (Python 3.11+) and yields an aware datetime; ``.isoformat()``
+        re-serializes with the ``T`` separator. Empty/unparseable values floor to
+        ``_TS_FLOOR`` (year 1), which — while valid date-time — is a nonsense publish
+        date, so we fall back to ``now(UTC)``. Idempotent for the recent() path, whose
+        ``date`` is already an ISO string.
+        """
+        parsed = _parse_ts(str(raw or ""))
+        if parsed == _TS_FLOOR:
+            return datetime.now(UTC).isoformat()
+        return parsed.isoformat()
 
     @staticmethod
     def _parse_decimal(raw: Any) -> Decimal | None:

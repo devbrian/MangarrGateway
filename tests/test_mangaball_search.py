@@ -252,7 +252,9 @@ async def test_search_mints_fully_specific_guid_and_opaque_handle() -> None:
     assert record.source_key == "mangaball"
     assert record.page_count == 66  # from translation.pages, reliable
     assert rel.page_count == 66
-    assert rel.publish_date == "2026-06-01 23:33:42"
+    # GAP-3 (live W-04): the space-separated listing date is normalized to RFC3339
+    # ``date-time`` (``T`` separator + UTC) so it conforms to Release.publishDate.
+    assert rel.publish_date == "2026-06-01T23:33:42+00:00"
     assert rel.language == "vi"
     assert rel.scanlation_group == "Rayquaza"
     assert rel.chapter_number == Decimal("1184.1")
@@ -368,8 +370,9 @@ async def test_search_per_candidate_slice_respects_limit_newest_first() -> None:
     releases = await source.search(SearchRequest(type="manga", query="x", limit=2), ctx)
     assert len(releases) == 2
     # Newest-first: the two latest dates (06-05, 06-04) survive the slice.
-    assert releases[0].publish_date == "2026-06-05 00:00:00"
-    assert releases[1].publish_date == "2026-06-04 00:00:00"
+    # publishDate is normalized to RFC3339 (GAP-3).
+    assert releases[0].publish_date == "2026-06-05T00:00:00+00:00"
+    assert releases[1].publish_date == "2026-06-04T00:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -395,3 +398,37 @@ async def test_search_empty_results_returns_no_releases() -> None:
     assert releases == []
     # Only the search-advanced POST fired — no candidate to deep-enumerate.
     assert len(ctx.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_mints_handles_only_for_returned_releases() -> None:
+    """GAP-2 (live): a handle is minted ONLY for the post-slice survivors.
+
+    A long-running title (One Piece ≈ 1382 chapters × thousands of translations)
+    must NOT mint a handle per (chapter×translation) for the whole listing — that
+    blew past ``HandleStore`` ``maxsize`` (10_000) so the TTLCache evicted the very
+    handles attached to the returned releases, and ``POST /downloads`` for
+    ``releases[0]`` resolved to a miss. Here a 40-chapter listing with ``limit=3``
+    yields 3 releases AND mints exactly 3 handles — and every returned handle still
+    resolves (the eviction regression would leave it unresolvable).
+    """
+    title_id = "68515540702284f8341784c8"
+    chapters = [
+        _chapter(
+            number_float=float(n),
+            translations=[
+                _translation(tx_id=f"{n:024x}", date=f"2026-06-01 {n:02d}:00:00")
+            ],
+        )
+        for n in range(1, 41)  # 40 chapters » limit
+    ]
+    ctx = _ctx(titles=[_title(title_id=title_id)], listings={title_id: chapters})
+    source = MangaBallSource()
+    releases = await source.search(SearchRequest(type="manga", query="x", limit=3), ctx)
+
+    assert len(releases) == 3
+    # Exactly one handle minted per returned release — NOT one per listing row.
+    assert len(ctx.handle_store._cache) == 3  # noqa: SLF001 — store-size assertion
+    # Every returned release's handle resolves (no eviction of survivors).
+    for rel in releases:
+        assert ctx.handle_store.resolve(rel.download_handle) is not None
