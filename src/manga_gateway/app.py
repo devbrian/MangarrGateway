@@ -189,19 +189,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         },
     )
     app.state.session_prep = session_prep
-    # Resolve the Cloudflare clearance URL from the first cloudflare-gated source's
-    # ``cloudflare_challenge_url`` metadata — the framework solver itself never
-    # names a host. If multiple cloudflare sources are registered, the first
-    # with a non-None URL wins; sources without a URL fall back to the framework
-    # solver default (an invalid.example placeholder useful only for tests).
-    challenge_url: str | None = next(
-        (
-            getattr(cls, "cloudflare_challenge_url", None)
-            for cls in cf_sources.values()
-            if getattr(cls, "cloudflare_challenge_url", None)
-        ),
-        None,
-    )
+    # Build the per-domain Cloudflare challenge-URL map (#88): each
+    # cloudflare-gated source maps its ``source_key`` -> its
+    # ``cloudflare_challenge_url`` metadata so N sources each solve against their
+    # OWN host (the framework solver itself never names a host). Sources without
+    # a URL fall back to the framework solver default (an invalid.example
+    # placeholder useful only for tests). With exactly one cf source registered
+    # (comix today) this collapses to the historic single-domain behavior.
+    challenge_urls: dict[str, str] = {
+        key: url
+        for key, cls in cf_sources.items()
+        if (url := getattr(cls, "cloudflare_challenge_url", None))
+    }
     solver_kwargs: dict[str, Any] = {
         "user_data_dir": settings.cloudflare_user_data_dir,
         "headless": settings.cloudflare_headless,
@@ -225,8 +224,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # ``comix-pageerror-throw-site-54.md``).
         "log_browser_events": settings.cloudflare_log_browser_events,
     }
-    if challenge_url is not None:
-        solver_kwargs["challenge_url"] = challenge_url
+    if challenge_urls:
+        solver_kwargs["challenge_urls"] = challenge_urls
     # PROXY-01 / #65: build the proxy ONCE from settings. The Playwright dict
     # (first element) threads into the solver's browser launch closures; the
     # transport built above derives the httpx leg (second element) from the SAME

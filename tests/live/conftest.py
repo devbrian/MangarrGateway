@@ -249,8 +249,8 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
     build, incl. the PROXY-01/#65 proxy gate) — the fields and source of each
     match. The only difference: this fixture uses
     a default-constructed ``Settings()`` (which picks up env vars exactly as
-    production does), then derives ``cloudflare_keys`` and ``challenge_url``
-    from the same registry inspection app.py performs.
+    production does), then derives ``cloudflare_keys`` and ``challenge_urls``
+    (the #88 per-domain map) from the same registry inspection app.py performs.
     """
     # ``api_key`` is a required Settings field but does not feed any solver
     # kwarg; supply a session-internal placeholder. All cloudflare_* fields
@@ -264,14 +264,14 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
         if getattr(cls, "antibot", "none").startswith("cloudflare")
     }
     cloudflare_keys = frozenset(cf_sources)
-    challenge_url = next(
-        (
-            getattr(cls, "cloudflare_challenge_url", None)
-            for cls in cf_sources.values()
-            if getattr(cls, "cloudflare_challenge_url", None)
-        ),
-        None,
-    )
+    # Per-domain challenge-URL map (#88) — MUST match app.py's lifespan build
+    # field-for-field (this fixture is the documented hand-mirror; a drift here
+    # silently makes the live solver bypass per-domain clearance).
+    challenge_urls = {
+        key: url
+        for key, cls in cf_sources.items()
+        if (url := getattr(cls, "cloudflare_challenge_url", None))
+    }
     kwargs: dict[str, Any] = {
         "user_data_dir": settings.cloudflare_user_data_dir,
         "headless": settings.cloudflare_headless,
@@ -281,8 +281,8 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
         "engine": settings.cloudflare_engine,
         "log_browser_events": settings.cloudflare_log_browser_events,
     }
-    if challenge_url is not None:
-        kwargs["challenge_url"] = challenge_url
+    if challenge_urls:
+        kwargs["challenge_urls"] = challenge_urls
     # PROXY-01 / #65: mirror the lifespan's proxy wiring so the session-shared
     # solver egresses through the SAME proxy as the per-test HttpxTransport
     # (which derives its own proxy from these same env-backed settings). Without
