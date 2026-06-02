@@ -120,6 +120,7 @@ def _parse_ts(raw: str) -> datetime:
         return _TS_FLOOR
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
+
 # SSRF allowlist for the DOM-extracted page-image URLs (T-07-07/T-07-09,
 # CLAUDE.md). The CDN host VARIES per content (RECON §4) so — unlike Comix — it
 # cannot be pinned to one literal; we allowlist the ``https`` scheme + the
