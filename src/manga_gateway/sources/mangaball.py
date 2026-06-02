@@ -122,6 +122,12 @@ _RELATIVE_UNIT_SECONDS: dict[str, int] = {
 _CHAPTER_DETAIL_HREF_RE = re.compile(r"/chapter-detail/([^/?#]+)/?")
 # Chapter number after a ``Ch.`` / ``Chapter`` label in the anchor text.
 _CHAPTER_NUMBER_RE = re.compile(r"(?:ch(?:apter)?\.?)\s*([\d.]+)", re.IGNORECASE)
+# Flag-image language token: a BCP-47-ish ``xx`` / ``xx-yy`` code (WR-01). The
+# ``last_chapter`` blob is NOT guaranteed to hold only a flag <img> — a preceding
+# group-icon img (``alt="Rayquaza Group"``) would otherwise poison ``language``
+# (breaking the ``[a-z-]`` guid shape and wrongly failing the recent language
+# filter). Validate the token shape before accepting it as a language.
+_LANG_TOKEN_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2,})?$")
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -223,8 +229,9 @@ def _parse_last_chapter(html: str) -> dict[str, Any] | None:
     * ``number`` — the digits/decimal after ``Ch.``/``Chapter`` in the anchor text.
       REQUIRED; returns ``None`` when absent (a chapter without a number cannot mint
       a sane guid).
-    * ``language`` — the ``alt``/``title`` of the flag ``<img>``; falls back to
-      ``"en"``.
+    * ``language`` — the ``alt``/``title`` of the flag ``<img>``, accepted ONLY when
+      it matches a BCP-47-ish ``xx``/``xx-yy`` token (a preceding non-flag img must
+      not poison it — WR-01); falls back to ``"en"``.
     * ``group`` — the ``title`` (or text) of the ``/group/{slug}/`` anchor; ``None``
       when absent.
     * ``date_raw`` — the raw relative date text (e.g. "1d ago"), for
@@ -263,10 +270,13 @@ def _parse_last_chapter(html: str) -> dict[str, Any] | None:
     if translation_id is None or number is None:
         return None
 
-    # Language flag: alt/title on a flag <img>.
+    # Language flag: alt/title on a flag <img>. Accept ONLY a BCP-47-ish token
+    # (WR-01) — a preceding non-flag img (e.g. a group icon ``alt="Rayquaza Group"``)
+    # must not poison ``language`` (which flows into the guid + the recent language
+    # filter). Off-shape alt/title values are skipped; ``language`` stays ``"en"``.
     for img in doc.iter("img"):
         flag = (img.get("alt") or img.get("title") or "").strip().lower()
-        if flag:
+        if flag and _LANG_TOKEN_RE.match(flag):
             language = flag
             break
 

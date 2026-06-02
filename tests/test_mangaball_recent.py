@@ -138,6 +138,44 @@ def test_parse_last_chapter_language_falls_back_to_en() -> None:
     assert parsed["number"] == "5"
 
 
+def test_parse_last_chapter_skips_non_flag_img_before_flag() -> None:
+    """WR-01: a preceding non-flag <img> must NOT poison ``language``.
+
+    The blob is NOT guaranteed to hold only the flag <img>. With a group-icon img
+    (``alt="Rayquaza Group"``) ordered BEFORE the real flag (``alt="vi"``), the old
+    "first <img> with any alt/title" logic selected ``"rayquaza group"`` — a value
+    with a space that breaks the ``[a-z-]`` guid shape and never matches a real
+    BCP-47 code, wrongly dropping the release under a ``languages`` filter. The
+    BCP-47-shape guard now skips the group icon and selects ``"vi"``.
+    """
+    tx_id = "6a1e164ac01e2cf095f75b1a"
+    html = (
+        "<div>"
+        '<img class="group-icon" alt="Rayquaza Group" title="Rayquaza Group" '
+        'src="/storage/groups/r.png">'
+        f'<a href="https://mangaball.net/chapter-detail/{tx_id}/">Ch. 12</a>'
+        '<img class="flag" alt="vi" title="vi" src="/storage/flags/vi.png">'
+        "</div>"
+    )
+    parsed = _parse_last_chapter(html)
+    assert parsed is not None
+    assert parsed["language"] == "vi"
+
+
+def test_parse_last_chapter_region_subtag_language_accepted() -> None:
+    """WR-01: a BCP-47 region subtag (``pt-br``) is a valid language token."""
+    tx_id = "6a1e164ac01e2cf095f75b1a"
+    html = (
+        "<div>"
+        f'<a href="https://mangaball.net/chapter-detail/{tx_id}/">Ch. 7</a>'
+        '<img class="flag" alt="pt-br" src="/storage/flags/ptbr.png">'
+        "</div>"
+    )
+    parsed = _parse_last_chapter(html)
+    assert parsed is not None
+    assert parsed["language"] == "pt-br"
+
+
 # ───────────────────────────────── recent() shape ───────────────────────────
 
 
