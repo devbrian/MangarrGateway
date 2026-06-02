@@ -179,6 +179,20 @@ def _make_deferred_composite(title_id: str, number: str, language: str) -> str:
     :func:`_resolve_deferred` re-discovers at download time (so it is dropped
     here). Every segment must be non-empty so :func:`_decode_deferred_composite`
     accepts it unchanged. The framework treats ``chapter_id`` as source-opaque.
+
+    DEFERRED-RESOLUTION FIDELITY (WR-02 — intended, locked decision, NOT a bug):
+    dropping the ``translation_id`` means the handle binds to a
+    *(number, language)* pair, not to a specific translation/scanlation group. At
+    download time :func:`_resolve_deferred` re-discovers the match with the D-11
+    tie-break (newest ``date`` → non-empty group → lowest id), so a DEFERRED handle
+    MAY resolve to a NEWER same-number/same-language translation by a DIFFERENT
+    scanlation group than the one shown in ``/recent`` (e.g. another group
+    re-translated the chapter between the feed and the grab). This deliberately
+    mirrors Comix's locked deferred-resolution design
+    (spike-findings ``comix-recent-deferred-resolution`` — the number+language
+    match + tie-break is the locked contract). Only an ENTIRELY-ABSENT chapter
+    (no matching number+language at all) fails closed; a same-number rebind is
+    intended fidelity, not silent corruption.
     """
     if not (title_id and number and language):
         raise ValueError("title_id, number, language must all be non-empty")
@@ -467,10 +481,13 @@ class MangaBallSource(Source):
         and, for each promised chapter, mints a DEFERRED Release keyed on
         ``title_id`` + the normalized ``number_float`` + ``language`` — the
         ``translation_id`` is intentionally dropped and re-discovered at
-        :meth:`fetch_manifest` time (D-10). The guid carries the literal
-        ``:DEFERRED`` suffix; it is NEVER rewritten when the composite resolves
-        (mirror comix locked decision 1). ``since`` cuts older items at the source
-        (RCNT-02) by comparing PARSED datetimes (WR-01) — MangaBall dates are
+        :meth:`fetch_manifest` time (D-10). Because the id is dropped, a DEFERRED
+        handle may resolve to a NEWER same-number/same-language translation (a
+        different scanlation group) than the one listed here — intended Comix-parity
+        fidelity, NOT a bug; see :func:`_make_deferred_composite` (WR-02). The guid
+        carries the literal ``:DEFERRED`` suffix; it is NEVER rewritten when it
+        resolves (mirror comix locked decision 1). ``since`` cuts older items at the
+        source (RCNT-02) by comparing PARSED datetimes (WR-01) — MangaBall dates are
         space-separated ``"YYYY-MM-DD HH:MM:SS"`` while ``since`` is ISO-`T`, so a
         raw string compare would silently drop genuinely-newer chapters.
         ``languages`` filters the eligible translations when supplied. Zero
