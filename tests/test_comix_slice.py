@@ -452,21 +452,31 @@ async def test_comix_fetch_manifest_routes_through_browser(
     # ``/si/`` path can never false-fail this (CodeRabbit PR #92).
     assert "\\/si\\/" not in extract_body
     # NN-order sort over the page-number-keyed Map, gaps preserved (Comix's
-    # reader scaffolds .rpage-page[data-page=N] divs and the extractor walks
-    # them with scrollIntoView to trigger the lazy loader per-page).
+    # reader scaffolds .rpage-page[data-page=N] divs; the extractor keys
+    # captured/synthesized URLs by the data-page integer and sorts ascending).
     assert "rpage-page" in extract_body
-    assert "scrollIntoView" in extract_body
     assert "sort" in extract_body
-    # Issue #45 (2026-05-31): the extractor's Step-2 walk now scrolls the
-    # inner Swiper scroll container to its midpoint then its end in two
-    # batched passes (head+tail), then falls back to per-missing-page
-    # scrollIntoView selectively. The ancestor walk that finds the inner
-    # Swiper container reads ``getComputedStyle(el).overflowY`` and
-    # ``el.scrollHeight`` — both substrings MUST appear in the extractor
-    # body so a future rewrite that loses the two-scroll strategy is
-    # caught here, not only by the live perf test.
+    # Issue #45 (2026-05-31): the extractor's Step-2 walk scrolls the inner
+    # Swiper scroll container to its midpoint then its end in two batched
+    # passes (head+tail) for a cheap real-image capture. The ancestor walk
+    # that finds the inner Swiper container reads
+    # ``getComputedStyle(el).overflowY`` and ``el.scrollHeight`` — both
+    # substrings MUST appear so a future rewrite that loses the two-scroll
+    # capture is caught here, not only by the live perf test.
     assert "scrollHeight" in extract_body
     assert "overflowY" in extract_body
+    # debug comix-manifest-60s-timeout (2026-06-03): Comix's single-page reader
+    # keeps only ~3 imgs DOM-resident, so the manifest is completed by SYNTHESIS
+    # — for every scaffold page not captured, substitute its zero-padded
+    # filename number into a captured img's /{NN}.{ext} tail (``padStart`` over
+    # the data-page count). This replaced the old O(pages) per-missing-page
+    # ``scrollIntoView`` walk that blew the 60s budget on long chapters; assert
+    # the synthesis marker is present AND the dropped slow-path marker is gone,
+    # so a regression to the per-page walk is caught here.
+    assert "padStart" in extract_body
+    # The per-page walk is gone: no scrollIntoView CALL remains (the strategy
+    # comment may still name it, so match the invocation form, not the word).
+    assert ".scrollIntoView(" not in extract_body
     # Issue #20: wait_for is now None — the extractor's own Step-1 polls for
     # the scaffold from inside ``page.evaluate``. A Python-side wait_for_selector
     # would double-wait the same condition and add ~1 s of pure overhead.
