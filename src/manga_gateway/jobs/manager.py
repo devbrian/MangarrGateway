@@ -101,6 +101,7 @@ class JobManager:
     ) -> None:
         self._store = store
         self._settings = settings
+        self._registry = registry  # D-30: read per-source max_concurrent_jobs overrides
         self._projection: dict[str, Job] = {}  # DL-05 read model
         self._global_sem = asyncio.Semaphore(settings.max_concurrent_chapters)  # D-30
         self._source_sems: dict[str, asyncio.Semaphore] = {}  # D-30 per-source
@@ -327,7 +328,9 @@ class JobManager:
         — a distinct, intentionally tighter knob than the global
         ``max_concurrent_chapters``. Previously both were sized to the same value
         so the per-source layer never constrained anything; this is the meaningful
-        ceiling that keeps one slow source from saturating every global slot.
+        ceiling that keeps one slow source from saturating every global slot. A source
+        may RAISE its own ceiling via the ``Source.max_concurrent_jobs`` class attr
+        (e.g. mangadot=3, measured safe); the override is clamped to the global bound.
         """
         job = self._projection.get(job_id)
         if job is None:  # pragma: no cover - defensive; submit always projects first
@@ -338,10 +341,25 @@ class JobManager:
             return
         source_sem = self._source_sems.setdefault(
             job.source_key,
-            asyncio.Semaphore(self._settings.max_concurrent_per_source),
+            asyncio.Semaphore(self._per_source_bound(job.source_key)),
         )
         async with self._global_sem, source_sem:
             await self._engine.run(job)
+
+    def _per_source_bound(self, source_key: str) -> int:
+        """Per-source concurrent-job bound (D-30).
+
+        The source's ``max_concurrent_jobs`` override if set, else
+        ``settings.max_concurrent_per_source`` — clamped to the global
+        ``max_concurrent_chapters`` so the per-source layer never exceeds it (WR-02).
+        """
+        cls = self._registry.get(source_key)
+        override = (
+            getattr(cls, "max_concurrent_jobs", None) if cls is not None else None
+        )
+        default = self._settings.max_concurrent_per_source
+        bound = override if override is not None else default
+        return max(1, min(bound, self._settings.max_concurrent_chapters))
 
     @staticmethod
     def _estimate_bytes_and_eta(job: Job) -> tuple[int, int, int | None]:

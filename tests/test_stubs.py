@@ -98,5 +98,5 @@ async def test_status_shape(client: httpx.AsyncClient) -> None:
     caps = body["capabilities"]
     assert caps["pause"] is False  # PAUSE-01 is v2 — unsupported in v1
     assert set(caps["outputFormats"]) >= {"cbz", "cbt", "folder"}
-    # STAT-01: maxConcurrentChapters reflects the effective D-30 config global (3).
-    assert caps["maxConcurrentChapters"] == 3
+    # STAT-01: maxConcurrentChapters reflects the effective D-30 config global (8).
+    assert caps["maxConcurrentChapters"] == 8

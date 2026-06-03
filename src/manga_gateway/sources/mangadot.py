@@ -56,8 +56,10 @@ the SAME manga with a matching ``page_count`` (see ``tests/live/profiles/mangado
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
 import re
+from collections.abc import Coroutine
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
@@ -76,6 +78,13 @@ if TYPE_CHECKING:
 # search is TITLE-ONLY, so each candidate is a full chapters/list fan-out). Like
 # mangaball, ``req.interactive`` does NOT widen the candidate count.
 _DEFAULT_MANGA_CANDIDATES = 5
+
+# Bounds the per-candidate ``chapters/list`` fan-out in ``search`` — at most this
+# many chapter-list fetches run concurrently. The candidates are no longer fetched
+# serially after the #101 fix (sequential at rate_limit=10 crossed the 30s fanout
+# timeout); 6 collapses the wall-clock while staying well under the per-source
+# rate budget (480/min).
+_CHAPTERS_FANOUT_CONCURRENCY = 6
 
 # Floor for empty/malformed timestamps so they sort oldest and never crash.
 _TS_FLOOR = datetime.min.replace(tzinfo=UTC)
@@ -140,8 +149,21 @@ class MangadotSource(Source):
     id_types: list[str] = []
     # English-only at v1 (widen if the live loop shows other langs present).
     languages = ["en"]
-    # Conservative start — origin 504s under load (CONTEXT.md). Live-tune.
-    rate_limit_per_minute = 10
+    # Measured ceiling (#101 fix): the PR #102 rate-limit probe ran mangadot live at
+    # concurrency 8 and the full sweep up to 960/min sustained across
+    # search/manifest/image with ZERO rate-limiting and ZERO latency degradation
+    # ("FLOOR — no limit hit across the full tested grid"). 480/min is a conservative
+    # half-of-floor with large headroom. The prior `10` was the root cause of #101: a
+    # single search issues up to 6 serialized rate-limited requests (1 /api/search + up
+    # to 5 sequential chapters/list); at 10/min the limiter spaced them ~6s apart once
+    # the burst budget drained, crossing framework/fanout.py's 30s timeout →
+    # source_unavailable. At 480/min the calls space ~0.125s apart.
+    rate_limit_per_minute = 480
+    # Per-source download-job concurrency (D-30 override): the PR #102 probe measured
+    # mangadot tolerating >=960/min/endpoint with no throttling, so up to 3 chapters
+    # download in parallel (vs the global per-source default of 1). Clamped to the
+    # global max_concurrent_chapters by the job manager.
+    max_concurrent_jobs = 3
     # Plaintext JSON behind Cloudflare (NOT +encrypted). The framework injects
     # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
     antibot = "cloudflare"
@@ -161,12 +183,16 @@ class MangadotSource(Source):
         Two-call live flow: ``GET /api/search`` is TITLE-ONLY, so ``search``
         deep-enumerates the first ``_DEFAULT_MANGA_CANDIDATES`` manga candidates
         via a per-candidate ``GET /api/manga/{id}/chapters/list`` (a bare JSON
-        array, consumed by ``ctx.get_json_array``). One Release is minted per
-        chapter row — and per language/group row when one ``chapter_number`` has
-        multiple rows (D-08). Releases are language-filtered by ``req.languages``,
-        ordered NEWEST-FIRST by parsed ``date_added``, sliced to ``req.limit``, and
-        ONLY THEN minted (mangaball GAP-2 mint-after-slice — handle-eviction
-        lesson). ZERO networking glue — both calls ride ``ctx`` (SRC-01/02).
+        array, consumed by ``ctx.get_json_array``). Those per-candidate fetches run
+        with bounded concurrency (``_CHAPTERS_FANOUT_CONCURRENCY``) — not serially —
+        which collapses the wall-clock under the 30s fan-out budget (#101). One
+        Release is minted per chapter row — and per language/group row when one
+        ``chapter_number`` has multiple rows (D-08). Per candidate, releases are
+        language-filtered by ``req.languages``, ordered NEWEST-FIRST by parsed
+        ``date_added``, sliced to ``req.limit``, and ONLY THEN minted (mangaball
+        GAP-2 mint-after-slice — handle-eviction lesson). Cross-candidate
+        aggregation preserves submission order (``asyncio.gather`` returns results
+        in task order). ZERO networking glue — both calls ride ``ctx`` (SRC-01/02).
         """
         envelope = await ctx.get_json(
             f"{self.base_url}/api/search",
@@ -181,21 +207,44 @@ class MangadotSource(Source):
         wanted_langs = set(req.languages) if req.languages else None
         limit = req.limit or 50
 
-        releases: list[Release] = []
+        # Bound the per-candidate chapters/list fan-out (one Semaphore shared across
+        # the dispatch; constructed HERE so it binds to the running loop, never at
+        # import time).
+        sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
+
+        async def _fetch_candidate(manga_id: str, manga_title: str) -> list[Release]:
+            async with sem:
+                rows = await ctx.get_json_array(
+                    f"{self.base_url}/api/manga/{manga_id}/chapters/list"
+                )
+            return self._chapters_to_releases(
+                rows, manga_id, manga_title, wanted_langs, limit, ctx
+            )
+
+        # Pre-filter candidates lacking a usable ``id`` BEFORE dispatching tasks — a
+        # candidate with no ``id`` must not produce a task (preserves the old skip).
+        tasks: list[Coroutine[Any, Any, list[Release]]] = []
         for manga in candidates:
             manga_id = manga.get("id")
             if manga_id is None:
                 continue
-            manga_id = str(manga_id)
-            manga_title = str(manga.get("title") or "Unknown")
-            rows = await ctx.get_json_array(
-                f"{self.base_url}/api/manga/{manga_id}/chapters/list"
+            tasks.append(
+                _fetch_candidate(str(manga_id), str(manga.get("title") or "Unknown"))
             )
-            releases.extend(
-                self._chapters_to_releases(
-                    rows, manga_id, manga_title, wanted_langs, limit, ctx
-                )
-            )
+
+        # gather, NOT TaskGroup: gather (return_exceptions=False) re-raises the FIRST
+        # child exception UNCHANGED, so a SourceError from ctx.get_json_array
+        # propagates out of search() exactly as the old sequential loop did, and
+        # framework/fanout.py's ``except SourceError`` classifies it as the source's
+        # own code. TaskGroup wraps child exceptions in an ExceptionGroup → fanout's
+        # ``except Exception`` → "unexpected error" (changed classification,
+        # regression). gather also returns results in submission order, so
+        # cross-candidate aggregation order is byte-identical to the old loop.
+        results = await asyncio.gather(*tasks)
+
+        releases: list[Release] = []
+        for chunk in results:
+            releases.extend(chunk)
         return releases
 
     def _chapters_to_releases(
