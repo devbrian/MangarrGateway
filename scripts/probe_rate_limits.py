@@ -48,10 +48,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import json
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -97,8 +100,25 @@ _CATEGORY_SEARCH = "search"
 _CATEGORY_MANIFEST = "manifest"
 _CATEGORY_IMAGE = "image"
 
-# Report output dir under the repo root (gitignored — see Task 2 / .gitignore).
+# Report output dir under the repo root (gitignored — see .gitignore).
 _REPORT_DIR = _REPO_ROOT / "_rate_limit_probe_out"
+
+# proxies.txt path (raw host:port:user:pass lines). Gitignored — holds secrets.
+_PROXIES_PATH = _REPO_ROOT / "proxies.txt"
+
+# A grid cell is the "first sustained block" when its blocked fraction crosses this
+# threshold. "Sustained" = the cell's own blocked-rate is at/above the threshold
+# (we map the WHOLE grid regardless, but mark the first cell that crosses).
+_BLOCK_THRESHOLD = 0.20
+
+# Suggested rate_limit_per_minute = this safety fraction of the measured calls/min
+# ceiling (the highest sustained rate with no sustained block). Conservative so the
+# fed-back value (closing #101) stays comfortably under the real ceiling.
+_SUGGESTED_RATE_SAFETY_FRACTION = 0.50
+
+# A proxy is treated as IP-BANNED (rotate to the next) when its whole-grid blocked
+# fraction crosses this — a sustained, grid-wide block that looks IP-level.
+_PROXY_BAN_FRACTION = 0.80
 
 
 # ──────────────────────────── proxy masking (T-w1k-01) ────────────────────────────
@@ -607,6 +627,347 @@ def _print_sweep_grid(
     print("=" * 72)
 
 
+# ──────────────────────────── block classification ────────────────────────────
+
+
+def _is_blocked(record: RequestRecord) -> bool:
+    """Classify one recorded outbound result as blocked vs ok (Claude's discretion).
+
+    "blocked" = any of (CONTEXT.md required coverage):
+
+    * HTTP 429 (rate limited);
+    * HTTP 403 (forbidden — includes a Cloudflare challenge 403, flagged separately
+      via ``record.cf_challenge`` reusing the ``framework.context.is_cf_challenge``
+      heuristic spirit);
+    * a 503 carrying a Cloudflare challenge marker (``record.cf_challenge``);
+    * a ``Retry-After`` header present on the response;
+    * a transport error / connection reset / timeout (``httpx.TransportError`` →
+      recorded as ``exception_type`` with no ``status_code``).
+    """
+    if record.exception_type is not None:
+        return True
+    if record.retry_after is not None:
+        return True
+    if record.cf_challenge:
+        return True
+    return record.status_code in (429, 403)
+
+
+def _block_signal(record: RequestRecord) -> str | None:
+    """A short human-readable label for WHY ``record`` is blocked (or None if ok)."""
+    if record.exception_type is not None:
+        return f"transport:{record.exception_type}"
+    if record.cf_challenge:
+        return "cf-challenge"
+    if record.status_code == 429:
+        return "http-429"
+    if record.status_code == 403:
+        return "http-403"
+    if record.retry_after is not None:
+        return "retry-after"
+    return None
+
+
+# ──────────────────────────── sweep engine ────────────────────────────
+
+
+@dataclass
+class CellResult:
+    """One concurrency × rate grid cell's measured outcome."""
+
+    concurrency: int
+    target_rate_per_min: int
+    ok_count: int
+    blocked_count: int
+    block_signals: dict[str, int]
+    latencies: list[float]
+
+    @property
+    def total(self) -> int:
+        return self.ok_count + self.blocked_count
+
+    @property
+    def blocked_fraction(self) -> float:
+        return self.blocked_count / self.total if self.total else 0.0
+
+    @property
+    def is_sustained_block(self) -> bool:
+        """True when this cell's blocked fraction crosses the sustained threshold."""
+        return self.total > 0 and self.blocked_fraction >= _BLOCK_THRESHOLD
+
+    def latency_summary(self) -> dict[str, float]:
+        """min / mean / max latency seconds (0.0s when the cell issued nothing)."""
+        if not self.latencies:
+            return {"min": 0.0, "mean": 0.0, "max": 0.0}
+        return {
+            "min": min(self.latencies),
+            "mean": sum(self.latencies) / len(self.latencies),
+            "max": max(self.latencies),
+        }
+
+
+@dataclass
+class CategoryResult:
+    """The full sweep outcome for one endpoint category (search/manifest/image)."""
+
+    category: str
+    cells: list[CellResult]
+
+    def first_sustained_block(self) -> CellResult | None:
+        """The FIRST grid cell (in sweep order) whose block fraction crossed."""
+        for cell in self.cells:
+            if cell.is_sustained_block:
+                return cell
+        return None
+
+    def max_parallelism(self) -> int:
+        """Highest concurrency level with NO sustained block at any tested rate."""
+        ok_levels = {
+            cell.concurrency for cell in self.cells if not cell.is_sustained_block
+        }
+        return max(ok_levels) if ok_levels else 0
+
+    def calls_per_min_ceiling(self) -> int:
+        """Highest target rate sustained with NO sustained block at any concurrency."""
+        ok_rates = {
+            cell.target_rate_per_min
+            for cell in self.cells
+            if not cell.is_sustained_block
+        }
+        return max(ok_rates) if ok_rates else 0
+
+    def suggested_rate_per_min(self) -> int:
+        """Safety-margin fraction of the measured ceiling — feeds back into #101."""
+        return int(self.calls_per_min_ceiling() * _SUGGESTED_RATE_SAFETY_FRACTION)
+
+
+async def _run_cell(
+    captured: CapturedRequest,
+    transport: InstrumentedTransport,
+    *,
+    concurrency: int,
+    target_rate_per_min: int,
+    remaining_budget: int,
+) -> CellResult:
+    """Replay ``captured`` across one grid cell and tally ok/blocked outcomes.
+
+    Replay = re-issue the SAME captured method+url+kwargs through the instrumented
+    transport directly (bypassing the source's parsing but still through the real
+    httpx client + pinned proxy + injected clearance). Concurrency is controlled by an
+    ``asyncio.Semaphore`` sized to ``concurrency``; rate by pacing the dispatch to
+    ``target_rate_per_min`` (NOT by ``SourceContext._limiter`` — we want the SITE's
+    limit). The number of requests this cell issues is bounded by ``remaining_budget``
+    (the global ``--max-requests`` cap) so even aggressive mode stays controlled.
+    """
+    # One "burst" per cell: issue up to min(target rate, remaining budget) requests,
+    # paced to the target rate, bounded by the concurrency semaphore.
+    n_requests = max(1, min(target_rate_per_min, remaining_budget))
+    interval = 60.0 / target_rate_per_min if target_rate_per_min > 0 else 0.0
+    semaphore = asyncio.Semaphore(concurrency)
+    transport.segment()  # isolate this cell's records
+
+    async def _one() -> None:
+        async with semaphore:
+            try:
+                resp = await transport.request(
+                    captured.method, captured.url, **captured.kwargs
+                )
+            except httpx.HTTPError:
+                return  # already recorded by the instrumented transport
+            # Drain the body so cf-challenge classification can read content.
+            with contextlib.suppress(Exception):
+                _ = resp.content
+
+    tasks: list[asyncio.Task[None]] = []
+    for i in range(n_requests):
+        tasks.append(asyncio.create_task(_one()))
+        if interval and i < n_requests - 1:
+            await asyncio.sleep(interval)
+    await asyncio.gather(*tasks)
+
+    cell_rows = transport.segment()
+    ok = 0
+    blocked = 0
+    signals: dict[str, int] = {}
+    latencies: list[float] = []
+    for row in cell_rows:
+        latencies.append(row.latency_seconds)
+        if _is_blocked(row):
+            blocked += 1
+            signal = _block_signal(row) or "unknown"
+            signals[signal] = signals.get(signal, 0) + 1
+        else:
+            ok += 1
+    return CellResult(
+        concurrency=concurrency,
+        target_rate_per_min=target_rate_per_min,
+        ok_count=ok,
+        blocked_count=blocked,
+        block_signals=signals,
+        latencies=latencies,
+    )
+
+
+async def _sweep_category(
+    captured: CapturedRequest,
+    transport: InstrumentedTransport,
+    *,
+    concurrency_steps: Sequence[int],
+    rate_steps: Sequence[int],
+    cooldown_seconds: float,
+    budget: list[int],
+) -> CategoryResult:
+    """Run the FULL concurrency × rate grid for one category (aggressive sweep).
+
+    Completes the WHOLE grid even after hitting a limit (maps the full
+    penalty/recovery curve) — :meth:`CategoryResult.first_sustained_block` marks where
+    the block first appears. ``budget`` is a one-element mutable list carrying the
+    remaining global ``--max-requests`` allowance, decremented across cells so the cap
+    spans ALL categories. A short cooldown between cells makes recovery observable.
+    """
+    cells: list[CellResult] = []
+    for concurrency in concurrency_steps:
+        for rate in rate_steps:
+            if budget[0] <= 0:
+                break
+            cell = await _run_cell(
+                captured,
+                transport,
+                concurrency=concurrency,
+                target_rate_per_min=rate,
+                remaining_budget=budget[0],
+            )
+            budget[0] -= cell.total
+            cells.append(cell)
+            mark = " <== FIRST SUSTAINED BLOCK" if cell.is_sustained_block else ""
+            print(
+                f"  [{captured.category}] c={concurrency} rate={rate}/min "
+                f"ok={cell.ok_count} blocked={cell.blocked_count} "
+                f"({cell.blocked_fraction:.0%}){mark}"
+            )
+            if cooldown_seconds > 0 and budget[0] > 0:
+                await asyncio.sleep(cooldown_seconds)
+        if budget[0] <= 0:
+            break
+    return CategoryResult(category=captured.category, cells=cells)
+
+
+# ──────────────────────────── report ────────────────────────────
+
+
+def _build_report(
+    *,
+    source_key: str,
+    antibot: str,
+    proxy: ProxyEntry | None,
+    warmup: WarmupResult,
+    category_results: list[CategoryResult],
+    concurrency_steps: Sequence[int],
+    rate_steps: Sequence[int],
+    max_requests: int,
+) -> dict[str, Any]:
+    """Build the JSON report dict (proxy referenced by MASKED index only).
+
+    NEVER writes any proxy value (server/user/pass/url) — only ``_mask_proxy`` output.
+    Answers all three user questions per endpoint category (max parallelism, calls/min
+    ceiling, per-endpoint difference) plus a suggested ``rate_limit_per_minute``.
+    """
+    per_category: dict[str, Any] = {}
+    for result in category_results:
+        per_category[result.category] = {
+            "max_parallelism": result.max_parallelism(),
+            "calls_per_min_ceiling": result.calls_per_min_ceiling(),
+            "suggested_rate_per_minute": result.suggested_rate_per_min(),
+            "first_sustained_block": _cell_to_dict(result.first_sustained_block()),
+            "cells": [_cell_to_dict(cell) for cell in result.cells],
+        }
+    suggestions = {r.category: r.suggested_rate_per_min() for r in category_results}
+    ceilings = {r.category: r.calls_per_min_ceiling() for r in category_results}
+    return {
+        "source_key": source_key,
+        "antibot": antibot,
+        "generated_at": datetime.now(UTC).isoformat(),
+        # SECURITY (T-w1k-01): masked label ONLY — never a proxy value.
+        "proxy": _mask_proxy(proxy),
+        "grid": {
+            "concurrency_steps": list(concurrency_steps),
+            "rate_steps": list(rate_steps),
+            "max_requests": max_requests,
+        },
+        "warmup_notes": warmup.notes,
+        "endpoints": per_category,
+        "limits_differ_across_endpoints": len(set(ceilings.values())) > 1,
+        "suggested_rate_per_minute": (min(suggestions.values()) if suggestions else 0),
+    }
+
+
+def _cell_to_dict(cell: CellResult | None) -> dict[str, Any] | None:
+    """Serialize one ``CellResult`` (or None) for the JSON report."""
+    if cell is None:
+        return None
+    return {
+        "concurrency": cell.concurrency,
+        "target_rate_per_min": cell.target_rate_per_min,
+        "ok": cell.ok_count,
+        "blocked": cell.blocked_count,
+        "blocked_fraction": round(cell.blocked_fraction, 3),
+        "block_signals": cell.block_signals,
+        "latency_seconds": {k: round(v, 3) for k, v in cell.latency_summary().items()},
+        "sustained_block": cell.is_sustained_block,
+    }
+
+
+def _write_report(report: dict[str, Any], source_key: str) -> Path:
+    """Write the JSON report under ``_REPORT_DIR`` and return its path."""
+    _REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    path = _REPORT_DIR / f"{source_key}-{stamp}.json"
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return path
+
+
+def _print_console_summary(report: dict[str, Any], report_path: Path) -> None:
+    """Print the ASCII-only console summary (Windows cp1252 — no arrow/glyph chars)."""
+    print("=" * 72)
+    print(f"  RATE-LIMIT PROBE SUMMARY -- source={report['source_key']}")
+    print(f"  Proxy: {report['proxy']}")
+    print("=" * 72)
+    endpoints: dict[str, Any] = report["endpoints"]
+    if not endpoints:
+        print("  No endpoint categories captured (see warmup_notes in the report).")
+    for category, data in endpoints.items():
+        print(f"  [{category}]")
+        print(f"    max parallelism tolerated : {data['max_parallelism']}")
+        print(f"    calls/min ceiling         : {data['calls_per_min_ceiling']}")
+        fsb = data["first_sustained_block"]
+        if fsb is None:
+            print("    first sustained block     : none observed in grid")
+        else:
+            print(
+                f"    first sustained block     : c={fsb['concurrency']} "
+                f"rate={fsb['target_rate_per_min']}/min "
+                f"({fsb['blocked_fraction']:.0%} blocked, "
+                f"signals={fsb['block_signals']})"
+            )
+        print(f"    SUGGESTED rate_per_minute : {data['suggested_rate_per_minute']}")
+    print("-" * 72)
+    differ = "YES" if report["limits_differ_across_endpoints"] else "no"
+    print(f"  Limits differ across endpoints: {differ}")
+    print(
+        f"  OVERALL SUGGESTED rate_limit_per_minute (closes #101): "
+        f"{report['suggested_rate_per_minute']}"
+    )
+    if report["warmup_notes"]:
+        print("-" * 72)
+        print("  Warm-up notes (endpoints not captured):")
+        for note in report["warmup_notes"]:
+            if not note.get("captured", True):
+                print(f"    - {note['category']}: {note['reason']}")
+    print("=" * 72)
+    print(f"  JSON report: {report_path}")
+    print("=" * 72)
+
+
 def _cmd_list_sources(registry: SourceRegistry) -> int:
     """Print registered source keys (no network, no proxy)."""
     for key in registry.keys():
@@ -677,9 +1038,167 @@ async def _async_main(argv: Sequence[str] | None = None) -> int:
     return await _cmd_live(args, registry)
 
 
+def _resolve_pinned_proxy(args: argparse.Namespace) -> ProxyEntry | None:
+    """Resolve the pinned proxy for a live run, enforcing the proxy-REQUIRED default.
+
+    DEFAULT: require a proxy. If ``proxies.txt`` is missing/empty AND ``--no-proxy``
+    was not passed, refuse to run the live sweep (never silently test on the user's own
+    IP — T-w1k-03). ``--no-proxy`` returns ``None`` (the explicit local-IP opt-out).
+    Otherwise the ``--proxy-index`` proxy is PINNED for the whole run (LOCKED: never fan
+    a single measurement across proxies). Raises ``SystemExit`` with a clear message on
+    the refuse path.
+    """
+    if args.no_proxy:
+        print(
+            "[probe] WARNING: --no-proxy set — sweeping on the LOCAL IP (no proxy).",
+            file=sys.stderr,
+        )
+        return None
+    proxies = _load_proxies(_PROXIES_PATH)
+    if not proxies:
+        raise SystemExit(
+            "[probe] ERROR: no proxy available. A live sweep REQUIRES a pinned proxy "
+            f"from {_PROXIES_PATH.name} (host:port:user:pass per line). Add one, or "
+            "pass --no-proxy to explicitly run on your own IP."
+        )
+    index = int(args.proxy_index)
+    if not 0 <= index < len(proxies):
+        raise SystemExit(
+            f"[probe] ERROR: --proxy-index {index} out of range "
+            f"(have {len(proxies)} proxies, indices 0..{len(proxies) - 1})."
+        )
+    return proxies[index]
+
+
+async def _warm_clearance_if_needed(
+    source_cls: type[Source],
+    solver: NoopSolver | CloudflareSolver,
+) -> None:
+    """Best-effort eager CF solve before the live warm-up (live path only).
+
+    For a ``cloudflare*`` source the warm-up ``search()`` needs injected clearance; we
+    eagerly solve so the captured request carries a valid cf_clearance + UA. A solve
+    failure is non-fatal — the warm-up will simply record a graceful skip note.
+    """
+    if not isinstance(solver, CloudflareSolver):
+        return
+    with contextlib.suppress(Exception):
+        await solver.get_clearance(source_cls.key)
+
+
 async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
-    """Live sweep entry point (filled in Task 2)."""
-    raise NotImplementedError("live sweep is implemented in Task 2")
+    """Run the live aggressive sweep: warm-up capture -> grid sweep -> report.
+
+    Guardrail: this path runs ONLY when explicitly invoked (NOT under --dry-run /
+    --list-sources). The executor never runs a real sweep — the user owns live runs.
+    """
+    source_cls = registry.get(args.source)
+    if source_cls is None:
+        print(
+            f"[probe] ERROR: unknown source {args.source!r}. Known: {registry.keys()}",
+            file=sys.stderr,
+        )
+        return 2
+    source = source_cls()
+    concurrency_steps = _parse_int_steps(args.concurrency_steps)
+    rate_steps = _parse_int_steps(args.rate_steps)
+
+    proxy = _resolve_pinned_proxy(args)
+    print(f"[probe] pinned proxy: {_mask_proxy(proxy)}")
+
+    settings = _build_settings(proxy)
+    inner = HttpxTransport(settings)
+    transport = InstrumentedTransport(inner)
+    session = SessionManager(transport)
+    ratelimiter = RateLimiter()
+    handle_store = HandleStore()
+    solver = _build_solver(source_cls, settings, proxy)
+    ctx = _build_context(
+        source,
+        session=session,
+        ratelimiter=ratelimiter,
+        handle_store=handle_store,
+        solver=solver,
+    )
+
+    try:
+        await _warm_clearance_if_needed(source_cls, solver)
+        print(f"[probe] warm-up: running search({args.query!r}) ...")
+        warmup = await _capture_warmup(source, ctx, transport, query=args.query)
+        if not warmup.captured:
+            print(
+                "[probe] ERROR: no endpoint captured during warm-up; cannot sweep.",
+                file=sys.stderr,
+            )
+            for note in warmup.notes:
+                print(f"  - {note['category']}: {note['reason']}", file=sys.stderr)
+            return 3
+
+        print(f"[probe] captured categories: {sorted(warmup.captured)}")
+        print("[probe] starting aggressive full sweep (whole grid) ...")
+        budget = [args.max_requests]
+        category_results: list[CategoryResult] = []
+        for category in (_CATEGORY_SEARCH, _CATEGORY_MANIFEST, _CATEGORY_IMAGE):
+            captured = warmup.captured.get(category)
+            if captured is None:
+                continue
+            result = await _sweep_category(
+                captured,
+                transport,
+                concurrency_steps=concurrency_steps,
+                rate_steps=rate_steps,
+                cooldown_seconds=args.cooldown_seconds,
+                budget=budget,
+            )
+            category_results.append(result)
+            if budget[0] <= 0:
+                print("[probe] --max-requests cap reached; stopping sweep.")
+                break
+    finally:
+        await transport.aclose()
+        if isinstance(solver, CloudflareSolver):
+            with contextlib.suppress(Exception):
+                await solver.aclose()
+
+    report = _build_report(
+        source_key=source.key,
+        antibot=source.antibot,
+        proxy=proxy,
+        warmup=warmup,
+        category_results=category_results,
+        concurrency_steps=concurrency_steps,
+        rate_steps=rate_steps,
+        max_requests=args.max_requests,
+    )
+    report_path = _write_report(report, source.key)
+    _print_console_summary(report, report_path)
+    _advise_proxy_rotation(proxy, category_results)
+    return 0
+
+
+def _advise_proxy_rotation(
+    proxy: ProxyEntry | None, category_results: list[CategoryResult]
+) -> None:
+    """If the pinned proxy looks IP-BANNED (grid-wide block), advise rotating forward.
+
+    A sustained, grid-wide block (whole-run blocked fraction over
+    :data:`_PROXY_BAN_FRACTION`) looks IP-level rather than a real rate ceiling — the
+    measurement is invalid on this IP. Rotation is a BETWEEN-RUNS action (LOCKED: one
+    proxy is pinned per run), so we advise the next ``--proxy-index`` rather than
+    silently re-running on a different IP mid-measurement.
+    """
+    if proxy is None:
+        return
+    total = sum(c.total for r in category_results for c in r.cells)
+    blocked = sum(c.blocked_count for r in category_results for c in r.cells)
+    if total == 0:
+        return
+    if blocked / total >= _PROXY_BAN_FRACTION:
+        print(
+            f"[probe] WARNING: {_mask_proxy(proxy)} looks IP-BANNED "
+            f"({blocked}/{total} blocked grid-wide). Re-run with "
+            f"--proxy-index {proxy.index + 1} to rotate to the next proxy."
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
