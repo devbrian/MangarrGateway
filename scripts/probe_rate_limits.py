@@ -786,7 +786,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--max-requests",
         type=int,
         default=400,
-        help="Hard cap on total outbound requests across the sweep (default: 400).",
+        help=(
+            "Hard cap on outbound requests PER ENDPOINT CATEGORY (search/manifest/"
+            "image each get their own budget, so a heavy search sweep no longer "
+            "starves image; default: 400)."
+        ),
+    )
+    parser.add_argument(
+        "--fresh-proxy-per-category",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Measure each endpoint category on its own fresh healthy proxy so a heavy "
+            "sweep on one IP can't contaminate the next category's numbers. Costs one "
+            "extra CF solve per category (cf_clearance is IP-bound). Needs >1 healthy "
+            "proxy; falls back to a single proxy otherwise (default: on)."
+        ),
     )
     parser.add_argument(
         "--cooldown-seconds",
@@ -1145,7 +1160,7 @@ async def _run_cell(
     ``asyncio.Semaphore`` sized to ``concurrency``; rate by pacing the dispatch to
     ``target_rate_per_min`` (NOT by ``SourceContext._limiter`` — we want the SITE's
     limit). The number of requests this cell issues is bounded by ``remaining_budget``
-    (the global ``--max-requests`` cap) so even aggressive mode stays controlled.
+    (the per-category ``--max-requests`` cap) so even aggressive mode stays controlled.
     """
     # One "burst" per cell: issue up to min(target rate, remaining budget) requests,
     # paced to the target rate, bounded by the concurrency semaphore. A WALL-CLOCK
@@ -1283,12 +1298,22 @@ async def _sweep_category(
 # ──────────────────────────── report ────────────────────────────
 
 
+def _summarize_proxy_labels(proxy_labels: dict[str, str]) -> str:
+    """Top-level masked-proxy summary: the single label if uniform, else a marker."""
+    unique = sorted(set(proxy_labels.values()))
+    if not unique:
+        return "no-proxy"
+    if len(unique) == 1:
+        return unique[0]
+    return "per-category (see endpoints)"
+
+
 def _build_report(
     *,
     source_key: str,
     antibot: str,
-    proxy: ProxyEntry | None,
-    warmup: WarmupResult,
+    proxy_labels: dict[str, str],
+    warmup_notes: list[dict[str, Any]],
     category_results: list[CategoryResult],
     concurrency_steps: Sequence[int],
     rate_steps: Sequence[int],
@@ -1298,11 +1323,15 @@ def _build_report(
 
     NEVER writes any proxy value (server/user/pass/url) — only ``_mask_proxy`` output.
     Answers all three user questions per endpoint category (max parallelism, calls/min
-    ceiling, per-endpoint difference) plus a suggested ``rate_limit_per_minute``.
+    ceiling, per-endpoint difference) plus a suggested ``rate_limit_per_minute``. Each
+    endpoint records the (masked) proxy it was measured on — distinct under
+    fresh-proxy-per-category.
     """
     per_category: dict[str, Any] = {}
     for result in category_results:
         per_category[result.category] = {
+            # Which (masked) proxy this endpoint was measured on.
+            "proxy": proxy_labels.get(result.category, "no-proxy"),
             # Fix 1 — rate-limiting kept distinct from slowness.
             "rate_limit_observed": result.rate_limit_observed,
             "first_rate_limit": _cell_to_dict(result.first_rate_limit(), result),
@@ -1335,14 +1364,15 @@ def _build_report(
         "source_key": source_key,
         "antibot": antibot,
         "generated_at": datetime.now(UTC).isoformat(),
-        # SECURITY (T-w1k-01): masked label ONLY — never a proxy value.
-        "proxy": _mask_proxy(proxy),
+        # SECURITY (T-w1k-01): masked label(s) ONLY — never a proxy value.
+        "proxy": _summarize_proxy_labels(proxy_labels),
+        "proxies_by_category": proxy_labels,
         "grid": {
             "concurrency_steps": list(concurrency_steps),
             "rate_steps": list(rate_steps),
-            "max_requests": max_requests,
+            "max_requests_per_category": max_requests,
         },
-        "warmup_notes": warmup.notes,
+        "warmup_notes": warmup_notes,
         "endpoints": per_category,
         "limits_differ_across_endpoints": len(set(ceilings.values())) > 1,
         # Overall = the most conservative per-endpoint suggestion (None if none clean).
@@ -1391,7 +1421,7 @@ def _print_console_summary(report: dict[str, Any], report_path: Path) -> None:
     if not endpoints:
         print("  No endpoint categories captured (see warmup_notes in the report).")
     for category, data in endpoints.items():
-        print(f"  [{category}]")
+        print(f"  [{category}]  (proxy: {data.get('proxy', 'no-proxy')})")
 
         # 1) True rate-limiting (429/403/CF/Retry-After) — the hard ceiling.
         if data["rate_limit_observed"]:
@@ -1660,21 +1690,30 @@ _WarmupOutcome = tuple[
 ]
 
 
-async def _warmup_with_rotation(
+async def _attempt_warmup(
     args: argparse.Namespace,
     source: Source,
     source_cls: type[Source],
     candidates: list[ProxyEntry | None],
-) -> _WarmupOutcome | None:
-    """Try candidate proxies in order until warm-up captures an endpoint (Tier 2).
+    *,
+    start: int,
+) -> tuple[_WarmupOutcome | None, int]:
+    """Warm up on proxies from ``candidates``, cycling from index ``start`` (Tier 2).
 
-    Returns ``(proxy, transport, solver, warmup)`` for the first proxy whose warm-up
-    captured at least one endpoint, or ``None`` if every attempt failed. Each failed
-    attempt's seams are closed before rotating. Bounded by ``--proxy-health-retries``.
+    Returns ``((proxy, transport, solver, warmup), next_index)`` for the first proxy
+    whose warm-up captured at least one endpoint, or ``(None, next_index)`` if every
+    attempt failed. ``next_index`` is where the NEXT category should start so it gets a
+    FRESH proxy (fresh-proxy-per-category). Bounded by ``--proxy-health-retries``. Each
+    failed attempt's seams are closed before rotating.
     """
-    attempts = candidates[: max(1, int(args.proxy_health_retries))]
-    for i, proxy in enumerate(attempts, start=1):
-        suffix = f" (attempt {i}/{len(attempts)})" if len(attempts) > 1 else ""
+    n = len(candidates)
+    if n == 0:
+        return None, start
+    max_attempts = max(1, int(args.proxy_health_retries))
+    for k in range(max_attempts):
+        idx = (start + k) % n
+        proxy = candidates[idx]
+        suffix = "" if n == 1 else f" (proxy@{idx}, attempt {k + 1}/{max_attempts})"
         print(f"[probe] pinned proxy: {_mask_proxy(proxy)}{suffix}")
         transport, solver, ctx = _build_live_seams(source, source_cls, proxy)
         warmup: WarmupResult | None = None
@@ -1689,17 +1728,17 @@ async def _warmup_with_rotation(
                 file=sys.stderr,
             )
         if warmup is not None and warmup.captured:
-            return proxy, transport, solver, warmup
+            return (proxy, transport, solver, warmup), start + k + 1
         if warmup is not None:
             for note in warmup.notes:
                 print(f"  - {note['category']}: {note['reason']}", file=sys.stderr)
         await _close_seams(transport, solver)
-        if i < len(attempts):
+        if k < max_attempts - 1:
             print(
                 f"[probe] no capture via {_mask_proxy(proxy)}; rotating to next proxy.",
                 file=sys.stderr,
             )
-    return None
+    return None, start + max_attempts
 
 
 async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
@@ -1720,45 +1759,111 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
     rate_steps = _parse_int_steps(args.rate_steps)
 
     candidates = await _resolve_proxy_candidates(args)
-    outcome = await _warmup_with_rotation(args, source, source_cls, candidates)
-    if outcome is None:
+    real_candidates = [c for c in candidates if c is not None]
+    fresh = args.fresh_proxy_per_category and len(real_candidates) > 1
+    categories = (_CATEGORY_SEARCH, _CATEGORY_MANIFEST, _CATEGORY_IMAGE)
+
+    category_results: list[CategoryResult] = []
+    proxy_labels: dict[str, str] = {}
+    warmup_notes: list[dict[str, Any]] = []
+    advise_pairs: list[tuple[ProxyEntry | None, CategoryResult]] = []
+
+    async def _sweep(
+        captured: CapturedRequest, transport: InstrumentedTransport
+    ) -> CategoryResult:
+        # Each call gets its OWN budget list so the per-category cap is independent
+        # (a heavy search sweep no longer starves manifest/image — Fix).
+        return await _sweep_category(
+            captured,
+            transport,
+            concurrency_steps=concurrency_steps,
+            rate_steps=rate_steps,
+            cooldown_seconds=args.cooldown_seconds,
+            cell_deadline_seconds=args.cell_timeout_seconds,
+            budget=[args.max_requests],
+        )
+
+    if not fresh:
+        outcome, _ = await _attempt_warmup(
+            args, source, source_cls, candidates, start=0
+        )
+        if outcome is None:
+            print(
+                "[probe] ERROR: no endpoint captured on any candidate proxy.",
+                file=sys.stderr,
+            )
+            return 3
+        proxy, transport, solver, warmup = outcome
+        warmup_notes.extend(warmup.notes)
+        print(f"[probe] captured categories: {sorted(warmup.captured)}")
+        print("[probe] starting sweep (one proxy, per-category budget) ...")
+        try:
+            for cat in categories:
+                captured = warmup.captured.get(cat)
+                if captured is None:
+                    continue
+                print(f"[probe] sweeping [{cat}] on {_mask_proxy(proxy)} ...")
+                result = await _sweep(captured, transport)
+                category_results.append(result)
+                proxy_labels[cat] = _mask_proxy(proxy)
+                advise_pairs.append((proxy, result))
+        finally:
+            await _close_seams(transport, solver)
+    else:
         print(
-            "[probe] ERROR: no endpoint captured on any candidate proxy; cannot sweep.",
+            f"[probe] fresh-proxy-per-category ON ({len(real_candidates)} healthy "
+            "proxies) — each endpoint measured on its own un-hammered IP."
+        )
+        cursor = 0
+        for cat in categories:
+            print(f"[probe] === [{cat}]: acquiring a fresh proxy ===")
+            outcome, cursor = await _attempt_warmup(
+                args, source, source_cls, candidates, start=cursor
+            )
+            if outcome is None:
+                warmup_notes.append(
+                    {"category": cat, "captured": False, "reason": "no proxy warmed up"}
+                )
+                continue
+            proxy, transport, solver, warmup = outcome
+            try:
+                captured = warmup.captured.get(cat)
+                if captured is None:
+                    note = next(
+                        (n for n in warmup.notes if n.get("category") == cat),
+                        {
+                            "category": cat,
+                            "captured": False,
+                            "reason": "not captured on this proxy",
+                        },
+                    )
+                    warmup_notes.append(note)
+                    print(
+                        f"[probe] [{cat}] not captured on {_mask_proxy(proxy)}; "
+                        "skipping it.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"[probe] sweeping [{cat}] on {_mask_proxy(proxy)} ...")
+                    result = await _sweep(captured, transport)
+                    category_results.append(result)
+                    proxy_labels[cat] = _mask_proxy(proxy)
+                    advise_pairs.append((proxy, result))
+            finally:
+                await _close_seams(transport, solver)
+
+    if not category_results:
+        print(
+            "[probe] ERROR: nothing swept on any proxy; nothing to report.",
             file=sys.stderr,
         )
         return 3
-    proxy, transport, solver, warmup = outcome
-
-    try:
-        print(f"[probe] captured categories: {sorted(warmup.captured)}")
-        print("[probe] starting aggressive full sweep (whole grid) ...")
-        budget = [args.max_requests]
-        category_results: list[CategoryResult] = []
-        for category in (_CATEGORY_SEARCH, _CATEGORY_MANIFEST, _CATEGORY_IMAGE):
-            captured = warmup.captured.get(category)
-            if captured is None:
-                continue
-            result = await _sweep_category(
-                captured,
-                transport,
-                concurrency_steps=concurrency_steps,
-                rate_steps=rate_steps,
-                cooldown_seconds=args.cooldown_seconds,
-                cell_deadline_seconds=args.cell_timeout_seconds,
-                budget=budget,
-            )
-            category_results.append(result)
-            if budget[0] <= 0:
-                print("[probe] --max-requests cap reached; stopping sweep.")
-                break
-    finally:
-        await _close_seams(transport, solver)
 
     report = _build_report(
         source_key=source.key,
         antibot=source.antibot,
-        proxy=proxy,
-        warmup=warmup,
+        proxy_labels=proxy_labels,
+        warmup_notes=warmup_notes,
         category_results=category_results,
         concurrency_steps=concurrency_steps,
         rate_steps=rate_steps,
@@ -1766,32 +1871,30 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
     )
     report_path = _write_report(report, source.key)
     _print_console_summary(report, report_path)
-    _advise_proxy_rotation(proxy, category_results)
+    _advise_proxy_rotation(advise_pairs)
     return 0
 
 
 def _advise_proxy_rotation(
-    proxy: ProxyEntry | None, category_results: list[CategoryResult]
+    pairs: list[tuple[ProxyEntry | None, CategoryResult]],
 ) -> None:
-    """If the pinned proxy looks IP-BANNED (grid-wide block), advise rotating forward.
+    """Warn about any proxy that looks IP-BANNED (grid-wide hard block) per category.
 
-    A sustained, grid-wide block (whole-run blocked fraction over
-    :data:`_PROXY_BAN_FRACTION`) looks IP-level rather than a real rate ceiling — the
-    measurement is invalid on this IP. Rotation is a BETWEEN-RUNS action (LOCKED: one
-    proxy is pinned per run), so we advise the next ``--proxy-index`` rather than
-    silently re-running on a different IP mid-measurement.
+    Hard block = rate-limited + connection errors (NOT plain timeouts — a slow site is
+    not a banned IP). Cells are aggregated per proxy (a proxy may span categories in
+    single-proxy mode), then each banned-looking proxy gets one rotation hint.
     """
-    if proxy is None:
-        return
-    total = sum(c.total for r in category_results for c in r.cells)
-    # Hard block = rate-limited + connection errors (NOT plain timeouts — a slow site is
-    # not a banned IP). This is the grid-wide IP-ban heuristic.
-    hard_blocked = sum(
-        c.rate_limited_count + c.error_count for r in category_results for c in r.cells
-    )
-    if total == 0:
-        return
-    if hard_blocked / total >= _PROXY_BAN_FRACTION:
+    by_index: dict[int, tuple[ProxyEntry, list[CellResult]]] = {}
+    for proxy, result in pairs:
+        if proxy is None:
+            continue
+        _, cells = by_index.setdefault(proxy.index, (proxy, []))
+        cells.extend(result.cells)
+    for proxy, cells in by_index.values():
+        total = sum(c.total for c in cells)
+        hard_blocked = sum(c.rate_limited_count + c.error_count for c in cells)
+        if total == 0 or hard_blocked / total < _PROXY_BAN_FRACTION:
+            continue
         print(
             f"[probe] WARNING: {_mask_proxy(proxy)} looks IP-BANNED "
             f"({hard_blocked}/{total} hard-blocked grid-wide). Re-run with "
