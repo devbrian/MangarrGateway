@@ -26,17 +26,25 @@ rate/concurrency. The sweep is an aggressive FULL sweep (does not stop at the
 first 429 — maps the whole penalty/recovery curve, but still marks the first
 sustained block).
 
-SECURITY (T-w1k-01): ``proxies.txt`` holds secret residential proxy credentials.
+By default the proxy pool is health-checked first (Tier 1: IP-echo liveness +
+bypass + latency); the fastest healthy proxy is pinned and the run rotates to the
+next on warm-up/CF-solve failure (Tier 2). ``--no-health-check`` pins
+``--proxy-index`` (or 0) directly.
+
+SECURITY (T-w1k-01/03): ``proxies.txt`` holds secret residential proxy credentials.
 This script NEVER prints a full proxy string, NEVER writes any proxy value into
 the JSON report, and NEVER hardcodes a proxy value. Proxies are referenced by
-host-only or a masked ``proxy[#index]``. The proxy is REQUIRED by default;
-``--no-proxy`` is the explicit opt-out that runs the sweep on the local IP.
+host-only or a masked ``proxy[#index]``. The health check also asserts the proxy
+actually changes the egress IP (never silently testing on your own IP). The proxy
+is REQUIRED by default; ``--no-proxy`` is the explicit opt-out that runs on the
+local IP.
 
 Usage::
 
     uv run python scripts/probe_rate_limits.py --list-sources
     uv run python scripts/probe_rate_limits.py --dry-run --source mangadex
-    uv run python scripts/probe_rate_limits.py --source mangadex --proxy-index 0
+    uv run python scripts/probe_rate_limits.py --source mangadex
+    uv run python scripts/probe_rate_limits.py --source mangadex --proxy-index 7
 
 This is a standalone diagnostic script — no pytest tests, no ``src/`` module, no
 CLI packaging — but it ships in the repo and MUST pass ``uv run nox -s gate``
@@ -136,6 +144,20 @@ _PROXY_BAN_FRACTION = 0.80
 # tarpitting site cannot hang the sweep — without it, concurrency=1 serial 30s timeouts
 # could stretch one cell toward an hour. Overridable via --cell-timeout-seconds.
 _DEFAULT_CELL_TIMEOUT_SECONDS = 90.0
+
+# Proxy health check (Tier 1): a single IP-echo call per proxy confirms it is alive,
+# fast enough, and ACTUALLY changes the egress IP (not silently bypassed to the user's
+# own IP — T-w1k-03). The pool is ranked fastest-first; the live path pins the best and
+# rotates to the next on warm-up/CF-solve failure (Tier 2). The IP-echo is an external
+# dependency; --no-health-check skips the whole step.
+_IP_ECHO_URL = "https://api.ipify.org"
+_HEALTH_PROBE_TIMEOUT_SECONDS = 10.0
+_HEALTH_CHECK_CONCURRENCY = (
+    10  # bounded liveness fan-out (NOT a rate-limit measurement)
+)
+_DEFAULT_MAX_PROXY_LATENCY_SECONDS = 5.0
+_DEFAULT_PROXY_HEALTH_RETRIES = 3
+_MAX_REJECTIONS_SHOWN = 10  # cap the masked rejection list so a dead pool isn't spammy
 
 
 # ──────────────────────────── proxy masking (T-w1k-01) ────────────────────────────
@@ -418,6 +440,138 @@ def _build_context(
     )
 
 
+# ──────────────────────────── proxy health check (Tier 1) ────────────────────────────
+
+
+@dataclass
+class ProxyHealth:
+    """One proxy's Tier-1 liveness result (referenced by MASKED index only).
+
+    SECURITY: no IP value (egress or local) is ever stored or printed — the bypass check
+    compares them in-memory and keeps only the boolean verdict (T-w1k-01/03).
+    """
+
+    proxy: ProxyEntry
+    reachable: bool
+    egress_ok: bool  # egress IP differs from the user's real IP (proxy not bypassed)
+    within_latency: bool
+    latency_seconds: float | None
+    reason: str
+
+    @property
+    def healthy(self) -> bool:
+        return self.reachable and self.egress_ok and self.within_latency
+
+
+async def _fetch_echo_ip(
+    transport: HttpxTransport,
+) -> tuple[str | None, float, str | None]:
+    """GET the IP-echo through ``transport``; return ``(ip, latency_s, error)``.
+
+    ``ip`` is None on any non-200 / transport failure (with ``error`` set). The returned
+    IP is held only long enough for the in-memory bypass comparison — never logged.
+    """
+    started = time.monotonic()
+    try:
+        resp = await transport.request(
+            "GET", _IP_ECHO_URL, timeout=_HEALTH_PROBE_TIMEOUT_SECONDS
+        )
+    except httpx.HTTPError as exc:
+        return None, time.monotonic() - started, f"transport:{type(exc).__name__}"
+    latency = time.monotonic() - started
+    if resp.status_code != 200:
+        return None, latency, f"http-{resp.status_code}"
+    return resp.text.strip(), latency, None
+
+
+async def _fetch_local_ip() -> str | None:
+    """Fetch the user's real public IP DIRECTLY (no proxy) for the bypass check."""
+    transport = HttpxTransport(_build_settings(None))
+    try:
+        ip, _latency, _error = await _fetch_echo_ip(transport)
+        return ip
+    finally:
+        await transport.aclose()
+
+
+async def _check_proxy_health(
+    proxy: ProxyEntry, local_ip: str | None, max_latency: float
+) -> ProxyHealth:
+    """Tier-1 liveness check for ONE proxy via a single IP-echo call.
+
+    Catches: dead/unreachable (request fails), bypassed (egress IP == the user's own IP
+    — T-w1k-03), and grossly slow (latency over ``max_latency``). It cannot predict a
+    proxy's bandwidth ceiling from one request, so a proxy that passes here can still
+    degrade at high rate during the sweep (the post-run IP-ban advisory backstops it).
+    """
+    transport = HttpxTransport(_build_settings(proxy))
+    try:
+        egress_ip, latency, error = await _fetch_echo_ip(transport)
+    finally:
+        await transport.aclose()
+    if egress_ip is None:
+        return ProxyHealth(proxy, False, False, False, latency, error or "unreachable")
+    bypassed = local_ip is not None and egress_ip == local_ip
+    within = latency <= max_latency
+    if bypassed:
+        reason = "bypassed (egress == local IP)"
+    elif not within:
+        reason = f"too slow ({latency:.1f}s > {max_latency:.1f}s)"
+    else:
+        reason = f"ok ({latency:.2f}s)"
+    return ProxyHealth(
+        proxy,
+        reachable=True,
+        egress_ok=not bypassed,
+        within_latency=within,
+        latency_seconds=latency,
+        reason=reason,
+    )
+
+
+async def _select_healthy_proxies(
+    proxies: list[ProxyEntry], *, max_latency: float
+) -> list[ProxyHealth]:
+    """Tier-1 health-check the whole pool; return HEALTHY proxies fastest-first.
+
+    Liveness checks MAY fan out across proxies in parallel: this is NOT a rate-limit
+    measurement (exactly one request per IP, nothing measured about throttling), so it
+    does not violate the one-proxy-per-measurement rule. Bounded to
+    :data:`_HEALTH_CHECK_CONCURRENCY` to stay gentle. The bypass safety check needs the
+    user's real IP; if that cannot be fetched it is skipped with a loud warning.
+    """
+    local_ip = await _fetch_local_ip()
+    if local_ip is None:
+        print(
+            "[probe] WARNING: could not determine your real IP; the proxy-bypass "
+            "safety check (egress != your IP) is DISABLED for this run.",
+            file=sys.stderr,
+        )
+    semaphore = asyncio.Semaphore(_HEALTH_CHECK_CONCURRENCY)
+
+    async def _guarded(p: ProxyEntry) -> ProxyHealth:
+        async with semaphore:
+            return await _check_proxy_health(p, local_ip, max_latency)
+
+    results = await asyncio.gather(*[_guarded(p) for p in proxies])
+    healthy = sorted(
+        (h for h in results if h.healthy),
+        key=lambda h: (
+            h.latency_seconds if h.latency_seconds is not None else float("inf")
+        ),
+    )
+    print(
+        f"[probe] proxy health: {len(healthy)}/{len(proxies)} healthy "
+        "(IP-echo liveness, fastest-first)."
+    )
+    rejected = [h for h in results if not h.healthy]
+    for h in rejected[:_MAX_REJECTIONS_SHOWN]:
+        print(f"  - {_mask_proxy(h.proxy)}: {h.reason}")
+    if len(rejected) > _MAX_REJECTIONS_SHOWN:
+        print(f"  - ... +{len(rejected) - _MAX_REJECTIONS_SHOWN} more rejected")
+    return healthy
+
+
 # ──────────────────────────── warm-up capture ────────────────────────────
 
 
@@ -583,8 +737,40 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--proxy-index",
         type=int,
-        default=0,
-        help="Starting proxy index in proxies.txt to pin (rotate forward on ban).",
+        default=None,
+        help=(
+            "Manually pin this proxies.txt index (skips health-based auto-selection; "
+            "still rotates to other healthy proxies on warm-up failure unless "
+            "--no-health-check). Omit to auto-select the fastest healthy proxy."
+        ),
+    )
+    parser.add_argument(
+        "--health-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Tier-1 health-check the proxy pool (IP-echo liveness + bypass + latency) "
+            "and pin the fastest healthy proxy, rotating on warm-up/CF failure. Use "
+            "--no-health-check to pin --proxy-index (or 0) unchecked (default: on)."
+        ),
+    )
+    parser.add_argument(
+        "--max-proxy-latency-seconds",
+        type=float,
+        default=_DEFAULT_MAX_PROXY_LATENCY_SECONDS,
+        help=(
+            "Reject proxies whose health-check IP-echo latency exceeds this, as too "
+            f"slow to measure cleanly (default: {_DEFAULT_MAX_PROXY_LATENCY_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--proxy-health-retries",
+        type=int,
+        default=_DEFAULT_PROXY_HEALTH_RETRIES,
+        help=(
+            "Max healthy proxies to try (rotate-on-failure) before giving up the "
+            f"warm-up (default: {_DEFAULT_PROXY_HEALTH_RETRIES})."
+        ),
     )
     parser.add_argument(
         "--concurrency-steps",
@@ -1340,22 +1526,11 @@ async def _async_main(argv: Sequence[str] | None = None) -> int:
     return await _cmd_live(args, registry)
 
 
-def _resolve_pinned_proxy(args: argparse.Namespace) -> ProxyEntry | None:
-    """Resolve the pinned proxy for a live run, enforcing the proxy-REQUIRED default.
+def _load_required_proxies(args: argparse.Namespace) -> list[ProxyEntry]:
+    """Load proxies.txt, enforcing the proxy-REQUIRED default (T-w1k-03).
 
-    DEFAULT: require a proxy. If ``proxies.txt`` is missing/empty AND ``--no-proxy``
-    was not passed, refuse to run the live sweep (never silently test on the user's own
-    IP — T-w1k-03). ``--no-proxy`` returns ``None`` (the explicit local-IP opt-out).
-    Otherwise the ``--proxy-index`` proxy is PINNED for the whole run (LOCKED: never fan
-    a single measurement across proxies). Raises ``SystemExit`` with a clear message on
-    the refuse path.
+    Refuses to run if proxies.txt is missing/empty and ``--no-proxy`` was not passed.
     """
-    if args.no_proxy:
-        print(
-            "[probe] WARNING: --no-proxy set — sweeping on the LOCAL IP (no proxy).",
-            file=sys.stderr,
-        )
-        return None
     proxies = _load_proxies(_PROXIES_PATH)
     if not proxies:
         raise SystemExit(
@@ -1363,13 +1538,102 @@ def _resolve_pinned_proxy(args: argparse.Namespace) -> ProxyEntry | None:
             f"from {_PROXIES_PATH.name} (host:port:user:pass per line). Add one, or "
             "pass --no-proxy to explicitly run on your own IP."
         )
-    index = int(args.proxy_index)
+    return proxies
+
+
+def _validate_index(index: int, proxies: list[ProxyEntry]) -> None:
     if not 0 <= index < len(proxies):
         raise SystemExit(
             f"[probe] ERROR: --proxy-index {index} out of range "
             f"(have {len(proxies)} proxies, indices 0..{len(proxies) - 1})."
         )
-    return proxies[index]
+
+
+async def _resolve_proxy_candidates(
+    args: argparse.Namespace,
+) -> list[ProxyEntry | None]:
+    """Resolve the ORDERED proxy candidates for a live run (first pinned, rest rotate).
+
+    Each measurement still uses exactly ONE pinned proxy (LOCKED — never fan a single
+    measurement across IPs); the list only provides rotate-on-failure fallbacks for the
+    warm-up. Precedence:
+
+    * ``--no-proxy`` -> ``[None]`` (explicit local-IP opt-out).
+    * ``--no-health-check`` -> ``[--proxy-index or 0]`` (single pin, no rotation).
+    * health-check on, ``--proxy-index`` set -> that index first, then other healthy
+      proxies (fastest-first) as fallbacks.
+    * health-check on, no index -> healthy proxies fastest-first (the default path).
+    """
+    if args.no_proxy:
+        print(
+            "[probe] WARNING: --no-proxy set — sweeping on the LOCAL IP (no proxy).",
+            file=sys.stderr,
+        )
+        return [None]
+
+    proxies = _load_required_proxies(args)
+
+    if not args.health_check:
+        index = 0 if args.proxy_index is None else int(args.proxy_index)
+        _validate_index(index, proxies)
+        return [proxies[index]]
+
+    healthy = await _select_healthy_proxies(
+        proxies, max_latency=args.max_proxy_latency_seconds
+    )
+
+    if args.proxy_index is not None:
+        index = int(args.proxy_index)
+        _validate_index(index, proxies)
+        chosen = proxies[index]
+        if not any(h.proxy.index == index for h in healthy):
+            print(
+                f"[probe] WARNING: --proxy-index {index} ({_mask_proxy(chosen)}) "
+                "failed the health check; pinning it anyway as you asked.",
+                file=sys.stderr,
+            )
+        fallbacks = [h.proxy for h in healthy if h.proxy.index != index]
+        return [chosen, *fallbacks]
+
+    if not healthy:
+        raise SystemExit(
+            "[probe] ERROR: no healthy proxy in the pool (all dead / bypassed / too "
+            "slow). Fix the pool, raise --max-proxy-latency-seconds, or pass "
+            "--no-health-check to pin one without checking."
+        )
+    return [h.proxy for h in healthy]
+
+
+def _build_live_seams(
+    source: Source, source_cls: type[Source], proxy: ProxyEntry | None
+) -> tuple[InstrumentedTransport, NoopSolver | CloudflareSolver, SourceContext]:
+    """Construct the per-proxy seams (transport/solver/context) for one live attempt.
+
+    Built per attempt so rotate-on-failure gets a fresh transport + solver bound to the
+    next proxy (the proxy is baked into Settings -> build_proxy -> both egress legs).
+    """
+    settings = _build_settings(proxy)
+    transport = InstrumentedTransport(HttpxTransport(settings))
+    session = SessionManager(transport)
+    solver = _build_solver(source_cls, settings, proxy)
+    ctx = _build_context(
+        source,
+        session=session,
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+        solver=solver,
+    )
+    return transport, solver, ctx
+
+
+async def _close_seams(
+    transport: InstrumentedTransport, solver: NoopSolver | CloudflareSolver
+) -> None:
+    """Tear down a live attempt's transport + browser solver before rotate/exit."""
+    await transport.aclose()
+    if isinstance(solver, CloudflareSolver):
+        with contextlib.suppress(Exception):
+            await solver.aclose()
 
 
 async def _warm_clearance_if_needed(
@@ -1386,6 +1650,56 @@ async def _warm_clearance_if_needed(
         return
     with contextlib.suppress(Exception):
         await solver.get_clearance(source_cls.key)
+
+
+_WarmupOutcome = tuple[
+    ProxyEntry | None,
+    InstrumentedTransport,
+    NoopSolver | CloudflareSolver,
+    WarmupResult,
+]
+
+
+async def _warmup_with_rotation(
+    args: argparse.Namespace,
+    source: Source,
+    source_cls: type[Source],
+    candidates: list[ProxyEntry | None],
+) -> _WarmupOutcome | None:
+    """Try candidate proxies in order until warm-up captures an endpoint (Tier 2).
+
+    Returns ``(proxy, transport, solver, warmup)`` for the first proxy whose warm-up
+    captured at least one endpoint, or ``None`` if every attempt failed. Each failed
+    attempt's seams are closed before rotating. Bounded by ``--proxy-health-retries``.
+    """
+    attempts = candidates[: max(1, int(args.proxy_health_retries))]
+    for i, proxy in enumerate(attempts, start=1):
+        suffix = f" (attempt {i}/{len(attempts)})" if len(attempts) > 1 else ""
+        print(f"[probe] pinned proxy: {_mask_proxy(proxy)}{suffix}")
+        transport, solver, ctx = _build_live_seams(source, source_cls, proxy)
+        warmup: WarmupResult | None = None
+        try:
+            await _warm_clearance_if_needed(source_cls, solver)
+            print(f"[probe] warm-up: running search({args.query!r}) ...")
+            warmup = await _capture_warmup(source, ctx, transport, query=args.query)
+        except Exception as exc:  # noqa: BLE001 — warm-up failure -> rotate proxy
+            print(
+                f"[probe] warm-up errored on {_mask_proxy(proxy)}: "
+                f"{type(exc).__name__}",
+                file=sys.stderr,
+            )
+        if warmup is not None and warmup.captured:
+            return proxy, transport, solver, warmup
+        if warmup is not None:
+            for note in warmup.notes:
+                print(f"  - {note['category']}: {note['reason']}", file=sys.stderr)
+        await _close_seams(transport, solver)
+        if i < len(attempts):
+            print(
+                f"[probe] no capture via {_mask_proxy(proxy)}; rotating to next proxy.",
+                file=sys.stderr,
+            )
+    return None
 
 
 async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
@@ -1405,37 +1719,17 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
     concurrency_steps = _parse_int_steps(args.concurrency_steps)
     rate_steps = _parse_int_steps(args.rate_steps)
 
-    proxy = _resolve_pinned_proxy(args)
-    print(f"[probe] pinned proxy: {_mask_proxy(proxy)}")
-
-    settings = _build_settings(proxy)
-    inner = HttpxTransport(settings)
-    transport = InstrumentedTransport(inner)
-    session = SessionManager(transport)
-    ratelimiter = RateLimiter()
-    handle_store = HandleStore()
-    solver = _build_solver(source_cls, settings, proxy)
-    ctx = _build_context(
-        source,
-        session=session,
-        ratelimiter=ratelimiter,
-        handle_store=handle_store,
-        solver=solver,
-    )
+    candidates = await _resolve_proxy_candidates(args)
+    outcome = await _warmup_with_rotation(args, source, source_cls, candidates)
+    if outcome is None:
+        print(
+            "[probe] ERROR: no endpoint captured on any candidate proxy; cannot sweep.",
+            file=sys.stderr,
+        )
+        return 3
+    proxy, transport, solver, warmup = outcome
 
     try:
-        await _warm_clearance_if_needed(source_cls, solver)
-        print(f"[probe] warm-up: running search({args.query!r}) ...")
-        warmup = await _capture_warmup(source, ctx, transport, query=args.query)
-        if not warmup.captured:
-            print(
-                "[probe] ERROR: no endpoint captured during warm-up; cannot sweep.",
-                file=sys.stderr,
-            )
-            for note in warmup.notes:
-                print(f"  - {note['category']}: {note['reason']}", file=sys.stderr)
-            return 3
-
         print(f"[probe] captured categories: {sorted(warmup.captured)}")
         print("[probe] starting aggressive full sweep (whole grid) ...")
         budget = [args.max_requests]
@@ -1458,10 +1752,7 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
                 print("[probe] --max-requests cap reached; stopping sweep.")
                 break
     finally:
-        await transport.aclose()
-        if isinstance(solver, CloudflareSolver):
-            with contextlib.suppress(Exception):
-                await solver.aclose()
+        await _close_seams(transport, solver)
 
     report = _build_report(
         source_key=source.key,
