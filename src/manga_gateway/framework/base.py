@@ -56,6 +56,12 @@ class Source(ABC):
     session_prep: str | None = None
     supports_search: bool = True
     supports_recent: bool = True
+    # D-30 / WR-02 per-source override: max concurrent download JOBS for THIS source.
+    # ``None`` = use the global ``settings.max_concurrent_per_source`` default. A source
+    # the rate-limit probe shows tolerates parallel chapter downloads sets this
+    # explicitly (e.g. mangadot=3); the job manager clamps it to the global bound.
+    # Sources with a parallelism constraint (e.g. comix CF-nav) leave it None.
+    max_concurrent_jobs: int | None = None
 
     @classmethod
     def source_cap(cls, health: SourceHealth | None = None) -> SourceCap:

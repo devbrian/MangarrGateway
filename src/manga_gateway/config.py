@@ -56,13 +56,15 @@ class Settings(BaseSettings):
     # (D-11), same treatment as host/port/output_root (NOT the api_key exclusion).
     # ge=1: a non-positive bound would break semaphore creation / job scheduling.
     max_concurrent_chapters: int = Field(
-        default=3, ge=1
+        default=8, ge=1
     )  # D-30: global job bound, reported by /status
-    # D-30 / WR-02: per-source ceiling, intentionally <= max_concurrent_chapters.
+    # D-30 / WR-02: DEFAULT per-source ceiling, intentionally <= the global bound.
     # Without a distinct knob the per-source semaphore was sized to the global
     # bound and so never constrained anything for the single-registered-source
     # case. Defaulting to 1 makes the second source's first job queue behind the
     # first source's job in the obvious way; operators raise it per deployment.
+    # A source MAY override this via its ``Source.max_concurrent_jobs`` class attr
+    # (e.g. mangadot=3); the job manager clamps any override to max_concurrent_chapters.
     max_concurrent_per_source: int = Field(default=1, ge=1)
     image_fetch_concurrency: int = Field(
         default=6, ge=1

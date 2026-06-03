@@ -82,9 +82,9 @@ _DEFAULT_MANGA_CANDIDATES = 5
 # Bounds the per-candidate ``chapters/list`` fan-out in ``search`` — at most this
 # many chapter-list fetches run concurrently. The candidates are no longer fetched
 # serially after the #101 fix (sequential at rate_limit=10 crossed the 30s fanout
-# timeout); 4 collapses the wall-clock while staying well under the per-source
-# rate budget.
-_CHAPTERS_FANOUT_CONCURRENCY = 4
+# timeout); 6 collapses the wall-clock while staying well under the per-source
+# rate budget (480/min).
+_CHAPTERS_FANOUT_CONCURRENCY = 6
 
 # Floor for empty/malformed timestamps so they sort oldest and never crash.
 _TS_FLOOR = datetime.min.replace(tzinfo=UTC)
@@ -159,6 +159,11 @@ class MangadotSource(Source):
     # the burst budget drained, crossing framework/fanout.py's 30s timeout →
     # source_unavailable. At 480/min the calls space ~0.125s apart.
     rate_limit_per_minute = 480
+    # Per-source download-job concurrency (D-30 override): the PR #102 probe measured
+    # mangadot tolerating >=960/min/endpoint with no throttling, so up to 3 chapters
+    # download in parallel (vs the global per-source default of 1). Clamped to the
+    # global max_concurrent_chapters by the job manager.
+    max_concurrent_jobs = 3
     # Plaintext JSON behind Cloudflare (NOT +encrypted). The framework injects
     # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
     antibot = "cloudflare"

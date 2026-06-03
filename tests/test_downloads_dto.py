@@ -148,7 +148,7 @@ def test_settings_concurrency_and_db_path_defaults(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text('api_key = "k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n', encoding="utf-8")
     settings = load_settings(cfg)
-    assert settings.max_concurrent_chapters == 3  # D-30
+    assert settings.max_concurrent_chapters == 8  # D-30 (raised 3->8 for throughput)
     assert settings.image_fetch_concurrency == 6  # D-31
     assert settings.cloudflare_fetch_concurrency == 3  # chromium-default flip
     assert settings.db_path == "gateway.db"

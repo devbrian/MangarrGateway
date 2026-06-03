@@ -284,6 +284,48 @@ async def test_per_source_semaphore_caps_below_global(tmp_path: Path) -> None:
         await store.close()
 
 
+@pytest.mark.asyncio
+async def test_per_source_bound_honors_source_override_and_clamps(
+    tmp_path: Path,
+) -> None:
+    """A source's ``max_concurrent_jobs`` override raises its per-source job bound
+    above the global default (mangadot=3, measured safe), clamped to
+    ``max_concurrent_chapters``; sources without an override (and unknown keys) fall
+    back to ``max_concurrent_per_source`` (D-30)."""
+    from manga_gateway.sources import register_builtin_sources
+
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        registry = SourceRegistry()
+        register_builtin_sources(registry)
+
+        def _mgr(*, glob: int, per_source: int) -> JobManager:
+            return JobManager(
+                store=store,
+                registry=registry,
+                session=SessionManager(_NullTransport()),
+                ratelimiter=RateLimiter(),
+                handle_store=HandleStore(),
+                settings=Settings(
+                    api_key="k",
+                    output_root="/tmp/out",
+                    max_concurrent_chapters=glob,
+                    max_concurrent_per_source=per_source,
+                ),
+            )
+
+        wide = _mgr(glob=8, per_source=1)
+        assert wide._per_source_bound("mangadot") == 3  # override applied
+        assert wide._per_source_bound("mangadex") == 1  # no override -> setting
+        assert wide._per_source_bound("does-not-exist") == 1  # unknown -> setting
+
+        # Override is clamped to the global ceiling (WR-02 invariant).
+        narrow = _mgr(glob=2, per_source=1)
+        assert narrow._per_source_bound("mangadot") == 2
+    finally:
+        await store.close()
+
+
 # ─────────────────────── 5. rehydrate populates projection (PLAT-03) ─────────
 
 
