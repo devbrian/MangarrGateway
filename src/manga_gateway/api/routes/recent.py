@@ -11,7 +11,6 @@ contract guarantee holds regardless of whether a source honored the upstream hin
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -39,6 +38,8 @@ from ...framework.session import SessionManager
 from ...framework.session_prep import SessionPrep
 from ...handles.store import HandleStore
 from ...models.search import Release, ReleaseListResponse, SourceWarning
+from ..sorting import parse_publish_ts as _parse_ts
+from ..sorting import sort_newest_first
 
 if TYPE_CHECKING:
     from ...framework.base import Source
@@ -48,27 +49,10 @@ router = APIRouter()
 # Contract ceiling for the recent feed (openapi.yaml: limit maximum 100, T-02-06).
 _MAX_LIMIT = 100
 
-# Floor for empty/malformed timestamps so they sort oldest and never crash the
-# comparison — guards a source emitting an empty publishDate (WR-05).
-_TS_FLOOR = datetime.min.replace(tzinfo=UTC)
-
-
-def _parse_ts(raw: str) -> datetime:
-    """Parse an ISO-8601 timestamp to an aware datetime (handles ``Z`` and offsets).
-
-    Lexicographic string comparison of ISO timestamps is unsafe across mixed
-    ``Z``/``+00:00`` suffixes and future multi-source merges (WR-02), so ``since``
-    filtering and the newest-first sort compare parsed datetimes instead. Empty or
-    malformed values floor to epoch-min (compare as oldest) rather than raising.
-    """
-    if not raw:
-        return _TS_FLOOR
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError:
-        return _TS_FLOOR
-    # Normalize naive timestamps to UTC so every comparison is aware-vs-aware.
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+# ``_parse_ts`` (ISO-8601 → aware datetime, malformed → epoch-min floor) and the
+# newest-first merge now live in ``api/sorting.py`` so /recent and /search share the
+# identical sort (issue #99). Imported above as ``_parse_ts`` to keep the ``since``
+# cut below unchanged.
 
 
 def _split_csv(raw: str | None) -> list[str] | None:
@@ -175,7 +159,7 @@ async def get_recent(
         releases = [rel for rel in releases if _parse_ts(rel.publish_date) > since_dt]
 
     # RCNT-01: merge newest-first by publishDate across all sources (datetime-parsed).
-    releases.sort(key=lambda rel: _parse_ts(rel.publish_date), reverse=True)
+    sort_newest_first(releases)
     # T-02-06: enforce the overall limit on the MERGED list — per-source paging caps
     # each source, but the merged feed across sources must not exceed the requested max.
     releases = releases[:clamped_limit]
