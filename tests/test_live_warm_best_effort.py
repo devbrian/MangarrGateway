@@ -12,6 +12,11 @@ runs 26912244601 / 26912471852 — ``31 errors``).
 only the CF-gated source fails on its own clearance need. These gate-run tests
 lock that contract in (no browser, no network).
 
+This module also covers ``_session_warm_budget_s`` (debug
+datacenter-cf-warm-regression): the warm ceiling must SCALE with the number of
+cloudflare-gated domains, since ``warm()`` solves them sequentially and each has
+its own 60s inner deadline — a flat 60s ceiling false-fails an N>1 warm.
+
 Importing ``tests.live.conftest`` from the gate is the established pattern
 (``tests/test_live_collection.py``).
 """
@@ -22,7 +27,11 @@ import asyncio
 
 import pytest
 
-from tests.live.conftest import _warm_best_effort
+from tests.live.conftest import (
+    _PER_DOMAIN_WARM_BUDGET_S,
+    _session_warm_budget_s,
+    _warm_best_effort,
+)
 
 
 @pytest.mark.asyncio
@@ -57,3 +66,28 @@ async def test_swallows_exception_without_raising() -> None:
         raise RuntimeError("browser never launched")
 
     assert await _warm_best_effort(boom, timeout=5.0) is False
+
+
+def test_warm_budget_scales_with_cf_domain_count() -> None:
+    """The ceiling is per-domain, not flat: N domains -> N * per-domain budget.
+
+    A flat 60s could not cover a 2-domain warm (each domain owns a 60s inner
+    _solve_real deadline), so one slow domain false-failed the whole warm."""
+    assert _session_warm_budget_s(2) == _PER_DOMAIN_WARM_BUDGET_S * 2
+    assert _session_warm_budget_s(3) == _PER_DOMAIN_WARM_BUDGET_S * 3
+    # Strictly increasing in the domain count.
+    assert _session_warm_budget_s(2) > _session_warm_budget_s(1)
+
+
+def test_warm_budget_floored_at_one_domain() -> None:
+    """A zero/one-CF session still gets a sane (>= one-domain) budget — never 0."""
+    assert _session_warm_budget_s(1) == _PER_DOMAIN_WARM_BUDGET_S
+    assert _session_warm_budget_s(0) == _PER_DOMAIN_WARM_BUDGET_S
+    assert _session_warm_budget_s(-5) == _PER_DOMAIN_WARM_BUDGET_S
+
+
+def test_two_domain_budget_exceeds_combined_inner_deadlines() -> None:
+    """With two cf domains each owning a 60s inner _solve_real deadline, the outer
+    ceiling must exceed their combined 120s so a legitimately-slow-but-clearing
+    second domain isn't cancelled — the exact flat-60s failure mode this fixes."""
+    assert _session_warm_budget_s(2) > 60.0 * 2
