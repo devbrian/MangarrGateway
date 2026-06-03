@@ -79,3 +79,5 @@ scripts/diagnose_subprocess_leak.py
 .planning/debug/_cf_subprocess_leak_scratch/
 .planning/debug/cf-cookie-reuse-evidence.log
 .planning/debug/cf-subprocess-leak-evidence.log
+
+proxies.txt
