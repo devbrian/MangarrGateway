@@ -135,6 +135,31 @@ async def _warm_best_effort(
         return False
 
 
+# Per-cloudflare-domain wall-clock budget for the shared-session warm. The inner
+# CloudflareSolver._solve_real has its own 60s cf_clearance deadline PER domain
+# (src/manga_gateway/framework/antibot.py), and warm() solves each cloudflare-
+# gated source SEQUENTIALLY on the one shared context. 75s = that 60s inner
+# deadline + headroom for launch/goto/poll overhead.
+_PER_DOMAIN_WARM_BUDGET_S = 75.0
+
+
+def _session_warm_budget_s(num_cf_domains: int) -> float:
+    """Total wall-clock ceiling for the shared-session warm, scaled by #CF domains.
+
+    debug datacenter-cf-warm-regression (secondary finding): the warm was bounded
+    by a single flat ``asyncio.wait_for(warm(), 60.0)``. But ``warm()`` solves N
+    cloudflare-gated domains sequentially, EACH with its own internal 60s
+    ``_solve_real`` deadline — so a flat 60s outer ceiling cannot even cover one
+    slow inner solve plus a second domain. The moment any single domain is slow
+    (e.g. comix on a flagged datacenter IP), the outer ``wait_for`` cancels
+    mid-solve and misreports the WHOLE warm as failed, even when the other
+    domain(s) cleared fine. Scale the ceiling with the number of cf-gated domains
+    (``_PER_DOMAIN_WARM_BUDGET_S`` each), floored at one domain so a zero/one-CF
+    session still gets a sane budget.
+    """
+    return _PER_DOMAIN_WARM_BUDGET_S * max(1, num_cf_domains)
+
+
 def _load_profile(source_key: str) -> LiveSmokeProfile:
     """Load ``tests/live/profiles/{source_key}.py``'s ``LIVE_SMOKE`` (D-49 / D-50).
 
@@ -365,7 +390,11 @@ async def _session_solver() -> AsyncIterator[CloudflareSolver]:
     # Best-effort (debug/live-warm-fatal-session-gate): a slow/failed Cloudflare
     # clearance for ONE source must not error the shared session and take every
     # other (non-CF) source's tests down with it. See _warm_best_effort.
-    await _warm_best_effort(real_warm, timeout=60.0)
+    # Budget scales with the number of cf-gated domains (debug
+    # datacenter-cf-warm-regression): warm() solves them sequentially, each with
+    # its own 60s inner deadline, so a flat 60s ceiling false-fails an N>1 warm.
+    num_cf_domains = len(kwargs.get("cloudflare_keys") or ())
+    await _warm_best_effort(real_warm, timeout=_session_warm_budget_s(num_cf_domains))
     real_aclose = solver.aclose
     try:
         yield solver
