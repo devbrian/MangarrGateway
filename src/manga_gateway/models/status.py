@@ -23,7 +23,10 @@ class StatusCapabilities(ApiModel):
         default_factory=lambda: ["cbz", "cbt", "folder"],
         alias="outputFormats",
     )
-    max_concurrent_chapters: int = Field(default=3, alias="maxConcurrentChapters")
+    # Schema default mirrors the config default (D-30, raised 3->8); the /status
+    # route always overrides it with the live settings value, so this is only the
+    # advertised OpenAPI default.
+    max_concurrent_chapters: int = Field(default=8, alias="maxConcurrentChapters")
 
 
 class StatusResponse(ApiModel):
