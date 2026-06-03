@@ -106,18 +106,30 @@ _REPORT_DIR = _REPO_ROOT / "_rate_limit_probe_out"
 # proxies.txt path (raw host:port:user:pass lines). Gitignored — holds secrets.
 _PROXIES_PATH = _REPO_ROOT / "proxies.txt"
 
-# A grid cell is the "first sustained block" when its blocked fraction crosses this
-# threshold. "Sustained" = the cell's own blocked-rate is at/above the threshold
-# (we map the WHOLE grid regardless, but mark the first cell that crosses).
-_BLOCK_THRESHOLD = 0.20
+# A grid cell is a "sustained RATE-LIMIT block" when its rate-limited fraction crosses
+# this threshold. Rate-limited = a TRUE anti-throttle signal (HTTP 429/403, a Cloudflare
+# challenge, or a Retry-After header), NOT a timeout/connection error. Timeouts/errors
+# are tracked separately as latency/degradation: a slow or flaky site is not the same
+# as one that is throttling you. We map the WHOLE grid, marking the first cell to cross.
+_RATE_LIMIT_THRESHOLD = 0.20
+
+# A grid cell is "latency-degraded" when the SITE starts responding slower under load —
+# the soft-throttle signal that often precedes (or replaces) a hard rate-limit. Two
+# independent triggers, either of which flags the cell:
+#   1) its median latency is at least this factor times the gentlest cell's baseline, or
+#   2) its timeout+error fraction crosses _DEGRADATION_FRACTION (requests starting to
+#      die on the read timeout rather than returning a block status).
+_LATENCY_DEGRADATION_FACTOR = 2.0
+_DEGRADATION_FRACTION = 0.20
 
 # Suggested rate_limit_per_minute = this safety fraction of the measured calls/min
 # ceiling (the highest sustained rate with no sustained block). Conservative so the
 # fed-back value (closing #101) stays comfortably under the real ceiling.
 _SUGGESTED_RATE_SAFETY_FRACTION = 0.50
 
-# A proxy is treated as IP-BANNED (rotate to the next) when its whole-grid blocked
-# fraction crosses this — a sustained, grid-wide block that looks IP-level.
+# A proxy is treated as IP-BANNED (rotate to the next) when its whole-grid HARD-block
+# fraction (rate-limited + connection errors, EXCLUDING plain timeouts) crosses this — a
+# sustained, grid-wide block that looks IP-level rather than a real rate ceiling.
 _PROXY_BAN_FRACTION = 0.80
 
 
@@ -630,33 +642,49 @@ def _print_sweep_grid(
 # ──────────────────────────── block classification ────────────────────────────
 
 
-def _is_blocked(record: RequestRecord) -> bool:
-    """Classify one recorded outbound result as blocked vs ok (Claude's discretion).
+# Per-request OUTCOME buckets. The key distinction (the whole point of this rewrite):
+# RATE_LIMITED is a TRUE anti-throttle signal; TIMEOUT/ERROR are slowness/connectivity
+# and must NOT be conflated with rate-limiting — a slow or flaky site is not throttling.
+_OUTCOME_OK = "ok"
+_OUTCOME_RATE_LIMITED = "rate_limited"
+_OUTCOME_TIMEOUT = "timeout"
+_OUTCOME_ERROR = "error"
 
-    "blocked" = any of (CONTEXT.md required coverage):
 
-    * HTTP 429 (rate limited);
-    * HTTP 403 (forbidden — includes a Cloudflare challenge 403, flagged separately
-      via ``record.cf_challenge`` reusing the ``framework.context.is_cf_challenge``
-      heuristic spirit);
-    * a 503 carrying a Cloudflare challenge marker (``record.cf_challenge``);
-    * a ``Retry-After`` header present on the response;
-    * a transport error / connection reset / timeout (``httpx.TransportError`` →
-      recorded as ``exception_type`` with no ``status_code``).
+def _classify(record: RequestRecord) -> str:
+    """Bucket one recorded outbound result into an OUTCOME (Claude's discretion).
+
+    Returns one of ``_OUTCOME_OK`` / ``_OUTCOME_RATE_LIMITED`` / ``_OUTCOME_TIMEOUT`` /
+    ``_OUTCOME_ERROR``:
+
+    * ``rate_limited`` — a TRUE rate-limit / anti-bot block: HTTP 429, HTTP 403, a
+      Cloudflare challenge (``record.cf_challenge``, reusing the
+      ``framework.context.is_cf_challenge`` heuristic spirit), or a ``Retry-After``
+      header. These are what drive the measured parallelism / calls-min ceiling.
+    * ``timeout`` — the request died on the read/connect timeout (``exception_type``
+      containing ``Timeout``). This is SLOWNESS, tracked for the latency-degradation
+      signal — NOT counted as rate-limiting.
+    * ``error`` — any other transport error (connection reset/read error) or a non-block
+      HTTP error status (4xx other than 429/403, or 5xx without a CF marker).
+    * ``ok`` — a normal success.
     """
-    if record.exception_type is not None:
-        return True
-    if record.retry_after is not None:
-        return True
     if record.cf_challenge:
-        return True
-    return record.status_code in (429, 403)
-
-
-def _block_signal(record: RequestRecord) -> str | None:
-    """A short human-readable label for WHY ``record`` is blocked (or None if ok)."""
+        return _OUTCOME_RATE_LIMITED
+    if record.retry_after is not None:
+        return _OUTCOME_RATE_LIMITED
+    if record.status_code in (429, 403):
+        return _OUTCOME_RATE_LIMITED
     if record.exception_type is not None:
-        return f"transport:{record.exception_type}"
+        if "Timeout" in record.exception_type:
+            return _OUTCOME_TIMEOUT
+        return _OUTCOME_ERROR
+    if record.status_code is not None and record.status_code >= 400:
+        return _OUTCOME_ERROR
+    return _OUTCOME_OK
+
+
+def _signal_label(record: RequestRecord) -> str:
+    """A short human-readable label for WHY ``record`` got its outcome (detail dict)."""
     if record.cf_challenge:
         return "cf-challenge"
     if record.status_code == 429:
@@ -665,7 +693,11 @@ def _block_signal(record: RequestRecord) -> str | None:
         return "http-403"
     if record.retry_after is not None:
         return "retry-after"
-    return None
+    if record.exception_type is not None:
+        return f"transport:{record.exception_type}"
+    if record.status_code is not None and record.status_code >= 400:
+        return f"http-{record.status_code}"
+    return _OUTCOME_OK
 
 
 # ──────────────────────────── sweep engine ────────────────────────────
@@ -673,72 +705,224 @@ def _block_signal(record: RequestRecord) -> str | None:
 
 @dataclass
 class CellResult:
-    """One concurrency × rate grid cell's measured outcome."""
+    """One concurrency × rate grid cell's measured outcome.
+
+    Outcomes are kept in SEPARATE buckets so rate-limiting is never conflated with
+    slowness: ``rate_limited_count`` drives the measured ceiling, while
+    ``timeout_count``/``error_count`` feed the latency-degradation signal only.
+    """
 
     concurrency: int
     target_rate_per_min: int
     ok_count: int
-    blocked_count: int
-    block_signals: dict[str, int]
+    rate_limited_count: int
+    timeout_count: int
+    error_count: int
+    signals: dict[str, int]
     latencies: list[float]
 
     @property
     def total(self) -> int:
-        return self.ok_count + self.blocked_count
+        return (
+            self.ok_count
+            + self.rate_limited_count
+            + self.timeout_count
+            + self.error_count
+        )
 
     @property
-    def blocked_fraction(self) -> float:
-        return self.blocked_count / self.total if self.total else 0.0
+    def rate_limited_fraction(self) -> float:
+        return self.rate_limited_count / self.total if self.total else 0.0
 
     @property
-    def is_sustained_block(self) -> bool:
-        """True when this cell's blocked fraction crosses the sustained threshold."""
-        return self.total > 0 and self.blocked_fraction >= _BLOCK_THRESHOLD
+    def timeout_fraction(self) -> float:
+        return self.timeout_count / self.total if self.total else 0.0
+
+    @property
+    def degradation_fraction(self) -> float:
+        """Fraction of requests that timed out or errored (slowness, not throttling)."""
+        return (
+            (self.timeout_count + self.error_count) / self.total if self.total else 0.0
+        )
+
+    @property
+    def hard_block_fraction(self) -> float:
+        """Rate-limited + connection errors (EXCLUDING timeouts) — IP-ban heuristic."""
+        return (
+            (self.rate_limited_count + self.error_count) / self.total
+            if self.total
+            else 0.0
+        )
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """True when this cell's TRUE rate-limit fraction crosses the threshold."""
+        return self.total > 0 and self.rate_limited_fraction >= _RATE_LIMIT_THRESHOLD
 
     def latency_summary(self) -> dict[str, float]:
-        """min / mean / max latency seconds (0.0s when the cell issued nothing)."""
+        """min / median / mean / p95 / max latency seconds (0.0s when empty)."""
         if not self.latencies:
-            return {"min": 0.0, "mean": 0.0, "max": 0.0}
+            return {"min": 0.0, "median": 0.0, "mean": 0.0, "p95": 0.0, "max": 0.0}
+        ordered = sorted(self.latencies)
         return {
-            "min": min(self.latencies),
-            "mean": sum(self.latencies) / len(self.latencies),
-            "max": max(self.latencies),
+            "min": ordered[0],
+            "median": _percentile(ordered, 0.50),
+            "mean": sum(ordered) / len(ordered),
+            "p95": _percentile(ordered, 0.95),
+            "max": ordered[-1],
         }
+
+    @property
+    def median_latency(self) -> float:
+        return _percentile(sorted(self.latencies), 0.50) if self.latencies else 0.0
+
+
+def _percentile(ordered: list[float], q: float) -> float:
+    """Nearest-rank percentile of an already-sorted list (empty -> 0.0)."""
+    if not ordered:
+        return 0.0
+    rank = max(0, min(len(ordered) - 1, int(round(q * (len(ordered) - 1)))))
+    return ordered[rank]
 
 
 @dataclass
 class CategoryResult:
-    """The full sweep outcome for one endpoint category (search/manifest/image)."""
+    """The full sweep outcome for one endpoint category (search/manifest/image).
+
+    ``planned_concurrency``/``planned_rates`` are the FULL configured grid axes, so the
+    report can distinguish a level that was tested-and-clean from one that was never
+    reached because the ``--max-requests`` budget ran out (Fix 2 — no untested level is
+    ever reported as a measured ceiling).
+    """
 
     category: str
     cells: list[CellResult]
+    planned_concurrency: list[int]
+    planned_rates: list[int]
 
-    def first_sustained_block(self) -> CellResult | None:
-        """The FIRST grid cell (in sweep order) whose block fraction crossed."""
+    # ── what was actually exercised vs planned ──────────────────────────────────
+    @property
+    def tested_concurrency(self) -> list[int]:
+        return sorted({cell.concurrency for cell in self.cells})
+
+    @property
+    def tested_rates(self) -> list[int]:
+        return sorted({cell.target_rate_per_min for cell in self.cells})
+
+    @property
+    def untested_concurrency(self) -> list[int]:
+        return sorted(set(self.planned_concurrency) - set(self.tested_concurrency))
+
+    @property
+    def untested_rates(self) -> list[int]:
+        return sorted(set(self.planned_rates) - set(self.tested_rates))
+
+    @property
+    def parallelism_fully_tested(self) -> bool:
+        return not self.untested_concurrency
+
+    @property
+    def rate_fully_tested(self) -> bool:
+        return not self.untested_rates
+
+    # ── true rate-limiting (drives the ceiling) ─────────────────────────────────
+    @property
+    def rate_limit_observed(self) -> bool:
+        return any(cell.is_rate_limited for cell in self.cells)
+
+    def first_rate_limit(self) -> CellResult | None:
+        """The FIRST grid cell (in sweep order) to cross the rate-limit threshold."""
         for cell in self.cells:
-            if cell.is_sustained_block:
+            if cell.is_rate_limited:
                 return cell
         return None
 
-    def max_parallelism(self) -> int:
-        """Highest concurrency level with NO sustained block at any tested rate."""
-        ok_levels = {
-            cell.concurrency for cell in self.cells if not cell.is_sustained_block
-        }
-        return max(ok_levels) if ok_levels else 0
+    @property
+    def baseline_latency(self) -> float:
+        """Median latency of the gentlest tested cell (lowest concurrency then rate)."""
+        if not self.cells:
+            return 0.0
+        gentlest = min(self.cells, key=lambda c: (c.concurrency, c.target_rate_per_min))
+        return gentlest.median_latency
 
-    def calls_per_min_ceiling(self) -> int:
-        """Highest target rate sustained with NO sustained block at any concurrency."""
-        ok_rates = {
+    def is_degraded(self, cell: CellResult) -> bool:
+        """True when ``cell`` shows latency degradation vs the gentlest baseline.
+
+        Either the cell's median latency blew past the baseline by
+        ``_LATENCY_DEGRADATION_FACTOR``, or its timeout+error fraction crossed
+        ``_DEGRADATION_FRACTION`` (requests dying on the read timeout under load).
+        """
+        if cell.total == 0:
+            return False
+        base = self.baseline_latency
+        slow = base > 0 and cell.median_latency >= base * _LATENCY_DEGRADATION_FACTOR
+        flaky = cell.degradation_fraction >= _DEGRADATION_FRACTION
+        return slow or flaky
+
+    @property
+    def degradation_observed(self) -> bool:
+        return any(self.is_degraded(cell) for cell in self.cells)
+
+    def first_degradation(self) -> CellResult | None:
+        for cell in self.cells:
+            if self.is_degraded(cell):
+                return cell
+        return None
+
+    # ── tolerated parallelism / rate (NO untested level reported as a ceiling) ───
+    def max_parallelism_clean(self) -> int | None:
+        """Highest TESTED concurrency with no rate-limit and no degradation at any rate.
+
+        ``None`` when nothing was tested. Read with ``parallelism_fully_tested``: if
+        that is False this is a FLOOR ("at least"), since higher levels never ran.
+        """
+        bad = {
+            cell.concurrency
+            for cell in self.cells
+            if cell.is_rate_limited or self.is_degraded(cell)
+        }
+        clean = {c for c in self.tested_concurrency if c not in bad}
+        return max(clean) if clean else None
+
+    def calls_per_min_clean(self) -> int | None:
+        """Highest TESTED rate with no rate-limit and no degradation at any concurrency.
+
+        ``None`` when nothing was tested. A FLOOR when ``rate_fully_tested`` is False.
+        """
+        bad = {
             cell.target_rate_per_min
             for cell in self.cells
-            if not cell.is_sustained_block
+            if cell.is_rate_limited or self.is_degraded(cell)
         }
-        return max(ok_rates) if ok_rates else 0
+        clean = {r for r in self.tested_rates if r not in bad}
+        return max(clean) if clean else None
 
-    def suggested_rate_per_min(self) -> int:
-        """Safety-margin fraction of the measured ceiling — feeds back into #101."""
-        return int(self.calls_per_min_ceiling() * _SUGGESTED_RATE_SAFETY_FRACTION)
+    # ── #101 feedback value ─────────────────────────────────────────────────────
+    def suggested_rate_per_min(self) -> int | None:
+        """Safety-margin suggestion for ``rate_limit_per_minute`` (feeds back to #101).
+
+        ``None`` when no clean rate was observed. See :meth:`suggested_basis` for how to
+        read it: when no limit was hit AND the rate axis was not fully tested, this is a
+        FLOOR, not a ceiling.
+        """
+        clean = self.calls_per_min_clean()
+        if clean is None:
+            return None
+        return int(clean * _SUGGESTED_RATE_SAFETY_FRACTION)
+
+    def suggested_basis(self) -> str:
+        """How the suggested value should be read (honest about what was measured)."""
+        if self.calls_per_min_clean() is None:
+            return "no clean cell (all tested rates rate-limited or degraded)"
+        if self.rate_limit_observed:
+            return "ceiling (safety fraction of the highest rate before a rate-limit)"
+        if self.degradation_observed:
+            return "soft ceiling (safety fraction of the highest rate before slowdown)"
+        if not self.rate_fully_tested:
+            return (
+                "FLOOR -- no limit hit; higher rates not tested (raise --max-requests)"
+            )
+        return "FLOOR -- no limit hit across the full tested grid"
 
 
 async def _run_cell(
@@ -786,24 +970,29 @@ async def _run_cell(
     await asyncio.gather(*tasks)
 
     cell_rows = transport.segment()
-    ok = 0
-    blocked = 0
+    counts = {
+        _OUTCOME_OK: 0,
+        _OUTCOME_RATE_LIMITED: 0,
+        _OUTCOME_TIMEOUT: 0,
+        _OUTCOME_ERROR: 0,
+    }
     signals: dict[str, int] = {}
     latencies: list[float] = []
     for row in cell_rows:
         latencies.append(row.latency_seconds)
-        if _is_blocked(row):
-            blocked += 1
-            signal = _block_signal(row) or "unknown"
-            signals[signal] = signals.get(signal, 0) + 1
-        else:
-            ok += 1
+        outcome = _classify(row)
+        counts[outcome] += 1
+        if outcome != _OUTCOME_OK:
+            label = _signal_label(row)
+            signals[label] = signals.get(label, 0) + 1
     return CellResult(
         concurrency=concurrency,
         target_rate_per_min=target_rate_per_min,
-        ok_count=ok,
-        blocked_count=blocked,
-        block_signals=signals,
+        ok_count=counts[_OUTCOME_OK],
+        rate_limited_count=counts[_OUTCOME_RATE_LIMITED],
+        timeout_count=counts[_OUTCOME_TIMEOUT],
+        error_count=counts[_OUTCOME_ERROR],
+        signals=signals,
         latencies=latencies,
     )
 
@@ -820,8 +1009,9 @@ async def _sweep_category(
     """Run the FULL concurrency × rate grid for one category (aggressive sweep).
 
     Completes the WHOLE grid even after hitting a limit (maps the full
-    penalty/recovery curve) — :meth:`CategoryResult.first_sustained_block` marks where
-    the block first appears. ``budget`` is a one-element mutable list carrying the
+    penalty/recovery curve) — :meth:`CategoryResult.first_rate_limit` marks where a true
+    rate-limit first appears, :meth:`CategoryResult.first_degradation` where the site
+    first slows down. ``budget`` is a one-element mutable list carrying the
     remaining global ``--max-requests`` allowance, decremented across cells so the cap
     spans ALL categories. A short cooldown between cells makes recovery observable.
     """
@@ -839,17 +1029,23 @@ async def _sweep_category(
             )
             budget[0] -= cell.total
             cells.append(cell)
-            mark = " <== FIRST SUSTAINED BLOCK" if cell.is_sustained_block else ""
+            mark = " <== FIRST RATE-LIMIT BLOCK" if cell.is_rate_limited else ""
             print(
                 f"  [{captured.category}] c={concurrency} rate={rate}/min "
-                f"ok={cell.ok_count} blocked={cell.blocked_count} "
-                f"({cell.blocked_fraction:.0%}){mark}"
+                f"ok={cell.ok_count} rate_limited={cell.rate_limited_count} "
+                f"timeout={cell.timeout_count} error={cell.error_count} "
+                f"median={cell.median_latency:.2f}s{mark}"
             )
             if cooldown_seconds > 0 and budget[0] > 0:
                 await asyncio.sleep(cooldown_seconds)
         if budget[0] <= 0:
             break
-    return CategoryResult(category=captured.category, cells=cells)
+    return CategoryResult(
+        category=captured.category,
+        cells=cells,
+        planned_concurrency=list(concurrency_steps),
+        planned_rates=list(rate_steps),
+    )
 
 
 # ──────────────────────────── report ────────────────────────────
@@ -875,14 +1071,34 @@ def _build_report(
     per_category: dict[str, Any] = {}
     for result in category_results:
         per_category[result.category] = {
-            "max_parallelism": result.max_parallelism(),
-            "calls_per_min_ceiling": result.calls_per_min_ceiling(),
+            # Fix 1 — rate-limiting kept distinct from slowness.
+            "rate_limit_observed": result.rate_limit_observed,
+            "first_rate_limit": _cell_to_dict(result.first_rate_limit(), result),
+            # Fix 3 — latency-degradation (soft-throttle) signal, separate axis.
+            "degradation_observed": result.degradation_observed,
+            "first_degradation": _cell_to_dict(result.first_degradation(), result),
+            "baseline_latency_seconds": round(result.baseline_latency, 3),
+            # Fix 2 — never report an untested level as a measured ceiling.
+            "max_parallelism_clean": result.max_parallelism_clean(),
+            "parallelism_fully_tested": result.parallelism_fully_tested,
+            "concurrency_tested": result.tested_concurrency,
+            "concurrency_not_tested": result.untested_concurrency,
+            "calls_per_min_clean": result.calls_per_min_clean(),
+            "rate_fully_tested": result.rate_fully_tested,
+            "rate_tested": result.tested_rates,
+            "rate_not_tested": result.untested_rates,
+            # #101 feedback (read with the basis string — may be a FLOOR not a ceiling).
             "suggested_rate_per_minute": result.suggested_rate_per_min(),
-            "first_sustained_block": _cell_to_dict(result.first_sustained_block()),
-            "cells": [_cell_to_dict(cell) for cell in result.cells],
+            "suggested_basis": result.suggested_basis(),
+            "cells": [_cell_to_dict(cell, result) for cell in result.cells],
         }
-    suggestions = {r.category: r.suggested_rate_per_min() for r in category_results}
-    ceilings = {r.category: r.calls_per_min_ceiling() for r in category_results}
+    # Per-endpoint difference is judged on the clean ceiling (None-aware).
+    ceilings = {r.category: r.calls_per_min_clean() for r in category_results}
+    suggestions = [
+        s
+        for s in (r.suggested_rate_per_min() for r in category_results)
+        if s is not None
+    ]
     return {
         "source_key": source_key,
         "antibot": antibot,
@@ -897,11 +1113,14 @@ def _build_report(
         "warmup_notes": warmup.notes,
         "endpoints": per_category,
         "limits_differ_across_endpoints": len(set(ceilings.values())) > 1,
-        "suggested_rate_per_minute": (min(suggestions.values()) if suggestions else 0),
+        # Overall = the most conservative per-endpoint suggestion (None if none clean).
+        "suggested_rate_per_minute": (min(suggestions) if suggestions else None),
     }
 
 
-def _cell_to_dict(cell: CellResult | None) -> dict[str, Any] | None:
+def _cell_to_dict(
+    cell: CellResult | None, result: CategoryResult
+) -> dict[str, Any] | None:
     """Serialize one ``CellResult`` (or None) for the JSON report."""
     if cell is None:
         return None
@@ -909,11 +1128,15 @@ def _cell_to_dict(cell: CellResult | None) -> dict[str, Any] | None:
         "concurrency": cell.concurrency,
         "target_rate_per_min": cell.target_rate_per_min,
         "ok": cell.ok_count,
-        "blocked": cell.blocked_count,
-        "blocked_fraction": round(cell.blocked_fraction, 3),
-        "block_signals": cell.block_signals,
+        "rate_limited": cell.rate_limited_count,
+        "timeout": cell.timeout_count,
+        "error": cell.error_count,
+        "rate_limited_fraction": round(cell.rate_limited_fraction, 3),
+        "degradation_fraction": round(cell.degradation_fraction, 3),
+        "signals": cell.signals,
         "latency_seconds": {k: round(v, 3) for k, v in cell.latency_summary().items()},
-        "sustained_block": cell.is_sustained_block,
+        "is_rate_limited": cell.is_rate_limited,
+        "is_degraded": result.is_degraded(cell),
     }
 
 
@@ -937,26 +1160,58 @@ def _print_console_summary(report: dict[str, Any], report_path: Path) -> None:
         print("  No endpoint categories captured (see warmup_notes in the report).")
     for category, data in endpoints.items():
         print(f"  [{category}]")
-        print(f"    max parallelism tolerated : {data['max_parallelism']}")
-        print(f"    calls/min ceiling         : {data['calls_per_min_ceiling']}")
-        fsb = data["first_sustained_block"]
-        if fsb is None:
-            print("    first sustained block     : none observed in grid")
-        else:
+
+        # 1) True rate-limiting (429/403/CF/Retry-After) — the hard ceiling.
+        if data["rate_limit_observed"]:
+            rl = data["first_rate_limit"]
             print(
-                f"    first sustained block     : c={fsb['concurrency']} "
-                f"rate={fsb['target_rate_per_min']}/min "
-                f"({fsb['blocked_fraction']:.0%} blocked, "
-                f"signals={fsb['block_signals']})"
+                f"    rate-limit block          : YES, first at "
+                f"c={rl['concurrency']} rate={rl['target_rate_per_min']}/min "
+                f"(signals={rl['signals']})"
             )
-        print(f"    SUGGESTED rate_per_minute : {data['suggested_rate_per_minute']}")
+        else:
+            print("    rate-limit block          : none (no 429/403/CF/Retry-After)")
+
+        # 3) Latency degradation (the site slowing down / timing out under load).
+        if data["degradation_observed"]:
+            dg = data["first_degradation"]
+            print(
+                f"    latency degradation       : YES, first at "
+                f"c={dg['concurrency']} rate={dg['target_rate_per_min']}/min "
+                f"(median {dg['latency_seconds']['median']}s vs baseline "
+                f"{data['baseline_latency_seconds']}s, "
+                f"timeouts+errors {dg['degradation_fraction']:.0%})"
+            )
+        else:
+            print("    latency degradation       : none (no slowdown / timeouts)")
+
+        # 2) Parallelism / rate — never claim an untested level as a measured limit.
+        par = data["max_parallelism_clean"]
+        par_txt = "untested" if par is None else f"{par}"
+        if not data["parallelism_fully_tested"] and data["concurrency_not_tested"]:
+            par_txt += f" (NOT reached: {data['concurrency_not_tested']} -- budget)"
+        elif par is not None:
+            par_txt += " (full axis tested)"
+        print(f"    max parallelism clean     : {par_txt}")
+
+        rate = data["calls_per_min_clean"]
+        rate_txt = "untested" if rate is None else f"{rate}/min"
+        if not data["rate_fully_tested"] and data["rate_not_tested"]:
+            rate_txt += f" (NOT reached: {data['rate_not_tested']} -- budget)"
+        elif rate is not None:
+            rate_txt += " (full axis tested)"
+        print(f"    calls/min clean           : {rate_txt}")
+
+        sug = data["suggested_rate_per_minute"]
+        sug_txt = "n/a" if sug is None else str(sug)
+        print(f"    SUGGESTED rate_per_minute : {sug_txt}")
+        print(f"      basis                   : {data['suggested_basis']}")
     print("-" * 72)
     differ = "YES" if report["limits_differ_across_endpoints"] else "no"
     print(f"  Limits differ across endpoints: {differ}")
-    print(
-        f"  OVERALL SUGGESTED rate_limit_per_minute (closes #101): "
-        f"{report['suggested_rate_per_minute']}"
-    )
+    overall = report["suggested_rate_per_minute"]
+    overall_txt = "n/a (no clean cell)" if overall is None else str(overall)
+    print(f"  OVERALL SUGGESTED rate_limit_per_minute (closes #101): {overall_txt}")
     if report["warmup_notes"]:
         print("-" * 72)
         print("  Warm-up notes (endpoints not captured):")
@@ -1190,13 +1445,17 @@ def _advise_proxy_rotation(
     if proxy is None:
         return
     total = sum(c.total for r in category_results for c in r.cells)
-    blocked = sum(c.blocked_count for r in category_results for c in r.cells)
+    # Hard block = rate-limited + connection errors (NOT plain timeouts — a slow site is
+    # not a banned IP). This is the grid-wide IP-ban heuristic.
+    hard_blocked = sum(
+        c.rate_limited_count + c.error_count for r in category_results for c in r.cells
+    )
     if total == 0:
         return
-    if blocked / total >= _PROXY_BAN_FRACTION:
+    if hard_blocked / total >= _PROXY_BAN_FRACTION:
         print(
             f"[probe] WARNING: {_mask_proxy(proxy)} looks IP-BANNED "
-            f"({blocked}/{total} blocked grid-wide). Re-run with "
+            f"({hard_blocked}/{total} hard-blocked grid-wide). Re-run with "
             f"--proxy-index {proxy.index + 1} to rotate to the next proxy."
         )
 
