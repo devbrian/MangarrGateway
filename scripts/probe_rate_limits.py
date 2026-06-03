@@ -77,19 +77,32 @@ from manga_gateway.framework.antibot import (  # noqa: E402
     NoopSolver,
 )
 from manga_gateway.framework.context import SourceContext, is_cf_challenge  # noqa: E402
+from manga_gateway.framework.errors import SourceError  # noqa: E402
 from manga_gateway.framework.ratelimit import RateLimiter  # noqa: E402
 from manga_gateway.framework.registry import SourceRegistry  # noqa: E402
 from manga_gateway.framework.session import SessionManager  # noqa: E402
-from manga_gateway.framework.session_prep import NoSessionPrep  # noqa: E402
+from manga_gateway.framework.session_prep import (  # noqa: E402
+    CsrfBootstrap,
+    NoSessionPrep,
+    SessionPrep,
+)
 from manga_gateway.framework.transport import HttpxTransport  # noqa: E402
 from manga_gateway.handles.store import HandleStore  # noqa: E402
 from manga_gateway.models.search import SearchRequest  # noqa: E402
 from manga_gateway.sources import register_builtin_sources  # noqa: E402
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from manga_gateway.framework.base import Source
+
+    # A per-cell dispatch issues exactly ONE logical request through the
+    # instrumented transport. Two flavours exist (issue #106): replay the captured
+    # kwargs verbatim (the default, valid for stateless sources) or re-invoke the
+    # real ``search()`` so a csrf-bootstrap source re-mints its CSRF token + cookie
+    # per call. Annotations are strings (``from __future__ import annotations``), so
+    # this alias is needed only by the type checker.
+    _CellDispatch = Callable[[], Awaitable[None]]
 
 # A non-real API key satisfies Settings(api_key=...) construction (config.py D-01:
 # init kwargs beat env, so this never persists or reads a real key).
@@ -139,6 +152,14 @@ _SUGGESTED_RATE_SAFETY_FRACTION = 0.50
 # fraction (rate-limited + connection errors, EXCLUDING plain timeouts) crosses this — a
 # sustained, grid-wide block that looks IP-level rather than a real rate ceiling.
 _PROXY_BAN_FRACTION = 0.80
+
+# Issue #106 (B): block signals that mean 'the REPLAYED request was structurally
+# invalid', not 'this IP is banned'. A csrf-bootstrap source replayed with its
+# single-use X-CSRF-Token 403s every cell; a CF browser-nav source replayed over
+# httpx hits the challenge wall. When such a source is hard-blocked grid-wide AND the
+# block is dominated by these signals from cell #1, the grid is UNMEASURABLE by replay
+# (the IP is fine — the live search() flow re-mints/solves) rather than IP-banned.
+_REPLAY_INCOMPATIBLE_SIGNALS = frozenset({"http-403", "cf-challenge"})
 
 # Per-cell WALL-CLOCK deadline (seconds). Caps each grid cell so a slow/dead proxy or a
 # tarpitting site cannot hang the sweep — without it, concurrency=1 serial 30s timeouts
@@ -410,6 +431,34 @@ def _build_solver(
     return CloudflareSolver(**solver_kwargs)
 
 
+def _build_session_prep(
+    source_cls: type[Source],
+    *,
+    session: SessionManager,
+    ratelimiter: RateLimiter,
+) -> SessionPrep:
+    """Build the ``SessionPrep`` for the source (mirrors app.py wiring).
+
+    ``session_prep == "csrf-bootstrap"`` -> a real :class:`CsrfBootstrap` over the
+    probe's ONE shared transport, so the warm-up ``search()`` actually mints a CSRF
+    token + PHPSESSID and the re-mint sweep (issue #106 path A) can re-mint per call.
+    Any other value -> :class:`NoSessionPrep` (MangaDex/Comix byte-for-byte
+    unchanged). The bootstrap is keyed on the source's ``base_url`` exactly like
+    ``app.py`` lifespan, and shares the SAME per-source limiter the context uses so
+    the bootstrap GET counts against the source budget.
+    """
+    if getattr(source_cls, "session_prep", None) != "csrf-bootstrap":
+        return NoSessionPrep()
+    key = source_cls.key
+    return CsrfBootstrap(
+        keys=frozenset({key}),
+        session=session,
+        bootstrap_urls={key: source_cls.base_url},
+        ratelimiter=ratelimiter,
+        rates={key: source_cls.rate_limit_per_minute},
+    )
+
+
 def _build_context(
     source: Source,
     *,
@@ -417,12 +466,15 @@ def _build_context(
     ratelimiter: RateLimiter,
     handle_store: HandleStore,
     solver: NoopSolver | CloudflareSolver,
+    session_prep: SessionPrep | None = None,
 ) -> SourceContext:
     """Build a ``SourceContext`` like search.py — but with OUR limiter unlimited.
 
     ``rate_limit_per_minute`` is forced to :data:`_UNLIMITED_RATE_PER_MINUTE` so
     OUR aiolimiter never gates (we want the SITE's ceiling). ``source_health=None``
-    neutralizes the breaker (context.py no-ops health when None).
+    neutralizes the breaker (context.py no-ops health when None). ``session_prep``
+    defaults to :class:`NoSessionPrep` but a csrf-bootstrap source threads a real
+    :class:`CsrfBootstrap` so its ``search()`` re-mints CSRF (issue #106).
     """
     src_decrypt_config = getattr(source, "decrypt_config", None)
     return SourceContext(
@@ -436,7 +488,7 @@ def _build_context(
         decrypt_scheme=source.decrypt_scheme,
         decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
         source_health=None,
-        session_prep=NoSessionPrep(),
+        session_prep=session_prep if session_prep is not None else NoSessionPrep(),
     )
 
 
@@ -1143,8 +1195,53 @@ class CategoryResult:
         return "FLOOR -- no limit hit across the full tested grid"
 
 
+def _replay_dispatch(
+    captured: CapturedRequest, transport: InstrumentedTransport
+) -> _CellDispatch:
+    """Dispatch that re-issues the captured request verbatim (the default driver).
+
+    Valid for stateless sources whose captured request stays replayable. The httpx
+    error is already recorded by the instrumented transport, so it is swallowed here.
+    """
+
+    async def _dispatch() -> None:
+        try:
+            resp = await transport.request(
+                captured.method, captured.url, **captured.kwargs
+            )
+        except httpx.HTTPError:
+            return  # already recorded by the instrumented transport
+        # Drain the body so cf-challenge classification can read content.
+        with contextlib.suppress(Exception):
+            _ = resp.content
+
+    return _dispatch
+
+
+def _search_dispatch(
+    source: Source, ctx: SourceContext, *, query: str
+) -> _CellDispatch:
+    """Dispatch that re-invokes the real ``source.search()`` (issue #106 path A).
+
+    For a ``session_prep == "csrf-bootstrap"`` source the captured request carries a
+    single-use ``X-CSRF-Token`` + ``PHPSESSID`` that 403s on replay. Re-running the
+    full ``search()`` drives the source's own networking, which re-mints the CSRF
+    credential via the wired :class:`CsrfBootstrap` provider — the honest measurement
+    path. Each call still rides the SAME instrumented transport (so every outbound
+    request, incl. any bootstrap refresh GET, is recorded + classified) and the SAME
+    pinned proxy. ``SourceError`` is swallowed: the recorded rows ARE the outcome.
+    """
+    req = SearchRequest(type="chapter", query=query, sources=[source.key])
+
+    async def _dispatch() -> None:
+        with contextlib.suppress(SourceError):
+            await source.search(req, ctx)
+
+    return _dispatch
+
+
 async def _run_cell(
-    captured: CapturedRequest,
+    dispatch: _CellDispatch,
     transport: InstrumentedTransport,
     *,
     concurrency: int,
@@ -1152,15 +1249,18 @@ async def _run_cell(
     remaining_budget: int,
     cell_deadline_seconds: float,
 ) -> CellResult:
-    """Replay ``captured`` across one grid cell and tally ok/blocked outcomes.
+    """Drive ``dispatch`` across one grid cell and tally ok/blocked outcomes.
 
-    Replay = re-issue the SAME captured method+url+kwargs through the instrumented
-    transport directly (bypassing the source's parsing but still through the real
-    httpx client + pinned proxy + injected clearance). Concurrency is controlled by an
-    ``asyncio.Semaphore`` sized to ``concurrency``; rate by pacing the dispatch to
-    ``target_rate_per_min`` (NOT by ``SourceContext._limiter`` — we want the SITE's
-    limit). The number of requests this cell issues is bounded by ``remaining_budget``
-    (the per-category ``--max-requests`` cap) so even aggressive mode stays controlled.
+    ``dispatch`` issues ONE logical request through the instrumented transport: either
+    a verbatim replay of the captured method+url+kwargs (the default) or a full
+    re-invocation of ``source.search()`` for a csrf-bootstrap source (issue #106 — so
+    the CSRF token is re-minted per call instead of replayed stale). Either way the
+    call rides the real httpx client + pinned proxy + injected clearance. Concurrency
+    is controlled by an ``asyncio.Semaphore`` sized to ``concurrency``; rate by pacing
+    the dispatch to ``target_rate_per_min`` (NOT by ``SourceContext._limiter`` — we
+    want the SITE's limit). The number of dispatches this cell issues is bounded by
+    ``remaining_budget`` (the per-category ``--max-requests`` cap) so even aggressive
+    mode stays controlled.
     """
     # One "burst" per cell: issue up to min(target rate, remaining budget) requests,
     # paced to the target rate, bounded by the concurrency semaphore. A WALL-CLOCK
@@ -1176,15 +1276,10 @@ async def _run_cell(
 
     async def _one() -> None:
         async with semaphore:
-            try:
-                resp = await transport.request(
-                    captured.method, captured.url, **captured.kwargs
-                )
-            except httpx.HTTPError:
-                return  # already recorded by the instrumented transport
-            # Drain the body so cf-challenge classification can read content.
-            with contextlib.suppress(Exception):
-                _ = resp.content
+            # The dispatch owns its own error handling: replay swallows httpx errors
+            # (already recorded by the instrumented transport) and search swallows
+            # SourceError; both leave the recorded rows as the measurement.
+            await dispatch()
 
     tasks: list[asyncio.Task[None]] = []
     for i in range(n_requests):
@@ -1246,6 +1341,7 @@ async def _sweep_category(
     captured: CapturedRequest,
     transport: InstrumentedTransport,
     *,
+    dispatch: _CellDispatch,
     concurrency_steps: Sequence[int],
     rate_steps: Sequence[int],
     cooldown_seconds: float,
@@ -1254,6 +1350,8 @@ async def _sweep_category(
 ) -> CategoryResult:
     """Run the FULL concurrency × rate grid for one category (aggressive sweep).
 
+    Drives ``dispatch`` (replay or search re-mint, issue #106) across every grid cell;
+    ``captured`` supplies only the category label + planned-axis context here.
     Completes the WHOLE grid even after hitting a limit (maps the full
     penalty/recovery curve) — :meth:`CategoryResult.first_rate_limit` marks where a true
     rate-limit first appears, :meth:`CategoryResult.first_degradation` where the site
@@ -1268,7 +1366,7 @@ async def _sweep_category(
             if budget[0] <= 0:
                 break
             cell = await _run_cell(
-                captured,
+                dispatch,
                 transport,
                 concurrency=concurrency,
                 target_rate_per_min=rate,
@@ -1313,6 +1411,7 @@ def _build_report(
     *,
     source_key: str,
     antibot: str,
+    source_cls: type[Source],
     proxy_labels: dict[str, str],
     warmup_notes: list[dict[str, Any]],
     category_results: list[CategoryResult],
@@ -1330,9 +1429,14 @@ def _build_report(
     """
     per_category: dict[str, Any] = {}
     for result in category_results:
+        # Issue #106 (B): a csrf-bootstrap / CF browser-nav grid that is a hard
+        # immediate 403/CF wall is UNMEASURABLE by replay, not a measured ceiling.
+        unmeasurable = _unmeasurable_reason(source_cls, result.cells)
         per_category[result.category] = {
             # Which (masked) proxy this endpoint was measured on.
             "proxy": proxy_labels.get(result.category, "no-proxy"),
+            # Issue #106 (B): None, or the "replay incompatible" reason string.
+            "unmeasurable_reason": unmeasurable,
             # Fix 1 — rate-limiting kept distinct from slowness.
             "rate_limit_observed": result.rate_limit_observed,
             "first_rate_limit": _cell_to_dict(result.first_rate_limit(), result),
@@ -1423,6 +1527,11 @@ def _print_console_summary(report: dict[str, Any], report_path: Path) -> None:
         print("  No endpoint categories captured (see warmup_notes in the report).")
     for category, data in endpoints.items():
         print(f"  [{category}]  (proxy: {data.get('proxy', 'no-proxy')})")
+
+        # Issue #106 (B): a replay-incompatible grid is UNMEASURABLE, not a ceiling.
+        if data.get("unmeasurable_reason"):
+            print(f"    {data['unmeasurable_reason']}")
+            continue
 
         # 1) True rate-limiting (429/403/CF/Retry-After) — the hard ceiling.
         if data["rate_limit_observed"]:
@@ -1515,12 +1624,16 @@ async def _cmd_dry_run(args: argparse.Namespace, registry: SourceRegistry) -> in
     ratelimiter = RateLimiter()
     handle_store = HandleStore()
     solver = _build_solver(source_cls, settings, None)
+    session_prep = _build_session_prep(
+        source_cls, session=session, ratelimiter=ratelimiter
+    )
     _build_context(
         source,
         session=session,
         ratelimiter=ratelimiter,
         handle_store=handle_store,
         solver=solver,
+        session_prep=session_prep,
     )
     # No outbound request happens; close the client we opened.
     await transport.aclose()
@@ -1647,12 +1760,19 @@ def _build_live_seams(
     transport = InstrumentedTransport(HttpxTransport(settings))
     session = SessionManager(transport)
     solver = _build_solver(source_cls, settings, proxy)
+    # One shared RateLimiter so the (optional) csrf-bootstrap GET and the data path
+    # draw from the SAME per-source token budget (mirrors app.py lifespan wiring).
+    ratelimiter = RateLimiter()
+    session_prep = _build_session_prep(
+        source_cls, session=session, ratelimiter=ratelimiter
+    )
     ctx = _build_context(
         source,
         session=session,
-        ratelimiter=RateLimiter(),
+        ratelimiter=ratelimiter,
         handle_store=HandleStore(),
         solver=solver,
+        session_prep=session_prep,
     )
     return transport, solver, ctx
 
@@ -1687,6 +1807,7 @@ _WarmupOutcome = tuple[
     ProxyEntry | None,
     InstrumentedTransport,
     NoopSolver | CloudflareSolver,
+    SourceContext,
     WarmupResult,
 ]
 
@@ -1701,9 +1822,11 @@ async def _attempt_warmup(
 ) -> tuple[_WarmupOutcome | None, int]:
     """Warm up on proxies from ``candidates``, cycling from index ``start`` (Tier 2).
 
-    Returns ``((proxy, transport, solver, warmup), next_index)`` for the first proxy
-    whose warm-up captured at least one endpoint, or ``(None, next_index)`` if every
-    attempt failed. ``next_index`` is where the NEXT category should start so it gets a
+    Returns ``((proxy, transport, solver, ctx, warmup), next_index)`` for the first
+    proxy whose warm-up captured at least one endpoint, or ``(None, next_index)`` if
+    every attempt failed. ``ctx`` is the live :class:`SourceContext` the warm-up ran
+    on — the search re-mint dispatch (issue #106 path A) drives ``source.search()``
+    through it. ``next_index`` is where the NEXT category should start so it gets a
     FRESH proxy (fresh-proxy-per-category). Bounded by ``--proxy-health-retries``. Each
     failed attempt's seams are closed before rotating.
     """
@@ -1729,7 +1852,7 @@ async def _attempt_warmup(
                 file=sys.stderr,
             )
         if warmup is not None and warmup.captured:
-            return (proxy, transport, solver, warmup), start + k + 1
+            return (proxy, transport, solver, ctx, warmup), start + k + 1
         if warmup is not None:
             for note in warmup.notes:
                 print(f"  - {note['category']}: {note['reason']}", file=sys.stderr)
@@ -1740,6 +1863,40 @@ async def _attempt_warmup(
                 file=sys.stderr,
             )
     return None, start + max_attempts
+
+
+def _is_csrf_bootstrap(source_cls: type[Source]) -> bool:
+    """True when the source mints per-request CSRF creds (canonical app.py:174 check).
+
+    The single ``getattr`` the whole #106 fix keys on: a csrf-bootstrap source's
+    captured request is NOT replayable (single-use ``X-CSRF-Token`` + ``PHPSESSID``).
+    """
+    return getattr(source_cls, "session_prep", None) == "csrf-bootstrap"
+
+
+def _make_cell_dispatch(
+    *,
+    source: Source,
+    source_cls: type[Source],
+    ctx: SourceContext,
+    captured: CapturedRequest,
+    transport: InstrumentedTransport,
+    query: str,
+) -> _CellDispatch:
+    """Pick the right per-cell dispatch for ``captured``'s category (issue #106).
+
+    A csrf-bootstrap source's SEARCH grid is driven by re-invoking ``search()`` so the
+    CSRF credential is re-minted per call (path A — the honest measurement). Manifest /
+    image categories, and every non-csrf-bootstrap source, keep the verbatim replay.
+    """
+    if _is_csrf_bootstrap(source_cls) and captured.category == _CATEGORY_SEARCH:
+        print(
+            f"[probe] [{captured.category}] csrf-bootstrap source — driving the grid "
+            "by re-invoking search() (re-mints CSRF per call) instead of replaying "
+            "the single-use captured token (#106)."
+        )
+        return _search_dispatch(source, ctx, query=query)
+    return _replay_dispatch(captured, transport)
 
 
 async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
@@ -1770,13 +1927,16 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
     advise_pairs: list[tuple[ProxyEntry | None, CategoryResult]] = []
 
     async def _sweep(
-        captured: CapturedRequest, transport: InstrumentedTransport
+        captured: CapturedRequest,
+        transport: InstrumentedTransport,
+        dispatch: _CellDispatch,
     ) -> CategoryResult:
         # Each call gets its OWN budget list so the per-category cap is independent
         # (a heavy search sweep no longer starves manifest/image — Fix).
         return await _sweep_category(
             captured,
             transport,
+            dispatch=dispatch,
             concurrency_steps=concurrency_steps,
             rate_steps=rate_steps,
             cooldown_seconds=args.cooldown_seconds,
@@ -1794,7 +1954,7 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
                 file=sys.stderr,
             )
             return 3
-        proxy, transport, solver, warmup = outcome
+        proxy, transport, solver, ctx, warmup = outcome
         warmup_notes.extend(warmup.notes)
         print(f"[probe] captured categories: {sorted(warmup.captured)}")
         print("[probe] starting sweep (one proxy, per-category budget) ...")
@@ -1804,7 +1964,15 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
                 if captured is None:
                     continue
                 print(f"[probe] sweeping [{cat}] on {_mask_proxy(proxy)} ...")
-                result = await _sweep(captured, transport)
+                dispatch = _make_cell_dispatch(
+                    source=source,
+                    source_cls=source_cls,
+                    ctx=ctx,
+                    captured=captured,
+                    transport=transport,
+                    query=args.query,
+                )
+                result = await _sweep(captured, transport, dispatch)
                 category_results.append(result)
                 proxy_labels[cat] = _mask_proxy(proxy)
                 advise_pairs.append((proxy, result))
@@ -1826,7 +1994,7 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
                     {"category": cat, "captured": False, "reason": "no proxy warmed up"}
                 )
                 continue
-            proxy, transport, solver, warmup = outcome
+            proxy, transport, solver, ctx, warmup = outcome
             try:
                 captured = warmup.captured.get(cat)
                 if captured is None:
@@ -1846,7 +2014,15 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
                     )
                 else:
                     print(f"[probe] sweeping [{cat}] on {_mask_proxy(proxy)} ...")
-                    result = await _sweep(captured, transport)
+                    dispatch = _make_cell_dispatch(
+                        source=source,
+                        source_cls=source_cls,
+                        ctx=ctx,
+                        captured=captured,
+                        transport=transport,
+                        query=args.query,
+                    )
+                    result = await _sweep(captured, transport, dispatch)
                     category_results.append(result)
                     proxy_labels[cat] = _mask_proxy(proxy)
                     advise_pairs.append((proxy, result))
@@ -1863,6 +2039,7 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
     report = _build_report(
         source_key=source.key,
         antibot=source.antibot,
+        source_cls=source_cls,
         proxy_labels=proxy_labels,
         warmup_notes=warmup_notes,
         category_results=category_results,
@@ -1872,18 +2049,89 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
     )
     report_path = _write_report(report, source.key)
     _print_console_summary(report, report_path)
-    _advise_proxy_rotation(advise_pairs)
+    _advise_proxy_rotation(advise_pairs, source_cls)
     return 0
+
+
+def _is_cf_browser_nav(source_cls: type[Source]) -> bool:
+    """True for a ``cloudflare*`` source whose challenge has no httpx re-mint twin.
+
+    The browser solves the CF nav; replaying its captured request over httpx hits the
+    challenge wall again (skill ``rate-limit-probe`` pitfall #3). Unlike csrf-bootstrap
+    there is no httpx-only re-mint, so path A cannot rescue it — only path B labels it.
+    """
+    return getattr(source_cls, "antibot", "none").startswith("cloudflare")
+
+
+def _replay_incompatible_block(cells: list[CellResult]) -> bool:
+    """True when the grid is a hard, immediate replay-invalid block.
+
+    Three conditions, ALL required (issue #106 path B), so a real ceiling or a genuine
+    IP ban is never mislabelled UNMEASURABLE:
+
+    * grid-wide hard-block fraction (rate-limited + errors) crosses
+      ``_PROXY_BAN_FRACTION``;
+    * the FIRST cell is already that hard-blocked (block from cell #1, not a
+      ceiling that only appears under load); and
+    * the blocking signals are dominated by ``_REPLAY_INCOMPATIBLE_SIGNALS``
+      (``http-403`` / ``cf-challenge``) -- the stale-credential / challenge-wall shape,
+      not ``http-429`` / ``retry-after`` (which WOULD be a measurable throttle).
+    """
+    total = sum(c.total for c in cells)
+    if total == 0:
+        return False
+    hard_blocked = sum(c.rate_limited_count + c.error_count for c in cells)
+    if hard_blocked / total < _PROXY_BAN_FRACTION:
+        return False
+    first = cells[0]
+    if first.total == 0 or first.hard_block_fraction < _PROXY_BAN_FRACTION:
+        return False
+    incompatible = 0
+    other_signals = 0
+    for cell in cells:
+        for label, count in cell.signals.items():
+            if label in _REPLAY_INCOMPATIBLE_SIGNALS:
+                incompatible += count
+            else:
+                other_signals += count
+    return incompatible > 0 and incompatible >= other_signals
+
+
+def _unmeasurable_reason(
+    source_cls: type[Source], cells: list[CellResult]
+) -> str | None:
+    """Return a UNMEASURABLE reason string for a replay-blind grid, else ``None``.
+
+    Only csrf-bootstrap or CF browser-nav sources can be replay-incompatible; for any
+    other source a grid-wide 403 wall is a real signal and stays IP-BANNED.
+    """
+    if not (_is_csrf_bootstrap(source_cls) or _is_cf_browser_nav(source_cls)):
+        return None
+    if not _replay_incompatible_block(cells):
+        return None
+    prep = getattr(source_cls, "session_prep", None)
+    antibot = getattr(source_cls, "antibot", "none")
+    kind = "csrf-bootstrap" if prep == "csrf-bootstrap" else antibot
+    return (
+        f"UNMEASURABLE: replay incompatible with {kind}; use live concurrency tests "
+        "(the captured request's per-request-minted credentials cannot be replayed)"
+    )
 
 
 def _advise_proxy_rotation(
     pairs: list[tuple[ProxyEntry | None, CategoryResult]],
+    source_cls: type[Source],
 ) -> None:
     """Warn about any proxy that looks IP-BANNED (grid-wide hard block) per category.
 
     Hard block = rate-limited + connection errors (NOT plain timeouts — a slow site is
     not a banned IP). Cells are aggregated per proxy (a proxy may span categories in
     single-proxy mode), then each banned-looking proxy gets one rotation hint.
+
+    Issue #106 (B): for a csrf-bootstrap / CF browser-nav source whose hard block is
+    the replay-incompatible 403/CF wall (block from cell #1), the IP is NOT banned —
+    the live ``search()`` flow re-mints / solves on the SAME IP. Suppress the false
+    IP-BANNED verdict and emit UNMEASURABLE instead, pointing at live concurrency tests.
     """
     by_index: dict[int, tuple[ProxyEntry, list[CellResult]]] = {}
     for proxy, result in pairs:
@@ -1895,6 +2143,15 @@ def _advise_proxy_rotation(
         total = sum(c.total for c in cells)
         hard_blocked = sum(c.rate_limited_count + c.error_count for c in cells)
         if total == 0 or hard_blocked / total < _PROXY_BAN_FRACTION:
+            continue
+        reason = _unmeasurable_reason(source_cls, cells)
+        if reason is not None:
+            print(
+                f"[probe] {reason} "
+                f"({hard_blocked}/{total} hard-blocked grid-wide on "
+                f"{_mask_proxy(proxy)} -- NOT an IP ban: the live search() flow "
+                "re-mints/solves on the same IP)."
+            )
             continue
         print(
             f"[probe] WARNING: {_mask_proxy(proxy)} looks IP-BANNED "
