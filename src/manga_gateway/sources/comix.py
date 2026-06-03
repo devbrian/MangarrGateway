@@ -899,7 +899,7 @@ class ComixSource(Source):
 
         Issue #42 (supersedes #31): synthesizes one ``Release`` per viable item
         from a single plaintext ``GET /api/v1/manga?order[chapter_updated_at]=desc``
-        call (the same plaintext path search uses, one of 10/min rate budget).
+        call (the same plaintext path search uses, one of 120/min rate budget).
         Each Release carries a ``:DEFERRED`` guid suffix and a deferred
         composite ``chapter_id`` whose numeric id is late-bound by
         :meth:`fetch_manifest` at download time (one extra browser nav per
