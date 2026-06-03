@@ -46,9 +46,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -94,6 +95,44 @@ REGISTERED_KEYS = _registered_keys()
 # previous ``importlib.reload(antibot_mod)`` approach that wiped any
 # module-level state and produced divergent class identities.
 _ORIGINAL_CLOUDFLARE_WARM = CloudflareSolver.warm
+
+_log = logging.getLogger(__name__)
+
+
+async def _warm_best_effort(
+    warm: Callable[[], Awaitable[Any]],
+    *,
+    timeout: float,  # noqa: ASYNC109 — wrapped in asyncio.wait_for below, not an op budget
+) -> bool:
+    """Run the shared live-session warm BEST-EFFORT.
+
+    The session solver (``_session_solver``) is shared across EVERY live test,
+    Cloudflare-gated or not (mangadex is pure httpx; mangaball is csrf-bootstrap —
+    neither touches Cloudflare). Production ``warm()`` is fire-and-forget and
+    isolates per-domain failures (D-33), and the nightly triage keeps a single
+    source's failure green, flipping red only when ALL sources fail (D-58).
+
+    A hard ``await asyncio.wait_for(warm(), 60)`` at session-fixture setup
+    violated both: when one Cloudflare-gated source (comix) was slow to clear on
+    the datacenter runner, the ``TimeoutError`` propagated out of session-fixture
+    setup and EVERY source's tests ERRORed before their own code ran — including
+    pure-httpx mangadex (nightly runs 26912244601 / 26912471852: ``31 errors``).
+
+    So a warm timeout/failure is logged and swallowed here. The Cloudflare-gated
+    source's own tests then fail on their real clearance need (correctly triaged
+    to that source's sticky issue), while non-CF sources run unaffected. Returns
+    ``True`` if warm completed, ``False`` if it timed out or raised.
+    """
+    try:
+        await asyncio.wait_for(warm(), timeout=timeout)
+        return True
+    except Exception:  # noqa: BLE001 — best-effort: a CF-clearance hiccup must not error non-CF sources
+        _log.warning(
+            "live session warm failed/timed out after %.0fs (best-effort); "
+            "Cloudflare-gated source tests may fail, non-CF sources proceed",
+            timeout,
+        )
+        return False
 
 
 def _load_profile(source_key: str) -> LiveSmokeProfile:
@@ -323,7 +362,10 @@ async def _session_solver() -> AsyncIterator[CloudflareSolver]:
     # tests/conftest.py is still active on the class. Bind the original to
     # this instance so warm() actually solves.
     real_warm = _ORIGINAL_CLOUDFLARE_WARM.__get__(solver, CloudflareSolver)
-    await asyncio.wait_for(real_warm(), timeout=60.0)
+    # Best-effort (debug/live-warm-fatal-session-gate): a slow/failed Cloudflare
+    # clearance for ONE source must not error the shared session and take every
+    # other (non-CF) source's tests down with it. See _warm_best_effort.
+    await _warm_best_effort(real_warm, timeout=60.0)
     real_aclose = solver.aclose
     try:
         yield solver
