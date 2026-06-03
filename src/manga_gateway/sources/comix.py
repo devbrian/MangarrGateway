@@ -615,11 +615,21 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   // `data-page` wrapper is absent but images still match the CDN pattern, OR a
   // page whose <img> only attached AFTER we scrolled past it). This is the
   // issue #32 silent-truncation safety net — DO NOT remove.
+  // Key by the nearest .rpage-page[data-page] ancestor — the SAME key space
+  // Step 2's captureAll uses — so a captured page is never double-recorded
+  // under both its data-page (Step 2) and its filename number (here); that
+  // would defeat Step 4's data-page→filename `offset` correction on a
+  // 0-/1-indexed reader. Only orphan imgs with no scaffold wrapper (the
+  // degenerate variant this net targets, where pageDivs is empty and Step 4
+  // is skipped) fall back to the filename number.
   for (const img of document.querySelectorAll('img')) {
     const src = img.currentSrc || img.src || '';
     const m = src.match(rx);
     if (m) {
-      const n = parseInt(m[2], 10);
+      const wrapper = img.closest('.rpage-page[data-page]');
+      const n = wrapper
+        ? parseInt(wrapper.getAttribute('data-page') || '0', 10)
+        : parseInt(m[2], 10);
       if (!seen.has(n)) seen.set(n, src);
     }
   }
