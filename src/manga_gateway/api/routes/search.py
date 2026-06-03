@@ -45,6 +45,7 @@ from ...models.search import (
     SearchRequest,
     SourceWarning,
 )
+from ..sorting import sort_newest_first
 
 if TYPE_CHECKING:
     from ...framework.base import Source
@@ -161,6 +162,12 @@ async def search(
         _run_one,
         collect_warnings=lambda src: soft_warnings.get(src.key, []),
     )
+    # #99: merge newest-first by publishDate across ALL sources BEFORE truncating —
+    # mirroring /recent (RCNT-01). fan_out concatenates results in source order, so
+    # without this sort ``[: limit]`` drops whichever sources land past the cap,
+    # letting a high-volume source (e.g. mangaball/mangadot returning 50-250 hits)
+    # silently starve sources after it of releases that exist upstream.
+    sort_newest_first(releases)
     # T-02-04: bound the total releases/handles a single search can mint. A title
     # search fans across multiple candidate manga, so per-source/per-manga paging
     # alone does not cap the merged total — truncate to the requested limit.
