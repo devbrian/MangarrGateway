@@ -81,3 +81,8 @@ scripts/diagnose_subprocess_leak.py
 .planning/debug/cf-subprocess-leak-evidence.log
 
 proxies.txt
+
+# Rate-limit probe harness (scripts/probe_rate_limits.py) JSON report output —
+# per-source measured ceilings (#101). Transient diagnostic artifact, never
+# committed; the proxy is referenced by masked index only (no creds inside).
+_rate_limit_probe_out/
