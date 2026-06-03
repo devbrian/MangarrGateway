@@ -1257,9 +1257,10 @@ async def _sweep_category(
     Completes the WHOLE grid even after hitting a limit (maps the full
     penalty/recovery curve) — :meth:`CategoryResult.first_rate_limit` marks where a true
     rate-limit first appears, :meth:`CategoryResult.first_degradation` where the site
-    first slows down. ``budget`` is a one-element mutable list carrying the
-    remaining global ``--max-requests`` allowance, decremented across cells so the cap
-    spans ALL categories. A short cooldown between cells makes recovery observable.
+    first slows down. ``budget`` is a one-element mutable list carrying the remaining
+    per-category ``--max-requests`` allowance, decremented across cells within THIS
+    category only (each category is invoked with its own fresh budget). A short cooldown
+    between cells makes recovery observable.
     """
     cells: list[CellResult] = []
     for concurrency in concurrency_steps:
