@@ -118,6 +118,15 @@ _FIRST_CHAPTER_COLD_BUDGET_SECONDS = 40.0
 # catching a ~30 % per-page slowdown.
 _SUBSEQUENT_PER_PAGE_CEIL = 1.30
 
+# Absolute per-page floor for the drift guard. Since the comix-manifest-60s-timeout
+# synthesis fix (#110), resolve is O(1) in pages, so per-page wall-clock is now
+# tiny and dominated by image download — a first chapter can land at ~0.12 s/page.
+# At that scale the relative 1.30x ceiling becomes ~0.16 s/page, where ordinary
+# CI/network jitter on a later chapter (e.g. 0.16 s/page) trips a FALSE state-leak
+# alarm. Floor the threshold at 0.20 s/page so the relative guard only governs
+# runs where per-page cost is substantial; below that, absolute noise rules.
+_SUBSEQUENT_PER_PAGE_FLOOR_S = 0.20
+
 _DEFAULT_CHAPTERS = 3
 _MIN_CHAPTERS = 2  # first + at least one more — anything less defeats the test
 
@@ -347,12 +356,17 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
                 "per-page drift guard cannot run"
             )
             later_per_page_avg = sum(later_per_page_values) / len(later_per_page_values)
-            drift_threshold = first_per_page * _SUBSEQUENT_PER_PAGE_CEIL
+            # Relative state-leak guard, floored at an absolute 0.20 s/page so a
+            # tiny post-synthesis baseline can't make ordinary jitter trip it.
+            drift_threshold = max(
+                first_per_page * _SUBSEQUENT_PER_PAGE_CEIL,
+                _SUBSEQUENT_PER_PAGE_FLOOR_S,
+            )
             assert later_per_page_avg <= drift_threshold, (
-                f"later-chapter per-page avg {later_per_page_avg:.2f}s/page "
-                f"exceeds {_SUBSEQUENT_PER_PAGE_CEIL:.2f} x first-chapter "
-                f"per-page ({first_per_page:.2f}s/page, threshold "
-                f"{drift_threshold:.2f}s/page); chapters past the first "
-                f"appear to be paying per-page overhead the first chapter "
-                f"avoided — solver state may be leaking (#45)"
+                f"later-chapter per-page avg {later_per_page_avg:.2f}s/page exceeds "
+                f"threshold {drift_threshold:.2f}s/page (max of "
+                f"{_SUBSEQUENT_PER_PAGE_CEIL:.2f}x first {first_per_page:.2f}s/page "
+                f"and {_SUBSEQUENT_PER_PAGE_FLOOR_S:.2f}s/page floor); chapters past "
+                f"the first pay per-page overhead the first avoided — solver state "
+                f"may be leaking (#45)"
             )
