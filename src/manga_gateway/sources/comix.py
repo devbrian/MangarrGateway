@@ -453,45 +453,65 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 # the ``.rpage-page`` divs with ``overflow:auto|scroll|hidden`` and
 # ``scrollHeight > clientHeight``) is what gates middle pages independently
 # of the window viewport. Two batched scrolls on THAT container — to
-# ``scrollHeight/2`` then ``scrollHeight`` — fire the middle-band and tail-
-# band IntersectionObservers in ~2 settle windows of ~500ms each, dropping
-# the typical wall-clock from ~14s to a predicted ~5-7s. Correctness is
-# preserved by Step 2b (selective per-missing-page ``scrollIntoView``
-# fallback — the OLD per-page slow path, applied ONLY to pages the
-# two-scroll walk failed to capture) and Step 3 (the issue #32
-# ``document.querySelectorAll('img')`` final sweep, retained verbatim). The
-# inner-container detection is dynamic (ancestor walk reading
-# ``getComputedStyle(el).overflowY``) so bundle rotations that change the
-# Swiper wrapper class do not break us; if no overflow ancestor is found we
-# fall back to ``document.scrollingElement`` (degraded path — Step 2b will
-# do most of the work in that case, but correctness still holds).
+# ``scrollHeight/2`` then ``scrollHeight`` — capture every page image the
+# reader has DOM-resident at the time, cheaply (~1s total). The inner-container
+# detection is dynamic (ancestor walk reading ``getComputedStyle(el).overflowY``
+# + ``scrollHeight``) so a Swiper wrapper-class rotation does not break us; a
+# miss falls back to ``document.scrollingElement``.
+#
+# debug comix-manifest-60s-timeout (2026-06-03): Comix rotated the chapter
+# reader from the long-strip variant (``rpage--long-strip rpage--ttb``) to a
+# single-page paginated one (``rpage--single rpage--ltr``). In single-page mode
+# only ~3 page ``<img>``s are EVER DOM-resident at once, so the old
+# per-missing-page ``scrollIntoView`` fallback (issue #45 Step 2b) force-loaded
+# nothing — it just burned ~1.55s/page polling for an ``<img>`` that never
+# attached. A 51-page chapter thus walked ~74s and blew the 60s
+# ``fetch_via_browser`` ceiling (``page.evaluate timed out after 60.0s``); a
+# 33-page chapter squeaked under 60s but shipped a SILENTLY TRUNCATED 3-of-33
+# CBZ (the issue #32 failure class, re-introduced by the reader rotation).
+#
+# FIX: drop the O(pages) per-missing walk entirely and SYNTHESIZE instead. The
+# full ``data-page`` scaffold (1..N) is always present, and (verified live
+# 2026-06-03) every page of a chapter shares ONE host + ONE token, differing
+# only by the zero-padded filename number. So after the cheap two-scroll
+# capture, derive the URL for every uncaptured scaffold page by substituting its
+# filename number into a captured img's own ``/{NN}.{ext}`` tail (Step 4). This
+# is O(1) in wall-clock, returns the complete 1..N manifest, fixes the
+# truncation, and works for BOTH reader shapes (the same per-page template holds
+# in long-strip too), so it is robust to this and future reader-shape rotations.
+# Real captures always win over synthesized ones (first-sight in ``seen``), so a
+# future per-page-token reader degrades to "captured pages correct, gaps filled"
+# rather than silently wrong. The host/extension SSRF anchors are unchanged and
+# every synthesized URL is still validated by ``_is_allowed_image_url`` before
+# fetch.
+#
+# NEVER synthesize from an empty capture: if Step 2/3 matched zero CDN imgs the
+# page is genuinely broken/gated and we return ``[]`` → fetch_manifest raises
+# ``malformed chapter manifest`` (fast, correct) rather than fabricating URLs.
 #
 # Step-1 scaffold wait is unchanged: count-unchanged-for-3-consecutive-ticks
-# (8s cap) so a partial scaffold cannot race the walk.
+# (8s cap) so a partial scaffold cannot race the capture/synthesis.
 _CHAPTER_PAGES_EXTRACT_JS = """
-  // Comix's chapter reader is a Swiper.js long-strip component
-  // (`class="rpage rpage--long-strip rpage--ttb"`). Each page is wrapped in a
-  // `<div class="rpage-page" data-page="N">` whose <img> child is LAZY-LOADED
-  // by an IntersectionObserver. `window.scrollTo()` does not move the inner
-  // Swiper viewport — there is a NESTED scroll container (an ancestor of
-  // the `.rpage-page` divs with overflow:auto|scroll|hidden) that gates
-  // middle pages independently of the window viewport. Issue #45 spike
-  // confirmed this empirically: tall window viewport loaded only head/tail
-  // pages, never the middle band.
+  // Comix's chapter reader is a Swiper.js component. Historically a long-strip
+  // (`rpage--long-strip rpage--ttb`); as of 2026-06-03 a single-page paginated
+  // variant (`rpage--single rpage--ltr`) is served, in which only ~3 page
+  // <img>s are DOM-resident at once. Each page is wrapped in a
+  // `<div class="rpage-page" data-page="N">` whose <img> child is LAZY-LOADED.
   //
-  // Strategy (issue #45):
-  //   Step 1  — wait for scaffold count stability (unchanged from #32).
-  //   Step 2  — find the inner Swiper scroll container by ancestor walk,
-  //             then scrollTo(scrollHeight/2) + scrollTo(scrollHeight) with
-  //             ~500ms settle each; capture every CDN-matching <img> after
-  //             each scroll (first-sight wins via a Map keyed on data-page
-  //             integer).
-  //   Step 2b — for every page the two-scroll walk missed, fall back to
-  //             the per-page scrollIntoView slow path (the issue #32 walk,
-  //             applied SELECTIVELY). Typical chapter → zero fallbacks.
-  //   Step 3  — final document.querySelectorAll('img') sweep (the issue
-  //             #32 silent-truncation safety net, retained verbatim).
-  //   Step 4  — sort the Map entries by NN ascending and return URLs.
+  // Strategy (debug comix-manifest-60s-timeout, 2026-06-03):
+  //   Step 1 — wait for the data-page scaffold COUNT to stabilize (gives N).
+  //   Step 2 — find the inner Swiper scroll container by ancestor walk, then
+  //            scrollTo(scrollHeight/2) + scrollTo(scrollHeight) with ~500ms
+  //            settle each; capture every CDN-matching <img> after each scroll
+  //            (first-sight wins via a Map keyed on the data-page integer).
+  //            Cheap (~1s) — gets whatever the reader has DOM-resident.
+  //   Step 3 — final document.querySelectorAll('img') sweep (issue #32 net).
+  //   Step 4 — SYNTHESIZE the URL for every scaffold page not captured by
+  //            substituting its filename number into a captured img's
+  //            /{NN}.{ext} tail (all pages share one host+token, verified live
+  //            2026-06-03). Replaces the old O(pages) per-missing-page
+  //            scrollIntoView walk that blew the 60s budget in single-page mode.
+  //   Step 5 — sort the Map entries by page number ascending and return URLs.
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   // Path segment (`si`/`i3`/…) is wildcarded — Comix rotates it; live
   // 2026-06-02: https://jloo.wowpic5.store/i3/<token>/01.webp. The host pin +
@@ -590,50 +610,71 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   await sleep(500);
   captureAll();
 
-  // Step 2b: for any page the two-scroll walk missed, fall back to the
-  // per-page scrollIntoView slow path (the issue #32 walk, applied
-  // SELECTIVELY). Typical chapter → empty missing list → zero fallback
-  // cost. Pathological chapter → bounded by missing x ~1.4s, comfortably
-  // under the 60s solver timeout. The `scrollIntoView` marker required
-  // by the offline slice test (test_comix_slice.py) lives in this block.
-  const missing = pageDivs.filter(
-    (div) => !seen.has(parseInt(div.getAttribute('data-page') || '0', 10))
-  );
-  for (const div of missing) {
-    const n = parseInt(div.getAttribute('data-page') || '0', 10);
-    div.scrollIntoView({ behavior: 'instant', block: 'center' });
-    await sleep(150);
-    let captured = false;
-    for (let attempt = 0; attempt < 14; attempt++) {
-      for (const img of div.querySelectorAll('img')) {
-        const src = img.currentSrc || img.src || '';
-        const m = src.match(rx);
-        if (m) {
-          if (!seen.has(n)) seen.set(n, src);
-          captured = true;
-          break;
-        }
-      }
-      if (captured) break;
-      await sleep(100);
-    }
-    // If we still didn't capture, Step 3 below is the final safety net.
-  }
-
-  // Step 3 (fallback): sweep the document for any <img> the per-div walk
-  // missed (covers reader-shape variants where the canonical `data-page`
-  // wrapper is absent but images still match the CDN pattern, OR a page
-  // whose <img> only attached AFTER we walked past it). This is the
+  // Step 3 (safety net): sweep the whole document for any CDN-matching <img>
+  // the per-div capture missed (reader-shape variants where the canonical
+  // `data-page` wrapper is absent but images still match the CDN pattern, OR a
+  // page whose <img> only attached AFTER we scrolled past it). This is the
   // issue #32 silent-truncation safety net — DO NOT remove.
+  // Key by the nearest .rpage-page[data-page] ancestor — the SAME key space
+  // Step 2's captureAll uses — so a captured page is never double-recorded
+  // under both its data-page (Step 2) and its filename number (here); that
+  // would defeat Step 4's data-page→filename `offset` correction on a
+  // 0-/1-indexed reader. Only orphan imgs with no scaffold wrapper (the
+  // degenerate variant this net targets, where pageDivs is empty and Step 4
+  // is skipped) fall back to the filename number.
   for (const img of document.querySelectorAll('img')) {
     const src = img.currentSrc || img.src || '';
     const m = src.match(rx);
     if (m) {
-      const n = parseInt(m[2], 10);
+      const wrapper = img.closest('.rpage-page[data-page]');
+      const n = wrapper
+        ? parseInt(wrapper.getAttribute('data-page') || '0', 10)
+        : parseInt(m[2], 10);
       if (!seen.has(n)) seen.set(n, src);
     }
   }
 
+  // Step 4: synthesize the URL for every scaffold page we did NOT capture.
+  // Comix's single-page reader keeps only ~3 imgs DOM-resident, so `seen` is
+  // short even on a healthy chapter — but the full data-page scaffold (1..N) is
+  // present and every page shares ONE host + ONE token, differing only by the
+  // zero-padded filename number (verified live 2026-06-03, debug
+  // comix-manifest-60s-timeout). Derive each missing page's URL by substituting
+  // its filename number into a captured src's /{NN}.{ext} tail — O(1), no
+  // per-page lazy-load round-trip. NEVER synthesize from an empty capture
+  // (seen.size === 0) — return [] so fetch_manifest raises
+  // "malformed chapter manifest" rather than fabricating URLs for a broken page.
+  if (seen.size > 0 && pageDivs.length > 0) {
+    // Lowest-data-page captured sample → template + data-page→filename offset
+    // + zero-pad width. Offset is normally 0 (data-page 1 → "01"); deriving it
+    // tolerates a 0-/1-indexed mismatch without guessing.
+    const sampleEntry = Array.from(seen.entries()).sort((a, b) => a[0] - b[0])[0];
+    const sampleN = sampleEntry[0];
+    const sampleSrc = sampleEntry[1];
+    const sm = sampleSrc.match(rx);
+    if (sm) {
+      const sampleFile = parseInt(sm[2], 10);
+      const width = sm[2].length;
+      const ext = sm[3];
+      const offset = sampleFile - sampleN;
+      for (const div of pageDivs) {
+        const n = parseInt(div.getAttribute('data-page') || '0', 10);
+        if (!n || seen.has(n)) continue;
+        const fileNum = n + offset;
+        if (fileNum < 0) continue;
+        const padded = String(fileNum).padStart(width, '0');
+        // Substitute into the sample's own src so host/seg/token (and any
+        // future query suffix) carry over verbatim; only the NN filename moves.
+        const synth = sampleSrc.replace(
+          /\\/\\d+\\.(webp|jpg|jpeg|png)$/i,
+          '/' + padded + '.' + ext
+        );
+        seen.set(n, synth);
+      }
+    }
+  }
+
+  // Step 5: page-number-ascending order, gaps preserved.
   return Array.from(seen.entries())
     .sort((a, b) => a[0] - b[0])
     .map(e => e[1]);
@@ -644,8 +685,10 @@ _CHAPTER_PAGES_EXTRACT_JS = """
 # every page in the chapter once the encrypted page-list arrives and decrypts;
 # images inside are lazy-loaded later via IntersectionObserver. Waiting for
 # the first scaffold div (not the first image) ensures the extract starts as
-# soon as the reader knows the chapter length, and the per-div scrollIntoView
-# loop in _CHAPTER_PAGES_EXTRACT_JS triggers the actual image loads.
+# soon as the reader knows the chapter length — the scaffold count IS N, which
+# Step 4 of _CHAPTER_PAGES_EXTRACT_JS uses to synthesize the full 1..N manifest
+# from a captured page-image template (the single-page reader only ever keeps
+# ~3 imgs DOM-resident, so we no longer try to lazy-load every page).
 _CHAPTER_PAGES_WAIT_FOR = ".rpage-page[data-page]"
 
 # JS extractor that returns the rendered chapter list off the series page DOM.
@@ -1058,13 +1101,16 @@ class ComixSource(Source):
                 # page.evaluate which Playwright is happy to schedule
                 # immediately after goto commits.
                 wait_for=None,
-                # Issue #32: the sequential page walk adds an O(pages) term
-                # to the resolve wall-clock (~150ms settle + up to ~2s poll
-                # per page, exits on first sight). A 12-page chapter
-                # typically completes well under 8s. Raise the per-call
-                # ceiling to 60s so a slow-CDN or first-page warm-up tail
-                # has room without prematurely aborting a recoverable walk;
-                # the per-source rate limiter still bounds outer cadence.
+                # debug comix-manifest-60s-timeout (2026-06-03): the extractor
+                # no longer walks pages serially — it does a cheap two-scroll
+                # capture (~1s) then SYNTHESIZES the full 1..N manifest from a
+                # captured page-image template, so resolve is now O(1) in pages
+                # (a couple seconds regardless of chapter length). The old
+                # O(pages) scrollIntoView walk burned ~1.55s/page and blew this
+                # ceiling on long chapters in the single-page reader. The 60s
+                # ceiling stays as a generous safety margin for the scaffold
+                # wait + Cloudflare/first-paint tail; the per-source rate
+                # limiter bounds outer cadence.
                 timeout=60.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
