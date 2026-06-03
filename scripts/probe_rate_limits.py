@@ -132,6 +132,11 @@ _SUGGESTED_RATE_SAFETY_FRACTION = 0.50
 # sustained, grid-wide block that looks IP-level rather than a real rate ceiling.
 _PROXY_BAN_FRACTION = 0.80
 
+# Per-cell WALL-CLOCK deadline (seconds). Caps each grid cell so a slow/dead proxy or a
+# tarpitting site cannot hang the sweep — without it, concurrency=1 serial 30s timeouts
+# could stretch one cell toward an hour. Overridable via --cell-timeout-seconds.
+_DEFAULT_CELL_TIMEOUT_SECONDS = 90.0
+
 
 # ──────────────────────────── proxy masking (T-w1k-01) ────────────────────────────
 
@@ -603,6 +608,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="Cooldown between grid cells so recovery is observable (default: 5.0).",
     )
+    parser.add_argument(
+        "--cell-timeout-seconds",
+        type=float,
+        default=_DEFAULT_CELL_TIMEOUT_SECONDS,
+        help=(
+            "Per-cell wall-clock deadline; stragglers past it are cancelled and "
+            "counted as slowness so a dead/slow proxy can't hang the sweep (default: "
+            f"{_DEFAULT_CELL_TIMEOUT_SECONDS})."
+        ),
+    )
     return parser
 
 
@@ -624,6 +639,7 @@ def _print_sweep_grid(
     rate_steps: Sequence[int],
     max_requests: int,
     cooldown_seconds: float,
+    cell_timeout_seconds: float,
     proxy_label: str,
 ) -> None:
     """Print the planned sweep grid (ASCII-only — Windows cp1252)."""
@@ -636,6 +652,7 @@ def _print_sweep_grid(
     print(f"  Grid cells        : {len(concurrency_steps) * len(rate_steps)}")
     print(f"  Max requests cap  : {max_requests}")
     print(f"  Cooldown per cell : {cooldown_seconds}s")
+    print(f"  Cell deadline     : {cell_timeout_seconds}s")
     print("=" * 72)
 
 
@@ -932,6 +949,7 @@ async def _run_cell(
     concurrency: int,
     target_rate_per_min: int,
     remaining_budget: int,
+    cell_deadline_seconds: float,
 ) -> CellResult:
     """Replay ``captured`` across one grid cell and tally ok/blocked outcomes.
 
@@ -944,11 +962,16 @@ async def _run_cell(
     (the global ``--max-requests`` cap) so even aggressive mode stays controlled.
     """
     # One "burst" per cell: issue up to min(target rate, remaining budget) requests,
-    # paced to the target rate, bounded by the concurrency semaphore.
+    # paced to the target rate, bounded by the concurrency semaphore. A WALL-CLOCK
+    # deadline caps the whole cell so a slow/dead proxy or a tarpitting site can't hang
+    # the sweep: at concurrency=1, serial 30s read-timeouts would otherwise stretch a
+    # 120-request cell toward an hour. Hitting the deadline is itself a strong slowness
+    # signal (the cell could not drain in its time budget) and feeds degradation.
     n_requests = max(1, min(target_rate_per_min, remaining_budget))
     interval = 60.0 / target_rate_per_min if target_rate_per_min > 0 else 0.0
     semaphore = asyncio.Semaphore(concurrency)
     transport.segment()  # isolate this cell's records
+    deadline = time.monotonic() + cell_deadline_seconds
 
     async def _one() -> None:
         async with semaphore:
@@ -964,10 +987,25 @@ async def _run_cell(
 
     tasks: list[asyncio.Task[None]] = []
     for i in range(n_requests):
+        if time.monotonic() >= deadline:
+            break  # stop DISPATCHING once the cell's time budget is spent
         tasks.append(asyncio.create_task(_one()))
         if interval and i < n_requests - 1:
-            await asyncio.sleep(interval)
-    await asyncio.gather(*tasks)
+            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+    # Await outstanding tasks up to the deadline, then cancel stragglers (requests too
+    # slow to complete in the cell window). Cancelled tasks raise CancelledError, which
+    # the instrumented transport does NOT record, so we count them here as a deadline
+    # signal folded into the cell's degradation (timeout) bucket.
+    deadline_cancelled = 0
+    if tasks:
+        remaining = max(0.0, deadline - time.monotonic())
+        _done, pending = await asyncio.wait(tasks, timeout=remaining)
+        deadline_cancelled = len(pending)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     cell_rows = transport.segment()
     counts = {
@@ -985,6 +1023,12 @@ async def _run_cell(
         if outcome != _OUTCOME_OK:
             label = _signal_label(row)
             signals[label] = signals.get(label, 0) + 1
+    if deadline_cancelled:
+        # Deadline-cancelled requests are slowness deaths: count toward timeouts (so
+        # they drive the degradation signal) and record their (capped) latency.
+        counts[_OUTCOME_TIMEOUT] += deadline_cancelled
+        signals["cell-deadline"] = deadline_cancelled
+        latencies.extend([cell_deadline_seconds] * deadline_cancelled)
     return CellResult(
         concurrency=concurrency,
         target_rate_per_min=target_rate_per_min,
@@ -1004,6 +1048,7 @@ async def _sweep_category(
     concurrency_steps: Sequence[int],
     rate_steps: Sequence[int],
     cooldown_seconds: float,
+    cell_deadline_seconds: float,
     budget: list[int],
 ) -> CategoryResult:
     """Run the FULL concurrency × rate grid for one category (aggressive sweep).
@@ -1026,6 +1071,7 @@ async def _sweep_category(
                 concurrency=concurrency,
                 target_rate_per_min=rate,
                 remaining_budget=budget[0],
+                cell_deadline_seconds=cell_deadline_seconds,
             )
             budget[0] -= cell.total
             cells.append(cell)
@@ -1269,6 +1315,7 @@ async def _cmd_dry_run(args: argparse.Namespace, registry: SourceRegistry) -> in
         rate_steps=rate_steps,
         max_requests=args.max_requests,
         cooldown_seconds=args.cooldown_seconds,
+        cell_timeout_seconds=args.cell_timeout_seconds,
         proxy_label=_mask_proxy(None),
     )
     print("[probe] dry-run: seams constructed, NO outbound request issued.")
@@ -1403,6 +1450,7 @@ async def _cmd_live(args: argparse.Namespace, registry: SourceRegistry) -> int:
                 concurrency_steps=concurrency_steps,
                 rate_steps=rate_steps,
                 cooldown_seconds=args.cooldown_seconds,
+                cell_deadline_seconds=args.cell_timeout_seconds,
                 budget=budget,
             )
             category_results.append(result)
