@@ -766,8 +766,17 @@ class ComixSource(Source):
     # Title-search fallback only — no external id namespace (SRCH-07).
     id_types: list[str] = []
     languages = ["en"]
-    # CLAUDE.md: "Comix ~10" req/min — the per-source aiolimiter is keyed to this.
-    rate_limit_per_minute = 10
+    # Probe-measured (PR #102 rate-limit probe, 2026-06-03), NOT the conservative
+    # CLAUDE.md "Comix ~10" guess: comix's PLAINTEXT search API + image CDN each
+    # sustained 240 calls/min at concurrency 4 with ZERO throttle signals (no
+    # 429/403/CF-challenge/Retry-After, flat latency) — a FLOOR ("no limit hit
+    # across the full tested grid"), not a true ceiling. 120 is the harness's
+    # conservative ~50%-of-floor OVERALL SUGGESTED value. The per-source
+    # aiolimiter (AsyncLimiter token bucket) is keyed to this attr and gates ONLY
+    # the plaintext call path; the browser-nav manifest read is gated by
+    # ``cloudflare_fetch_concurrency`` and image bytes are
+    # ``get_bytes(limited=False)``-exempt.
+    rate_limit_per_minute = 120
     # caps.AntibotLevel already carries this literal (CAPS-02). The framework injects
     # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
     antibot = "cloudflare+encrypted"
@@ -779,7 +788,7 @@ class ComixSource(Source):
     # with deferred chapter-id resolution; see ``recent()`` below. Late-binding
     # of the chapter id happens in ``fetch_manifest`` (one extra browser nav
     # per first download), keeping the per-poll cost to one cheap plaintext
-    # call (1 of 10/min rate-limit budget) rather than the N+1 series-page
+    # call (1 of 120/min rate-limit budget) rather than the N+1 series-page
     # drill-down PR #41 originally rejected as too expensive.
     supports_recent = True
 
@@ -890,7 +899,7 @@ class ComixSource(Source):
 
         Issue #42 (supersedes #31): synthesizes one ``Release`` per viable item
         from a single plaintext ``GET /api/v1/manga?order[chapter_updated_at]=desc``
-        call (the same plaintext path search uses, one of 10/min rate budget).
+        call (the same plaintext path search uses, one of 120/min rate budget).
         Each Release carries a ``:DEFERRED`` guid suffix and a deferred
         composite ``chapter_id`` whose numeric id is late-bound by
         :meth:`fetch_manifest` at download time (one extra browser nav per

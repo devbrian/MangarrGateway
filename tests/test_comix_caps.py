@@ -6,7 +6,7 @@ advertises in ``GET /caps``:
 
 * ``antibot == "cloudflare+encrypted"`` (the new anti-bot level, CAPS-02).
 * ``idTypes == []`` (title-search fallback, SRCH-07).
-* ``rateLimitPerMinute == 10`` (CLAUDE.md "Comix ~10").
+* ``rateLimitPerMinute == 120`` (probe-measured, PR #102).
 * ``languages == ["en"]``.
 
 No network, no browser — the caps document is built from the registry's declarative
@@ -31,7 +31,7 @@ def test_comix_class_declares_encrypted_antibot() -> None:
     assert ComixSource.key == "comix"
     assert ComixSource.id_types == []  # title-search fallback (SRCH-07)
     assert ComixSource.languages == ["en"]
-    assert ComixSource.rate_limit_per_minute == 10  # CLAUDE.md: Comix ~10
+    assert ComixSource.rate_limit_per_minute == 120  # probe-measured (PR #102)
 
 
 def test_comix_is_registered_in_the_builtin_registry() -> None:
@@ -55,7 +55,7 @@ async def test_caps_advertises_comix_encrypted_source(
     assert comix is not None, "comix not advertised in /caps"
     assert comix["antibot"] == "cloudflare+encrypted"
     assert comix["idTypes"] == []
-    assert comix["rateLimitPerMinute"] == 10
+    assert comix["rateLimitPerMinute"] == 120
     assert comix["languages"] == ["en"]
     assert comix["name"] == "Comix"
     # enabled defaults True (no breaker tripped); dynamic per D-38.
