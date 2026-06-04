@@ -11,8 +11,9 @@ ONE scrub applied at two boundaries:
 
 Denylist posture (D-03): mask KNOWN secret keys, keep everything else (the full
 forensic URL is the point). Masked keys: ``cf_clearance``, ``apikey``/``api_key``,
-``*token*``, ``*auth*``, ``authorization``, ``x-csrf-token`` (case-insensitive
-substring match) plus ``Cookie``/``Authorization`` log-line values.
+``x-api-key`` (the gateway's own master credential), ``*token*``, ``*auth*``,
+``authorization``, ``x-csrf-token`` (case-insensitive substring match) plus
+``Cookie``/``Authorization``/``X-Api-Key`` log-line values.
 
 **Proxy-credential nuance (D-04 — INTENTIONAL, scoped relaxation of CLAUDE.md's
 blanket proxy-redaction rule.)** CLAUDE.md says "never log the proxy server /
@@ -35,6 +36,7 @@ _SECRET_KEYS = {
     "cf_clearance",
     "apikey",
     "api_key",
+    "x-api-key",  # WR-01: the gateway's own master credential header/query
     "token",
     "auth",
     "authorization",
@@ -76,7 +78,7 @@ _CF_RE = re.compile(r"(cf_clearance=)[^;&\s\"]+")
 # A whitespace-terminated class ([^...\s]+) masked only "Bearer" and left the
 # token, and only masked the first pair of "Cookie: a=x; b=y".
 _HEADER_RE = re.compile(
-    r"((?:authorization|x-csrf-token|cookie)[\"']?\s*[:=]\s*[\"']?)[^\"'}\r\n]+",
+    r"((?:authorization|x-api-key|x-csrf-token|cookie)[\"']?\s*[:=]\s*[\"']?)[^\"'}\r\n]+",
     re.IGNORECASE,
 )
 # Inline proxy creds in a URL embedded in a log line.

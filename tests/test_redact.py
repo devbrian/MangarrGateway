@@ -54,6 +54,14 @@ def test_redact_url_masks_all_denylist_query_keys() -> None:
     assert "keep=E" in out
 
 
+def test_redact_url_masks_x_api_key_query() -> None:
+    # WR-01: the gateway's own master credential, supplied as ?apikey=/?x-api-key=.
+    out = redact_url("https://h/api?x-api-key=MASTERKEY&keep=ok")
+    assert out is not None
+    assert "MASTERKEY" not in out
+    assert "keep=ok" in out
+
+
 def test_redact_url_noop_on_falsy() -> None:
     assert redact_url(None) is None
     assert redact_url("") == ""
@@ -93,6 +101,14 @@ def test_redact_text_masks_all_cookie_pairs() -> None:
     assert "secret1" not in out
     assert "secret2" not in out
     assert "secret3" not in out
+
+
+def test_redact_text_masks_x_api_key_header() -> None:
+    # WR-01: a log line echoing the gateway's own X-Api-Key must be masked.
+    line = "X-Api-Key: realsecretkey123"
+    out = redact_text(line)
+    assert "realsecretkey123" not in out
+    assert "X-Api-Key: ***" in out
 
 
 def test_redact_text_masks_proxy_creds() -> None:
