@@ -69,9 +69,14 @@ def redact_url(url: str | None) -> str | None:
 
 # cf_clearance=VALUE (value ends at ; & whitespace or quote)
 _CF_RE = re.compile(r"(cf_clearance=)[^;&\s\"]+")
-# Cookie:/Authorization:/X-CSRF-Token: VALUE in a freeform line (header-ish)
+# Cookie:/Authorization:/X-CSRF-Token: VALUE in a freeform line (header-ish).
+# CR-01: the value class consumes the REST of the header value — including the
+# scheme prefix ("Bearer <token>") and every pair of a multi-pair Cookie line —
+# up to a JSON/structural delimiter (quote / comma / closing brace / newline).
+# A whitespace-terminated class ([^...\s]+) masked only "Bearer" and left the
+# token, and only masked the first pair of "Cookie: a=x; b=y".
 _HEADER_RE = re.compile(
-    r"((?:authorization|x-csrf-token|cookie)[\"']?\s*[:=]\s*[\"']?)[^\"',}\s]+",
+    r"((?:authorization|x-csrf-token|cookie)[\"']?\s*[:=]\s*[\"']?)[^\"'}\r\n]+",
     re.IGNORECASE,
 )
 # Inline proxy creds in a URL embedded in a log line.

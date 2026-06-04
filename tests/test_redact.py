@@ -75,6 +75,26 @@ def test_redact_text_masks_cookie_authorization_csrf() -> None:
     assert "csrf-val" not in out
 
 
+# ── CR-01: scheme-prefixed Authorization + multi-pair Cookie fully masked ─────
+def test_redact_text_masks_full_bearer_token() -> None:
+    # Regression for CR-01: the OLD value class stopped at the first space, so
+    # "Bearer <token>" masked only the literal word "Bearer" and leaked the token.
+    line = "Authorization: Bearer tok_SECRET_value_here"
+    out = redact_text(line)
+    assert "tok_SECRET_value_here" not in out
+    assert "SECRET" not in out
+
+
+def test_redact_text_masks_all_cookie_pairs() -> None:
+    # Regression for CR-01: a multi-pair Cookie line must mask EVERY pair, not
+    # just the first (the old \s-terminated class leaked later pairs).
+    line = "Cookie: a=secret1; b=secret2; c=secret3"
+    out = redact_text(line)
+    assert "secret1" not in out
+    assert "secret2" not in out
+    assert "secret3" not in out
+
+
 def test_redact_text_masks_proxy_creds() -> None:
     line = "using proxy http://puser:ppass@10.0.0.1:3128 for fetch"
     out = redact_text(line)
