@@ -124,6 +124,27 @@ def test_redact_text_leaves_benign_text_intact() -> None:
     assert redact_text(line) == line
 
 
+def test_redact_text_masks_cf_clearance_case_insensitive() -> None:
+    # CodeRabbit finding 5: Cf_Clearance= / CF_CLEARANCE= must mask too; the key
+    # prefix is preserved with its original case, only the value is masked.
+    for line in (
+        "fetching Cf_Clearance=ABC123; done",
+        "fetching CF_CLEARANCE=ABC123; done",
+    ):
+        out = redact_text(line)
+        assert "ABC123" not in out
+        assert "***" in out
+
+
+def test_redact_text_header_value_stops_at_comma() -> None:
+    # CodeRabbit finding 6: a comma after the secret terminates the mask so a
+    # trailing comma-separated field is NOT over-redacted.
+    line = 'Authorization: Bearer tok_SECRET, "next_field": "keepme"'
+    out = redact_text(line)
+    assert "tok_SECRET" not in out  # the token IS masked
+    assert "keepme" in out  # the trailing comma-separated field is preserved
+
+
 # ── MetricEvent schema ───────────────────────────────────────────────────────
 def test_metric_event_has_all_fields_incl_method() -> None:
     field_names = {f.name for f in dataclasses.fields(MetricEvent)}
