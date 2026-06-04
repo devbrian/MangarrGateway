@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -116,9 +117,23 @@ def fake_solver() -> _FakeSolver:
 
 
 @pytest.fixture
-def app() -> FastAPI:
-    """A fresh app built with the fixed test key (D-03)."""
-    return create_app(Settings(api_key=TEST_API_KEY))
+def app(tmp_path: Path) -> FastAPI:
+    """A fresh app built with the fixed test key (D-03).
+
+    All on-disk paths point at a per-test tmp dir so tests never touch the
+    ``/state`` (metrics snapshot DB, logs) or ``/data`` (output) volumes —
+    those defaults are absent/unwritable outside the docker container (e.g. CI),
+    and the metrics snapshot DB open would otherwise fail there.
+    """
+    return create_app(
+        Settings(
+            api_key=TEST_API_KEY,
+            metrics_db_path=str(tmp_path / "metrics.db"),
+            log_dir=str(tmp_path / "logs"),
+            output_root=str(tmp_path / "out"),
+            db_path=str(tmp_path / "jobs.db"),
+        )
+    )
 
 
 @pytest_asyncio.fixture
