@@ -638,8 +638,19 @@ class SourceContext:
         """Issue the ONE transport request, emitting an additive ``http`` event.
 
         Behaviour-neutral: on success returns the response unchanged after emitting
-        ``outcome="ok"``; on exception emits ``outcome="error"`` then re-raises the
-        ORIGINAL exception untouched. A ``None`` collector makes both emits no-ops.
+        an outcome CLASSIFIED by status; on exception emits ``outcome="error"`` then
+        re-raises the ORIGINAL exception untouched. A ``None`` collector makes both
+        emits no-ops.
+
+        Outcome classification mirrors the request-middleware WR-04 split (and the
+        contract ``client_error`` value): ``>=500 -> "error"``,
+        ``>=400 -> "client_error"``, else ``"ok"``. This success path is reached
+        BEFORE the caller's ``raise_for_status()`` (``_send_with_clearance`` raises
+        only AFTER ``_send`` returns), so a 4xx/5xx transport response DOES land here
+        and was previously mis-emitted as ``"ok"`` — a 401/404/500 from the upstream
+        is now visible in the failures ring / error_rate per-call, not just at the
+        request rollup. (Even where tenacity/raise_for_status would later convert a
+        5xx to the except branch, this classification is correct + harmless.)
         """
         start = time.perf_counter()
         try:
@@ -658,12 +669,19 @@ class SourceContext:
             )
             raise
         duration_ms = (time.perf_counter() - start) * 1000.0
+        # Classify by status (mirrors middleware WR-04 + contract client_error).
+        if resp.status_code >= 500:
+            outcome = "error"
+        elif resp.status_code >= 400:
+            outcome = "client_error"
+        else:
+            outcome = "ok"
         self._emit_http(
             op=op,
             method=method,
             url=url,
             status=resp.status_code,
-            outcome="ok",
+            outcome=outcome,
             duration_ms=duration_ms,
             attempt=attempt,
             error=None,

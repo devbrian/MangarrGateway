@@ -202,6 +202,43 @@ async def test_http_error_emits_error_outcome_then_reraises(
     assert all(e.error is not None for e in errs)
 
 
+@pytest.mark.asyncio
+async def test_http_success_path_classifies_outcome_by_status(
+    collector: tuple[Collector, InMemoryStore],
+) -> None:
+    """A 4xx/5xx transport response that REACHES the success emit path (before the
+    caller's raise_for_status) is classified, not mis-labelled ``ok`` (CodeRabbit).
+
+    Drives ``_send_emitting`` directly: it returns the response unchanged regardless
+    of status (raise_for_status lives in ``_send_with_clearance``, the caller), so a
+    200/404/503 must emit ``ok`` / ``client_error`` / ``error`` respectively.
+    """
+    _c, store = collector
+    transport = _RecordingTransport(
+        [
+            httpx.Response(200, json={}, request=httpx.Request("GET", "u")),
+            httpx.Response(404, json={}, request=httpx.Request("GET", "u")),
+            httpx.Response(503, json={}, request=httpx.Request("GET", "u")),
+        ]
+    )
+    ctx = _ctx("alpha", transport)
+    with _source_bound("alpha"):
+        await ctx._send_emitting(
+            "GET", "https://alpha.test/ok", op="get_json", attempt=1
+        )
+        await ctx._send_emitting(
+            "GET", "https://alpha.test/missing", op="get_json", attempt=1
+        )
+        await ctx._send_emitting(
+            "GET", "https://alpha.test/down", op="get_json", attempt=1
+        )
+
+    by_status = {e.status: e.outcome for e in _http_events(store)}
+    assert by_status[200] == "ok"
+    assert by_status[404] == "client_error"
+    assert by_status[503] == "error"
+
+
 # ─────────────────── Task 2: additive solve / job / package emit ──────────────────
 
 
