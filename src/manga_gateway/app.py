@@ -41,7 +41,7 @@ from .logging_config import configure_logging
 from .metrics.collector import Collector, set_collector
 from .metrics.middleware import MetricsRequestMiddleware
 from .metrics.routes import router as metrics_router
-from .metrics.snapshot import open_metric_store
+from .metrics.snapshot import MetricSnapshotStore, open_metric_store
 from .metrics.store import InMemoryStore
 from .security import require_api_key
 from .sources import register_builtin_sources
@@ -312,21 +312,41 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # framework seam (Plan 04) + the request middleware flip live. The rehydrated
     # store IS the live store — its rings are then re-bounded to the configured
     # sizes by replacing it with a freshly-bounded store seeded from the rehydrate.
-    metric_snapshot = await open_metric_store(settings.metrics_db_path)
-    # WR-02: metrics are a purely diagnostic subsystem and must NEVER abort
-    # startup. A corrupt / schema-drifted metrics.db (TypeError from a changed
-    # MetricEvent shape, json.JSONDecodeError on a partial write, etc.) degrades
-    # cleanly to an empty live store instead of taking down the whole gateway.
+    # WR-02 + open-resilience: the metrics subsystem is purely diagnostic and must
+    # NEVER abort startup. Two failure modes degrade cleanly:
+    #  (1) the snapshot DB cannot be OPENED — metrics_db_path is unwritable (the
+    #      default /state volume is absent outside docker, e.g. CI / a bare run).
+    #      sqlite3.OperationalError "unable to open database file" here would
+    #      otherwise take the whole gateway down. → in-memory-only metrics, no
+    #      restart survival (snapshot loop + final snapshot are skipped below).
+    #  (2) the DB opens but rehydrate fails (corrupt / schema-drifted metrics.db —
+    #      a changed MetricEvent shape, a partial-write JSONDecodeError, etc.).
+    #      → keep the (writable) store for future snapshots, just start empty.
+    metric_snapshot: MetricSnapshotStore | None = None
     try:
-        rehydrated = await metric_snapshot.rehydrate()
-    except Exception:  # noqa: BLE001 — bad snapshot must not break the service
+        metric_snapshot = await open_metric_store(settings.metrics_db_path)
+    except Exception:  # noqa: BLE001 — unwritable/unavailable DB must not break startup
         _log.warning(
-            "metrics rehydrate failed; starting with an empty metric store",
+            "metrics snapshot store could not be opened (metrics_db_path=%s); "
+            "continuing with in-memory-only metrics (no restart survival)",
+            settings.metrics_db_path,
             exc_info=True,
         )
+    if metric_snapshot is None:
         rehydrated = InMemoryStore(
             recent_max=1, failures_max=1, slow_max=1, slow_factor=1.0
         )
+    else:
+        try:
+            rehydrated = await metric_snapshot.rehydrate()
+        except Exception:  # noqa: BLE001 — bad snapshot must not break the service
+            _log.warning(
+                "metrics rehydrate failed; starting with an empty metric store",
+                exc_info=True,
+            )
+            rehydrated = InMemoryStore(
+                recent_max=1, failures_max=1, slow_max=1, slow_factor=1.0
+            )
     metric_store = InMemoryStore(
         recent_max=settings.metrics_recent_ring,
         failures_max=settings.metrics_failures_ring,
@@ -354,10 +374,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Worst-case loss on a hard crash is one interval (≤45s default), accepted.
         while True:
             await asyncio.sleep(settings.metrics_snapshot_interval_s)
+            if metric_snapshot is None:  # in-memory-only degraded mode
+                continue
             with suppress(Exception):
                 await metric_snapshot.snapshot(metric_store)
 
-    snapshot_task = asyncio.create_task(_snapshot_loop())  # strong ref (Pitfall 4)
+    # No snapshot loop when the store is unavailable (in-memory-only degraded mode).
+    snapshot_task: asyncio.Task[None] | None = (
+        asyncio.create_task(_snapshot_loop())  # strong ref (Pitfall 4)
+        if metric_snapshot is not None
+        else None
+    )
 
     # D-37 recovery supervisor: once a cloudflare-gated breaker trips, re-probe
     # on the escalating +1h/+6h schedule (off the request path), then stay down
@@ -393,7 +420,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # Cancel the warm + watchdog + snapshot bg tasks and close the solver BEFORE
         # the transport, so no orphan Chromium survives shutdown (Pitfall 4).
-        bg_tasks = [warm_task, *watchdog_tasks, snapshot_task]
+        bg_tasks = [
+            t for t in (warm_task, *watchdog_tasks, snapshot_task) if t is not None
+        ]
         for bg in bg_tasks:
             bg.cancel()
         with suppress(Exception):
@@ -422,9 +451,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # (Pitfall 4), then close the snapshot connection. set_collector(None) so a
         # straggler emit during teardown is a no-op and tests don't leak a collector.
         set_collector(None)
-        with suppress(Exception):
-            await metric_snapshot.snapshot(metric_store)
-        await metric_snapshot.close()
+        if metric_snapshot is not None:
+            with suppress(Exception):
+                await metric_snapshot.snapshot(metric_store)
+            with suppress(Exception):
+                await metric_snapshot.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

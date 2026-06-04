@@ -165,3 +165,36 @@ async def test_snapshot_is_idempotent_over_resnapshot(tmp_path: Path) -> None:
         assert len(restored.recent_calls(1000)) == len(mem.recent_calls(1000))
     finally:
         await snap.close()
+
+
+async def test_create_app_boots_when_metrics_db_unwritable(tmp_path: Path) -> None:
+    """Open-resilience: an UNOPENABLE ``metrics_db_path`` must degrade to
+    in-memory-only metrics, NOT abort gateway startup.
+
+    Regression for the CI ``/state`` failure: ``metrics_db_path`` defaults under
+    ``/state`` (the docker volume), which is unwritable outside the container, so
+    ``open_metric_store`` raised ``sqlite3.OperationalError`` and took down the
+    whole lifespan. The metrics subsystem is purely diagnostic and must live
+    without restart survival when its DB can't be opened. Reproduced cross-platform
+    by pointing the path at a non-existent parent dir (sqlite won't ``mkdir`` it).
+    """
+    from manga_gateway.app import create_app
+    from manga_gateway.config import Settings
+
+    unopenable = tmp_path / "missing_dir" / "metrics.db"  # parent absent → open fails
+    app = create_app(
+        Settings(
+            api_key="test-key-deterministic-0123456789",
+            metrics_db_path=str(unopenable),
+            log_dir=str(tmp_path / "logs"),
+            output_root=str(tmp_path / "out"),
+            db_path=str(tmp_path / "jobs.db"),
+        )
+    )
+    # Entering the lifespan must NOT raise despite the unopenable snapshot DB.
+    async with app.router.lifespan_context(app):
+        # In-memory metrics stay fully wired (collector installed, live store present).
+        assert app.state.collector is not None
+        assert app.state.metric_store is not None
+    # Degraded mode created no snapshot file; the gateway lived.
+    assert not unopenable.exists()
