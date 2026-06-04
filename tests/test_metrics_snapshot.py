@@ -124,6 +124,34 @@ async def test_snapshot_rehydrate_roundtrips_rings(tmp_path: Path) -> None:
         await snap.close()
 
 
+async def test_rehydrate_skips_unknown_ring_label(tmp_path: Path) -> None:
+    """CodeRabbit: a forward/corrupt snapshot carrying an UNKNOWN ring label must be
+    skipped row-by-row, not KeyError out of the whole rehydrate."""
+    import json
+
+    from manga_gateway.metrics.snapshot import _RING_INSERT, _event_to_json
+
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        mem = _make_store()
+        good = _ev(duration_ms=100.0, request_id=7)
+        await snap.snapshot(mem)
+        # Inject one good 'recent' row and one row with an unknown ring label.
+        await snap._conn.execute(_RING_INSERT, ("recent", 9999, _event_to_json(good)))
+        await snap._conn.execute(
+            _RING_INSERT, ("from_the_future", 0, json.dumps({"garbage": True}))
+        )
+        await snap._conn.commit()
+
+        # Must NOT raise; the unknown-ring row is dropped, the good row survives.
+        restored = await snap.rehydrate()
+        recent = restored.recent_calls(1000)
+        assert any(e["request_id"] == 7 for e in recent)
+    finally:
+        await snap.close()
+
+
 async def test_snapshot_is_idempotent_over_resnapshot(tmp_path: Path) -> None:
     # Re-snapshotting (DELETE + re-insert) must not double rows.
     db = str(tmp_path / "metrics.db")

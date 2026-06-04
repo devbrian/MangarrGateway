@@ -146,8 +146,13 @@ class MetricSnapshotStore:
             ring_rows = await cur.fetchall()
 
         # Size the rehydrated rings to exactly what was persisted (no eviction).
+        # An UNKNOWN ring label (a forward/corrupt snapshot) is skipped, not a
+        # KeyError that breaks the whole rehydrate (CodeRabbit — metrics must never
+        # break the service). The same guard is applied in the restore loop below.
         counts = {"recent": 0, "failures": 0, "slow": 0}
         for row in ring_rows:
+            if row["ring"] not in counts:
+                continue
             counts[row["ring"]] += 1
         mem = InMemoryStore(
             recent_max=max(1, counts["recent"]),
@@ -169,12 +174,18 @@ class MetricSnapshotStore:
             # WR-02: salvage a partially-valid snapshot — a single corrupt /
             # schema-drifted row is skipped rather than aborting the whole
             # rehydrate (metrics must never break the service).
+            ring = row["ring"]
+            if ring not in restore:
+                # Unknown ring label (forward/corrupt snapshot): skip rather than
+                # KeyError (CodeRabbit).
+                _log.warning("skipping metric snapshot row with unknown ring %r", ring)
+                continue
             try:
                 ev = _event_from_json(row["payload"])
             except Exception:  # noqa: BLE001 — drop the bad row, keep the rest
                 _log.warning("skipping corrupt metric snapshot row", exc_info=True)
                 continue
-            restore[row["ring"]](ev)
+            restore[ring](ev)
 
         return mem
 
