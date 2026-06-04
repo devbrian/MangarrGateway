@@ -133,6 +133,30 @@ async def test_500_response_marks_request_error(
 
 
 @pytest.mark.asyncio
+async def test_4xx_response_marks_request_client_error(
+    store: InMemoryStore, collector: Collector
+) -> None:
+    """WR-04: a 4xx (e.g. 401) is a non-ok outcome so it reaches the failures
+    ring / error_rate, not silently counted as success."""
+
+    async def downstream(
+        scope: MutableMapping[str, Any], receive: Any, send: Any
+    ) -> None:
+        await send({"type": "http.response.start", "status": 401})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = MetricsRequestMiddleware(downstream)
+    await mw(_http_scope("/api/v1/search"), _noop_receive, _make_send())
+
+    request_events = [e for e in store.recent_calls(10) if e["kind"] == "request"]
+    assert request_events[0]["outcome"] == "client_error"
+    assert request_events[0]["status"] == 401
+    # A non-ok outcome must have admitted the event to the failures ring.
+    failures = [e for e in store.latest_failures(10) if e["kind"] == "request"]
+    assert any(e["status"] == 401 for e in failures)
+
+
+@pytest.mark.asyncio
 async def test_non_http_scope_short_circuits() -> None:
     """A lifespan/websocket scope passes straight through, untouched."""
     called: dict[str, Any] = {}

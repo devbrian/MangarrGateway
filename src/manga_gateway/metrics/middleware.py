@@ -94,7 +94,17 @@ class MetricsRequestMiddleware:
             duration_ms = (time.perf_counter() - start) * 1000.0
             collector = get_collector()
             if collector is not None:
-                outcome = "error" if status_code >= 500 or status_code == 0 else "ok"
+                # WR-04: a 4xx (401 unauthorized, 404, 422 validation) is NOT a
+                # success — it must admit to the failures ring + error_rate so a
+                # flood of 401s/404s (the prime observability signal) is visible.
+                # The store treats any outcome != "ok" as a failure, so a distinct
+                # "client_error" label counts without conflating with 5xx "error".
+                if status_code == 0 or status_code >= 500:
+                    outcome = "error"
+                elif status_code >= 400:
+                    outcome = "client_error"
+                else:
+                    outcome = "ok"
                 collector.emit_request(
                     endpoint=endpoint,
                     status=status_code or None,
