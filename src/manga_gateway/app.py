@@ -213,16 +213,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "headless": settings.cloudflare_headless,
         "solve_concurrency": settings.cloudflare_solve_concurrency,
         # PR #58 follow-up: per-source-shape concurrency cap for the warm
-        # browser. Defaults to 5 to match the Comix /search candidate
-        # ceiling; raise via GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY when
-        # adding a source whose fan-out exceeds that (Pitfall 6 caveat
-        # applies — see config field comment).
+        # browser. Defaults to 3 (config.py cloudflare_fetch_concurrency) —
+        # the patchright/Chromium engine can run that many concurrent CF
+        # navigations on one warm context; tune via
+        # GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY. A camoufox deploy MUST pin
+        # this to 1 (the _reject_camoufox_parallel validator enforces it —
+        # Firefox cannot run parallel CF navs).
         "fetch_concurrency": settings.cloudflare_fetch_concurrency,
         "cloudflare_keys": cloudflare_keys,
-        # #35 / #40: select the stealth-browser engine (camoufox default
-        # everywhere — dev + CI + prod — so Firefox-only failure modes like
-        # issue #54 surface in local repro; patchright opt-in via
-        # GATEWAY_CLOUDFLARE_ENGINE=patchright). Driven by Settings.cloudflare_engine.
+        # #35 / #40: select the stealth-browser engine. patchright (Chromium,
+        # patched CDP leaks) is the DEFAULT since the comix-parallel-engine-probe
+        # finding (2026-06-01) — only Chromium runs concurrent CF navigations, so
+        # it is what makes fetch_concurrency > 1 work. camoufox (Firefox, C++
+        # fingerprint spoof) is the opt-in fallback via
+        # GATEWAY_CLOUDFLARE_ENGINE=camoufox for hosts where Chromium's
+        # fingerprint is flagged (must pin fetch_concurrency=1). Driven by
+        # Settings.cloudflare_engine.
         "engine": settings.cloudflare_engine,
         # #54 diagnostic: forward the per-page browser-event capture flag.
         # OFF by default — flip to ON via GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS=1
