@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from manga_gateway.app import create_app
 from manga_gateway.config import Settings
 from manga_gateway.metrics.collector import get_collector
+from manga_gateway.metrics.context import current_request
 
 from .conftest import TEST_API_KEY
 
@@ -53,20 +54,33 @@ async def metrics_client(
 
 
 async def _seed_request(app: FastAPI) -> int:
-    """Drive one inbound request so the store has events; returns its request_id."""
+    """Drive one inbound request so the store has events; returns its request_id.
+
+    The request_id is minted from a process-global counter (``_request_ids``), so it
+    is NOT deterministically ``1`` in a full suite run — read it back from the most
+    recent ``request`` event the middleware emitted.
+    """
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport,
         base_url="http://testserver",
         headers={"X-Api-Key": TEST_API_KEY},
     ) as ac:
-        # A real /api/v1 call flows through the middleware (emits a `request` event)
-        # and, via the registry, may emit child http events too.
+        # A real /api/v1 call flows through the middleware (emits a `request` event).
         await ac.get("/api/v1/version")
-        # Also emit a synthetic http event carrying a secret-bearing url to prove
-        # redaction reaches the served JSON.
+        store = app.state.metric_store
+        request_event = next(
+            e for e in store.recent_calls(50) if e["kind"] == "request"
+        )
+        request_id = int(request_event["request_id"])
+        # Also emit a synthetic http event UNDER that request_id carrying a
+        # secret-bearing url to prove redaction reaches the served JSON, and to give
+        # the breakdown a child call alongside the request event.
         collector = get_collector()
         assert collector is not None
+        current_request.set(
+            {"request_id": request_id, "surface": "search", "endpoint": "GET /version"}
+        )
         collector.emit_http(
             op="get_json",
             method="GET",
@@ -76,7 +90,7 @@ async def _seed_request(app: FastAPI) -> int:
             duration_ms=10.0,
             attempt=1,
         )
-        return 1
+        return request_id
 
 
 @pytest.mark.asyncio

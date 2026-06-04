@@ -8,7 +8,8 @@ ASGI tests deterministic.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import logging
+from collections.abc import AsyncIterator, Iterator
 
 import httpx
 import pytest
@@ -18,6 +19,54 @@ from fastapi import FastAPI
 from manga_gateway.app import create_app
 from manga_gateway.config import Settings
 from manga_gateway.framework.antibot import Clearance, CloudflareSolver
+from manga_gateway.logging_config import _QUIET_LIBS
+
+
+@pytest.fixture(autouse=True)
+def _restore_logging_global() -> Iterator[None]:
+    """Snapshot + restore the loggers ``configure_logging`` touches (session-wide).
+
+    ``create_app`` now calls ``configure_logging`` (08-05), which ``dictConfig``-
+    attaches handlers and sets ``propagate=False`` on the ``manga_gateway`` logger.
+    Without restoration that global state leaks across tests and breaks ``caplog``-
+    based assertions in OTHER modules depending on test ordering (caplog attaches to
+    the root logger and relies on propagation). Snapshot before, restore after — and
+    close any file handlers we attached so Windows releases the lock on the log file.
+    """
+    touched = ("manga_gateway", *_QUIET_LIBS)
+    snapshots: dict[str, tuple[int, bool, list[logging.Handler]]] = {}
+    for name in touched:
+        logger = logging.getLogger(name)
+        snapshots[name] = (logger.level, logger.propagate, list(logger.handlers))
+    root = logging.getLogger()
+    root_snapshot = (root.level, list(root.handlers))
+
+    # ``test_contract.py`` builds the app at MODULE import time, so configure_logging
+    # may have ALREADY run during collection — leaving manga_gateway with
+    # propagate=False + dictConfig handlers before the first test even starts. Reset to
+    # a clean baseline (propagate=True, no leftover handlers) so ``caplog`` (which
+    # relies on propagation to the root logger) captures deterministically regardless
+    # of import-time pollution. close() detaches any file handlers (Windows lock).
+    for name in touched:
+        logger = logging.getLogger(name)
+        for handler in list(logger.handlers):
+            handler.close()
+        logger.handlers = []
+        logger.propagate = True
+        logger.setLevel(logging.NOTSET)
+
+    yield
+
+    for name, (level, propagate, handlers) in snapshots.items():
+        logger = logging.getLogger(name)
+        for handler in logger.handlers:
+            if handler not in handlers:
+                handler.close()
+        logger.handlers = handlers
+        logger.level = level
+        logger.propagate = propagate
+    root.handlers = root_snapshot[1]
+    root.level = root_snapshot[0]
 
 
 @pytest.fixture(autouse=True)
