@@ -16,10 +16,11 @@ from .logging_config import configure_logging
 
 
 def main() -> None:
-    # Configure logging BEFORE create_app so the lifespan startup events
-    # (staging sweep, solver warm result) reach the console (#21).
-    configure_logging()
+    # Load settings first so the logging config can read log_* knobs, then
+    # configure logging BEFORE create_app so the lifespan startup events
+    # (staging sweep, solver warm result) are already structured (#21 / OBS-09).
     settings = load_settings()
+    configure_logging(settings)
     app = create_app(settings)
     # Single process. No workers kwarg — multi-worker is forbidden (R1).
     uvicorn.run(app, host=settings.host, port=settings.port)

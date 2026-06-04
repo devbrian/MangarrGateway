@@ -14,6 +14,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol
 
+from ..metrics.context import current_source
 from .errors import SourceError
 
 # Default per-source fan-out timeout (D-14 discretion). Sized to comfortably
@@ -60,6 +61,12 @@ async def fan_out[S: _HasKey, R](
     warnings: list[WarningTuple] = []
 
     async def _guarded(src: S) -> tuple[str, list[R]]:
+        # Source-scope metrics bind (OBS-02, RESEARCH Pattern 1): every per-source
+        # call inside this child self-attributes its source_key via current_source.
+        # asyncio copies the context into each Task at creation, so sibling sources
+        # mutate only their own copy and never cross-attribute (T-08-12). Strictly
+        # additive — does not change any control flow / exception propagation below.
+        token = current_source.set(src.key)
         try:
             async with asyncio.timeout(per_source_timeout):
                 result = await run_one(src)
@@ -73,6 +80,8 @@ async def fan_out[S: _HasKey, R](
             warnings.append((src.key, exc.code, str(exc)))
         except Exception:  # noqa: BLE001 — isolation: one source must never break others
             warnings.append((src.key, "source_unavailable", "unexpected error"))
+        finally:
+            current_source.reset(token)
         return src.key, []
 
     tasks: list[asyncio.Task[tuple[str, list[R]]]] = []

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,7 @@ import httpx
 
 from ..framework.context import SourceContext
 from ..framework.errors import SourceError
+from ..metrics.collector import get_collector
 from .model import Job, JobStatus
 from .package import (
     compute_output_path,
@@ -50,6 +52,50 @@ from .package import (
 )
 
 _log = logging.getLogger("manga_gateway.jobs.engine")
+
+
+def _emit_job(source_key: str, *, op: str, outcome: str, error: str | None) -> None:
+    """No-op-safe, failure-isolated ``emit_job`` (OBS-01/05, T-08-15).
+
+    The engine runs OUTSIDE a fan-out child, so ``current_source`` is unbound here;
+    ``source_scope`` binds the job's source_key for the duration of the emit so the
+    job event self-attributes. Strictly additive — a ``None`` collector is a no-op
+    and a collector error never breaks a job transition.
+    """
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        from ..metrics.context import source_scope
+
+        with source_scope(source_key):
+            collector.emit_job(op=op, outcome=outcome, error=error)
+    except Exception:  # noqa: BLE001 — a metric failure must never break a job
+        pass
+
+
+def _emit_package(
+    source_key: str,
+    *,
+    op: str,
+    outcome: str,
+    duration_ms: float,
+    error: str | None,
+) -> None:
+    """No-op-safe, failure-isolated ``emit_package`` (timed at the to_thread site)."""
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        from ..metrics.context import source_scope
+
+        with source_scope(source_key):
+            collector.emit_package(
+                op=op, outcome=outcome, duration_ms=duration_ms, error=error
+            )
+    except Exception:  # noqa: BLE001 — a metric failure must never break a job
+        pass
+
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -222,7 +268,28 @@ class JobEngine:
             manga_title=job.manga_title,
         )
         writer = _WRITERS.get(job.output_format, write_cbz)
-        await asyncio.to_thread(writer, pages, final_path)
+        # Time the package step at the ASYNC call-site (RESEARCH DRIFT — the sync
+        # write_* worker runs in a thread where the contextvars aren't readable, so
+        # emit here, never inside package.py). Strictly additive + failure-isolated.
+        _pkg_start = time.perf_counter()
+        try:
+            await asyncio.to_thread(writer, pages, final_path)
+        except Exception as exc:
+            _emit_package(
+                job.source_key,
+                op=job.output_format,
+                outcome="error",
+                duration_ms=(time.perf_counter() - _pkg_start) * 1000.0,
+                error=repr(exc),
+            )
+            raise
+        _emit_package(
+            job.source_key,
+            op=job.output_format,
+            outcome="ok",
+            duration_ms=(time.perf_counter() - _pkg_start) * 1000.0,
+            error=None,
+        )
 
         # completed → expose the host-reachable output path (JOB-03/D-26).
         job.output_path = str(final_path)
@@ -384,6 +451,10 @@ class JobEngine:
             status.value,
             job.total_pages if job.total_pages is not None else "?",
         )
+        # Additive job-state metric (OBS-05): every RESOLVING→…→COMPLETED change
+        # flows through here. op = the new state; outcome ok (the failure twin is
+        # in _fail). Strictly additive — no effect on the write-through above.
+        _emit_job(job.source_key, op=status.value, outcome="ok", error=None)
 
     async def _fail(self, job: Job, message: str) -> None:
         previous = job.status
@@ -401,6 +472,8 @@ class JobEngine:
             previous.value,
             message,
         )
+        # Additive job-failure metric (OBS-05): the failure twin of _transition.
+        _emit_job(job.source_key, op="failed", outcome="error", error=message)
 
 
 class _StaleManifest(Exception):

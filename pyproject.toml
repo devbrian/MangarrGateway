@@ -8,6 +8,7 @@ dependencies = [
     "cachetools==7.1.4",
     "camoufox[geoip]==0.4.11",
     "fastapi==0.136.3",
+    "hdrhistogram==0.10.3",
     "httpx==0.28.1",
     "lxml==6.1.1",
     "patchright==1.60.0",
@@ -78,6 +79,13 @@ disallow_untyped_decorators = false
 # the MangaBall manifest parse (sources/mangaball.py) is the only consumer.
 # Treat the import as untyped rather than pulling a stubs package into the tree.
 module = ["lxml.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# hdrhistogram (0.10.3) ships no type stubs / py.typed marker; the metrics store +
+# snapshot (metrics/store.py, metrics/snapshot.py) are the only consumers (OBS-08
+# p95 sketch). Treat the import as untyped rather than pulling a stubs package in.
+module = ["hdrh.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

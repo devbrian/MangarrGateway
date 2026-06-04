@@ -1,41 +1,67 @@
-"""Logging-config tests (#21).
+"""Central JSON-lines logging-config tests (OBS-09, Plan 08-03).
 
-``manga_gateway.logging_config.configure_logging`` is the explicit, idempotent
-entry-point that ``__main__`` calls at startup. The tests verify:
+``manga_gateway.logging_config.configure_logging(settings)`` is the explicit,
+idempotent entry-point ``__main__`` calls before ``create_app``. These tests verify the
+four load-bearing OBS-09 truths against a ``log_dir`` pointed at ``tmp_path`` so the
+suite NEVER writes to ``/state``:
 
-* default ``manga_gateway*`` level is INFO so existing ``_log.info(...)`` lines
-  reach the console;
-* ``GATEWAY_LOG_LEVEL=DEBUG`` widens it to DEBUG;
-* third-party loggers (``httpx`` et al.) stay at WARNING;
-* reapplying the config does NOT stack handlers (idempotent).
+* every emitted line is a single valid JSON object carrying ``ts/level/logger/msg/
+  request_id`` (the five core keys);
+* a line emitted inside a ``current_request.set({"request_id": ...})`` scope carries
+  that same ``request_id`` (the D-08 join key); outside any scope it is ``null``;
+* secrets (``cf_clearance`` value, proxy credentials) are redacted in the WRITTEN
+  line while proxy ``host:port`` is preserved (D-04/D-05);
+* the file handler is a size-rotating ``RotatingFileHandler`` configured with
+  ``settings.log_max_bytes`` / ``settings.log_backup_count`` and writes
+  ``<log_dir>/gateway.jsonl``.
 
-These tests deliberately mutate the global logging state; they snapshot and
-restore handlers/levels around each case so ``pytest``'s ``caplog`` (which
+These tests deliberately mutate global logging state; the autouse fixture snapshots and
+restores the loggers ``configure_logging`` touches so ``pytest``'s ``caplog`` (which
 relies on root propagation) stays usable in the rest of the suite.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import logging.handlers
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
-from manga_gateway.logging_config import configure_logging
+from manga_gateway.config import Settings
+from manga_gateway.logging_config import (
+    _LOG_FILENAME,
+    _QUIET_LIBS,
+    configure_logging,
+)
+from manga_gateway.metrics.context import current_request
+
+TEST_API_KEY = "test-key-deadbeef"
+
+
+def _settings(
+    tmp_path: Path,
+    *,
+    log_level: str = "INFO",
+    log_max_bytes: int = 10_000_000,
+    log_backup_count: int = 5,
+) -> Settings:
+    """A ``Settings`` whose ``log_dir`` is ``tmp_path`` (never ``/state``)."""
+    return Settings(
+        api_key=TEST_API_KEY,
+        log_dir=str(tmp_path),
+        log_level=log_level,
+        log_max_bytes=log_max_bytes,
+        log_backup_count=log_backup_count,
+    )
 
 
 @pytest.fixture(autouse=True)
 def _restore_logging() -> Iterator[None]:
     """Snapshot + restore the loggers configure_logging touches."""
-    touched_names = (
-        "manga_gateway",
-        "httpx",
-        "httpcore",
-        "asyncio",
-        "patchright",
-        "playwright",
-        "uvicorn.access",
-    )
+    touched_names = ("manga_gateway", *_QUIET_LIBS)
     snapshots: dict[str, tuple[int, bool, list[logging.Handler]]] = {}
     for name in touched_names:
         logger = logging.getLogger(name)
@@ -45,6 +71,11 @@ def _restore_logging() -> Iterator[None]:
     yield
     for name, (level, propagate, handlers) in snapshots.items():
         logger = logging.getLogger(name)
+        # Close any rotating file handlers we attached so the tmp file is released
+        # (Windows keeps an exclusive lock on the open file otherwise).
+        for handler in logger.handlers:
+            if handler not in handlers:
+                handler.close()
         logger.handlers = handlers
         logger.level = level
         logger.propagate = propagate
@@ -52,63 +83,201 @@ def _restore_logging() -> Iterator[None]:
     root.level = root_snapshot[0]
 
 
-def test_default_level_is_info_for_gateway_logger() -> None:
-    configure_logging()
-    assert logging.getLogger("manga_gateway").getEffectiveLevel() == logging.INFO
+def _read_file_lines(tmp_path: Path) -> list[str]:
+    """Flush handlers, then return the non-empty lines written to gateway.jsonl."""
+    logger = logging.getLogger("manga_gateway")
+    for handler in logger.handlers:
+        handler.flush()
+    text = (tmp_path / "gateway.jsonl").read_text(encoding="utf-8")
+    return [line for line in text.splitlines() if line.strip()]
 
 
-def test_third_party_loggers_pinned_to_warning() -> None:
-    configure_logging()
-    # WARNING keeps httpx access lines + uvicorn access spam out of the console.
+def test_emitted_line_is_valid_json_with_core_keys(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path))
+    logging.getLogger("manga_gateway").info("hello world")
+    lines = _read_file_lines(tmp_path)
+    assert lines, "a line must be written to gateway.jsonl"
+    payload = json.loads(lines[-1])  # must be a single valid JSON object
+    assert set(payload) >= {"ts", "level", "logger", "msg", "request_id"}
+    assert payload["level"] == "INFO"
+    assert payload["logger"] == "manga_gateway"
+    assert payload["msg"] == "hello world"
+
+
+def test_request_id_correlates_with_contextvar(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path))
+    log = logging.getLogger("manga_gateway")
+
+    # Outside any request scope → request_id is null.
+    log.info("outside")
+    outside = json.loads(_read_file_lines(tmp_path)[-1])
+    assert outside["request_id"] is None
+
+    # Inside a request scope → the line carries the SAME request_id (D-08).
+    token = current_request.set(
+        {"request_id": 7, "surface": "search", "endpoint": "/caps"}
+    )
+    try:
+        log.info("inside")
+    finally:
+        current_request.reset(token)
+    inside = json.loads(_read_file_lines(tmp_path)[-1])
+    assert inside["request_id"] == 7
+
+
+def test_secrets_are_redacted_in_the_written_line(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path))
+    log = logging.getLogger("manga_gateway")
+    log.info(
+        "fetch via cf_clearance=SUPERSECRET through http://user:pass@proxy.example:8080"
+    )
+    written = "\n".join(_read_file_lines(tmp_path))
+    # D-05: the secret values are masked in the file the dashboard reads.
+    assert "SUPERSECRET" not in written
+    assert "user:pass" not in written
+    assert "cf_clearance=***" in written
+    # D-04: proxy host:port is forensic signal and is KEPT.
+    assert "proxy.example:8080" in written
+
+
+def test_rotating_file_handler_uses_settings_and_writes_jsonl(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path, log_max_bytes=12345, log_backup_count=7))
+    handlers = logging.getLogger("manga_gateway").handlers
+    rotating = [
+        h for h in handlers if isinstance(h, logging.handlers.RotatingFileHandler)
+    ]
+    assert len(rotating) == 1, "exactly one size-rotating file handler is attached"
+    handler = rotating[0]
+    # Size-based rotation configured from settings (not TimedRotatingFileHandler).
+    assert not isinstance(handler, logging.handlers.TimedRotatingFileHandler)
+    assert handler.maxBytes == 12345
+    assert handler.backupCount == 7
+    assert Path(handler.baseFilename).name == "gateway.jsonl"
+    # The file lives under the tmp log dir, never /state.
+    assert Path(handler.baseFilename).parent == tmp_path.resolve()
+
+
+def test_stdout_and_file_handlers_both_attached(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path))
+    handlers = logging.getLogger("manga_gateway").handlers
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in handlers
+    )
+    has_file = any(
+        isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
+    )
+    assert has_stream, "a stdout StreamHandler is attached (12-factor)"
+    assert has_file, "a rotating file handler is attached (/state volume)"
+
+
+def test_third_party_loggers_pinned_to_warning(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path))
     for noisy in ("httpx", "httpcore", "patchright", "uvicorn.access"):
         assert logging.getLogger(noisy).getEffectiveLevel() == logging.WARNING
 
 
-def test_env_override_widens_to_debug(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GATEWAY_LOG_LEVEL", "DEBUG")
-    configure_logging()
-    assert logging.getLogger("manga_gateway").getEffectiveLevel() == logging.DEBUG
-
-
-def test_explicit_level_argument_beats_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GATEWAY_LOG_LEVEL", "DEBUG")
-    configure_logging(level="ERROR")
+def test_log_level_setting_is_honored(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path, log_level="ERROR"))
     assert logging.getLogger("manga_gateway").getEffectiveLevel() == logging.ERROR
 
 
-def test_invalid_env_value_falls_back_to_info(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("GATEWAY_LOG_LEVEL", "not-a-level")
-    configure_logging()
-    assert logging.getLogger("manga_gateway").getEffectiveLevel() == logging.INFO
-
-
-def test_idempotent_does_not_stack_handlers() -> None:
-    configure_logging()
+def test_idempotent_does_not_stack_handlers(tmp_path: Path) -> None:
+    configure_logging(_settings(tmp_path))
     first = list(logging.getLogger("manga_gateway").handlers)
-    configure_logging()
+    configure_logging(_settings(tmp_path))
     second = list(logging.getLogger("manga_gateway").handlers)
-    # dictConfig replaces the handler list when reapplied — not stacks it.
+    # dictConfig replaces the handler list when reapplied — it does not stack.
     assert len(second) == len(first)
 
 
-def test_handler_format_string_includes_level_logger_message() -> None:
-    """The gateway handler's format string emits level + logger name + message.
+def test_creates_missing_log_dir(tmp_path: Path) -> None:
+    nested = tmp_path / "deep" / "logs"
+    assert not nested.exists()
+    configure_logging(_settings(nested))
+    logging.getLogger("manga_gateway").info("make the dir")
+    assert (nested / "gateway.jsonl").exists()
 
-    We inspect the formatter directly rather than asserting through ``caplog``:
-    ``configure_logging`` installs a dedicated handler on ``manga_gateway`` with
-    ``propagate=False`` (so a record never reaches ``caplog``'s root hook), and
-    that is intentional — operator-facing output must be format-stable and not
-    depend on the root configuration.
+
+def test_unwritable_log_dir_degrades_to_stdout_only(tmp_path: Path) -> None:
+    """CI regression: an unwritable log_dir must NOT raise — the app degrades to
+    stdout-only JSON logging instead of crashing app construction at import time.
+
+    Reproduces the Linux-CI scenario (``/state`` read-only → ``mkdir`` raises
+    ``PermissionError``) cross-platform by pointing ``log_dir`` at an existing FILE,
+    so ``mkdir(parents=True)`` raises an ``OSError`` (``FileExistsError`` /
+    ``NotADirectoryError``) on every platform including the Windows dev host.
     """
-    configure_logging()
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("i am a file, not a directory", encoding="utf-8")
+
+    # Must NOT raise (the bug was a PermissionError crashing the gate).
+    configure_logging(_settings(blocker))
+
     handlers = logging.getLogger("manga_gateway").handlers
-    assert handlers, "configure_logging must attach a handler"
-    formatter = handlers[0].formatter
-    assert formatter is not None
-    fmt = formatter._fmt or ""
-    # Order-independent: any layout containing these three placeholders works.
-    assert "%(levelname)s" in fmt
-    assert "%(name)s" in fmt
-    assert "%(message)s" in fmt
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in handlers
+    )
+    has_file = any(
+        isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
+    )
+    assert has_stream, "stdout JSON handler stays attached when the dir is unwritable"
+    assert not has_file, "no file handler is attached when the dir cannot be created"
+    # The stdout handler still emits redacted JSON lines.
+    logging.getLogger("manga_gateway").info("still logging after degrade")
+
+
+def test_permission_error_on_mkdir_degrades_gracefully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directly reproduce the CI ``PermissionError`` from ``mkdir`` (the exact crash):
+    monkeypatch ``Path.mkdir`` to raise it, then assert ``configure_logging`` does NOT
+    propagate and still attaches the stdout JSON handler.
+    """
+
+    def _raise_permission(self: Path, *args: object, **kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", _raise_permission)
+
+    configure_logging(_settings(tmp_path / "state" / "logs"))
+
+    handlers = logging.getLogger("manga_gateway").handlers
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in handlers
+    )
+    has_file = any(
+        isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
+    )
+    assert has_stream, "stdout JSON handler stays attached on PermissionError"
+    assert not has_file, "no file handler is attached on PermissionError"
+
+
+def test_file_open_failure_at_dictconfig_degrades_to_stdout_only(
+    tmp_path: Path,
+) -> None:
+    """``mkdir`` can succeed yet the ``RotatingFileHandler`` still fail to OPEN the
+    file at ``dictConfig`` time (read-only mount, or the path is a directory).
+    ``configure_logging`` must catch that path too and degrade to stdout-only
+    instead of aborting startup (CodeRabbit). Reproduced cross-platform by making
+    the log-FILE path a directory, so ``log_dir.mkdir(exist_ok=True)`` succeeds but
+    opening ``<log_dir>/gateway.jsonl`` raises.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / _LOG_FILENAME).mkdir()  # the log-file path is now a directory
+
+    configure_logging(_settings(log_dir))  # must NOT raise
+
+    handlers = logging.getLogger("manga_gateway").handlers
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in handlers
+    )
+    has_file = any(
+        isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
+    )
+    assert has_stream, "stdout JSON handler stays attached when the file open fails"
+    assert not has_file, "no file handler is attached when the file open fails"

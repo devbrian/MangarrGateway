@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .framework.transport import Transport
     from .handles.store import HandleStore
     from .jobs.manager import JobManager
+    from .metrics.store import InMemoryStore
 
 
 def get_settings(request: Request) -> Settings:
@@ -97,3 +98,14 @@ def get_handle_store(request: Request) -> HandleStore:
 def get_job_manager(request: Request) -> JobManager:
     job_manager: JobManager = request.app.state.job_manager
     return job_manager
+
+
+def get_metric_store(request: Request) -> InMemoryStore:
+    """The lifespan-owned (rehydrated) live ``InMemoryStore`` (OBS-05/06).
+
+    Mirrors ``get_job_manager``: a one-liner reading the singleton the lifespan
+    stashed on ``app.state.metric_store``. The admin metrics routes read this to
+    serve flat-cost JSON (poll-friendly, like ``GET /downloads``).
+    """
+    store: InMemoryStore = request.app.state.metric_store
+    return store

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from cachetools import TTLCache
 from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .api import api_router
 from .config import Settings
@@ -36,6 +37,12 @@ from .framework.transport import HttpxTransport
 from .handles.store import HandleStore
 from .jobs.manager import JobManager
 from .jobs.store import open_store
+from .logging_config import configure_logging
+from .metrics.collector import Collector, set_collector
+from .metrics.middleware import MetricsRequestMiddleware
+from .metrics.routes import router as metrics_router
+from .metrics.snapshot import MetricSnapshotStore, open_metric_store
+from .metrics.store import InMemoryStore
 from .security import require_api_key
 from .sources import register_builtin_sources
 
@@ -206,16 +213,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "headless": settings.cloudflare_headless,
         "solve_concurrency": settings.cloudflare_solve_concurrency,
         # PR #58 follow-up: per-source-shape concurrency cap for the warm
-        # browser. Defaults to 5 to match the Comix /search candidate
-        # ceiling; raise via GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY when
-        # adding a source whose fan-out exceeds that (Pitfall 6 caveat
-        # applies — see config field comment).
+        # browser. Defaults to 3 (config.py cloudflare_fetch_concurrency) —
+        # the patchright/Chromium engine can run that many concurrent CF
+        # navigations on one warm context; tune via
+        # GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY. A camoufox deploy MUST pin
+        # this to 1 (the _reject_camoufox_parallel validator enforces it —
+        # Firefox cannot run parallel CF navs).
         "fetch_concurrency": settings.cloudflare_fetch_concurrency,
         "cloudflare_keys": cloudflare_keys,
-        # #35 / #40: select the stealth-browser engine (camoufox default
-        # everywhere — dev + CI + prod — so Firefox-only failure modes like
-        # issue #54 surface in local repro; patchright opt-in via
-        # GATEWAY_CLOUDFLARE_ENGINE=patchright). Driven by Settings.cloudflare_engine.
+        # #35 / #40: select the stealth-browser engine. patchright (Chromium,
+        # patched CDP leaks) is the DEFAULT since the comix-parallel-engine-probe
+        # finding (2026-06-01) — only Chromium runs concurrent CF navigations, so
+        # it is what makes fetch_concurrency > 1 work. camoufox (Firefox, C++
+        # fingerprint spoof) is the opt-in fallback via
+        # GATEWAY_CLOUDFLARE_ENGINE=camoufox for hosts where Chromium's
+        # fingerprint is flagged (must pin fetch_concurrency=1). Driven by
+        # Settings.cloudflare_engine.
         "engine": settings.cloudflare_engine,
         # #54 diagnostic: forward the per-page browser-event capture flag.
         # OFF by default — flip to ON via GATEWAY_CLOUDFLARE_LOG_BROWSER_EVENTS=1
@@ -293,6 +306,86 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _log.info("Swept %d orphan staging artifact(s) on startup", swept)
     app.state.job_manager = job_manager
 
+    # Metrics system (OBS-04/05/06): open the SEPARATE snapshot DB, rehydrate the
+    # last snapshot into the LIVE store (so a restart keeps the recent rings +
+    # rollups), build the Collector over it and install it process-wide so every
+    # framework seam (Plan 04) + the request middleware flip live. The rehydrated
+    # store IS the live store — its rings are then re-bounded to the configured
+    # sizes by replacing it with a freshly-bounded store seeded from the rehydrate.
+    # WR-02 + open-resilience: the metrics subsystem is purely diagnostic and must
+    # NEVER abort startup. Two failure modes degrade cleanly:
+    #  (1) the snapshot DB cannot be OPENED — metrics_db_path is unwritable (the
+    #      default /state volume is absent outside docker, e.g. CI / a bare run).
+    #      sqlite3.OperationalError "unable to open database file" here would
+    #      otherwise take the whole gateway down. → in-memory-only metrics, no
+    #      restart survival (snapshot loop + final snapshot are skipped below).
+    #  (2) the DB opens but rehydrate fails (corrupt / schema-drifted metrics.db —
+    #      a changed MetricEvent shape, a partial-write JSONDecodeError, etc.).
+    #      → keep the (writable) store for future snapshots, just start empty.
+    metric_snapshot: MetricSnapshotStore | None = None
+    try:
+        metric_snapshot = await open_metric_store(settings.metrics_db_path)
+    except Exception:  # noqa: BLE001 — unwritable/unavailable DB must not break startup
+        _log.warning(
+            "metrics snapshot store could not be opened (metrics_db_path=%s); "
+            "continuing with in-memory-only metrics (no restart survival)",
+            settings.metrics_db_path,
+            exc_info=True,
+        )
+    if metric_snapshot is None:
+        rehydrated = InMemoryStore(
+            recent_max=1, failures_max=1, slow_max=1, slow_factor=1.0
+        )
+    else:
+        try:
+            rehydrated = await metric_snapshot.rehydrate()
+        except Exception:  # noqa: BLE001 — bad snapshot must not break the service
+            _log.warning(
+                "metrics rehydrate failed; starting with an empty metric store",
+                exc_info=True,
+            )
+            rehydrated = InMemoryStore(
+                recent_max=1, failures_max=1, slow_max=1, slow_factor=1.0
+            )
+    metric_store = InMemoryStore(
+        recent_max=settings.metrics_recent_ring,
+        failures_max=settings.metrics_failures_ring,
+        slow_max=settings.metrics_slow_ring,
+        slow_factor=settings.metrics_slow_factor,
+    )
+    # Re-admit the rehydrated events/rollups verbatim into the configured-size store
+    # (restore_* bypasses slow/failure re-classification — they were already
+    # classified before the snapshot). Rollups restore as-is.
+    for rk, rollup in rehydrated.iter_rollups():
+        metric_store.restore_rollup(rk, rollup)
+    for ev in rehydrated.iter_recent():
+        metric_store.restore_recent(ev)
+    for ev in rehydrated.iter_failures():
+        metric_store.restore_failure(ev)
+    for ev in rehydrated.iter_slow():
+        metric_store.restore_slow(ev)
+    collector = Collector(store=metric_store)
+    set_collector(collector)  # flips the Plan-04 seam + the request middleware live
+    app.state.metric_store = metric_store
+    app.state.collector = collector
+
+    async def _snapshot_loop() -> None:
+        # Periodic full-store snapshot (one transaction, ~5ms — never per-event).
+        # Worst-case loss on a hard crash is one interval (≤45s default), accepted.
+        while True:
+            await asyncio.sleep(settings.metrics_snapshot_interval_s)
+            if metric_snapshot is None:  # in-memory-only degraded mode
+                continue
+            with suppress(Exception):
+                await metric_snapshot.snapshot(metric_store)
+
+    # No snapshot loop when the store is unavailable (in-memory-only degraded mode).
+    snapshot_task: asyncio.Task[None] | None = (
+        asyncio.create_task(_snapshot_loop())  # strong ref (Pitfall 4)
+        if metric_snapshot is not None
+        else None
+    )
+
     # D-37 recovery supervisor: once a cloudflare-gated breaker trips, re-probe
     # on the escalating +1h/+6h schedule (off the request path), then stay down
     # until a manual restart. Strong-ref'd (manager.py:247-251 idiom) so each
@@ -325,9 +418,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Cancel the warm + watchdog bg tasks and close the solver BEFORE the
-        # transport, so no orphan Chromium survives shutdown (Pitfall 4).
-        bg_tasks = [warm_task, *watchdog_tasks]
+        # Cancel the warm + watchdog + snapshot bg tasks and close the solver BEFORE
+        # the transport, so no orphan Chromium survives shutdown (Pitfall 4).
+        bg_tasks = [
+            t for t in (warm_task, *watchdog_tasks, snapshot_task) if t is not None
+        ]
         for bg in bg_tasks:
             bg.cancel()
         with suppress(Exception):
@@ -351,6 +446,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await job_manager.cancel_all()
         await store.close()  # release the job-store connection
         await transport.aclose()  # release the one shared client
+        # Metrics teardown LAST (independent of solver/job/transport): a FINAL
+        # snapshot so nothing in-memory since the last timer tick is lost
+        # (Pitfall 4), then close the snapshot connection. set_collector(None) so a
+        # straggler emit during teardown is a no-op and tests don't leak a collector.
+        set_collector(None)
+        if metric_snapshot is not None:
+            with suppress(Exception):
+                await metric_snapshot.snapshot(metric_store)
+            with suppress(Exception):
+                await metric_snapshot.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -365,6 +470,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         settings = load_settings()
 
+    # Structured JSON-lines logging FIRST (OBS-09, §Q3) so even startup/lifespan logs
+    # are structured + redacted and carry request_id once a request scope exists.
+    configure_logging(settings)
+
     app = FastAPI(
         title="Mangarr Manga-Gateway API",
         lifespan=lifespan,
@@ -372,6 +481,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         root_path=settings.url_base or "",  # PLAT-01 UrlBase
     )
     app.state.settings = settings
+
+    # Middleware ordering (§Q5): add the pure-ASGI metrics middleware FIRST so it ends
+    # up INNER (closest to routing — the request_id contextvar is set just before the
+    # route + fan-out children run), then CORS LAST so it ends up OUTERMOST (stamps
+    # CORS headers even on error responses). CORS is default-deny: added ONLY when an
+    # origin allowlist is configured (empty list → no middleware → no CORS header,
+    # identical to today's behavior). allow_credentials=False (auth is the X-Api-Key
+    # header, not cookies); read-only methods; the custom header triggers preflight.
+    app.add_middleware(MetricsRequestMiddleware)
+    if settings.metrics_cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.metrics_cors_origins,  # exact origins, NEVER ["*"]
+            allow_credentials=False,
+            allow_methods=["GET", "OPTIONS"],
+            allow_headers=["X-Api-Key", "Content-Type"],
+            max_age=600,
+        )
+
     app.include_router(api_router)
+    # Admin metrics router as a SIBLING of /api/v1 (NOT nested) — its own versioned
+    # prefix, still under the global API-key dep + UrlBase root_path (OBS-05/06/07).
+    app.include_router(metrics_router, prefix="/admin/metrics/v1")
     register_error_handlers(app)
     return app

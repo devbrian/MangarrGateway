@@ -9,7 +9,9 @@
 # explicitly:
 #     docker compose -f docker-compose.yml up --build
 #
-# The auto-generated API key, the SQLite DB, and cf_clearance all live on the
+# The auto-generated API key, the SQLite DB, cf_clearance, the metrics snapshot
+# DB (`/state/metrics.db`), and the JSON-lines logs (`/state/logs/gateway.jsonl`,
+# which the metrics dashboard reads directly off the volume) all live on the
 # app-data mount (`/state`); CBZ output lives on the downloads mount
 # (`/data/manga`). Both default to Docker NAMED volumes (portable, work on any
 # host incl. the Windows dev box). To land them on specific HOST directories
@@ -31,8 +33,9 @@ services:
         required: false
     volumes:
       # App data (config.toml + the auto-generated API key, gateway.db,
-      # cf_clearance). Defaults to the named `gateway-state` volume; set
-      # MANGARR_STATE_DIR=/opt/mangarrgateway (in .env) to bind a host dir.
+      # cf_clearance, the metrics snapshot DB `metrics.db`, and the JSON-lines
+      # logs under `logs/gateway.jsonl`). Defaults to the named `gateway-state`
+      # volume; set MANGARR_STATE_DIR=/opt/mangarrgateway (in .env) to bind a host dir.
       - ${MANGARR_STATE_DIR:-gateway-state}:/state
       # CBZ downloads/output. Defaults to the named `gateway-output` volume; set
       # MANGARR_DOWNLOADS_DIR=/mnt/mediatrial/mangarr_dl (in .env) to bind a host dir.

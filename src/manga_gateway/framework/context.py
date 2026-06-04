@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
 import tenacity
 
+from ..metrics.collector import get_collector
 from .decrypt import decrypt
 from .errors import SourceError
 
@@ -51,6 +53,11 @@ if TYPE_CHECKING:
 
 # Permanent (non-retryable) upstream statuses — STOP, do not retry (Pattern 3).
 _PERMANENT_STATUSES = (401, 403, 404)
+
+# limiter-wait metric threshold (Open Question 2): only emit a ``limiter-wait``
+# event when the acquire actually blocked longer than this — a token-bucket
+# acquire that returns immediately (~0ms) would otherwise flood the store.
+_LIMITER_WAIT_EMIT_THRESHOLD_MS = 5.0
 
 
 def is_cf_challenge(resp: httpx.Response) -> bool:
@@ -336,7 +343,9 @@ class SourceContext:
         ``SourceError`` from :meth:`_parse_json_object`) also trips ``_feed_failure``.
         """
         try:
-            body = await self._request_bytes(url, params=params, limited=True)
+            body = await self._request_bytes(
+                url, params=params, limited=True, op="get_json"
+            )
             result = self._parse_json_object(body)
         except SourceError:
             self._feed_failure()
@@ -368,7 +377,9 @@ class SourceContext:
         object-bodied call paths (comix/mangadex/mangaball) are untouched.
         """
         try:
-            body = await self._request_bytes(url, params=params, limited=True)
+            body = await self._request_bytes(
+                url, params=params, limited=True, op="get_json_array"
+            )
             result = self._parse_json_array(body)
         except SourceError:
             self._feed_failure()
@@ -398,7 +409,7 @@ class SourceContext:
         """
         try:
             body = await self._request_bytes(
-                url, params=None, limited=True, method="POST", data=data
+                url, params=None, limited=True, method="POST", data=data, op="post_json"
             )
             result = self._parse_json_object(body)
         except SourceError:
@@ -427,7 +438,7 @@ class SourceContext:
         """
         try:
             body = await self._request_bytes(
-                url, params=params, limited=True, decrypt=False
+                url, params=params, limited=True, decrypt=False, op="get_json_plain"
             )
             result = self._parse_json_object(body)
         except SourceError:
@@ -454,7 +465,9 @@ class SourceContext:
         to tenacity. Bytes are decrypted (D-39) but never recompressed (PKG-04).
         """
         try:
-            body = await self._request_bytes(url, params=None, limited=False)
+            body = await self._request_bytes(
+                url, params=None, limited=False, op="get_bytes"
+            )
         except SourceError:
             self._feed_failure()
             raise
@@ -481,7 +494,7 @@ class SourceContext:
         """
         try:
             body = await self._request_bytes(
-                url, params=None, limited=False, decrypt=False
+                url, params=None, limited=False, decrypt=False, op="get_bytes_plain"
             )
         except SourceError:
             self._feed_failure()
@@ -498,6 +511,7 @@ class SourceContext:
         decrypt: bool = True,
         method: str = "GET",
         data: dict[str, Any] | None = None,
+        op: str = "request",
     ) -> bytes:
         """Single request → optionally-decrypted body, with clearance + 403 reconcile.
 
@@ -524,6 +538,7 @@ class SourceContext:
             force_resolve=False,
             method=method,
             data=data,
+            op=op,
         )
         cf_stale = (
             self._is_cloudflare and resp.status_code == 403 and is_cf_challenge(resp)
@@ -554,6 +569,7 @@ class SourceContext:
                 force_resolve=True,
                 method=method,
                 data=data,
+                op=op,
             )
         if resp.status_code in _PERMANENT_STATUSES:
             raise SourceError(
@@ -575,22 +591,145 @@ class SourceContext:
         force_resolve: bool,
         method: str = "GET",
         data: dict[str, Any] | None = None,
+        op: str = "request",
     ) -> httpx.Response:
         """Inject credentials (D-02/D-40) and issue ONE request (gated iff ``limited``).
 
         ``method`` defaults to ``"GET"`` (the unchanged search/image path). For
         ``method="POST"`` the ``data=dict`` form body is attached and httpx
         form-encodes it as ``application/x-www-form-urlencoded`` (A2).
+
+        Metrics seam (OBS-01/02/05, RESEARCH Pattern 2): this is the ONE http choke
+        point, so the awaited transport call is wrapped in ``perf_counter`` and an
+        additive ``emit_http`` (+ ``emit_limiter_wait`` for the limiter acquire).
+        The emit is STRICTLY additive — it never changes control flow, exception
+        propagation, or timing of the request: a ``None`` collector short-circuits
+        to a no-op, and ``_emit_http`` swallows any collector-side error so a
+        metric failure can never break search/download (T-08-15).
         """
         kwargs = await self._clearance_kwargs(force_resolve=force_resolve)
         if params is not None:
             kwargs["params"] = params
         if data is not None:
             kwargs["data"] = data
+        # ``attempt`` rides ``force_resolve``: a forced re-solve is the D-35
+        # attempt-2 retry; tenacity's own retries each re-enter ``_send`` and emit
+        # their own http event, so per-attempt counts come for free.
+        attempt = 2 if force_resolve else 1
         if limited:
+            wait_start = time.perf_counter()
             async with self._limiter:  # gate at CALL SITE (aiolimiter caveat)
-                return await self._session.transport.request(method, url, **kwargs)
-        return await self._session.transport.request(method, url, **kwargs)
+                wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                self._emit_limiter_wait(wait_ms)
+                return await self._send_emitting(
+                    method, url, op=op, attempt=attempt, **kwargs
+                )
+        return await self._send_emitting(method, url, op=op, attempt=attempt, **kwargs)
+
+    async def _send_emitting(
+        self,
+        method: str,
+        url: str,
+        *,
+        op: str,
+        attempt: int,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Issue the ONE transport request, emitting an additive ``http`` event.
+
+        Behaviour-neutral: on success returns the response unchanged after emitting
+        an outcome CLASSIFIED by status; on exception emits ``outcome="error"`` then
+        re-raises the ORIGINAL exception untouched. A ``None`` collector makes both
+        emits no-ops.
+
+        Outcome classification mirrors the request-middleware WR-04 split (and the
+        contract ``client_error`` value): ``>=500 -> "error"``,
+        ``>=400 -> "client_error"``, else ``"ok"``. This success path is reached
+        BEFORE the caller's ``raise_for_status()`` (``_send_with_clearance`` raises
+        only AFTER ``_send`` returns), so a 4xx/5xx transport response DOES land here
+        and was previously mis-emitted as ``"ok"`` — a 401/404/500 from the upstream
+        is now visible in the failures ring / error_rate per-call, not just at the
+        request rollup. (Even where tenacity/raise_for_status would later convert a
+        5xx to the except branch, this classification is correct + harmless.)
+        """
+        start = time.perf_counter()
+        try:
+            resp = await self._session.transport.request(method, url, **kwargs)
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            self._emit_http(
+                op=op,
+                method=method,
+                url=url,
+                status=None,
+                outcome="error",
+                duration_ms=duration_ms,
+                attempt=attempt,
+                error=repr(exc),
+            )
+            raise
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        # Classify by status (mirrors middleware WR-04 + contract client_error).
+        if resp.status_code >= 500:
+            outcome = "error"
+        elif resp.status_code >= 400:
+            outcome = "client_error"
+        else:
+            outcome = "ok"
+        self._emit_http(
+            op=op,
+            method=method,
+            url=url,
+            status=resp.status_code,
+            outcome=outcome,
+            duration_ms=duration_ms,
+            attempt=attempt,
+            error=None,
+        )
+        return resp
+
+    @staticmethod
+    def _emit_http(
+        *,
+        op: str,
+        method: str,
+        url: str,
+        status: int | None,
+        outcome: str,
+        duration_ms: float,
+        attempt: int,
+        error: str | None,
+    ) -> None:
+        """No-op-safe, failure-isolated ``emit_http`` (T-08-14/T-08-15)."""
+        collector = get_collector()
+        if collector is None:
+            return
+        try:
+            collector.emit_http(
+                op=op,
+                method=method,
+                url=url,
+                status=status,
+                outcome=outcome,
+                duration_ms=duration_ms,
+                attempt=attempt,
+                error=error,
+            )
+        except Exception:  # noqa: BLE001 — a metric failure must never break a request
+            pass
+
+    @staticmethod
+    def _emit_limiter_wait(wait_ms: float) -> None:
+        """Emit ``limiter-wait`` only when the acquire actually blocked (Open Q2)."""
+        if wait_ms < _LIMITER_WAIT_EMIT_THRESHOLD_MS:
+            return
+        collector = get_collector()
+        if collector is None:
+            return
+        try:
+            collector.emit_limiter_wait(duration_ms=wait_ms)
+        except Exception:  # noqa: BLE001 — a metric failure must never break a request
+            pass
 
     def _feed_failure(self) -> None:
         if self._source_health is not None:

@@ -64,7 +64,9 @@ also runs with no `.env` (the image bakes safe defaults).
 Two mounts persist across container recreation:
 
 - `/state` — `config.toml` (incl. the **auto-generated API key**), `gateway.db`,
-  and the Cloudflare `cf_clearance` user-data dir.
+  the Cloudflare `cf_clearance` user-data dir, the metrics snapshot DB
+  (`metrics.db`), and the JSON-lines logs (`logs/gateway.jsonl`) — see
+  **Observability & Metrics** below.
 - `/data/manga` — packaged CBZ output.
 
 Both default to Docker **named volumes** (portable — work on any host, including a
@@ -194,6 +196,104 @@ the host's IP reputation:
 (`python:3.12-slim-bookworm` + `patchright==1.60.0` + `patchright install
 chromium --with-deps` + `xvfb`); on a datacenter host run it with
 `GATEWAY_CLOUDFLARE_HEADLESS=false`.
+
+## Observability & Metrics
+
+The gateway records a small event for every meaningful outbound action (HTTP
+request, Cloudflare solve, rate-limit wait, CBZ package, job transition),
+aggregates them in-process, and serves the results as **ready-made JSON** behind
+the global API key. A **separate dashboard application** consumes this contract —
+it never parses raw logs. The contract of record for these admin endpoints is the
+gateway's own runtime **`/openapi.json`** (+ Swagger **`/docs`**, both behind the
+API key); they are intentionally **NOT** in `manga-gateway.openapi.yaml`, which
+stays Mangarr's contract of record (D-06).
+
+### The `/admin/metrics/v1/*` contract
+
+Six read-only endpoints, all relative to the base path `/admin/metrics/v1/` and
+all behind the API key. Reads are **flat-cost** (served from in-memory
+rollups/rings), so frequent polling is cheap:
+
+| Endpoint | Params | Returns | What it is |
+|----------|--------|---------|------------|
+| `GET summary` | — | `Summary` object | Top-line KPIs: `total_calls`, `total_errors`, `error_rate`, `tracked_series`. |
+| `GET per-source-endpoint` | — | `RollupRow[]` | One precomputed rollup per (source, endpoint): `count`, `errors`, `error_rate`, `avg_ms`, `p95_ms`, `min_ms`, `max_ms`. The core health table. |
+| `GET failures` | `limit` (default 25, max 1000) | `MetricEvent[]` | The most recent **failed** calls, newest first (status, url, error, attempt). |
+| `GET slow` | `limit` (default 25, max 1000) | `MetricEvent[]` | The most recent calls flagged slow **relative to their own source+endpoint baseline** (`> max(slow_factor × avg, p95)`), never a fixed ms cutoff (OBS-09). |
+| `GET recent` | `limit` (default 25, max 1000) | `MetricEvent[]` | The most recent calls of any outcome — a live activity stream. |
+| `GET requests/{request_id}` | path id | `RequestBreakdown` | The drill-down: `request_id`, `surface`, `endpoint`, `ts`, `total_duration_ms`, `outcome`, and the ordered `calls[]` (every child action under one inbound request). A `request_id` aged out of the ring → 404. |
+
+A `MetricEvent` carries: `ts` (epoch seconds), `kind`
+(`http`/`solve`/`package`/`limiter-wait`/`job`/`request`), `request_id`,
+`surface`, `endpoint`, `source_key`, `op`, `method`, `url` (redacted), `status`,
+`outcome` (`ok`/`error`), `duration_ms`, `attempt`, `error` (redacted).
+
+The **`request_id`** is the join key (D-08): it correlates a served metric event
+with the structured log lines emitted while handling the same inbound request,
+and it is the path id for the `requests/{request_id}` drill-down. Treat it as
+opaque.
+
+### Auth, CORS & UrlBase
+
+- **Auth:** every `/admin/metrics/v1/*` endpoint requires the global API key —
+  the `X-Api-Key` header (or the `?apikey=` query parameter). No key / wrong key
+  → `401`, same as every other gateway endpoint (AUTH-01 / SEC-01).
+- **UrlBase-aware:** the router is mounted under the gateway's `root_path`, so if
+  the gateway is deployed under a reverse-proxy sub-path (`GATEWAY_URL_BASE`),
+  the admin surface sits behind that prefix too — do not hardcode `/admin`.
+- **CORS is default-deny:** for a browser dashboard to call the gateway
+  cross-origin, set `GATEWAY_METRICS_CORS_ORIGINS` to a **JSON list** of allowed
+  dashboard origins (e.g. `'["http://localhost:5173"]'`). When the list is empty
+  (the default) the CORS middleware is **not even added** — no origin is
+  reflected. Only `GET`/`OPTIONS` are allowed; cookies are not used
+  (`allow_credentials=false`); the custom `X-Api-Key` header triggers a CORS
+  preflight (expected).
+
+### Redaction (SEC-01 / D-04)
+
+URLs and error text are scrubbed at the ingest boundary before any event reaches
+the served JSON or the logs — the gateway is the only thing that should ever hold
+secrets. Secret values (`cf_clearance`, `Cookie`, `Authorization`, auth tokens,
+`apikey`, `x-csrf-token`) are masked to `***`. Proxy **credentials** are masked,
+but the proxy **`host:port` is kept on purpose** (the scoped D-04 relaxation) so
+an operator can see *which* proxy a slow/failed call used — a proxied URL appears
+as `http://10.0.0.5:8080/...`, never `http://user:pass@10.0.0.5:8080/...`.
+
+### Structured logs (JSON-lines)
+
+The gateway writes **JSON-lines** logs to stdout and to a rotating file on the
+state volume at **`/state/logs/gateway.jsonl`**. The dashboard reads this file
+directly off the volume (D-09); every line is valid JSON carrying the
+`request_id` join key (D-08) and is run through the same redaction as the served
+metrics — no raw secret or API key is ever written.
+
+### Configuration (the 11 observability env vars)
+
+All are `GATEWAY_`-prefixed, env > TOML > default (D-11 ops knobs — same treatment
+as `host`/`port`, **not** the API-key exclusion):
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `GATEWAY_LOG_LEVEL` | `INFO` | Root log level for the JSON-lines dictConfig. |
+| `GATEWAY_LOG_DIR` | `/state/logs` | Directory for the rotating `gateway.jsonl` file. |
+| `GATEWAY_LOG_MAX_BYTES` | `10000000` | `RotatingFileHandler` `maxBytes` per file (≥1). |
+| `GATEWAY_LOG_BACKUP_COUNT` | `5` | How many rotated log files to keep (≥1). |
+| `GATEWAY_METRICS_CORS_ORIGINS` | `[]` (deny) | JSON list of dashboard origins allowed cross-origin. |
+| `GATEWAY_METRICS_RECENT_RING` | `500` | Bounded size of the `recent` event ring (≥1). |
+| `GATEWAY_METRICS_FAILURES_RING` | `200` | Bounded size of the `failures` event ring (≥1). |
+| `GATEWAY_METRICS_SLOW_RING` | `200` | Bounded size of the `slow` event ring (≥1). |
+| `GATEWAY_METRICS_SNAPSHOT_INTERVAL_S` | `45` | Snapshot-loop cadence; the worst-case data lost on a hard crash (≥1). |
+| `GATEWAY_METRICS_SLOW_FACTOR` | `3.0` | "Slow" admission multiplier — `duration_ms > max(factor × avg, p95)` per rollup (>0). |
+| `GATEWAY_METRICS_DB_PATH` | `/state/metrics.db` | The metrics snapshot DB (a **separate** SQLite file from `gateway.db` so metrics persistence never contends with the job store). |
+
+### Restart survival
+
+Metrics survive a restart: the store is snapshotted to `/state/metrics.db` on the
+`GATEWAY_METRICS_SNAPSHOT_INTERVAL_S` cadence (plus a final snapshot on graceful
+shutdown) and `rehydrate()`d on startup, so rollups/rings persist across a
+gateway restart. On a *hard* crash, at most one snapshot interval (≤45s by
+default) of pre-crash data is lost — metrics are diagnostic, so this bound is
+accepted (OBS-04).
 
 ## Development
 
