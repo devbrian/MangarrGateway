@@ -35,8 +35,8 @@ def collector(store: InMemoryStore) -> Iterator[Collector]:
     set_collector(None)
 
 
-def _http_scope(path: str) -> MutableMapping[str, Any]:
-    return {"type": "http", "path": path}
+def _http_scope(path: str, method: str = "GET") -> MutableMapping[str, Any]:
+    return {"type": "http", "path": path, "method": method}
 
 
 async def _noop_receive() -> MutableMapping[str, Any]:
@@ -157,6 +157,28 @@ async def test_4xx_response_marks_request_client_error(
 
 
 @pytest.mark.asyncio
+async def test_get_vs_post_downloads_attribute_distinctly(
+    store: InMemoryStore, collector: Collector
+) -> None:
+    """End-to-end through the middleware: a GET poll and a POST submit of
+    /api/v1/downloads carry DISTINCT endpoint labels on their request events."""
+
+    async def downstream(
+        scope: MutableMapping[str, Any], receive: Any, send: Any
+    ) -> None:
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = MetricsRequestMiddleware(downstream)
+    await mw(_http_scope("/api/v1/downloads", "GET"), _noop_receive, _make_send())
+    await mw(_http_scope("/api/v1/downloads", "POST"), _noop_receive, _make_send())
+
+    request_events = [e for e in store.recent_calls(10) if e["kind"] == "request"]
+    endpoints = {e["endpoint"] for e in request_events}
+    assert endpoints == {"GET /downloads", "POST /downloads"}
+
+
+@pytest.mark.asyncio
 async def test_non_http_scope_short_circuits() -> None:
     """A lifespan/websocket scope passes straight through, untouched."""
     called: dict[str, Any] = {}
@@ -194,9 +216,32 @@ async def test_no_collector_is_noop_but_contextvar_still_set() -> None:
 
 
 def test_attribution_map() -> None:
-    assert _attribution("/api/v1/search") == ("search", "POST /search")
-    assert _attribution("/api/v1/recent") == ("search", "GET /recent")
-    assert _attribution("/api/v1/downloads/abc") == ("download", "POST /downloads")
-    assert _attribution("/admin/metrics/v1/summary") == ("admin", "GET /admin/metrics")
-    assert _attribution("/docs") == (None, None)
-    assert _attribution("/openapi.json") == (None, None)
+    assert _attribution("/api/v1/search", "POST") == ("search", "POST /search")
+    assert _attribution("/api/v1/recent", "GET") == ("search", "GET /recent")
+    assert _attribution("/admin/metrics/v1/summary", "GET") == (
+        "admin",
+        "GET /admin/metrics",
+    )
+    assert _attribution("/docs", "GET") == (None, None)
+    assert _attribution("/openapi.json", "GET") == (None, None)
+
+
+def test_downloads_attribution_is_method_aware() -> None:
+    """CodeRabbit: GET /downloads (poll), POST /downloads (submit), per-id GET
+    (status) and per-id DELETE (cancel) get DISTINCT endpoint labels instead of all
+    collapsing to "POST /downloads"."""
+    # Collection path: POST submit vs GET poll are distinct.
+    assert _attribution("/api/v1/downloads", "POST") == ("download", "POST /downloads")
+    assert _attribution("/api/v1/downloads", "GET") == ("download", "GET /downloads")
+    # Per-id path: GET status vs DELETE cancel are distinct.
+    assert _attribution("/api/v1/downloads/abc", "GET") == (
+        "download",
+        "GET /downloads/{id}",
+    )
+    assert _attribution("/api/v1/downloads/abc", "DELETE") == (
+        "download",
+        "DELETE /downloads/{id}",
+    )
+    # An unmapped method on the collection falls back to the default label
+    # (still the download surface, never (None, None)).
+    assert _attribution("/api/v1/downloads", "PUT")[0] == "download"

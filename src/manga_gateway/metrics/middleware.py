@@ -33,26 +33,56 @@ Send = Callable[[MutableMapping[str, Any]], Awaitable[None]]
 # Static path-prefix -> (surface, endpoint-label) map (Open Question 1, RESOLVED).
 # Cosmetic labelling derived from the api/routes/* paths; the gateway's own /api/v1
 # operations. The admin metrics surface gets its own label. Longest-prefix-first.
-_SURFACE_MAP: tuple[tuple[str, tuple[str, str]], ...] = (
-    ("/api/v1/search", ("search", "POST /search")),
-    ("/api/v1/recent", ("search", "GET /recent")),
-    ("/api/v1/caps", ("search", "GET /caps")),
-    ("/api/v1/status", ("search", "GET /status")),
-    ("/api/v1/version", ("search", "GET /version")),
-    ("/api/v1/downloads", ("download", "POST /downloads")),
-    ("/admin/metrics", ("admin", "GET /admin/metrics")),
+#
+# /api/v1/downloads is METHOD-AWARE (CodeRabbit): the SAME path prefix serves the
+# frequent GET poll, the POST submit, the per-id GET status, and the per-id DELETE
+# cancel. Hardcoding it to "POST /downloads" mis-attributed every GET poll +
+# DELETE as POST, contaminating the endpoint rollups. The ``methods`` mapping below
+# resolves (method, path) -> endpoint for those; ``None`` means method-agnostic.
+_SURFACE_MAP: tuple[tuple[str, str, dict[str, str] | None, str], ...] = (
+    # (prefix, surface, per-method endpoints | None, default endpoint)
+    ("/api/v1/search", "search", None, "POST /search"),
+    ("/api/v1/recent", "search", None, "GET /recent"),
+    ("/api/v1/caps", "search", None, "GET /caps"),
+    ("/api/v1/status", "search", None, "GET /status"),
+    ("/api/v1/version", "search", None, "GET /version"),
+    (
+        "/api/v1/downloads",
+        "download",
+        {
+            # Collection: POST submit, GET list (the frequent poll).
+            "POST /api/v1/downloads": "POST /downloads",
+            "GET /api/v1/downloads": "GET /downloads",
+            # Per-id: GET status, DELETE cancel (path is /api/v1/downloads/{id}).
+            "GET /api/v1/downloads/*": "GET /downloads/{id}",
+            "DELETE /api/v1/downloads/*": "DELETE /downloads/{id}",
+        },
+        "POST /downloads",
+    ),
+    ("/admin/metrics", "admin", None, "GET /admin/metrics"),
 )
 
 
-def _attribution(path: str) -> tuple[str | None, str | None]:
-    """Derive ``(surface, endpoint)`` from the request path (longest-prefix wins).
+def _attribution(path: str, method: str = "GET") -> tuple[str | None, str | None]:
+    """Derive ``(surface, endpoint)`` from ``(method, path)`` (longest-prefix wins).
+
+    For most routes the endpoint label is method-agnostic. For ``/api/v1/downloads``
+    the label is resolved per-method so the GET poll, POST submit, per-id GET status,
+    and per-id DELETE cancel get DISTINCT endpoint labels instead of all collapsing
+    to ``POST /downloads`` (CodeRabbit).
 
     Unmatched paths (``/docs``, ``/openapi.json``, an unknown route) attribute to
     ``(None, None)`` — a recordable request with no logical surface label.
     """
-    for prefix, (surface, endpoint) in _SURFACE_MAP:
+    for prefix, surface, methods, default in _SURFACE_MAP:
         if path == prefix or path.startswith(prefix + "/"):
-            return surface, endpoint
+            if methods is None:
+                return surface, default
+            # Method-aware: distinguish the collection path from a per-id path.
+            is_collection = path == prefix
+            suffix = "" if is_collection else "/*"
+            endpoint = methods.get(f"{method} {prefix}{suffix}")
+            return surface, endpoint if endpoint is not None else default
     return None, None
 
 
@@ -75,7 +105,9 @@ class MetricsRequestMiddleware:
             return
 
         request_id = next(_request_ids)
-        surface, endpoint = _attribution(scope.get("path", ""))
+        surface, endpoint = _attribution(
+            scope.get("path", ""), scope.get("method", "GET")
+        )
         token = current_request.set(
             {"request_id": request_id, "surface": surface, "endpoint": endpoint}
         )
