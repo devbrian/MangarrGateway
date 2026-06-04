@@ -307,7 +307,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # store IS the live store — its rings are then re-bounded to the configured
     # sizes by replacing it with a freshly-bounded store seeded from the rehydrate.
     metric_snapshot = await open_metric_store(settings.metrics_db_path)
-    rehydrated = await metric_snapshot.rehydrate()
+    # WR-02: metrics are a purely diagnostic subsystem and must NEVER abort
+    # startup. A corrupt / schema-drifted metrics.db (TypeError from a changed
+    # MetricEvent shape, json.JSONDecodeError on a partial write, etc.) degrades
+    # cleanly to an empty live store instead of taking down the whole gateway.
+    try:
+        rehydrated = await metric_snapshot.rehydrate()
+    except Exception:  # noqa: BLE001 — bad snapshot must not break the service
+        _log.warning(
+            "metrics rehydrate failed; starting with an empty metric store",
+            exc_info=True,
+        )
+        rehydrated = InMemoryStore(
+            recent_max=1, failures_max=1, slow_max=1, slow_factor=1.0
+        )
     metric_store = InMemoryStore(
         recent_max=settings.metrics_recent_ring,
         failures_max=settings.metrics_failures_ring,

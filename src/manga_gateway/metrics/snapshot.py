@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import asdict
 
 import aiosqlite
@@ -50,6 +51,8 @@ from .store import (
     histogram_from_pairs,
     histogram_pairs,
 )
+
+_log = logging.getLogger("manga_gateway")
 
 _CREATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rollups (
@@ -163,7 +166,15 @@ class MetricSnapshotStore:
             "slow": mem.restore_slow,
         }
         for row in ring_rows:
-            restore[row["ring"]](_event_from_json(row["payload"]))
+            # WR-02: salvage a partially-valid snapshot — a single corrupt /
+            # schema-drifted row is skipped rather than aborting the whole
+            # rehydrate (metrics must never break the service).
+            try:
+                ev = _event_from_json(row["payload"])
+            except Exception:  # noqa: BLE001 — drop the bad row, keep the rest
+                _log.warning("skipping corrupt metric snapshot row", exc_info=True)
+                continue
+            restore[row["ring"]](ev)
 
         return mem
 
