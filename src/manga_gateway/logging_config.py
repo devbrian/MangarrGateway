@@ -120,10 +120,51 @@ def configure_logging(settings: Settings) -> None:
     ``disable_existing_loggers=False`` so module loggers created at import time before
     this runs are NOT silenced. Reapplying it REPLACES the ``"manga_gateway"`` handler
     list rather than stacking handlers (``dictConfig`` semantics) — it stays idempotent.
+
+    **Graceful degradation when ``log_dir`` is unwritable.** The ``mkdir`` +
+    ``RotatingFileHandler`` provisioning is wrapped in ``try/except OSError``. On a
+    host where the dir cannot be created (Linux CI: ``/state`` read-only), the file
+    handler is SKIPPED and the gateway runs stdout-only (still JSON-lines, still
+    redacted), emitting a single WARNING recording that file logging was disabled
+    and why. ``configure_logging`` therefore NEVER raises on an unwritable dir —
+    app construction (and the test gate) always succeeds.
     """
+    # Attempt to provision the size-rotating file handler under ``log_dir``. The
+    # default ``/state/logs`` is the docker-volume path and is correct in prod, but
+    # on a host where that dir is not writable (Linux CI: ``/state`` is read-only;
+    # the app is constructed at test-collection time) the ``mkdir`` raises
+    # ``PermissionError`` and previously crashed app construction — and with it the
+    # whole gate (CodeRabbit). Graceful degradation: if the dir cannot be created,
+    # SKIP the file handler and run stdout-only (still JSON-lines, still redacted),
+    # so the gateway always starts. This is NOT a default change — the path stays.
+    handlers: dict[str, dict[str, object]] = {
+        "stdout": {
+            "class": "logging.StreamHandler",
+            "formatter": "json",
+            "filters": ["request_id"],
+            "stream": "ext://sys.stdout",
+        },
+    }
+    handler_names = ["stdout"]
+    file_disabled_reason: str | None = None
     log_dir = Path(settings.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / _LOG_FILENAME
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / _LOG_FILENAME
+        handlers["file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "json",
+            "filters": ["request_id"],
+            "filename": str(log_path),
+            "maxBytes": settings.log_max_bytes,
+            "backupCount": settings.log_backup_count,
+            "encoding": "utf-8",
+        }
+        handler_names.append("file")
+    except OSError as exc:
+        # PermissionError (read-only /state on CI) or any other OSError: keep
+        # stdout-only and record WHY after dictConfig wires up the logger.
+        file_disabled_reason = f"{type(exc).__name__}: {exc}"
 
     config: dict[str, object] = {
         "version": 1,
@@ -134,30 +175,24 @@ def configure_logging(settings: Settings) -> None:
         "filters": {
             "request_id": {"()": f"{__name__}.RequestIdFilter"},
         },
-        "handlers": {
-            "stdout": {
-                "class": "logging.StreamHandler",
-                "formatter": "json",
-                "filters": ["request_id"],
-                "stream": "ext://sys.stdout",
-            },
-            "file": {
-                "class": "logging.handlers.RotatingFileHandler",
-                "formatter": "json",
-                "filters": ["request_id"],
-                "filename": str(log_path),
-                "maxBytes": settings.log_max_bytes,
-                "backupCount": settings.log_backup_count,
-                "encoding": "utf-8",
-            },
-        },
+        "handlers": handlers,
         "loggers": {
             "manga_gateway": {
                 "level": settings.log_level,
-                "handlers": ["stdout", "file"],
+                "handlers": handler_names,
                 "propagate": False,
             },
             **{lib: {"level": "WARNING"} for lib in _QUIET_LIBS},
         },
     }
     logging.config.dictConfig(config)
+
+    if file_disabled_reason is not None:
+        # Emit ONCE through the now-configured logger so the operator sees on
+        # stdout that file logging is off and why (the gateway still runs).
+        logging.getLogger("manga_gateway").warning(
+            "file logging disabled (log_dir=%s not writable): %s; "
+            "continuing with stdout-only JSON logging",
+            settings.log_dir,
+            file_disabled_reason,
+        )

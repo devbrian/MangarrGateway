@@ -193,3 +193,59 @@ def test_creates_missing_log_dir(tmp_path: Path) -> None:
     configure_logging(_settings(nested))
     logging.getLogger("manga_gateway").info("make the dir")
     assert (nested / "gateway.jsonl").exists()
+
+
+def test_unwritable_log_dir_degrades_to_stdout_only(tmp_path: Path) -> None:
+    """CI regression: an unwritable log_dir must NOT raise — the app degrades to
+    stdout-only JSON logging instead of crashing app construction at import time.
+
+    Reproduces the Linux-CI scenario (``/state`` read-only → ``mkdir`` raises
+    ``PermissionError``) cross-platform by pointing ``log_dir`` at an existing FILE,
+    so ``mkdir(parents=True)`` raises an ``OSError`` (``FileExistsError`` /
+    ``NotADirectoryError``) on every platform including the Windows dev host.
+    """
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("i am a file, not a directory", encoding="utf-8")
+
+    # Must NOT raise (the bug was a PermissionError crashing the gate).
+    configure_logging(_settings(blocker))
+
+    handlers = logging.getLogger("manga_gateway").handlers
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in handlers
+    )
+    has_file = any(
+        isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
+    )
+    assert has_stream, "stdout JSON handler stays attached when the dir is unwritable"
+    assert not has_file, "no file handler is attached when the dir cannot be created"
+    # The stdout handler still emits redacted JSON lines.
+    logging.getLogger("manga_gateway").info("still logging after degrade")
+
+
+def test_permission_error_on_mkdir_degrades_gracefully(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directly reproduce the CI ``PermissionError`` from ``mkdir`` (the exact crash):
+    monkeypatch ``Path.mkdir`` to raise it, then assert ``configure_logging`` does NOT
+    propagate and still attaches the stdout JSON handler.
+    """
+
+    def _raise_permission(self: Path, *args: object, **kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", _raise_permission)
+
+    configure_logging(_settings(tmp_path / "state" / "logs"))
+
+    handlers = logging.getLogger("manga_gateway").handlers
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in handlers
+    )
+    has_file = any(
+        isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
+    )
+    assert has_stream, "stdout JSON handler stays attached on PermissionError"
+    assert not has_file, "no file handler is attached on PermissionError"
