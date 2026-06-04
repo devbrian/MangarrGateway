@@ -81,6 +81,13 @@ disallow_untyped_decorators = false
 module = ["lxml.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# hdrhistogram (0.10.3) ships no type stubs / py.typed marker; the metrics store +
+# snapshot (metrics/store.py, metrics/snapshot.py) are the only consumers (OBS-08
+# p95 sketch). Treat the import as untyped rather than pulling a stubs package in.
+module = ["hdrh.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
