@@ -12,15 +12,25 @@ or the framework wired up.
 
 from __future__ import annotations
 
+from .collector import Collector, get_collector, set_collector
 from .context import current_request, current_source, source_scope
 from .event import MetricEvent
 from .redact import redact_text, redact_url
+from .snapshot import MetricSnapshotStore, open_metric_store
+from .store import InMemoryStore, Rollup
 
 __all__ = [
+    "Collector",
+    "InMemoryStore",
     "MetricEvent",
+    "MetricSnapshotStore",
+    "Rollup",
     "current_request",
     "current_source",
+    "get_collector",
+    "open_metric_store",
     "redact_text",
     "redact_url",
+    "set_collector",
     "source_scope",
 ]
