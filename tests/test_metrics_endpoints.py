@@ -78,18 +78,23 @@ async def _seed_request(app: FastAPI) -> int:
         # the breakdown a child call alongside the request event.
         collector = get_collector()
         assert collector is not None
-        current_request.set(
+        token = current_request.set(
             {"request_id": request_id, "surface": "search", "endpoint": "GET /version"}
         )
-        collector.emit_http(
-            op="get_json",
-            method="GET",
-            url="https://comix.example/x?cf_clearance=SECRET&apikey=NOPE",
-            status=200,
-            outcome="ok",
-            duration_ms=10.0,
-            attempt=1,
-        )
+        try:
+            collector.emit_http(
+                op="get_json",
+                method="GET",
+                url="https://comix.example/x?cf_clearance=SECRET&apikey=NOPE",
+                status=200,
+                outcome="ok",
+                duration_ms=10.0,
+                attempt=1,
+            )
+        finally:
+            # Reset so this synthetic request attribution doesn't leak into later
+            # assertions / tests (CodeRabbit).
+            current_request.reset(token)
         return request_id
 
 
