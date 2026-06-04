@@ -177,6 +177,41 @@ class Settings(BaseSettings):
     cloudflare_proxy_password: SecretStr | None = None
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
+    # ── Observability & metrics (Phase 8) ─────────────────────────────────────
+    # Env-overridable ops knobs (D-11), same treatment as host/port/output_root
+    # (NOT the api_key exclusion). They ride the existing load_settings
+    # TOML->kwargs merge automatically — env > TOML > default. Bounds keep a
+    # zero/negative override from reaching a deque/timer (T-08-02): every ring /
+    # interval / backup-count is Field(ge=1); metrics_slow_factor is Field(gt=0).
+    log_level: str = "INFO"  # §Q3: root log level for the dictConfig
+    log_dir: str = "/state/logs"  # §Q3: RotatingFileHandler dir (mkdir at setup)
+    log_max_bytes: int = Field(
+        default=10_000_000, ge=1
+    )  # §Q3: RotatingFileHandler maxBytes (≥1 byte)
+    log_backup_count: int = Field(
+        default=5, ge=1
+    )  # §Q3: RotatingFileHandler backupCount (≥1 rotation kept)
+    # §Q2: default-deny — empty list means the CORS middleware is not even added
+    # (T-08-03). pydantic-settings parses a JSON-list env value, e.g.
+    # GATEWAY_METRICS_CORS_ORIGINS='["http://localhost:5173"]'.
+    metrics_cors_origins: list[str] = Field(default_factory=list)
+    metrics_recent_ring: int = Field(
+        default=500, ge=1
+    )  # §Q4: bounded `recent` deque size
+    metrics_failures_ring: int = Field(
+        default=200, ge=1
+    )  # §Q4: bounded `failures` deque size
+    metrics_slow_ring: int = Field(default=200, ge=1)  # §Q4: bounded `slow` deque size
+    metrics_snapshot_interval_s: int = Field(
+        default=45, ge=1
+    )  # §Q4: snapshot-loop cadence (≤45s loss-on-crash bound)
+    # §Q4: "slow" admission factor — duration_ms > max(slow_factor*avg, p95) per
+    # rollup. A float multiplier, bounded gt=0 (a non-positive factor would admit
+    # everything / nothing); NEVER a global ms constant.
+    metrics_slow_factor: float = Field(default=3.0, gt=0)
+    # Runtime State Inventory: SEPARATE DB file from gateway.db for the snapshot
+    # store (08-02), so the metrics persistence never contends with the job store.
+    metrics_db_path: str = "/state/metrics.db"
 
     @model_validator(mode="after")
     def _reject_camoufox_parallel(self) -> Settings:
