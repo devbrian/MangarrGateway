@@ -26,12 +26,39 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from typing import TYPE_CHECKING, Any, Protocol
+
+from ..metrics.collector import get_collector
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from .antibot import Clearance
+
+
+def _emit_solve(
+    key: str,
+    *,
+    outcome: str,
+    duration_ms: float,
+    attempt: int,
+    error: str | None,
+) -> None:
+    """No-op-safe, failure-isolated ``emit_solve`` (T-08-15)."""
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        collector.emit_solve(
+            source_key=key,
+            outcome=outcome,
+            duration_ms=duration_ms,
+            attempt=attempt,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001 — a metric failure must never break a solve
+        pass
 
 
 class _LaunchFn(Protocol):
@@ -167,7 +194,9 @@ class BrowserLifecycle:
                 return await inflight
 
         if force:
-            clearance = await self._run_solve(key)
+            # attempt=2: a forced solve IS the D-35 re-solve → captures re-solve
+            # frequency in the solve metric (RESEARCH DRIFT note).
+            clearance = await self._run_solve(key, attempt=2)
             self._held[key] = clearance  # D-35 re-solve replaces the cached value
             return clearance
 
@@ -190,11 +219,37 @@ class BrowserLifecycle:
         finally:
             self._inflight.pop(key, None)
 
-    async def _run_solve(self, key: str) -> Clearance:
-        """Acquire the solve-cap semaphore, ensure a context, and solve ``key``."""
+    async def _run_solve(self, key: str, *, attempt: int = 1) -> Clearance:
+        """Acquire the solve-cap semaphore, ensure a context, and solve ``key``.
+
+        Metrics seam (OBS-01, RESEARCH DRIFT): the solve choke point emits an
+        additive ``solve`` event here (NOT the public ``get_clearance`` Protocol in
+        ``antibot.py``). ``attempt=2`` marks a forced D-35 re-solve. The emit is
+        strictly additive + failure-isolated — a ``None`` collector is a no-op and a
+        collector-side error never breaks the solve.
+        """
+        start = time.perf_counter()
         async with self._sem:
             ctx = await self._ensure_context()
-            return await self._solve(ctx, key)
+            try:
+                clearance = await self._solve(ctx, key)
+            except Exception as exc:
+                _emit_solve(
+                    key,
+                    outcome="error",
+                    duration_ms=(time.perf_counter() - start) * 1000.0,
+                    attempt=attempt,
+                    error=repr(exc),
+                )
+                raise
+            _emit_solve(
+                key,
+                outcome="ok",
+                duration_ms=(time.perf_counter() - start) * 1000.0,
+                attempt=attempt,
+                error=None,
+            )
+            return clearance
 
     # ─────────────────────────── recycle watchdog ───────────────────────────
 

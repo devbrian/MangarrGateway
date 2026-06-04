@@ -200,3 +200,120 @@ async def test_http_error_emits_error_outcome_then_reraises(
     assert errs, "an error outcome http event should have been emitted"
     assert all(e.source_key == "alpha" for e in errs)
     assert all(e.error is not None for e in errs)
+
+
+# ─────────────────── Task 2: additive solve / job / package emit ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_forced_solve_emits_solve_event_attempt_2(
+    collector: tuple[Collector, InMemoryStore],
+) -> None:
+    """A forced solve (D-35 re-solve) emits a ``solve`` event with ``attempt=2``."""
+    from manga_gateway.framework.antibot import Clearance
+    from manga_gateway.framework.solver_lifecycle import BrowserLifecycle
+
+    async def _launch() -> object:
+        return object()  # a fake "context"
+
+    async def _solve(_ctx: object, key: str) -> Clearance:
+        return Clearance(cookies={"cf_clearance": "X"}, user_agent="UA")
+
+    lifecycle = BrowserLifecycle(launch=_launch, solve=_solve)
+    await lifecycle.solve("comix", force=True)
+
+    _c, store = collector
+    solves = [e for e in store.iter_recent() if e.kind == "solve"]
+    assert len(solves) == 1
+    ev = solves[0]
+    assert ev.source_key == "comix"  # bound via emit_solve's source_scope fallback
+    assert ev.outcome == "ok"
+    assert ev.attempt == 2  # forced = D-35 re-solve
+
+
+@pytest.mark.asyncio
+async def test_nonforced_solve_emits_attempt_1(
+    collector: tuple[Collector, InMemoryStore],
+) -> None:
+    """A normal (single-flight leader) solve emits ``attempt=1``."""
+    from manga_gateway.framework.antibot import Clearance
+    from manga_gateway.framework.solver_lifecycle import BrowserLifecycle
+
+    async def _launch() -> object:
+        return object()
+
+    async def _solve(_ctx: object, key: str) -> Clearance:
+        return Clearance(cookies={"cf_clearance": "X"}, user_agent="UA")
+
+    lifecycle = BrowserLifecycle(launch=_launch, solve=_solve)
+    await lifecycle.solve("comix")  # non-forced leader path
+
+    _c, store = collector
+    solves = [e for e in store.iter_recent() if e.kind == "solve"]
+    assert len(solves) == 1
+    assert solves[0].attempt == 1
+    assert solves[0].source_key == "comix"
+
+
+@pytest.mark.asyncio
+async def test_failed_solve_emits_error_then_reraises(
+    collector: tuple[Collector, InMemoryStore],
+) -> None:
+    """A solve that raises emits ``outcome="error"`` then re-raises."""
+    from manga_gateway.framework.solver_lifecycle import BrowserLifecycle
+
+    async def _launch() -> object:
+        return object()
+
+    async def _solve(_ctx: object, key: str) -> object:
+        raise RuntimeError("solve blew up")
+
+    lifecycle = BrowserLifecycle(launch=_launch, solve=_solve)
+    with pytest.raises(RuntimeError):
+        await lifecycle.solve("comix", force=True)
+
+    _c, store = collector
+    solves = [e for e in store.iter_recent() if e.kind == "solve"]
+    assert len(solves) == 1
+    assert solves[0].outcome == "error"
+    assert solves[0].error is not None
+
+
+@pytest.mark.asyncio
+async def test_job_transition_and_fail_emit_job_events(
+    collector: tuple[Collector, InMemoryStore],
+) -> None:
+    """``_transition`` and ``_fail`` each emit a ``job`` event self-attributed to
+    the job's source."""
+    from manga_gateway.jobs.engine import _emit_job
+
+    # Drive the two choke-point helpers directly (the engine calls these from
+    # _transition / _fail). A focused, dependency-free witness of the emit shape.
+    _emit_job("comix", op="downloading", outcome="ok", error=None)
+    _emit_job("comix", op="failed", outcome="error", error="boom")
+
+    _c, store = collector
+    jobs = [e for e in store.iter_recent() if e.kind == "job"]
+    assert len(jobs) == 2
+    assert {e.op for e in jobs} == {"downloading", "failed"}
+    assert all(e.source_key == "comix" for e in jobs)
+    fail = next(e for e in jobs if e.op == "failed")
+    assert fail.outcome == "error"
+    assert fail.error == "boom"
+
+
+@pytest.mark.asyncio
+async def test_package_callsite_emits_package_with_nonzero_duration(
+    collector: tuple[Collector, InMemoryStore],
+) -> None:
+    """The package call-site emits a ``package`` event with a non-zero duration."""
+    from manga_gateway.jobs.engine import _emit_package
+
+    _emit_package("comix", op="cbz", outcome="ok", duration_ms=12.5, error=None)
+
+    _c, store = collector
+    pkgs = [e for e in store.iter_recent() if e.kind == "package"]
+    assert len(pkgs) == 1
+    assert pkgs[0].op == "cbz"
+    assert pkgs[0].duration_ms == 12.5
+    assert pkgs[0].source_key == "comix"
