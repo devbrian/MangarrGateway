@@ -106,7 +106,6 @@ class MetricsRequestMiddleware:
                 else:
                     outcome = "ok"
                 collector.emit_request(
-                    endpoint=endpoint,
                     status=status_code or None,
                     outcome=outcome,
                     duration_ms=duration_ms,

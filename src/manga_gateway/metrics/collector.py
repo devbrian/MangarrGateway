@@ -201,12 +201,15 @@ class Collector:
     def emit_request(
         self,
         *,
-        endpoint: str | None = None,
         status: int | None = None,
         outcome: str,
         duration_ms: float,
         error: str | None = None,
     ) -> None:
+        # NOTE: endpoint/surface/request_id are read from current_request by
+        # _ingest (the middleware set them for the whole request scope), so this
+        # helper takes NO endpoint arg — a passed value would have been silently
+        # dropped (WR-03).
         self._ingest(
             kind="request",
             op=None,
