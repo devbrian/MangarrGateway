@@ -120,18 +120,19 @@ def fake_solver() -> _FakeSolver:
 def app(tmp_path: Path) -> FastAPI:
     """A fresh app built with the fixed test key (D-03).
 
-    All on-disk paths point at a per-test tmp dir so tests never touch the
-    ``/state`` (metrics snapshot DB, logs) or ``/data`` (output) volumes —
-    those defaults are absent/unwritable outside the docker container (e.g. CI),
-    and the metrics snapshot DB open would otherwise fail there.
+    The two ``/state``-volume paths are redirected to a per-test tmp dir so tests
+    never touch ``/state`` — that default is absent/unwritable outside the docker
+    container (e.g. CI), where the metrics snapshot DB open would otherwise fail.
+    ``output_root`` (``/data/manga``) and ``db_path`` are LEFT at their defaults:
+    they don't break outside docker (the staging sweep tolerates a missing dir;
+    ``db_path`` is a relative, writable path), and ``/status`` reports
+    ``output_root`` verbatim — overriding it would break the STAT-01 contract test.
     """
     return create_app(
         Settings(
             api_key=TEST_API_KEY,
             metrics_db_path=str(tmp_path / "metrics.db"),
             log_dir=str(tmp_path / "logs"),
-            output_root=str(tmp_path / "out"),
-            db_path=str(tmp_path / "jobs.db"),
         )
     )
 
