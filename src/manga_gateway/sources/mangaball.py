@@ -476,6 +476,13 @@ class MangaBallSource(Source):
     # (#101). The CSRF-bootstrap ``search`` path (~3-5.5s/call) was latency/proxy-bound,
     # NOT a site throttle, so ``480`` here is gated by latency, not a rate ceiling.
     rate_limit_per_minute = 480
+    # Per-source download-job concurrency (D-30 override): the 2026-06-04 probe
+    # found manifest + image sustaining 960/min cleanly at concurrency 8 with zero
+    # throttling, so chapter downloads (manifest/image paths) parallelize safely.
+    # 3 mirrors the mangadot precedent (#101); the job manager clamps it to the
+    # global max_concurrent_chapters. (The CSRF-bootstrap search path stays
+    # sequential — this override governs downloads, not search.)
+    max_concurrent_jobs = 3
     # Passive Cloudflare only on a residential IP (D-07/D-12) — see module
     # docstring's anti-bot caveat. No decrypt (plain .jpg, D-06).
     antibot = "none"
