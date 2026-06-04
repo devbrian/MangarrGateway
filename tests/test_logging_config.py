@@ -31,7 +31,11 @@ from pathlib import Path
 import pytest
 
 from manga_gateway.config import Settings
-from manga_gateway.logging_config import _QUIET_LIBS, configure_logging
+from manga_gateway.logging_config import (
+    _LOG_FILENAME,
+    _QUIET_LIBS,
+    configure_logging,
+)
 from manga_gateway.metrics.context import current_request
 
 TEST_API_KEY = "test-key-deadbeef"
@@ -249,3 +253,31 @@ def test_permission_error_on_mkdir_degrades_gracefully(
     )
     assert has_stream, "stdout JSON handler stays attached on PermissionError"
     assert not has_file, "no file handler is attached on PermissionError"
+
+
+def test_file_open_failure_at_dictconfig_degrades_to_stdout_only(
+    tmp_path: Path,
+) -> None:
+    """``mkdir`` can succeed yet the ``RotatingFileHandler`` still fail to OPEN the
+    file at ``dictConfig`` time (read-only mount, or the path is a directory).
+    ``configure_logging`` must catch that path too and degrade to stdout-only
+    instead of aborting startup (CodeRabbit). Reproduced cross-platform by making
+    the log-FILE path a directory, so ``log_dir.mkdir(exist_ok=True)`` succeeds but
+    opening ``<log_dir>/gateway.jsonl`` raises.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / _LOG_FILENAME).mkdir()  # the log-file path is now a directory
+
+    configure_logging(_settings(log_dir))  # must NOT raise
+
+    handlers = logging.getLogger("manga_gateway").handlers
+    has_stream = any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in handlers
+    )
+    has_file = any(
+        isinstance(h, logging.handlers.RotatingFileHandler) for h in handlers
+    )
+    assert has_stream, "stdout JSON handler stays attached when the file open fails"
+    assert not has_file, "no file handler is attached when the file open fails"

@@ -185,13 +185,27 @@ def configure_logging(settings: Settings) -> None:
             **{lib: {"level": "WARNING"} for lib in _QUIET_LIBS},
         },
     }
-    logging.config.dictConfig(config)
+    try:
+        logging.config.dictConfig(config)
+    except Exception as exc:  # noqa: BLE001 — handler instantiation must not abort startup
+        # mkdir succeeding does NOT guarantee the file handler can be built:
+        # dictConfig is what actually instantiates the RotatingFileHandler (opens
+        # the file), which can still fail when the dir exists but the file open is
+        # denied (read-only mount, the path is a directory, etc.). Catch it here too
+        # and fall back to a stdout-only config so app construction never aborts
+        # (CodeRabbit). Mutating handlers/handler_names also updates ``config`` (same
+        # objects), so the retry uses the stdout-only handler set.
+        handlers.pop("file", None)
+        if "file" in handler_names:
+            handler_names.remove("file")
+        file_disabled_reason = f"{type(exc).__name__}: {exc}"
+        logging.config.dictConfig(config)  # stdout-only — no file handler to fail on
 
     if file_disabled_reason is not None:
         # Emit ONCE through the now-configured logger so the operator sees on
         # stdout that file logging is off and why (the gateway still runs).
         logging.getLogger("manga_gateway").warning(
-            "file logging disabled (log_dir=%s not writable): %s; "
+            "file logging disabled (log_dir=%s): %s; "
             "continuing with stdout-only JSON logging",
             settings.log_dir,
             file_disabled_reason,
