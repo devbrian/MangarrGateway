@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import tomli_w
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _log = logging.getLogger("manga_gateway")
@@ -212,6 +212,33 @@ class Settings(BaseSettings):
     # Runtime State Inventory: SEPARATE DB file from gateway.db for the snapshot
     # store (08-02), so the metrics persistence never contends with the job store.
     metrics_db_path: str = "/state/metrics.db"
+
+    @field_validator("metrics_cors_origins")
+    @classmethod
+    def _reject_wildcard_cors(cls, origins: list[str]) -> list[str]:
+        """Enforce the default-deny / explicit-allowlist / never-``*`` CORS rule.
+
+        §Q2 is default-deny (empty list = no CORS middleware). When an operator DOES
+        configure origins they must be an explicit allowlist — a wildcard ``"*"`` (or
+        a blank/whitespace-only entry that some configs use as a stand-in) would
+        re-open the surface to any origin, defeating the allowlist. Reject those at
+        construction so the misconfiguration fails fast at startup instead of silently
+        widening CORS (CodeRabbit). The empty-list default still passes untouched.
+        """
+        for origin in origins:
+            if origin.strip() == "*":
+                raise ValueError(
+                    'metrics_cors_origins must be an explicit allowlist, never "*" '
+                    "(default-deny / never-wildcard CORS). Remove the wildcard and "
+                    "list each allowed origin, e.g. "
+                    '["http://localhost:5173"].'
+                )
+            if not origin.strip():
+                raise ValueError(
+                    "metrics_cors_origins entries must be non-empty origins; "
+                    "remove blank/whitespace-only entries."
+                )
+        return origins
 
     @model_validator(mode="after")
     def _reject_camoufox_parallel(self) -> Settings:

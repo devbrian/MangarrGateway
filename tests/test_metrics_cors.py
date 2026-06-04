@@ -14,6 +14,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 from manga_gateway.app import create_app
 from manga_gateway.config import Settings
@@ -30,6 +31,24 @@ async def _client_for(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=transport, base_url=_ADMIN) as ac:
             yield ac
+
+
+def test_wildcard_origin_rejected_at_construction() -> None:
+    """never-``*`` CORS: a wildcard origin fails fast at Settings construction."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=TEST_API_KEY, metrics_cors_origins=["*"])
+
+
+def test_blank_origin_rejected_at_construction() -> None:
+    """A blank / whitespace-only origin is rejected (no stand-in wildcards)."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=TEST_API_KEY, metrics_cors_origins=["   "])
+
+
+def test_explicit_allowlist_accepted() -> None:
+    """A concrete origin list still constructs fine (the default-deny path)."""
+    settings = Settings(api_key=TEST_API_KEY, metrics_cors_origins=[_ALLOWED_ORIGIN])
+    assert settings.metrics_cors_origins == [_ALLOWED_ORIGIN]
 
 
 @pytest.mark.asyncio
