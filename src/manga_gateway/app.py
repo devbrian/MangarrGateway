@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from cachetools import TTLCache
 from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .api import api_router
 from .config import Settings
@@ -36,6 +37,12 @@ from .framework.transport import HttpxTransport
 from .handles.store import HandleStore
 from .jobs.manager import JobManager
 from .jobs.store import open_store
+from .logging_config import configure_logging
+from .metrics.collector import Collector, set_collector
+from .metrics.middleware import MetricsRequestMiddleware
+from .metrics.routes import router as metrics_router
+from .metrics.snapshot import open_metric_store
+from .metrics.store import InMemoryStore
 from .security import require_api_key
 from .sources import register_builtin_sources
 
@@ -293,6 +300,46 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _log.info("Swept %d orphan staging artifact(s) on startup", swept)
     app.state.job_manager = job_manager
 
+    # Metrics system (OBS-04/05/06): open the SEPARATE snapshot DB, rehydrate the
+    # last snapshot into the LIVE store (so a restart keeps the recent rings +
+    # rollups), build the Collector over it and install it process-wide so every
+    # framework seam (Plan 04) + the request middleware flip live. The rehydrated
+    # store IS the live store — its rings are then re-bounded to the configured
+    # sizes by replacing it with a freshly-bounded store seeded from the rehydrate.
+    metric_snapshot = await open_metric_store(settings.metrics_db_path)
+    rehydrated = await metric_snapshot.rehydrate()
+    metric_store = InMemoryStore(
+        recent_max=settings.metrics_recent_ring,
+        failures_max=settings.metrics_failures_ring,
+        slow_max=settings.metrics_slow_ring,
+        slow_factor=settings.metrics_slow_factor,
+    )
+    # Re-admit the rehydrated events/rollups verbatim into the configured-size store
+    # (restore_* bypasses slow/failure re-classification — they were already
+    # classified before the snapshot). Rollups restore as-is.
+    for rk, rollup in rehydrated.iter_rollups():
+        metric_store.restore_rollup(rk, rollup)
+    for ev in rehydrated.iter_recent():
+        metric_store.restore_recent(ev)
+    for ev in rehydrated.iter_failures():
+        metric_store.restore_failure(ev)
+    for ev in rehydrated.iter_slow():
+        metric_store.restore_slow(ev)
+    collector = Collector(store=metric_store)
+    set_collector(collector)  # flips the Plan-04 seam + the request middleware live
+    app.state.metric_store = metric_store
+    app.state.collector = collector
+
+    async def _snapshot_loop() -> None:
+        # Periodic full-store snapshot (one transaction, ~5ms — never per-event).
+        # Worst-case loss on a hard crash is one interval (≤45s default), accepted.
+        while True:
+            await asyncio.sleep(settings.metrics_snapshot_interval_s)
+            with suppress(Exception):
+                await metric_snapshot.snapshot(metric_store)
+
+    snapshot_task = asyncio.create_task(_snapshot_loop())  # strong ref (Pitfall 4)
+
     # D-37 recovery supervisor: once a cloudflare-gated breaker trips, re-probe
     # on the escalating +1h/+6h schedule (off the request path), then stay down
     # until a manual restart. Strong-ref'd (manager.py:247-251 idiom) so each
@@ -325,9 +372,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Cancel the warm + watchdog bg tasks and close the solver BEFORE the
-        # transport, so no orphan Chromium survives shutdown (Pitfall 4).
-        bg_tasks = [warm_task, *watchdog_tasks]
+        # Cancel the warm + watchdog + snapshot bg tasks and close the solver BEFORE
+        # the transport, so no orphan Chromium survives shutdown (Pitfall 4).
+        bg_tasks = [warm_task, *watchdog_tasks, snapshot_task]
         for bg in bg_tasks:
             bg.cancel()
         with suppress(Exception):
@@ -351,6 +398,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await job_manager.cancel_all()
         await store.close()  # release the job-store connection
         await transport.aclose()  # release the one shared client
+        # Metrics teardown LAST (independent of solver/job/transport): a FINAL
+        # snapshot so nothing in-memory since the last timer tick is lost
+        # (Pitfall 4), then close the snapshot connection. set_collector(None) so a
+        # straggler emit during teardown is a no-op and tests don't leak a collector.
+        set_collector(None)
+        with suppress(Exception):
+            await metric_snapshot.snapshot(metric_store)
+        await metric_snapshot.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -365,6 +420,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         settings = load_settings()
 
+    # Structured JSON-lines logging FIRST (OBS-09, §Q3) so even startup/lifespan logs
+    # are structured + redacted and carry request_id once a request scope exists.
+    configure_logging(settings)
+
     app = FastAPI(
         title="Mangarr Manga-Gateway API",
         lifespan=lifespan,
@@ -372,6 +431,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         root_path=settings.url_base or "",  # PLAT-01 UrlBase
     )
     app.state.settings = settings
+
+    # Middleware ordering (§Q5): add the pure-ASGI metrics middleware FIRST so it ends
+    # up INNER (closest to routing — the request_id contextvar is set just before the
+    # route + fan-out children run), then CORS LAST so it ends up OUTERMOST (stamps
+    # CORS headers even on error responses). CORS is default-deny: added ONLY when an
+    # origin allowlist is configured (empty list → no middleware → no CORS header,
+    # identical to today's behavior). allow_credentials=False (auth is the X-Api-Key
+    # header, not cookies); read-only methods; the custom header triggers preflight.
+    app.add_middleware(MetricsRequestMiddleware)
+    if settings.metrics_cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.metrics_cors_origins,  # exact origins, NEVER ["*"]
+            allow_credentials=False,
+            allow_methods=["GET", "OPTIONS"],
+            allow_headers=["X-Api-Key", "Content-Type"],
+            max_age=600,
+        )
+
     app.include_router(api_router)
+    # Admin metrics router as a SIBLING of /api/v1 (NOT nested) — its own versioned
+    # prefix, still under the global API-key dep + UrlBase root_path (OBS-05/06/07).
+    app.include_router(metrics_router, prefix="/admin/metrics/v1")
     register_error_handlers(app)
     return app
