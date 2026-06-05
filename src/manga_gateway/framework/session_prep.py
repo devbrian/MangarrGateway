@@ -37,6 +37,7 @@ R1: the bootstrap GET rides the ONE shared transport drawn from the
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -158,6 +159,22 @@ class CsrfBootstrap:
         self._ratelimiter = ratelimiter
         self._rates = dict(rates)
         self._cache: dict[str, SessionCredentials] = {}
+        # Per-source-key single-flight registry (#260604-rnm). Each key gets ONE
+        # asyncio.Lock, created lazily on first use (see ``_lock_for``) so locks bind
+        # to the running loop, never at __init__/import time. Keyed PER source so
+        # unrelated sources are NEVER serialized — only concurrent acquire/refresh for
+        # the SAME key collapse to a single ``_acquire``.
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, source_key: str) -> asyncio.Lock:
+        """Return the per-source single-flight lock, creating it on first use.
+
+        ``setdefault`` on a plain dict is synchronous and atomic within one
+        event-loop step (no ``await`` between check-and-set), so two coroutines
+        racing to ``_lock_for`` the SAME key both receive the SAME ``asyncio.Lock``
+        instance — correct for single-flight. Kept synchronous (no await inside).
+        """
+        return self._locks.setdefault(source_key, asyncio.Lock())
 
     async def prepare(
         self, source_key: str, *, force_refresh: bool = False
@@ -166,14 +183,42 @@ class CsrfBootstrap:
 
         ``None`` for an unconfigured key (MangaDex/Comix). ``force_refresh`` skips
         the cache and re-GETs the bootstrap HTML page (D-03/D-05).
+
+        Single-flight (T-RNM-01): under the parallel candidate fan-out, a mid-batch
+        CSRF-403 could otherwise fire N redundant bootstrap GETs for one source. A
+        per-source-key ``asyncio.Lock`` + double-checked cache collapses that herd to
+        ONE ``_acquire``: the warm-cache common path stays lock-free (fast check), and
+        a waiter that blocked on the lock during a peer's mint re-checks the cache
+        under the lock and REUSES the freshly-minted creds instead of re-minting.
+        Unrelated source keys take different locks, so they are never serialized.
         """
+        # Unconfigured key (MangaDex/Comix): take NO lock and do NO work — must keep
+        # ``html_gets == 0`` for a session_prep=None source.
         if source_key not in self._keys:
             return None
+        # FAST check, OUTSIDE the lock — the warm-cache common path (the title-search
+        # POST warms the cache, so every parallel candidate hits this branch and never
+        # contends). A force_refresh call deliberately bypasses this.
         if not force_refresh and source_key in self._cache:
             return self._cache[source_key]
-        creds = await self._acquire(source_key)
-        self._cache[source_key] = creds
-        return creds
+        # On a forced refresh, capture the stale creds reference BEFORE blocking on the
+        # lock. If a peer re-minted while we waited, the cache now holds a DIFFERENT
+        # object than ``stale`` → reuse it instead of re-GETting (collapse N forced
+        # CSRF-403 refreshes for one source to a single re-GET). Only re-GET when the
+        # cache is unchanged from the stale reference we saw.
+        stale = self._cache.get(source_key) if force_refresh else None
+        async with self._lock_for(source_key):
+            # SECOND (re-)check INSIDE the lock — the single-flight core.
+            if not force_refresh and source_key in self._cache:
+                return self._cache[source_key]
+            if force_refresh:
+                current = self._cache.get(source_key)
+                if current is not None and current is not stale:
+                    # A peer already re-minted while we waited — reuse the fresh creds.
+                    return current
+            creds = await self._acquire(source_key)
+            self._cache[source_key] = creds
+            return creds
 
     async def _acquire(self, source_key: str) -> SessionCredentials:
         """GET the bootstrap HTML page → parse the token + harvest the cookie.

@@ -18,6 +18,7 @@ returns queued responses; respx mocks the bootstrap HTML GET.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from urllib.parse import parse_qs
@@ -245,6 +246,59 @@ async def test_csrf_bootstrap_get_is_gated_by_the_source_limiter() -> None:
     await prep.prepare("mangaball", force_refresh=True)
     assert transport.html_gets == 2
     assert spy.entered == 2
+
+
+class _SlowGetTransport(_RecordingTransport):
+    """``_RecordingTransport`` whose bootstrap GET blocks until released.
+
+    Lets a test pile K coroutines onto the per-source single-flight lock BEFORE the
+    first ``_acquire``'s GET resolves, so the lock — not GET timing — is what
+    serializes them. ``gate`` is set once the first GET is in flight; the test then
+    releases ``release`` and awaits all K callers.
+    """
+
+    def __init__(self, *, html_token: str, session_cookie: str = "sess-1") -> None:
+        super().__init__(html_token=html_token, session_cookie=session_cookie)
+        self.gate = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        if method == "GET" and self._html_token is not None:
+            self.gate.set()  # signal: a GET is in flight
+            await self.release.wait()  # hold until the herd has formed
+        return await super().request(method, url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_csrf_bootstrap_concurrent_acquire_collapses_to_single_get() -> None:
+    """The single-flight lock collapses a concurrent cold-acquire herd to ONE GET.
+
+    Under the parallel candidate fan-out, K coroutines can hit a cold cache at once
+    (or a CSRF-403 force_refresh storm). Without the per-source lock each would fire
+    its own bootstrap GET. With the double-checked lock, the first coroutine mints
+    under the lock and the rest re-check the cache inside the lock and REUSE the
+    freshly-minted creds. Asserts ``html_gets == 1`` and all K callers get the SAME
+    creds object — the behavior the lock exists to guarantee (T-RNM-01)."""
+    transport = _SlowGetTransport(html_token=_TOKEN, session_cookie="abc123")
+    prep = CsrfBootstrap(
+        keys={"mangaball"},
+        session=SessionManager(transport),  # type: ignore[arg-type]
+        bootstrap_urls={"mangaball": _HTML_URL},
+        ratelimiter=RateLimiter(),
+        rates={"mangaball": 6000},
+    )
+
+    k = 5
+    callers = [asyncio.create_task(prep.prepare("mangaball")) for _ in range(k)]
+    # Wait until a GET is in flight, then let the rest of the herd form on the lock.
+    await transport.gate.wait()
+    await asyncio.sleep(0)  # let the other K-1 coroutines reach the lock
+    transport.release.set()
+
+    results = await asyncio.gather(*callers)
+    assert transport.html_gets == 1  # the herd collapsed to a single bootstrap GET
+    assert all(r is results[0] for r in results)  # one shared creds object
+    assert isinstance(results[0], SessionCredentials)
 
 
 def test_session_prep_protocol_is_runtime_checkable() -> None:
