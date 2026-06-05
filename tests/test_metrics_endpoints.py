@@ -268,6 +268,57 @@ async def test_read_endpoints_echo_enriched_fields(metrics_app: FastAPI) -> None
 
 
 @pytest.mark.asyncio
+async def test_response_model_preserves_served_keys(metrics_app: FastAPI) -> None:
+    """No byte regression after attaching response_model to the read endpoints.
+
+    Every served event dict's keyset must be a SUPERSET-or-equal of the 18
+    MetricEvent field names — i.e. the response_model dropped no key (extra="allow"
+    keeps undeclared keys; the declared 18 are always present). Proven through the
+    LIVE app against /recent, /failures, /slow, and the /requests/{id} breakdown
+    calls[]. If response_model had dropped/renamed a key, this (and the existing
+    verbatim-echo assertions in test_read_endpoints_echo_enriched_fields) break.
+    """
+    import dataclasses
+
+    from manga_gateway.metrics.event import MetricEvent
+
+    event_fields = {f.name for f in dataclasses.fields(MetricEvent)}
+
+    transport = httpx.ASGITransport(app=metrics_app)
+    async with metrics_app.router.lifespan_context(metrics_app):
+        request_id = await _seed_request(metrics_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=_ADMIN,
+            headers={"X-Api-Key": TEST_API_KEY},
+        ) as ac:
+            recent = (await ac.get("/recent?limit=200")).json()
+            failures = (await ac.get("/failures?limit=200")).json()
+            slow = (await ac.get("/slow?limit=200")).json()
+            breakdown = (await ac.get(f"/requests/{request_id}")).json()
+
+    served_event_lists = [recent, failures, slow, breakdown["calls"]]
+    saw_event = False
+    for events in served_event_lists:
+        for ev in events:
+            saw_event = True
+            missing = event_fields - set(ev)
+            assert not missing, f"served event dropped MetricEvent fields: {missing}"
+    assert saw_event, "expected at least one served event to validate keysets"
+
+    # The breakdown envelope keeps its exact documented shape (RequestBreakdownOut).
+    assert set(breakdown) == {
+        "request_id",
+        "surface",
+        "endpoint",
+        "ts",
+        "total_duration_ms",
+        "outcome",
+        "calls",
+    }
+
+
+@pytest.mark.asyncio
 async def test_served_json_is_redacted(metrics_app: FastAPI) -> None:
     """The url in a served ring event has secrets masked (SEC-01)."""
     transport = httpx.ASGITransport(app=metrics_app)
