@@ -111,6 +111,7 @@ from urllib.parse import urlparse
 
 from ..framework.base import Source
 from ..framework.errors import SourceError
+from ..framework.relevance import prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -886,6 +887,17 @@ class ComixSource(Source):
             else _DEFAULT_SERIES_CANDIDATES
         )
         series = await self._search_series(req.query or "", count, ctx)
+        # Prune obviously-irrelevant candidates BEFORE the per-candidate browser
+        # chapter fan-out (#126) — each wasted candidate is a 7-18s nav (#101).
+        # An exact-match query narrows to the one correct series; ambiguous
+        # queries still fan out to ``count`` (the prune only narrows, never
+        # widens, so the ``req.interactive`` 15-candidate path is preserved).
+        series = prune_candidates(
+            series,
+            req.query or "",
+            key=lambda t: t[2],
+            cap=count,
+        )
         # 260605-e9a deliverable 5: report how many series candidates we deep-
         # enumerate (one ``_series_chapters`` browser fan-out each).
         ctx.candidates_enumerated = len(series)
