@@ -163,6 +163,11 @@ def test_metric_event_has_all_fields_incl_method() -> None:
         "duration_ms",
         "attempt",
         "error",
+        # 260605-e9a payload-only enrichment fields (all default None).
+        "request_blob",
+        "result_count",
+        "candidates_enumerated",
+        "warnings_summary",
     }
     assert field_names == expected
 

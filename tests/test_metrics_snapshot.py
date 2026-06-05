@@ -268,6 +268,73 @@ async def test_payload_roundtrips_byte_identical(tmp_path: Path) -> None:
         await snap.close()
 
 
+async def test_enriched_request_event_roundtrips_verbatim(tmp_path: Path) -> None:
+    """A ``request`` event WITH request_blob + result_count + warnings_summary
+    serializes through json.dumps(asdict(MetricEvent)), persists to
+    ring_events.payload, and reads back VERBATIM via calls_for_request — NO schema
+    migration, NO new ring_events column (260605-e9a)."""
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        ev = MetricEvent(
+            ts=5.0,
+            kind="request",
+            request_id=11,
+            surface="search",
+            endpoint="POST /search",
+            source_key=None,
+            op=None,
+            method=None,
+            url=None,
+            status=200,
+            outcome="ok",
+            duration_ms=42.0,
+            attempt=1,
+            request_blob={
+                "method": "POST",
+                "path": "/api/v1/search",
+                "query_string": "x=1",
+                "body": {"type": "chapter", "query": "naruto"},
+            },
+            result_count=37,
+            warnings_summary=[{"source_key": "comix", "code": "timeout"}],
+        )
+        snap.enqueue(ev, {"recent"})
+        await snap.flush()
+        calls = await snap.calls_for_request(11)
+        assert calls == [asdict(ev)]
+        # The new fields survive the JSON round-trip verbatim.
+        got = calls[0]
+        assert got["request_blob"]["body"] == {"type": "chapter", "query": "naruto"}
+        assert got["result_count"] == 37
+        assert got["warnings_summary"] == [{"source_key": "comix", "code": "timeout"}]
+    finally:
+        await snap.close()
+
+
+async def test_ring_events_has_no_promoted_enrichment_columns(tmp_path: Path) -> None:
+    """The four enrichment fields live ONLY in payload JSON — PRAGMA confirms the
+    ring_events table has NO new column for them (the locked no-migration design)."""
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        conn = await aiosqlite.connect(db)
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("PRAGMA table_info(ring_events)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        await conn.close()
+        assert cols == {"id", "ring", "ts", "request_id", "payload"}
+        for promoted in (
+            "request_blob",
+            "result_count",
+            "candidates_enumerated",
+            "warnings_summary",
+        ):
+            assert promoted not in cols
+    finally:
+        await snap.close()
+
+
 # ─────────────────────────── request_id seed + prune ─────────────────────────
 
 
