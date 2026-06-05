@@ -9,6 +9,7 @@ WITHOUT it (T-08-16), the per-request breakdown works, ``?limit=0`` is rejected
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -34,8 +35,20 @@ _ENDPOINTS = [
 
 
 @pytest.fixture
-def metrics_app() -> FastAPI:
-    return create_app(Settings(api_key=TEST_API_KEY))
+def metrics_app(tmp_path: Path) -> FastAPI:
+    # Point the metrics DB + logs/output at a writable tmp dir so the disk ring
+    # store opens (the default /state path is unwritable outside docker, which
+    # would force degraded in-memory-only mode — the ring reads need the disk
+    # store live, 260604-wm2).
+    return create_app(
+        Settings(
+            api_key=TEST_API_KEY,
+            metrics_db_path=str(tmp_path / "metrics.db"),
+            log_dir=str(tmp_path / "logs"),
+            output_root=str(tmp_path / "out"),
+            db_path=str(tmp_path / "jobs.db"),
+        )
+    )
 
 
 @pytest_asyncio.fixture
@@ -56,10 +69,13 @@ async def metrics_client(
 async def _seed_request(app: FastAPI) -> int:
     """Drive one inbound request so the store has events; returns its request_id.
 
-    The request_id is minted from a process-global counter (``_request_ids``), so it
-    is NOT deterministically ``1`` in a full suite run — read it back from the most
-    recent ``request`` event the middleware emitted.
+    The request_id is minted from a process-global counter, so it is NOT
+    deterministically ``1`` in a full suite run — read it back from the most recent
+    ``request`` event the middleware emitted. Ring events are now on disk and only
+    queryable after a flush, so this flushes the lifespan's disk ring store before
+    reading and again after the synthetic emit (260604-wm2).
     """
+    ring = app.state.metric_snapshot  # the disk ring store (system of record)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport,
@@ -70,9 +86,10 @@ async def _seed_request(app: FastAPI) -> int:
         # event). Must NOT be an endpoint excluded from dashboard metrics
         # (/version, /admin/metrics) — those deliberately emit no request event.
         await ac.get("/api/v1/status")
-        store = app.state.metric_store
+        # Flush the batched ring queue so the request event is queryable on disk.
+        await ring.flush()
         request_event = next(
-            e for e in store.recent_calls(50) if e["kind"] == "request"
+            e for e in await ring.recent_calls(50) if e["kind"] == "request"
         )
         request_id = int(request_event["request_id"])
         # Also emit a synthetic http event UNDER that request_id carrying a
@@ -97,6 +114,9 @@ async def _seed_request(app: FastAPI) -> int:
             # Reset so this synthetic request attribution doesn't leak into later
             # assertions / tests (CodeRabbit).
             current_request.reset(token)
+        # Flush again so the synthetic child call is queryable for the breakdown +
+        # redaction assertions.
+        await ring.flush()
         return request_id
 
 

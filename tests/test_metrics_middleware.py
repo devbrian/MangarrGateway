@@ -10,26 +10,37 @@ emit_request-in-finally + reset, and the static surface/endpoint map.
 from __future__ import annotations
 
 from collections.abc import Iterator, MutableMapping
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from manga_gateway.metrics.collector import Collector, get_collector, set_collector
 from manga_gateway.metrics.context import current_request
 from manga_gateway.metrics.middleware import MetricsRequestMiddleware, _attribution
+from manga_gateway.metrics.snapshot import MetricSnapshotStore
 from manga_gateway.metrics.store import InMemoryStore
 
+from ._metrics_helpers import CapturingRingWriter
+
 
 @pytest.fixture
-def store() -> InMemoryStore:
-    return InMemoryStore(
-        recent_max=100, failures_max=100, slow_max=100, slow_factor=3.0
+def store() -> CapturingRingWriter:
+    """The capturing ring writer the tests read emitted events back from.
+
+    Under the disk-backed ring model (260604-wm2) the collector enqueues ring
+    events to a ``MetricSnapshotStore``; here a synchronous in-memory capture
+    stands in so the middleware-attribution assertions read events without a DB.
+    Named ``store`` to keep the test bodies unchanged.
+    """
+    return CapturingRingWriter()
+
+
+@pytest.fixture
+def collector(store: CapturingRingWriter) -> Iterator[Collector]:
+    coll = Collector(
+        store=InMemoryStore(slow_factor=3.0),
+        ring_writer=cast("MetricSnapshotStore", store),
     )
-
-
-@pytest.fixture
-def collector(store: InMemoryStore) -> Iterator[Collector]:
-    coll = Collector(store=store)
     set_collector(coll)
     yield coll
     set_collector(None)
@@ -52,7 +63,7 @@ def _make_send() -> Any:
 
 @pytest.mark.asyncio
 async def test_contextvar_readable_inward_via_collector_emit(
-    store: InMemoryStore, collector: Collector
+    store: CapturingRingWriter, collector: Collector
 ) -> None:
     """A downstream app reads the contextvar through a collector emit (OBS-02)."""
     seen: dict[str, Any] = {}
@@ -93,7 +104,7 @@ async def test_contextvar_readable_inward_via_collector_emit(
 
 @pytest.mark.asyncio
 async def test_emits_request_event_and_resets_contextvar(
-    store: InMemoryStore, collector: Collector
+    store: CapturingRingWriter, collector: Collector
 ) -> None:
     """A ``request`` event is emitted in finally; the contextvar resets after."""
 
@@ -116,7 +127,7 @@ async def test_emits_request_event_and_resets_contextvar(
 
 @pytest.mark.asyncio
 async def test_500_response_marks_request_error(
-    store: InMemoryStore, collector: Collector
+    store: CapturingRingWriter, collector: Collector
 ) -> None:
     async def downstream(
         scope: MutableMapping[str, Any], receive: Any, send: Any
@@ -134,7 +145,7 @@ async def test_500_response_marks_request_error(
 
 @pytest.mark.asyncio
 async def test_4xx_response_marks_request_client_error(
-    store: InMemoryStore, collector: Collector
+    store: CapturingRingWriter, collector: Collector
 ) -> None:
     """WR-04: a 4xx (e.g. 401) is a non-ok outcome so it reaches the failures
     ring / error_rate, not silently counted as success."""
@@ -158,7 +169,7 @@ async def test_4xx_response_marks_request_client_error(
 
 @pytest.mark.asyncio
 async def test_get_vs_post_downloads_attribute_distinctly(
-    store: InMemoryStore, collector: Collector
+    store: CapturingRingWriter, collector: Collector
 ) -> None:
     """End-to-end through the middleware: a GET poll and a POST submit of
     /api/v1/downloads carry DISTINCT endpoint labels on their request events."""
@@ -187,7 +198,7 @@ async def test_get_vs_post_downloads_attribute_distinctly(
     ],
 )
 async def test_excluded_endpoints_emit_no_request_event(
-    store: InMemoryStore,
+    store: CapturingRingWriter,
     collector: Collector,
     path: str,
     expected_endpoint: str,

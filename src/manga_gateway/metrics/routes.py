@@ -26,19 +26,23 @@ from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..deps import get_metric_store
+from ..deps import get_metric_ring_store, get_metric_store
+from .snapshot import MetricSnapshotStore
 from .store import InMemoryStore
 
 router = APIRouter()
 
-# Upper bound on ``?limit=`` (T-08-18). Generous ceiling: the rings are already
-# bounded (default recent=500), so a large limit reads at most ring-size events;
-# this only rejects absurd/negative input. ge=1 rejects 0 and negatives.
+# Upper bound on ``?limit=`` (T-08-18). The disk ring read is a single indexed
+# query with this LIMIT (poll-friendly); ge=1 rejects 0 and negatives.
 _MAX_LIMIT = 1000
 _DEFAULT_LIMIT = 25
 
 LimitQuery = Annotated[int, Query(ge=1, le=_MAX_LIMIT)]
 StoreDep = Annotated[InMemoryStore, Depends(get_metric_store)]
+# The disk ring store (recent/failures/slow/requests-{id}); ``None`` in the
+# degraded mode where the snapshot DB could not be opened — handlers then return
+# []/404, never 500 (260604-wm2).
+RingDep = Annotated["MetricSnapshotStore | None", Depends(get_metric_ring_store)]
 
 
 @router.get("/summary", operation_id="getMetricsSummary")
@@ -55,38 +59,44 @@ async def get_per_source_endpoint(store: StoreDep) -> list[dict[str, Any]]:
 
 @router.get("/failures", operation_id="getFailures")
 async def get_failures(
-    store: StoreDep, limit: LimitQuery = _DEFAULT_LIMIT
+    ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
 ) -> list[dict[str, Any]]:
     """The most recent failed calls, newest first (the failures feed)."""
-    return store.latest_failures(limit)
+    if ring is None:
+        return []
+    return await ring.latest_failures(limit)
 
 
 @router.get("/slow", operation_id="getSlow")
 async def get_slow(
-    store: StoreDep, limit: LimitQuery = _DEFAULT_LIMIT
+    ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
 ) -> list[dict[str, Any]]:
     """The most recent baseline-relative slow calls, newest first."""
-    return store.latest_slow(limit)
+    if ring is None:
+        return []
+    return await ring.latest_slow(limit)
 
 
 @router.get("/recent", operation_id="getMetricsRecent")
 async def get_recent(
-    store: StoreDep, limit: LimitQuery = _DEFAULT_LIMIT
+    ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
 ) -> list[dict[str, Any]]:
     """The most recent calls of any outcome, newest first (live activity)."""
-    return store.recent_calls(limit)
+    if ring is None:
+        return []
+    return await ring.recent_calls(limit)
 
 
 @router.get("/requests/{request_id}", operation_id="getRequestBreakdown")
-async def get_request_calls(store: StoreDep, request_id: int) -> dict[str, Any]:
+async def get_request_calls(ring: RingDep, request_id: int) -> dict[str, Any]:
     """The per-request breakdown: the child calls made under one ``request_id``.
 
     Builds the ``RequestBreakdown`` envelope the contract documents (request_id +
     surface/endpoint/ts/total_duration_ms/outcome + ordered ``calls[]``) from the
-    ``recent`` ring. A ``request_id`` with no retained events (aged out of the ring)
-    is a 404 (contract).
+    on-disk ``ring_events`` table. A ``request_id`` with no retained events (aged
+    out under retention, or degraded ``None`` ring store) is a 404 (contract).
     """
-    calls = store.calls_for_request(request_id)
+    calls = await ring.calls_for_request(request_id) if ring is not None else []
     if not calls:
         raise HTTPException(status_code=404, detail="No events retained for request_id")
 

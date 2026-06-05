@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Iterator
+from typing import cast
 
 import httpx
 import pytest
@@ -28,7 +29,10 @@ from manga_gateway.handles.store import HandleStore
 from manga_gateway.metrics.collector import Collector, set_collector
 from manga_gateway.metrics.context import current_source
 from manga_gateway.metrics.event import MetricEvent
+from manga_gateway.metrics.snapshot import MetricSnapshotStore
 from manga_gateway.metrics.store import InMemoryStore
+
+from ._metrics_helpers import CapturingRingWriter
 
 # ───────────────────────────── transport / source fakes ──────────────────────────
 
@@ -70,22 +74,29 @@ def _ctx(source_key: str, transport: _RecordingTransport) -> SourceContext:
 
 
 @pytest.fixture
-def collector() -> Iterator[tuple[Collector, InMemoryStore]]:
-    """Install a real Collector + store for the duration of one test, then clear."""
-    store = InMemoryStore(
-        recent_max=500, failures_max=200, slow_max=200, slow_factor=3.0
+def collector() -> Iterator[tuple[Collector, CapturingRingWriter]]:
+    """Install a real Collector + capturing ring writer for one test, then clear.
+
+    Under the disk-backed ring model (260604-wm2) the collector enqueues ring
+    events to a ``MetricSnapshotStore``; the synchronous in-memory
+    :class:`CapturingRingWriter` stands in so the seam assertions read emitted
+    events (and their source-key attribution) back without a DB.
+    """
+    ring = CapturingRingWriter()
+    c = Collector(
+        InMemoryStore(slow_factor=3.0),
+        ring_writer=cast("MetricSnapshotStore", ring),
     )
-    c = Collector(store)
     set_collector(c)
     try:
-        yield c, store
+        yield c, ring
     finally:
         set_collector(None)
         # reset the source contextvar in case a test left it bound
         current_source.set(None)
 
 
-def _http_events(store: InMemoryStore) -> list[MetricEvent]:
+def _http_events(store: CapturingRingWriter) -> list[MetricEvent]:
     return [e for e in store.iter_recent() if e.kind == "http"]
 
 
@@ -105,7 +116,7 @@ def _source_bound(key: str) -> Iterator[None]:
 
 @pytest.mark.asyncio
 async def test_concurrent_fanout_never_cross_attributes_http_source_key(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """Each http event's ``source_key`` matches the source that produced it (T-08-12).
 
@@ -178,7 +189,7 @@ async def test_no_collector_is_a_noop() -> None:
 
 @pytest.mark.asyncio
 async def test_http_error_emits_error_outcome_then_reraises(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """A transport error emits ``outcome="error"`` then re-raises the original exc."""
     _c, store = collector
@@ -204,7 +215,7 @@ async def test_http_error_emits_error_outcome_then_reraises(
 
 @pytest.mark.asyncio
 async def test_http_success_path_classifies_outcome_by_status(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """A 4xx/5xx transport response that REACHES the success emit path (before the
     caller's raise_for_status) is classified, not mis-labelled ``ok`` (CodeRabbit).
@@ -244,7 +255,7 @@ async def test_http_success_path_classifies_outcome_by_status(
 
 @pytest.mark.asyncio
 async def test_forced_solve_emits_solve_event_attempt_2(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """A forced solve (D-35 re-solve) emits a ``solve`` event with ``attempt=2``."""
     from manga_gateway.framework.antibot import Clearance
@@ -270,7 +281,7 @@ async def test_forced_solve_emits_solve_event_attempt_2(
 
 @pytest.mark.asyncio
 async def test_nonforced_solve_emits_attempt_1(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """A normal (single-flight leader) solve emits ``attempt=1``."""
     from manga_gateway.framework.antibot import Clearance
@@ -294,7 +305,7 @@ async def test_nonforced_solve_emits_attempt_1(
 
 @pytest.mark.asyncio
 async def test_failed_solve_emits_error_then_reraises(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """A solve that raises emits ``outcome="error"`` then re-raises."""
     from manga_gateway.framework.solver_lifecycle import BrowserLifecycle
@@ -318,7 +329,7 @@ async def test_failed_solve_emits_error_then_reraises(
 
 @pytest.mark.asyncio
 async def test_job_transition_and_fail_emit_job_events(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """``_transition`` and ``_fail`` each emit a ``job`` event self-attributed to
     the job's source."""
@@ -341,7 +352,7 @@ async def test_job_transition_and_fail_emit_job_events(
 
 @pytest.mark.asyncio
 async def test_package_callsite_emits_package_with_nonzero_duration(
-    collector: tuple[Collector, InMemoryStore],
+    collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
     """The package call-site emits a ``package`` event with a non-zero duration."""
     from manga_gateway.jobs.engine import _emit_package
