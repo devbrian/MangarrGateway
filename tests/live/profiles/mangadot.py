@@ -10,14 +10,15 @@ file (D-49 keeps profiles structurally separate from the Source class).
 
 Anti-bot expectations
 ----------------------
-* ``expected_caps_antibot = "cloudflare"`` — matches ``MangadotSource.antibot``.
-  Mangadot serves plaintext JSON behind Cloudflare (NOT ``+encrypted``); the
-  framework injects ``cf_clearance`` + matching UA per request (D-40) and reconciles
-  a challenge 403 (D-35).
-* ``needs_solver_warm = True`` — like Comix, Mangadot requires a Patchright warm so
-  the framework can capture + inject the ``cf_clearance`` cookie. Per-domain CF (#90)
-  auto-wires the challenge slot from ``MangadotSource.cloudflare_challenge_url`` — no
-  ``app.py`` / ``conftest.py`` change.
+* ``expected_caps_antibot = "none"`` — matches ``MangadotSource.antibot``. Mangadot
+  dropped its Cloudflare interstitial (debug nightly-cf-warm-127-128, #127/#128): the
+  homepage and every ``/api`` endpoint now return plaintext JSON directly with NO
+  ``cf_clearance`` cookie ever issued. It is now a clean-JSON open source like
+  mangadex — no clearance to inject, no challenge 403 to reconcile.
+* ``needs_solver_warm = False`` — mangadot no longer needs a Patchright warm; there is
+  no clearance cookie to capture. Reclassifying ``antibot="none"`` also removes it from
+  the shared CF solver's warm set, so its old never-clearing 60s warm-poll stops
+  starving comix on the one ``solve_concurrency=1`` solver (#127 cascade).
 
 Release shape (D-08): Mangadot releases carry ``mangaId`` as the leading id
 (``mangadot:{manga_id}:ch-{number}:{language}:{chapter_id}``); the smoke modules key
@@ -46,8 +47,8 @@ LIVE-TUNE items (refine from the first deploy-host smoke)
   catalog shifts or the leading hit is a junk/aggregated entry.
 * **languages** — currently ``["en"]`` on the source; widen only if the live loop
   shows other languages present in the chapter array.
-* **download_timeout_s** — 480.0 accounts for the Cloudflare warm + per-page
-  same-origin image fetch; re-size against the real end-to-end download wall-clock.
+* **download_timeout_s** — 480.0 now covers only the per-page same-origin image
+  fetch (no Cloudflare warm anymore); re-size against the real end-to-end wall-clock.
 * **Referer on the image GET** — RESEARCH §image: same-origin, Referer likely
   unneeded. If a bare GET 403s live, add ``Referer: https://mangadot.net/`` in
   ``MangadotSource.fetch_image`` (the fetch_image docstring flags this).
@@ -65,9 +66,9 @@ LIVE_SMOKE = LiveSmokeProfile(
     # The live loop verifies chapter-id -> images provenance resolves back to the
     # SAME manga with a matching page_count before relying on it for the download leg.
     default_query="Murim Psychopath",
-    expected_caps_antibot="cloudflare",
-    needs_solver_warm=True,
-    # Cloudflare warm + per-page same-origin image fetch — sized like Comix's 480s.
+    expected_caps_antibot="none",
+    needs_solver_warm=False,
+    # Per-page same-origin image fetch only (no Cloudflare warm — mangadot is now open).
     download_timeout_s=480.0,
     max_releases_to_try=3,
     min_releases_returned=1,

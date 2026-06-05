@@ -1,12 +1,25 @@
 """Mangadot source — the 4th declarative source + the bare-array endpoint proof.
 
-Mangadot (``https://mangadot.net``) is a **clean-JSON** ``antibot="cloudflare"``
+Mangadot (``https://mangadot.net``) is a **clean-JSON** ``antibot="none"``
 source (plaintext JSON, NOT ``+encrypted``): plain ``ctx.get_json`` /
-``ctx.get_json_array`` / ``ctx.get_bytes`` calls auto-inject the captured
-``cf_clearance`` + matching UA (D-40) and reconcile a challenge 403 (D-35). The
-parsing analog is **mangaball/mangadex** (clean JSON, no browser-DOM read); the
-Cloudflare class-attr analog is **comix** (``cloudflare_challenge_url`` +
-``needs_solver_warm`` in the live profile).
+``ctx.get_json_array`` / ``ctx.get_bytes`` calls hit the open ``/api`` endpoints
+directly — no clearance to inject. The parsing AND antibot analog is now
+**mangadex** (clean JSON, no browser-DOM read, ``antibot="none"``).
+
+HISTORY (debug ``nightly-cf-warm-127-128``, 2026-06-05): Mangadot was originally
+``antibot="cloudflare"`` — it served a Cloudflare managed-challenge interstitial
+that issued a ``cf_clearance`` cookie. It has since **dropped that interstitial**:
+the homepage and every ``/api`` endpoint (search / chapters-list / images) now
+return directly with NO ``cf_clearance`` cookie ever set (verified live through a
+residential egress: full JSON, HTTP 200, no ``challenges.cloudflare.com`` frame,
+no Turnstile gate). The old ``antibot="cloudflare"`` made the solver navigate the
+homepage and poll 60s for a ``cf_clearance`` cookie the site no longer issues —
+every warm timed out (issues #127/#128), and on the ONE shared
+``solve_concurrency=1`` solver that 60s hang also starved comix's real solves.
+Reclassifying to ``antibot="none"`` removes mangadot from the CF warm set entirely
+(fixes #128 and un-starves comix → #127). The ``site`` (Cloudflare-fronted) header
+``server`` is irrelevant — what matters is whether a clearance cookie is REQUIRED,
+and it is not.
 
 The one genuinely-new framework capability Mangadot exercises is a **bare
 top-level JSON array** chapter-list endpoint: ``GET /api/manga/{id}/chapters/list``
@@ -133,7 +146,7 @@ def _is_allowed_image_url(url: str) -> bool:
 
 
 class MangadotSource(Source):
-    """Mangadot (mangadot.net) — clean-JSON ``cloudflare`` source (bare-array list).
+    """Mangadot (mangadot.net) — clean-JSON ``antibot="none"`` source (bare-array list).
 
     A mangadex/mangaball-class clean-JSON source whose only new requirement is the
     bare top-level JSON array chapter-list endpoint, consumed via the additive
@@ -164,13 +177,14 @@ class MangadotSource(Source):
     # download in parallel (vs the global per-source default of 1). Clamped to the
     # global max_concurrent_chapters by the job manager.
     max_concurrent_jobs = 3
-    # Plaintext JSON behind Cloudflare (NOT +encrypted). The framework injects
-    # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
-    antibot = "cloudflare"
+    # Open plaintext JSON — mangadot dropped its Cloudflare interstitial and no
+    # longer issues a cf_clearance cookie (debug nightly-cf-warm-127-128, #127/#128).
+    # ``antibot="none"`` keeps it OUT of the shared CF solver's warm set: there is no
+    # clearance to capture, and the old 60s warm-poll for a never-issued cookie both
+    # failed mangadot and starved comix on the one solve_concurrency=1 solver. No
+    # ``cloudflare_challenge_url`` — a non-cloudflare source grants no clearance slot.
+    antibot = "none"
     decrypt_scheme = None
-    # The URL the framework solver navigates to so Cloudflare issues a cf_clearance
-    # cookie. Per-domain CF (#90) auto-wires the challenge_urls map from this attr.
-    cloudflare_challenge_url = "https://mangadot.net/"
     session_prep = None
     supports_search = True
     # No clean chapter-level JSON feed (CONTEXT.md / RESEARCH.md). recent() is a
