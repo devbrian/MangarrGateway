@@ -26,6 +26,8 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+import aiosqlite
+
 from manga_gateway.metrics.event import MetricEvent
 from manga_gateway.metrics.snapshot import MetricSnapshotStore, open_metric_store
 from manga_gateway.metrics.store import InMemoryStore
@@ -381,3 +383,58 @@ async def test_create_app_boots_when_metrics_db_unwritable(tmp_path: Path) -> No
         assert app.state.collector is not None
         assert app.state.metric_store is not None
     assert not unopenable.exists()
+
+
+async def test_open_migrates_old_shape_ring_events(tmp_path: Path) -> None:
+    """A pre-260604-wm2 ``metrics.db`` (ring_events = ring/seq/payload, no ts/id)
+    must migrate cleanly on open — NOT raise ``no such column: ts``.
+
+    Regression (prod deploy 260604-wm2): ``open_metric_store`` ran
+    ``executescript(_CREATE_SCHEMA)`` — which creates indexes on the NEW columns
+    (``ring_events(ring, ts)``) — BEFORE ``_migrate_ring_events``. Against a real
+    upgraded DB the old-shape table survived ``CREATE TABLE IF NOT EXISTS`` and the
+    index DDL exploded with ``sqlite3.OperationalError: no such column: ts``,
+    forcing the metrics subsystem into degraded in-memory-only mode on every boot.
+    The migration must run FIRST so the stale table is dropped before the schema +
+    indexes apply.
+    """
+    db = str(tmp_path / "metrics.db")
+    # Hand-build the OLD-shape DB: an old ring_events (+ a row) and the unchanged
+    # rollups table, exactly as a pre-260604-wm2 gateway would have left it.
+    conn = await aiosqlite.connect(db)
+    await conn.executescript(
+        """
+        CREATE TABLE rollups (
+          surface TEXT, source_key TEXT, endpoint TEXT, op TEXT,
+          count INTEGER NOT NULL, error_count INTEGER NOT NULL,
+          sum_ms REAL NOT NULL, min_ms REAL NOT NULL, max_ms REAL NOT NULL,
+          hist_blob TEXT NOT NULL
+        );
+        CREATE TABLE ring_events (
+          ring TEXT NOT NULL, seq INTEGER NOT NULL, payload TEXT NOT NULL
+        );
+        """
+    )
+    await conn.execute(
+        "INSERT INTO ring_events (ring, seq, payload) VALUES (?, ?, ?)",
+        ("recent", 0, '{"ts": 1.0, "kind": "request", "request_id": 7}'),
+    )
+    await conn.commit()
+    await conn.close()
+
+    # Must NOT raise (was: sqlite3.OperationalError: no such column: ts).
+    snap = await open_metric_store(db)
+    try:
+        # New schema is in place and writable: an enqueue→flush→indexed-read
+        # round-trips, proving the table was migrated to the append-only shape.
+        mem = InMemoryStore(slow_factor=3.0)
+        await _enqueue_via_classify(snap, mem, _ev(duration_ms=100.0, request_id=42))
+        await snap.flush()
+        recent = await snap.recent_calls(10)
+        assert [r["request_id"] for r in recent] == [42]
+        # The old ephemeral row was discarded by the migration (not the new one).
+        assert all(r["request_id"] != 7 for r in recent)
+        # The restart-monotonic seed reads the migrated table's MAX.
+        assert await snap.max_request_id() == 42
+    finally:
+        await snap.close()

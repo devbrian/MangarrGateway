@@ -395,9 +395,16 @@ async def open_metric_store(path: str) -> MetricSnapshotStore:
     conn = await aiosqlite.connect(path)
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA journal_mode=WAL")
+    # Migrate an existing OLD-shape ring_events BEFORE applying _CREATE_SCHEMA. The
+    # schema script creates indexes on the new columns (e.g.
+    # ``ring_events(ring, ts)``); if a pre-260604-wm2 ``ring/seq/payload`` table
+    # still exists, ``CREATE TABLE IF NOT EXISTS`` is a no-op so the old columns
+    # remain and the index DDL explodes with "no such column: ts" — which would
+    # take the whole metrics subsystem into degraded in-memory-only mode on every
+    # boot against a real upgraded DB. Migrating first DROPs the stale table so the
+    # schema + indexes below apply to the new shape. On a fresh DB the PRAGMA check
+    # is a no-op (table absent); on an already-new DB it is a no-op (ts/id present).
+    await _migrate_ring_events(conn)
     await conn.executescript(_CREATE_SCHEMA)
     await conn.commit()
-    # Migrate an existing OLD-shape ring_events (no migration framework). Fresh DBs
-    # already have the new shape from _CREATE_SCHEMA, so this is a no-op there.
-    await _migrate_ring_events(conn)
     return MetricSnapshotStore(conn)
