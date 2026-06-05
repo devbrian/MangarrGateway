@@ -51,6 +51,10 @@ def _populated_event() -> MetricEvent:
             "path": "/api/v1/search",
             "query_string": "x=1",
             "body": {"type": "chapter", "query": "naruto"},
+            # stash_request_blob ALWAYS stores body_truncated (False default), so a
+            # stored-blob fixture must carry it or the model round-trip diverges
+            # (dump emits body_truncated: False; expected would lack it).
+            "body_truncated": False,
         },
         result_count=13,
         candidates_enumerated=5,
@@ -175,3 +179,47 @@ def test_openapi_documents_metric_fields() -> None:
         assert field in blob, f"{field} not documented in metrics component schemas"
     recent = spec["paths"]["/admin/metrics/v1/recent"]["get"]
     assert recent["responses"]["200"]["content"], "/recent has no documented 200 schema"
+
+
+def test_openapi_documents_request_blob_and_warning_models() -> None:
+    """RequestBlob + WarningSummaryItem are named $ref'd component schemas.
+
+    Proves the two richest MetricEventOut payload fields are NO LONGER bare
+    free-form objects: each sub-model is a named ``components.schemas`` entry with
+    its real properties, and ``MetricEventOut.request_blob`` / ``warnings_summary``
+    reference them via ``$ref`` (tolerant of Pydantic v2 anyOf/allOf optional
+    wrapping).
+    """
+    app = create_app(Settings(api_key="test"))
+    spec = app.openapi()
+    schemas = spec["components"]["schemas"]
+
+    # Named component schemas with their real properties.
+    assert "RequestBlob" in schemas, "RequestBlob not a named component schema"
+    assert "WarningSummaryItem" in schemas, (
+        "WarningSummaryItem not a named component schema"
+    )
+    blob_props = set(schemas["RequestBlob"]["properties"])
+    assert {"method", "path", "query_string", "body", "body_truncated"} <= blob_props
+    warn_props = set(schemas["WarningSummaryItem"]["properties"])
+    assert {"source_key", "code"} <= warn_props
+
+    # MetricEventOut references both via $ref (anyOf/allOf-tolerant: search the
+    # serialized property for the ref string rather than a fixed nesting).
+    event = schemas["MetricEventOut"]["properties"]
+    request_blob_prop = json.dumps(event["request_blob"])
+    warnings_prop = json.dumps(event["warnings_summary"])
+    assert "#/components/schemas/RequestBlob" in request_blob_prop, (
+        "MetricEventOut.request_blob does not $ref RequestBlob"
+    )
+    assert "#/components/schemas/WarningSummaryItem" in warnings_prop, (
+        "MetricEventOut.warnings_summary items do not $ref WarningSummaryItem"
+    )
+    # No longer free-form: the two properties must not be a bare
+    # additionalProperties:true object.
+    assert event["request_blob"].get("additionalProperties") is not True, (
+        "MetricEventOut.request_blob is still a free-form object"
+    )
+    assert event["warnings_summary"].get("additionalProperties") is not True, (
+        "MetricEventOut.warnings_summary is still a free-form object"
+    )

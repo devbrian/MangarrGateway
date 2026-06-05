@@ -104,7 +104,10 @@ def stash_request_blob(
     size cap, because truncation serializes a dict body to a string that
     ``redact_blob`` can no longer key-redact (CodeRabbit #129). The already-redacted
     body is then SIZE-CAPPED at :data:`REQUEST_BLOB_BODY_CAP`: an oversized body is
-    truncated to a string and ``body_truncated: true`` is set inside the blob.
+    truncated to a string and ``body_truncated`` is set ``True``. ``body_truncated``
+    is ALWAYS present in the stored blob — defaulted ``False`` and flipped ``True``
+    only on truncation — so the stored dict keyset matches
+    :class:`~manga_gateway.models.metrics.RequestBlob`.
     """
     req = current_request.get()
     if req is None:
@@ -121,6 +124,11 @@ def stash_request_blob(
             "body": _json_safe(body),
         }
     )
+    # ALWAYS set body_truncated (False default, True on truncation) AFTER
+    # redact_blob — redact_blob keys on the original method/path/query_string/body
+    # shape and must not see body_truncated. One O(1) dict assignment on the hot
+    # path so the stored keyset always matches RequestBlob.model_fields.
+    blob["body_truncated"] = False
     body_val = blob.get("body")
     if body_val is not None:
         encoded = json.dumps(body_val).encode("utf-8")
