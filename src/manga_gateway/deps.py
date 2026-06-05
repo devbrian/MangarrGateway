@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .framework.transport import Transport
     from .handles.store import HandleStore
     from .jobs.manager import JobManager
+    from .metrics.snapshot import MetricSnapshotStore
     from .metrics.store import InMemoryStore
 
 
@@ -109,3 +110,19 @@ def get_metric_store(request: Request) -> InMemoryStore:
     """
     store: InMemoryStore = request.app.state.metric_store
     return store
+
+
+def get_metric_ring_store(request: Request) -> MetricSnapshotStore | None:
+    """The lifespan-owned disk ring store (recent/failures/slow), or ``None``.
+
+    The ring events moved to the on-disk ``ring_events`` table (260604-wm2): the
+    admin recent/failures/slow/requests-{id} routes read THIS store's indexed
+    queries instead of the in-memory deques. ``None`` is the degraded mode (the
+    snapshot DB could not be opened — ``test_create_app_boots_when_metrics_db_
+    unwritable``); the routes then return ``[]`` / 404, never 500. Tolerates the
+    pre-wiring app via ``getattr`` (mirrors ``get_source_health``).
+    """
+    snapshot: MetricSnapshotStore | None = getattr(
+        request.app.state, "metric_snapshot", None
+    )
+    return snapshot

@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from manga_gateway.metrics.collector import (
     Collector,
     get_collector,
@@ -16,13 +18,14 @@ from manga_gateway.metrics.collector import (
 )
 from manga_gateway.metrics.context import current_request, source_scope
 from manga_gateway.metrics.event import MetricEvent
+from manga_gateway.metrics.snapshot import MetricSnapshotStore
 from manga_gateway.metrics.store import InMemoryStore
+
+from ._metrics_helpers import CapturingRingWriter
 
 
 def _store() -> InMemoryStore:
-    return InMemoryStore(
-        recent_max=500, failures_max=200, slow_max=200, slow_factor=3.0
-    )
+    return InMemoryStore(slow_factor=3.0)
 
 
 def _ev(duration_ms: float) -> MetricEvent:
@@ -68,7 +71,8 @@ def test_hdr_p95_high_tail() -> None:
 
 def test_collector_redacts_url_at_ingest() -> None:
     s = _store()
-    c = Collector(s)
+    ring = CapturingRingWriter()
+    c = Collector(s, ring_writer=cast("MetricSnapshotStore", ring))
     token = current_request.set(
         {"request_id": 9, "surface": "search", "endpoint": "GET /search"}
     )
@@ -85,7 +89,7 @@ def test_collector_redacts_url_at_ingest() -> None:
             )
     finally:
         current_request.reset(token)
-    calls = s.recent_calls(10)
+    calls = ring.recent_calls(10)
     assert len(calls) == 1
     stored = calls[0]
     assert "TOPSECRET" not in str(stored["url"])

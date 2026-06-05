@@ -18,11 +18,15 @@ app stay byte-for-byte unchanged.
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 
 from .context import current_request, current_source
 from .event import MetricEvent
 from .redact import redact_url
 from .store import InMemoryStore
+
+if TYPE_CHECKING:
+    from .snapshot import MetricSnapshotStore
 
 _collector: Collector | None = None
 
@@ -39,10 +43,24 @@ def get_collector() -> Collector | None:
 
 
 class Collector:
-    """Builds fully-attributed ``MetricEvent``s from the contextvars + ingests."""
+    """Builds fully-attributed ``MetricEvent``s from the contextvars + ingests.
 
-    def __init__(self, store: InMemoryStore) -> None:
+    ``store`` (in-memory) holds the rollups and classifies each event's ring
+    membership; ``ring_writer`` (the disk ``MetricSnapshotStore``, 260604-wm2) is
+    the append-only ring system of record. ``_ingest`` updates the rollup +
+    classifies, then enqueues ONE O(1) append to the ring writer (no await, no
+    disk write on the hot path). A ``None`` ring_writer makes ingest rollup-only
+    (degraded in-memory mode — same posture as the historic deque-only path).
+    """
+
+    def __init__(
+        self,
+        store: InMemoryStore,
+        *,
+        ring_writer: MetricSnapshotStore | None = None,
+    ) -> None:
         self.store = store
+        self.ring_writer = ring_writer
 
     def _ingest(
         self,
@@ -74,7 +92,12 @@ class Collector:
             attempt=attempt,
             error=error,
         )
-        self.store.ingest(ev)
+        # O(1) hot path: update the rollup + get the ring-membership set, then a
+        # plain queue append to the disk ring writer (no await, no disk I/O here —
+        # the batched flush in app.py does the writes).
+        rings = self.store.classify(ev)
+        if self.ring_writer is not None:
+            self.ring_writer.enqueue(ev, rings)
 
     # ── D-01 emit catalog ────────────────────────────────────────────────────
     def emit_http(

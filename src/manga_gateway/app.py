@@ -39,6 +39,7 @@ from .jobs.manager import JobManager
 from .jobs.store import open_store
 from .logging_config import configure_logging
 from .metrics.collector import Collector, set_collector
+from .metrics.context import seed_request_ids
 from .metrics.middleware import MetricsRequestMiddleware
 from .metrics.routes import router as metrics_router
 from .metrics.snapshot import MetricSnapshotStore, open_metric_store
@@ -333,10 +334,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             exc_info=True,
         )
     if metric_snapshot is None:
-        rehydrated = InMemoryStore(
-            recent_max=1, failures_max=1, slow_max=1, slow_factor=1.0
-        )
+        rehydrated = InMemoryStore(slow_factor=1.0)
     else:
+        # The batch-size flush trigger comes from Settings (260604-wm2).
+        metric_snapshot.configure(flush_max_batch=settings.metrics_ring_flush_max_batch)
         try:
             rehydrated = await metric_snapshot.rehydrate()
         except Exception:  # noqa: BLE001 — bad snapshot must not break the service
@@ -344,44 +345,67 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "metrics rehydrate failed; starting with an empty metric store",
                 exc_info=True,
             )
-            rehydrated = InMemoryStore(
-                recent_max=1, failures_max=1, slow_max=1, slow_factor=1.0
-            )
-    metric_store = InMemoryStore(
-        recent_max=settings.metrics_recent_ring,
-        failures_max=settings.metrics_failures_ring,
-        slow_max=settings.metrics_slow_ring,
-        slow_factor=settings.metrics_slow_factor,
-    )
-    # Re-admit the rehydrated events/rollups verbatim into the configured-size store
-    # (restore_* bypasses slow/failure re-classification — they were already
-    # classified before the snapshot). Rollups restore as-is.
+            rehydrated = InMemoryStore(slow_factor=1.0)
+    metric_store = InMemoryStore(slow_factor=settings.metrics_slow_factor)
+    # Re-admit the rehydrated ROLLUPS verbatim (rollups stay in memory + survive
+    # restart). Ring events are NOT rehydrated into memory anymore — they are the
+    # on-disk system of record served by the disk ring store (260604-wm2).
     for rk, rollup in rehydrated.iter_rollups():
         metric_store.restore_rollup(rk, rollup)
-    for ev in rehydrated.iter_recent():
-        metric_store.restore_recent(ev)
-    for ev in rehydrated.iter_failures():
-        metric_store.restore_failure(ev)
-    for ev in rehydrated.iter_slow():
-        metric_store.restore_slow(ev)
-    collector = Collector(store=metric_store)
+    # Restart-monotonic request_id: seed the counter from the persisted ring MAX+1
+    # (1 on an empty/missing/degraded DB) so ids never reset-and-collide on boot.
+    seed_start = 1
+    if metric_snapshot is not None:
+        with suppress(Exception):
+            seed_start = (await metric_snapshot.max_request_id()) + 1
+    seed_request_ids(seed_start)
+    # The collector enqueues ring events to the disk writer on the O(1) hot path
+    # (None in degraded mode → rollup-only ingest, no ring persistence).
+    collector = Collector(store=metric_store, ring_writer=metric_snapshot)
     set_collector(collector)  # flips the Plan-04 seam + the request middleware live
     app.state.metric_store = metric_store
+    app.state.metric_snapshot = metric_snapshot  # read by deps.get_metric_ring_store
     app.state.collector = collector
 
     async def _snapshot_loop() -> None:
-        # Periodic full-store snapshot (one transaction, ~5ms — never per-event).
-        # Worst-case loss on a hard crash is one interval (≤45s default), accepted.
+        # Periodic ROLLUP snapshot (one transaction, ~5ms — never per-event) PLUS a
+        # ring flush + dual-bound prune on the same (slower) cadence. Worst-case
+        # rollup loss on a hard crash is one interval (≤45s default), accepted.
         while True:
             await asyncio.sleep(settings.metrics_snapshot_interval_s)
             if metric_snapshot is None:  # in-memory-only degraded mode
                 continue
             with suppress(Exception):
                 await metric_snapshot.snapshot(metric_store)
+            with suppress(Exception):
+                await metric_snapshot.flush()
+            with suppress(Exception):
+                await metric_snapshot.prune(
+                    settings.metrics_ring_max_rows,
+                    settings.metrics_ring_max_age_days,
+                )
 
-    # No snapshot loop when the store is unavailable (in-memory-only degraded mode).
+    async def _ring_flush_loop() -> None:
+        # Faster batched-ring flusher (260604-wm2): wake on the flush signal (a
+        # burst hit flush_max_batch) OR the flush interval, whichever first, and
+        # drain the ring queue. Prune + rollups snapshot stay on the slower
+        # _snapshot_loop cadence (prune is cheap-but-not-per-5s).
+        assert metric_snapshot is not None  # only created when the store exists
+        while True:
+            with suppress(TimeoutError):
+                async with asyncio.timeout(settings.metrics_ring_flush_interval_s):
+                    await metric_snapshot.flush_signal.wait()
+            with suppress(Exception):
+                await metric_snapshot.flush()
+
+    # No snapshot/flush loops when the store is unavailable (degraded mode).
     snapshot_task: asyncio.Task[None] | None = (
         asyncio.create_task(_snapshot_loop())  # strong ref (Pitfall 4)
+        if metric_snapshot is not None
+        else None
+    )
+    ring_flush_task: asyncio.Task[None] | None = (
+        asyncio.create_task(_ring_flush_loop())  # strong ref (Pitfall 4)
         if metric_snapshot is not None
         else None
     )
@@ -421,7 +445,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Cancel the warm + watchdog + snapshot bg tasks and close the solver BEFORE
         # the transport, so no orphan Chromium survives shutdown (Pitfall 4).
         bg_tasks = [
-            t for t in (warm_task, *watchdog_tasks, snapshot_task) if t is not None
+            t
+            for t in (warm_task, *watchdog_tasks, snapshot_task, ring_flush_task)
+            if t is not None
         ]
         for bg in bg_tasks:
             bg.cancel()
@@ -452,6 +478,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # straggler emit during teardown is a no-op and tests don't leak a collector.
         set_collector(None)
         if metric_snapshot is not None:
+            # Final ring FLUSH first so no enqueued ring event since the last timer
+            # tick is lost (≤ flush_interval honesty, 260604-wm2), THEN the final
+            # rollup snapshot, then close the connection.
+            with suppress(Exception):
+                await metric_snapshot.flush()
             with suppress(Exception):
                 await metric_snapshot.snapshot(metric_store)
             with suppress(Exception):

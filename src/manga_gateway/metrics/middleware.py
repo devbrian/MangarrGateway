@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
 from .collector import get_collector
-from .context import _request_ids, current_request
+from .context import current_request, next_request_id
 
 Scope = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
@@ -114,7 +114,9 @@ class MetricsRequestMiddleware:
             await self.app(scope, receive, send)
             return
 
-        request_id = next(_request_ids)
+        # Mint via the accessor (NOT a by-value import) so the lifespan reseed
+        # from MAX(request_id)+1 is observed (restart-monotonic, 260604-wm2).
+        request_id = next_request_id()
         surface, endpoint = _attribution(
             scope.get("path", ""), scope.get("method", "GET")
         )
