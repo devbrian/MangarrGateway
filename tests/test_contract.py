@@ -37,6 +37,7 @@ from schemathesis.specs.openapi.checks import (
 
 from manga_gateway.app import create_app
 from manga_gateway.config import Settings
+from manga_gateway.framework.antibot import Clearance, CloudflareSolver
 
 from .conftest import BASE_URL, TEST_API_KEY
 
@@ -52,6 +53,12 @@ _COMIX_HOST = "comix.to"
 # also fans out to mangaball.net. Stub it to a fast permanent 403 for the same
 # reason as Comix — a per-source warnings[] entry, no retry, no real network.
 _MANGABALL_HOST = "mangaball.net"
+# Mangadot (08-xx) is now registered with antibot="cloudflare". Without a stub its
+# get_clearance() call would launch a real Patchright browser (the lifespan runs for
+# every schemathesis-generated case via TestClient.__enter__), turning the contract
+# suite into a multi-minute browser-farm. Stub the host AND short-circuit
+# get_clearance so no browser is ever launched from the deterministic gate (D-42).
+_MANGADOT_HOST = "mangadot.net"
 
 # Contract of record lives at the repo root (D-07), copied from .handoff/.
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "manga-gateway.openapi.yaml"
@@ -100,16 +107,40 @@ class ApiKeyAuth:
 
 
 @pytest.fixture(autouse=True)
-def _stub_source_hosts() -> Iterator[None]:
+def _stub_source_hosts(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Intercept all source HTTP so the contract suite touches NO real network.
 
     schemathesis generates many ``search``/``getRecent`` cases; each fans out to
     every registered source. We stub the upstream hosts so the suite is fast and
     deterministic (D-42): MangaDex returns an empty-but-valid collection (→ 0
-    releases, still 200), and Comix returns a fast permanent 403 (→ a per-source
-    ``warnings[]`` entry, no retry). The gateway's contract-level response shape —
-    the only thing schemathesis validates here — is unchanged either way.
+    releases, still 200), and Comix/MangaBall/Mangadot return a fast permanent 403
+    (→ a per-source ``warnings[]`` entry, no retry). The gateway's contract-level
+    response shape — the only thing schemathesis validates here — is unchanged
+    either way.
+
+    Cloudflare-gated sources (Comix, Mangadot) also have ``CloudflareSolver.
+    get_clearance`` short-circuited to a canned ``Clearance``. schemathesis drives
+    the app via ``starlette TestClient``, which starts a fresh lifespan (and a fresh
+    real ``CloudflareSolver``) for EVERY generated case. Without this patch each
+    case would launch a Patchright browser to solve Cloudflare before the (stubbed)
+    HTTP call, adding ~8 s x 200 cases = ~1600 s to the gate (D-42 regression).
+    The patch is scoped to this module so the ``test_solver_lifecycle`` tests that
+    exercise ``get_clearance`` against injected fake lifecycles are unaffected.
     """
+
+    async def _canned_clearance(
+        self: CloudflareSolver, source_key: str, **_: object
+    ) -> Clearance | None:
+        """Return a fixed Clearance for CF-gated keys; None for everything else."""
+        if source_key not in self._cloudflare_keys:
+            return None
+        return Clearance(
+            cookies={"cf_clearance": "contract-test-stub"},
+            user_agent="ContractTestUA/1",
+        )
+
+    monkeypatch.setattr(CloudflareSolver, "get_clearance", _canned_clearance)
+
     with respx.mock(assert_all_called=False) as mock:
         mock.route(host="api.mangadex.org").mock(
             return_value=httpx.Response(
@@ -119,6 +150,7 @@ def _stub_source_hosts() -> Iterator[None]:
         )
         mock.route(host=_COMIX_HOST).mock(return_value=httpx.Response(403))
         mock.route(host=_MANGABALL_HOST).mock(return_value=httpx.Response(403))
+        mock.route(host=_MANGADOT_HOST).mock(return_value=httpx.Response(403))
         yield
 
 
