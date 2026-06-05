@@ -54,6 +54,37 @@ def _mask_query(qs: str) -> str:
     )
 
 
+def _is_secret_key(key: str) -> bool:
+    """True if ``key`` matches the shared denylist (case-insensitive substring)."""
+    return any(s in key.lower() for s in _SECRET_KEYS)
+
+
+def redact_blob(blob: dict[str, object]) -> dict[str, object]:
+    """Return a redacted COPY of a request blob (260605-e9a, T-e9a-01 / D-03).
+
+    Reuses the SINGLE denylist (:data:`_SECRET_KEYS` via :func:`_mask_query`) —
+    no second source of truth. The blob's ``query_string`` is scrubbed via the
+    existing ``_mask_query`` boundary, and any denylisted key in the ``body`` dict
+    is masked to ``"***"``. ``X-Api-Key`` / ``Authorization`` / ``token`` / ``auth``
+    (all already in ``_SECRET_KEYS``) can never survive. Headers are NOT part of the
+    blob (never captured), so there is nothing to redact there.
+
+    Defensive on shape: a non-string ``query_string`` or a non-dict ``body`` (e.g.
+    ``None`` for a GET) is passed through untouched. The input is not mutated.
+    """
+    out = dict(blob)
+    qs = out.get("query_string")
+    if isinstance(qs, str):
+        out["query_string"] = _mask_query(qs)
+    body = out.get("body")
+    if isinstance(body, dict):
+        out["body"] = {
+            k: ("***" if isinstance(k, str) and _is_secret_key(k) else v)
+            for k, v in body.items()
+        }
+    return out
+
+
 def redact_url(url: str | None) -> str | None:
     """Mask injected secrets in a forensic URL; no-op on falsy input.
 

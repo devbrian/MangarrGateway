@@ -20,8 +20,17 @@ from __future__ import annotations
 
 import contextvars
 import itertools
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+
+from .redact import redact_blob
+
+# Max serialized length of the captured request body (bytes of the JSON-safe
+# form). A hostile/huge body is truncated here at stash time and flagged so it
+# cannot bloat the ring or smuggle a large secret payload past truncation review
+# (T-e9a-02). 8192 mirrors the constraint's ~8KB cap.
+REQUEST_BLOB_BODY_CAP = 8192
 
 current_request: contextvars.ContextVar[dict[str, object] | None] = (
     contextvars.ContextVar("mg_request", default=None)
@@ -61,6 +70,76 @@ def next_request_id() -> int:
     lifespan ``seed_request_ids`` rebind is observed by the caller.
     """
     return next(_request_ids)
+
+
+def _json_safe(value: object) -> object:
+    """Coerce ``value`` to a JSON-serializable form (defensive, never raises).
+
+    The body handed in is already a Pydantic ``model_dump(by_alias=True)`` (plain
+    dicts/lists/scalars), but a source that stashes something exotic must not break
+    the request path — fall back to ``str(value)`` on any non-serializable input.
+    """
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
+
+
+def stash_request_blob(
+    *,
+    method: str,
+    path: str,
+    query_string: str,
+    body: object | None,
+) -> None:
+    """Stash the request blob into the request-scoped ``current_request`` dict.
+
+    Mutates the SAME dict the middleware set for the whole request scope IN PLACE
+    (no new contextvar, no token churn) — the middleware finally-block ``_ingest``
+    reads it back. No-op when no request scope is active (defensive).
+
+    The body is serialized to a JSON-safe form and SIZE-CAPPED at
+    :data:`REQUEST_BLOB_BODY_CAP`: an oversized body is dropped to a marker string
+    and ``body_truncated: true`` is set inside the blob (T-e9a-02). Secrets are
+    redacted via :func:`redact_blob` AT STASH TIME so they never enter the
+    contextvar (defense in depth, T-e9a-01).
+    """
+    req = current_request.get()
+    if req is None:
+        return
+    safe_body = _json_safe(body)
+    truncated = False
+    if safe_body is not None:
+        serialized = json.dumps(safe_body)
+        if len(serialized) > REQUEST_BLOB_BODY_CAP:
+            safe_body = serialized[:REQUEST_BLOB_BODY_CAP]
+            truncated = True
+    blob: dict[str, object] = {
+        "method": method,
+        "path": path,
+        "query_string": query_string,
+        "body": safe_body,
+    }
+    if truncated:
+        blob["body_truncated"] = True
+    req["request_blob"] = redact_blob(blob)
+
+
+def stash_request_result(
+    *,
+    result_count: int,
+    warnings_summary: list[dict[str, object]],
+) -> None:
+    """Stash the final merged ``result_count`` + ``warnings_summary`` into the
+    request-scoped dict IN PLACE (read by the middleware emit). No-op without a
+    request scope. These are inherently request-level (one value per request) so
+    they ride the umbrella ``request`` event, not a per-source row."""
+    req = current_request.get()
+    if req is None:
+        return
+    req["result_count"] = result_count
+    req["warnings_summary"] = warnings_summary
 
 
 @contextmanager

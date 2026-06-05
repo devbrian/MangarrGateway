@@ -39,3 +39,21 @@ class MetricEvent:
     duration_ms: float
     attempt: int  # 1-based; >1 means a tenacity retry / forced re-solve
     error: str | None = None
+    # ── 260605-e9a payload-only enrichment fields (all default None) ──────────
+    # Additive + optional so asdict() round-trips for every existing emit
+    # unchanged and no positional-arg construction past ``error`` breaks. These
+    # ride ``json.dumps(asdict(MetricEvent))`` into ring_events.payload and
+    # surface through the read endpoints automatically — NO new ring_events
+    # column, NO DB migration (the locked design).
+    request_blob: dict[str, object] | None = (
+        None  # {method, path, query_string, body} on the umbrella request event
+    )
+    result_count: int | None = (
+        None  # final merged count (request) / pre-merge count (source-result)
+    )
+    candidates_enumerated: int | None = (
+        None  # how many ≤5 title candidates a source deep-enumerated
+    )
+    warnings_summary: list[dict[str, object]] | None = (
+        None  # [{source_key, code}, …] on the umbrella request event
+    )
