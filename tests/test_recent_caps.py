@@ -18,6 +18,8 @@ import httpx
 import pytest
 import respx
 
+from manga_gateway.api.routes.recent import _split_multi
+
 _MANGADEX = "https://api.mangadex.org"
 
 
@@ -157,6 +159,105 @@ async def test_recent_sorts_by_instant_across_mixed_offsets(
     # True newest-first: Y (20:00Z) precedes X (15:00Z) — opposite of a string sort.
     assert releases[0]["publishDate"] == y_utc
     assert releases[1]["publishDate"] == x_local
+
+
+def test_split_multi_accepts_repeated_csv_and_mixed() -> None:
+    """The /recent source/language parser flattens repeated params AND CSV."""
+    assert _split_multi(None) is None
+    assert _split_multi([]) is None
+    assert _split_multi([""]) is None
+    assert _split_multi(["mangadex"]) == ["mangadex"]
+    # Repeated params (?sources=a&sources=b&sources=c) — the Mangarr form.
+    assert _split_multi(["mangadex", "comix", "mangaball"]) == [
+        "mangadex",
+        "comix",
+        "mangaball",
+    ]
+    # Legacy single CSV value (?sources=a,b,c).
+    assert _split_multi(["mangadex,comix,mangaball"]) == [
+        "mangadex",
+        "comix",
+        "mangaball",
+    ]
+    # Mixed + surrounding whitespace + empty fragments are all normalised.
+    assert _split_multi(["mangadex, comix", "", " mangaball "]) == [
+        "mangadex",
+        "comix",
+        "mangaball",
+    ]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_recent_repeated_source_params_select_all_sources(
+    client: httpx.AsyncClient,
+) -> None:
+    """Regression (prod): Mangarr sends ``?sources=a&sources=b`` (repeated params),
+    not CSV. The route must fan out to BOTH, not silently keep only the last value
+    (which dropped every source but the last in prod).
+
+    mangadex (mocked) yields a release AND mangaball (stubbed 403) yields a warning
+    — both appearing proves the fan-out hit both selected sources, not just one.
+    """
+    manga_id = str(uuid.uuid4())
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        return_value=httpx.Response(
+            200,
+            json=_recent_payload(
+                [
+                    _chapter(
+                        chapter="1",
+                        chapter_id=str(uuid.uuid4()),
+                        manga_id=manga_id,
+                        published="2026-05-29T00:00:00+00:00",
+                    )
+                ]
+            ),
+        )
+    )
+    # MangaBall (antibot=none, csrf-bootstrap) → fast permanent 403 → a per-source
+    # warnings[] entry (no browser, no retry) — mirrors the contract harness stub.
+    respx.route(host="mangaball.net").mock(return_value=httpx.Response(403))
+
+    # httpx encodes a list value as repeated params: ?sources=mangadex&sources=mangaball
+    resp = await client.get(
+        "/recent", params={"sources": ["mangadex", "mangaball"], "limit": "50"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # mangadex was queried (its release is present) — NOT dropped as a non-last value.
+    assert any(r["sourceKey"] == "mangadex" for r in body["releases"])
+    # mangaball was ALSO queried (it failed → warning) — both sources fanned out.
+    assert any(w["sourceKey"] == "mangaball" for w in body["warnings"])
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_recent_csv_source_param_still_works(client: httpx.AsyncClient) -> None:
+    """Backward-compat: the legacy single CSV value (?sources=a,b) still works."""
+    manga_id = str(uuid.uuid4())
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        return_value=httpx.Response(
+            200,
+            json=_recent_payload(
+                [
+                    _chapter(
+                        chapter="1",
+                        chapter_id=str(uuid.uuid4()),
+                        manga_id=manga_id,
+                        published="2026-05-29T00:00:00+00:00",
+                    )
+                ]
+            ),
+        )
+    )
+    respx.route(host="mangaball.net").mock(return_value=httpx.Response(403))
+
+    resp = await client.get("/recent", params={"sources": "mangadex,mangaball"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert any(r["sourceKey"] == "mangadex" for r in body["releases"])
+    assert any(w["sourceKey"] == "mangaball" for w in body["warnings"])
 
 
 @respx.mock
