@@ -195,13 +195,39 @@ class Settings(BaseSettings):
     # (T-08-03). pydantic-settings parses a JSON-list env value, e.g.
     # GATEWAY_METRICS_CORS_ORIGINS='["http://localhost:5173"]'.
     metrics_cors_origins: list[str] = Field(default_factory=list)
+    # NOTE (260604-wm2): the three ring-size knobs below are SUPERSEDED by the
+    # disk-backed ring model — ring events are now the on-disk ring_events table
+    # (system of record), NOT in-memory deques, bounded by the retention knobs
+    # (metrics_ring_max_rows / metrics_ring_max_age_days) rather than a per-ring
+    # maxlen. They are retained (NOT removed) so an operator's existing TOML/env
+    # that sets them does not fail validation; the disk store ignores them.
     metrics_recent_ring: int = Field(
         default=500, ge=1
-    )  # §Q4: bounded `recent` deque size
+    )  # SUPERSEDED: was the bounded `recent` deque size
     metrics_failures_ring: int = Field(
         default=200, ge=1
-    )  # §Q4: bounded `failures` deque size
-    metrics_slow_ring: int = Field(default=200, ge=1)  # §Q4: bounded `slow` deque size
+    )  # SUPERSEDED: was the bounded `failures` deque size
+    metrics_slow_ring: int = Field(
+        default=200, ge=1
+    )  # SUPERSEDED: was the bounded `slow` deque size
+    # ── Disk-backed ring retention + batched-write knobs (260604-wm2) ──────────
+    # Env-overridable ops knobs (D-11), same TOML→kwargs merge as the other
+    # metrics_* fields. The ring_events table is pruned to BOTH bounds (whichever
+    # hits first) on the background timer; writes are batched (O(1) enqueue, a
+    # ~5s/1000-event flush). Bounds are Field(ge=1) so a zero/negative override is
+    # rejected at construction.
+    metrics_ring_max_rows: int = Field(
+        default=200_000, ge=1
+    )  # retention: max ring_events rows kept (oldest pruned beyond this)
+    metrics_ring_max_age_days: int = Field(
+        default=30, ge=1
+    )  # retention: max ring_events age in days (older pruned)
+    metrics_ring_flush_interval_s: int = Field(
+        default=5, ge=1
+    )  # batched flush cadence (≤ this many seconds of events lost on hard crash)
+    metrics_ring_flush_max_batch: int = Field(
+        default=1000, ge=1
+    )  # batched flush trigger: flush early once the queue reaches this size
     metrics_snapshot_interval_s: int = Field(
         default=45, ge=1
     )  # §Q4: snapshot-loop cadence (≤45s loss-on-crash bound)

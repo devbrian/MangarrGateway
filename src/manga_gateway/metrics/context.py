@@ -31,7 +31,36 @@ current_source: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 # Monotonic request-id source for the ASGI middleware (Plan 05).
+#
+# Restart-monotonic (260604-wm2): the counter is RESEEDED on startup from
+# MAX(request_id)+1 in the on-disk ring_events table (1 on an empty/missing/
+# degraded DB) so ids climb across restarts instead of resetting to 1 and
+# colliding with persisted history. ``seed_request_ids`` rebinds this module
+# global IN PLACE; every reader goes through the ``next_request_id()`` accessor
+# (NOT a by-value import of ``_request_ids``) so the reseed is visible.
 _request_ids = itertools.count(1)
+
+
+def seed_request_ids(start: int) -> None:
+    """Reseed the request-id counter (restart-monotonic, 260604-wm2).
+
+    Rebinds the module-global ``_request_ids`` to ``itertools.count(max(1,
+    start))``. Called once from the lifespan with ``MAX(request_id)+1`` from the
+    persisted ring_events (or 1 on an empty/missing/degraded DB). ``max(1, ...)``
+    keeps the first id ≥ 1 even if a caller passes 0 (empty-DB MAX → 0, +1 → 1;
+    the guard is belt-and-suspenders against a bare 0/negative seed).
+    """
+    global _request_ids
+    _request_ids = itertools.count(max(1, start))
+
+
+def next_request_id() -> int:
+    """Return the next monotonic request id (the middleware's mint accessor).
+
+    Read THROUGH this function (never import ``_request_ids`` by value) so a
+    lifespan ``seed_request_ids`` rebind is observed by the caller.
+    """
+    return next(_request_ids)
 
 
 @contextmanager

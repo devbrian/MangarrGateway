@@ -1,26 +1,29 @@
-"""In-process metric store: HDR-backed rollups + recent/failures/slow rings.
+"""In-process metric store: HDR-backed rollups + ring-membership classification.
 
-Two structures, both updated in O(1) per event at *ingest* so *reads* stay cheap
-(the poll-friendliness constraint — same world as ``GET /downloads``):
+Rollups stay IN MEMORY (O(1) update at ingest, cheap reads — the
+poll-friendliness constraint, same world as ``GET /downloads``); the recent /
+failures / slow RING EVENTS moved to the on-disk ``ring_events`` table
+(``snapshot.py``, system of record, 260604-wm2). This store therefore no longer
+holds ring deques — it holds:
 
 1. **ROLLUPS** keyed by ``(surface, source_key, endpoint, op)`` ONLY: count,
    error_count, sum_ms (→ avg), min/max, and a per-rollup ``HdrHistogram`` for a
-   constant-relative-error p95 (OBS-08 — replaces the spike's coarse fixed-bucket
-   placeholder). NEVER keyed on ``url`` or ``request_id`` (cardinality explosion).
-2. Three bounded ``deque(maxlen=N)`` **RINGS** carrying full event detail:
-   * ``recent`` — every event (answers "recent calls" + ``/requests/{id}``);
-   * ``failures`` — admits ``outcome != "ok"``;
-   * ``slow`` — admits ``duration_ms > max(slow_factor*avg, p95)`` evaluated AFTER
-     the rollup is updated (a PER-SOURCE-relative baseline, NEVER a global ms
-     constant — comix ~220ms vs mangadex ~35ms).
+   constant-relative-error p95 (OBS-08). NEVER keyed on ``url`` or ``request_id``
+   (cardinality explosion).
+2. **Ring classification** — :meth:`classify` updates the rollup (so the slow
+   threshold reflects this series' own live baseline) and returns the SET of
+   rings this event belongs to: always ``"recent"``; ``"failures"`` when
+   ``outcome != "ok"``; ``"slow"`` when ``duration_ms > max(slow_factor*avg,
+   p95)`` (a PER-SOURCE-relative baseline, NEVER a global ms constant — comix
+   ~220ms vs mangadex ~35ms). The collector enqueues one on-disk row per
+   (event, ring) membership; reads filter on the persisted ``ring`` tag.
 
-The dashboard reads ready-made JSON from here; it never parses a log line.
+The dashboard reads ready-made JSON: rollups from here, ring events from disk.
 """
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 from hdrh.histogram import HdrHistogram
 
@@ -65,6 +68,12 @@ def histogram_from_pairs(pairs: list[tuple[int, int]]) -> HdrHistogram:
 
 
 RollupKey = tuple[str | None, str | None, str | None, str | None]
+
+# The three ring names. ``recent`` admits every event; ``failures`` admits
+# ``outcome != "ok"``; ``slow`` admits a per-baseline outlier (see classify).
+RING_RECENT = "recent"
+RING_FAILURES = "failures"
+RING_SLOW = "slow"
 
 
 @dataclass
@@ -116,38 +125,48 @@ class Rollup:
 
 
 class InMemoryStore:
-    """Live source of truth (R1 single-process). Ring sizes + slow factor come
-    from ``Settings`` (RESEARCH §Q4); reads are O(rollup count), not O(events)."""
+    """Live rollup source of truth (R1 single-process). Reads are O(rollup count),
+    not O(events); the slow factor comes from ``Settings`` (RESEARCH §Q4).
 
-    def __init__(
-        self,
-        *,
-        recent_max: int,
-        failures_max: int,
-        slow_max: int,
-        slow_factor: float,
-    ) -> None:
+    Ring events are NOT held here anymore (260604-wm2) — they live in the on-disk
+    ring_events table. :meth:`classify` returns the ring-membership set the
+    collector persists; the ring READ path is the disk store.
+    """
+
+    def __init__(self, *, slow_factor: float) -> None:
         self._rollups: dict[RollupKey, Rollup] = {}
-        self._recent: deque[MetricEvent] = deque(maxlen=recent_max)
-        self._failures: deque[MetricEvent] = deque(maxlen=failures_max)
-        self._slow: deque[MetricEvent] = deque(maxlen=slow_max)
         self._slow_factor = slow_factor
 
-    # ── ingest (hot path, O(1)) ──────────────────────────────────────────────
-    def ingest(self, ev: MetricEvent) -> None:
+    # ── ingest / classify (hot path, O(1)) ───────────────────────────────────
+    def classify(self, ev: MetricEvent) -> set[str]:
+        """Update the rollup and return this event's ring-membership set.
+
+        Always includes ``"recent"``; adds ``"failures"`` for a non-ok outcome;
+        adds ``"slow"`` for a per-baseline outlier (``duration_ms >
+        max(slow_factor*avg, p95)``), evaluated AFTER the rollup update so the
+        threshold reflects this series' own live avg/p95 — never a global ms
+        constant. The collector enqueues one on-disk row per returned ring.
+        """
         key: RollupKey = (ev.surface, ev.source_key, ev.endpoint, ev.op)
         rollup = self._rollups.setdefault(key, Rollup())
         rollup.observe(ev)
-        self._recent.append(ev)
+        rings = {RING_RECENT}
         if ev.outcome != "ok":
-            self._failures.append(ev)
-        # Slow admission is PER-BASELINE, evaluated AFTER the rollup update so the
-        # threshold reflects this series' own avg/p95 — never a global ms constant.
+            rings.add(RING_FAILURES)
         threshold = max(self._slow_factor * rollup.avg_ms, rollup.p95_ms())
         if ev.duration_ms > threshold:
-            self._slow.append(ev)
+            rings.add(RING_SLOW)
+        return rings
 
-    # ── read side (all O(rollup count) or O(ring)) ───────────────────────────
+    def ingest(self, ev: MetricEvent) -> set[str]:
+        """Rollup-only ingest (still callable for pure rollup tests).
+
+        Delegates to :meth:`classify` — same rollup update — and returns the
+        membership set so a caller that wants it (the collector path) gets it.
+        """
+        return self.classify(ev)
+
+    # ── read side (rollups; all O(rollup count)) ─────────────────────────────
     def summary(self) -> dict[str, object]:
         total_calls = sum(r.count for r in self._rollups.values())
         total_errors = sum(r.error_count for r in self._rollups.values())
@@ -195,48 +214,14 @@ class InMemoryStore:
             out.append(row)
         return out
 
-    def latest_failures(self, limit: int) -> list[dict[str, object]]:
-        return _as_dicts(list(self._failures)[-limit:][::-1])
-
-    def latest_slow(self, limit: int) -> list[dict[str, object]]:
-        return _as_dicts(list(self._slow)[-limit:][::-1])
-
-    def recent_calls(self, limit: int) -> list[dict[str, object]]:
-        return _as_dicts(list(self._recent)[-limit:][::-1])
-
-    def calls_for_request(self, request_id: int) -> list[dict[str, object]]:
-        return _as_dicts([e for e in self._recent if e.request_id == request_id])
-
-    # ── snapshot accessors (used by snapshot.py) ─────────────────────────────
+    # ── snapshot accessors (used by snapshot.py — ROLLUPS ONLY) ───────────────
     def iter_rollups(self) -> list[tuple[RollupKey, Rollup]]:
         return list(self._rollups.items())
 
-    def iter_recent(self) -> list[MetricEvent]:
-        return list(self._recent)
-
-    def iter_failures(self) -> list[MetricEvent]:
-        return list(self._failures)
-
-    def iter_slow(self) -> list[MetricEvent]:
-        return list(self._slow)
-
     def restore_rollup(self, key: RollupKey, rollup: Rollup) -> None:
         self._rollups[key] = rollup
-
-    def restore_recent(self, ev: MetricEvent) -> None:
-        self._recent.append(ev)
-
-    def restore_failure(self, ev: MetricEvent) -> None:
-        self._failures.append(ev)
-
-    def restore_slow(self, ev: MetricEvent) -> None:
-        self._slow.append(ev)
 
 
 def _sort_key(item: tuple[RollupKey, Rollup]) -> tuple[str, str, str, str]:
     surface, source, endpoint, op = item[0]
     return (surface or "", source or "", endpoint or "", op or "")
-
-
-def _as_dicts(events: list[MetricEvent]) -> list[dict[str, object]]:
-    return [asdict(e) for e in events]

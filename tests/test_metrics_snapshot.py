@@ -1,13 +1,19 @@
-"""MetricSnapshotStore round-trip tests (Task 3 — OBS-04, aiosqlite persistence).
+"""MetricSnapshotStore tests (OBS-04 — rollup snapshot + APPEND-ONLY disk ring).
 
-Mirrors ``jobs/store.py`` shape into a SEPARATE sqlite file:
+Two halves with different durability models (260604-wm2):
 
-* ``open_metric_store(tmp)`` connects, sets WAL, creates the schema; ``rehydrate()``
-  on a fresh DB returns an empty ``InMemoryStore`` (no-op);
-* ``snapshot(mem)`` → ``rehydrate()`` round-trips rollups (count/error_count/sum_ms/
-  min/max AND p95 from the rehydrated HDR blob, within HDR tolerance) plus the
-  recent/failures/slow rings (order + bound preserved);
-* the snapshot is ONE transaction (DELETE + executemany + single commit).
+* **Rollups** keep their full-rewrite snapshot/rehydrate: ``snapshot(mem)`` →
+  ``rehydrate()`` round-trips count/error_count/sum_ms/min/max AND p95 from the
+  rehydrated HDR blob (within HDR tolerance), in ONE transaction. ``rehydrate()``
+  of a fresh DB is empty. Rings are NEVER rehydrated into memory.
+
+* **Ring events** are the on-disk system of record, written APPEND-ONLY:
+  ``enqueue`` is O(1) (no await, no I/O); ``flush`` bulk-INSERTs one row per
+  (event, ring) membership; the indexed reads return newest-first, bounded,
+  filtered by the persisted ``ring`` tag; ``calls_for_request`` returns every
+  recent-ring row for a request id; ``max_request_id`` seeds the restart-monotonic
+  counter; ``prune`` enforces BOTH the row bound and the age bound; payload reads
+  back byte-identical to ``asdict(MetricEvent)`` (response-shape fidelity).
 
 CRITICAL (08-01 known-issue): the HDR blob is the cross-platform ``(value, count)``
 pair list, NOT ``HdrHistogram.encode()`` (which raises OverflowError on the Windows
@@ -16,10 +22,12 @@ dev host). This test MUST pass on Windows.
 
 from __future__ import annotations
 
+import time
+from dataclasses import asdict
 from pathlib import Path
 
 from manga_gateway.metrics.event import MetricEvent
-from manga_gateway.metrics.snapshot import open_metric_store
+from manga_gateway.metrics.snapshot import MetricSnapshotStore, open_metric_store
 from manga_gateway.metrics.store import InMemoryStore
 
 
@@ -29,10 +37,12 @@ def _ev(
     outcome: str = "ok",
     request_id: int = 1,
     op: str = "get_json",
+    ts: float = 1.0,
+    kind: str = "http",
 ) -> MetricEvent:
     return MetricEvent(
-        ts=1.0,
-        kind="http",
+        ts=ts,
+        kind=kind,
         request_id=request_id,
         surface="search",
         endpoint="GET /search",
@@ -47,8 +57,8 @@ def _ev(
     )
 
 
-def _make_store() -> InMemoryStore:
-    s = InMemoryStore(recent_max=500, failures_max=200, slow_max=200, slow_factor=3.0)
+def _make_rollup_store() -> InMemoryStore:
+    s = InMemoryStore(slow_factor=3.0)
     for _ in range(95):
         s.ingest(_ev(duration_ms=100.0))
     for _ in range(5):
@@ -58,6 +68,17 @@ def _make_store() -> InMemoryStore:
     return s
 
 
+async def _enqueue_via_classify(
+    snap: MetricSnapshotStore, mem: InMemoryStore, ev: MetricEvent
+) -> None:
+    """Classify (rollup update + membership set) then enqueue — the collector path."""
+    rings = mem.classify(ev)
+    snap.enqueue(ev, rings)
+
+
+# ───────────────────────────────── rollups ───────────────────────────────────
+
+
 async def test_open_fresh_db_rehydrates_empty(tmp_path: Path) -> None:
     db = str(tmp_path / "metrics.db")
     snap = await open_metric_store(db)
@@ -65,7 +86,9 @@ async def test_open_fresh_db_rehydrates_empty(tmp_path: Path) -> None:
         mem = await snap.rehydrate()
         assert mem.summary()["total_calls"] == 0
         assert mem.rollups() == []
-        assert mem.recent_calls(10) == []
+        # Fresh ring is empty too.
+        assert await snap.recent_calls(10) == []
+        assert await snap.max_request_id() == 0
     finally:
         await snap.close()
 
@@ -74,7 +97,7 @@ async def test_snapshot_rehydrate_roundtrips_rollups(tmp_path: Path) -> None:
     db = str(tmp_path / "metrics.db")
     snap = await open_metric_store(db)
     try:
-        mem = _make_store()
+        mem = _make_rollup_store()
         before = {
             (r["surface"], r["source"], r["endpoint"], r["op"]): r
             for r in mem.rollups()
@@ -94,77 +117,241 @@ async def test_snapshot_rehydrate_roundtrips_rollups(tmp_path: Path) -> None:
             assert a["avg_ms"] == b["avg_ms"]
             assert a["min_ms"] == b["min_ms"]
             assert a["max_ms"] == b["max_ms"]
-            # p95 from the rehydrated HDR pairs — exact at this distribution.
             assert abs(a["p95_ms"] - b["p95_ms"]) <= max(1.0, 0.02 * b["p95_ms"])
         assert restored.summary() == before_summary
     finally:
         await snap.close()
 
 
-async def test_snapshot_rehydrate_roundtrips_rings(tmp_path: Path) -> None:
+async def test_snapshot_is_idempotent_over_resnapshot(tmp_path: Path) -> None:
+    # Re-snapshotting rollups (DELETE + re-insert) must not double rows.
     db = str(tmp_path / "metrics.db")
     snap = await open_metric_store(db)
     try:
-        mem = _make_store()
-        # Add a genuine slow outlier so the slow ring is non-empty.
-        mem.ingest(_ev(duration_ms=9000.0, request_id=42))
-        recent_before = mem.recent_calls(1000)
-        failures_before = mem.latest_failures(1000)
-        slow_before = mem.latest_slow(1000)
-        assert failures_before  # sanity: there ARE failures
-        assert slow_before  # sanity: there IS a slow call
-
+        mem = _make_rollup_store()
+        await snap.snapshot(mem)
         await snap.snapshot(mem)
         restored = await snap.rehydrate()
-
-        assert restored.recent_calls(1000) == recent_before
-        assert restored.latest_failures(1000) == failures_before
-        assert restored.latest_slow(1000) == slow_before
+        assert restored.summary() == mem.summary()
     finally:
         await snap.close()
 
 
-async def test_rehydrate_skips_unknown_ring_label(tmp_path: Path) -> None:
-    """CodeRabbit: a forward/corrupt snapshot carrying an UNKNOWN ring label must be
-    skipped row-by-row, not KeyError out of the whole rehydrate."""
-    import json
-
-    from manga_gateway.metrics.snapshot import _RING_INSERT, _event_to_json
-
+async def test_snapshot_does_not_touch_ring_events(tmp_path: Path) -> None:
+    """Rollup snapshot is now ring-agnostic — it must NOT clobber appended ring
+    history (the whole point of the append-only model, 260604-wm2)."""
     db = str(tmp_path / "metrics.db")
     snap = await open_metric_store(db)
     try:
-        mem = _make_store()
-        good = _ev(duration_ms=100.0, request_id=7)
+        mem = _make_rollup_store()
+        await _enqueue_via_classify(snap, mem, _ev(duration_ms=100.0, request_id=7))
+        await snap.flush()
+        # A rollup snapshot must leave the appended ring rows intact.
         await snap.snapshot(mem)
-        # Inject one good 'recent' row and one row with an unknown ring label.
-        await snap._conn.execute(_RING_INSERT, ("recent", 9999, _event_to_json(good)))
-        await snap._conn.execute(
-            _RING_INSERT, ("from_the_future", 0, json.dumps({"garbage": True}))
-        )
-        await snap._conn.commit()
-
-        # Must NOT raise; the unknown-ring row is dropped, the good row survives.
-        restored = await snap.rehydrate()
-        recent = restored.recent_calls(1000)
+        recent = await snap.recent_calls(10)
         assert any(e["request_id"] == 7 for e in recent)
     finally:
         await snap.close()
 
 
-async def test_snapshot_is_idempotent_over_resnapshot(tmp_path: Path) -> None:
-    # Re-snapshotting (DELETE + re-insert) must not double rows.
+# ─────────────────────────── append-only ring writes ─────────────────────────
+
+
+async def test_enqueue_is_sync_and_flush_persists(tmp_path: Path) -> None:
+    """enqueue does no I/O (returns synchronously); flush makes rows readable."""
     db = str(tmp_path / "metrics.db")
     snap = await open_metric_store(db)
     try:
-        mem = _make_store()
-        await snap.snapshot(mem)
-        await snap.snapshot(mem)
-        restored = await snap.rehydrate()
-        assert restored.summary() == mem.summary()
-        assert len(restored.recent_calls(1000)) == len(mem.recent_calls(1000))
+        # enqueue is a plain method (no await) — the O(1) hot path.
+        for i in range(10):
+            snap.enqueue(_ev(duration_ms=100.0, request_id=i), {"recent"})
+        # Nothing is readable until flush.
+        assert await snap.recent_calls(100) == []
+        written = await snap.flush()
+        assert written == 10
+        assert len(await snap.recent_calls(100)) == 10
     finally:
         await snap.close()
+
+
+async def test_flush_signal_set_at_batch_size(tmp_path: Path) -> None:
+    """Enqueuing flush_max_batch events sets the flush signal so the flusher does
+    not wait the full interval."""
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        snap.configure(flush_max_batch=5)
+        for i in range(4):
+            snap.enqueue(_ev(duration_ms=100.0, request_id=i), {"recent"})
+        assert not snap.flush_signal.is_set()
+        snap.enqueue(_ev(duration_ms=100.0, request_id=4), {"recent"})
+        assert snap.flush_signal.is_set()
+        # flush clears the signal.
+        await snap.flush()
+        assert not snap.flush_signal.is_set()
+    finally:
+        await snap.close()
+
+
+async def test_indexed_reads_newest_first_and_bounded(tmp_path: Path) -> None:
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        # Ascending ts so newest-first is well-defined.
+        for i in range(20):
+            snap.enqueue(_ev(duration_ms=100.0, request_id=i, ts=float(i)), {"recent"})
+        await snap.flush()
+        recent = await snap.recent_calls(5)
+        assert len(recent) == 5  # bounded to the limit
+        # Newest-first: highest ts first.
+        assert [e["ts"] for e in recent] == [19.0, 18.0, 17.0, 16.0, 15.0]
+    finally:
+        await snap.close()
+
+
+async def test_multi_ring_membership_writes_one_row_per_ring(tmp_path: Path) -> None:
+    """A failed slow call lands in recent AND failures AND slow."""
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        mem = InMemoryStore(slow_factor=3.0)
+        for _ in range(100):
+            await _enqueue_via_classify(snap, mem, _ev(duration_ms=100.0))
+        await _enqueue_via_classify(
+            snap, mem, _ev(duration_ms=9000.0, outcome="error", request_id=42, ts=99.0)
+        )
+        await snap.flush()
+        recent = await snap.recent_calls(1000)
+        failures = await snap.latest_failures(1000)
+        slow = await snap.latest_slow(1000)
+        assert any(e["request_id"] == 42 for e in recent)
+        assert any(e["request_id"] == 42 for e in failures)
+        assert any(e["request_id"] == 42 for e in slow)
+        # A steady ok call is only in recent.
+        assert failures == [f for f in failures if f["outcome"] != "ok"]
+    finally:
+        await snap.close()
+
+
+async def test_calls_for_request_returns_request_rows(tmp_path: Path) -> None:
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        snap.enqueue(_ev(duration_ms=100.0, request_id=7, ts=1.0), {"recent"})
+        snap.enqueue(
+            _ev(duration_ms=200.0, request_id=7, op="get_bytes", ts=2.0), {"recent"}
+        )
+        snap.enqueue(_ev(duration_ms=100.0, request_id=8, ts=3.0), {"recent"})
+        await snap.flush()
+        calls = await snap.calls_for_request(7)
+        assert len(calls) == 2
+        assert all(c["request_id"] == 7 for c in calls)
+        # Oldest-first within the request.
+        assert [c["ts"] for c in calls] == [1.0, 2.0]
+    finally:
+        await snap.close()
+
+
+async def test_payload_roundtrips_byte_identical(tmp_path: Path) -> None:
+    """A row read back equals asdict(MetricEvent) — the API echoes payload verbatim."""
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        ev = _ev(duration_ms=123.0, request_id=5, op="get_bytes")
+        snap.enqueue(ev, {"recent"})
+        await snap.flush()
+        recent = await snap.recent_calls(10)
+        assert recent == [asdict(ev)]
+    finally:
+        await snap.close()
+
+
+# ─────────────────────────── request_id seed + prune ─────────────────────────
+
+
+async def test_max_request_id(tmp_path: Path) -> None:
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        assert await snap.max_request_id() == 0  # empty DB
+        for rid in (3, 7, 5):
+            snap.enqueue(_ev(duration_ms=100.0, request_id=rid), {"recent"})
+        await snap.flush()
+        assert await snap.max_request_id() == 7
+    finally:
+        await snap.close()
+
+
+async def test_seed_request_ids_climbs_above_persisted(tmp_path: Path) -> None:
+    """seed_request_ids(max+1) makes next_request_id climb above the persisted max;
+    an empty DB seeds to 1 (the restart-monotonic fix, 260604-wm2)."""
+    from manga_gateway.metrics import context
+
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        for rid in (3, 7, 5):
+            snap.enqueue(_ev(duration_ms=100.0, request_id=rid), {"recent"})
+        await snap.flush()
+        context.seed_request_ids(await snap.max_request_id() + 1)
+        assert context.next_request_id() == 8
+        assert context.next_request_id() == 9
+    finally:
+        await snap.close()
+        # Restore the import-time default so this test does not leak into others.
+        context.seed_request_ids(1)
+
+
+def test_seed_request_ids_floors_at_one() -> None:
+    """An empty/zero seed still yields ids ≥ 1 (max(1, start) guard)."""
+    from manga_gateway.metrics import context
+
+    try:
+        context.seed_request_ids(0)
+        assert context.next_request_id() == 1
+    finally:
+        context.seed_request_ids(1)
+
+
+async def test_prune_row_bound(tmp_path: Path) -> None:
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        # Realistic recent ts (now-relative) so the age bound does NOT also fire —
+        # this isolates the row-bound delete.
+        base = time.time()
+        for i in range(50):
+            snap.enqueue(_ev(duration_ms=100.0, request_id=i, ts=base + i), {"recent"})
+        await snap.flush()
+        deleted = await snap.prune(max_rows=10, max_age_days=3650)
+        assert deleted == 40
+        recent = await snap.recent_calls(1000)
+        assert len(recent) == 10
+        # The 10 newest (highest ts) survive.
+        assert {e["ts"] for e in recent} == {base + i for i in range(40, 50)}
+    finally:
+        await snap.close()
+
+
+async def test_prune_age_bound(tmp_path: Path) -> None:
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        now = time.time()
+        old = now - 40 * 86_400  # 40 days old
+        fresh = now - 1 * 86_400  # 1 day old
+        snap.enqueue(_ev(duration_ms=100.0, request_id=1, ts=old), {"recent"})
+        snap.enqueue(_ev(duration_ms=100.0, request_id=2, ts=fresh), {"recent"})
+        await snap.flush()
+        deleted = await snap.prune(max_rows=1_000_000, max_age_days=30)
+        assert deleted == 1
+        recent = await snap.recent_calls(1000)
+        assert [e["request_id"] for e in recent] == [2]
+    finally:
+        await snap.close()
+
+
+# ───────────────────────────── degraded / boot ───────────────────────────────
 
 
 async def test_create_app_boots_when_metrics_db_unwritable(tmp_path: Path) -> None:
@@ -174,9 +361,8 @@ async def test_create_app_boots_when_metrics_db_unwritable(tmp_path: Path) -> No
     Regression for the CI ``/state`` failure: ``metrics_db_path`` defaults under
     ``/state`` (the docker volume), which is unwritable outside the container, so
     ``open_metric_store`` raised ``sqlite3.OperationalError`` and took down the
-    whole lifespan. The metrics subsystem is purely diagnostic and must live
-    without restart survival when its DB can't be opened. Reproduced cross-platform
-    by pointing the path at a non-existent parent dir (sqlite won't ``mkdir`` it).
+    whole lifespan. Reproduced cross-platform by pointing the path at a
+    non-existent parent dir (sqlite won't ``mkdir`` it).
     """
     from manga_gateway.app import create_app
     from manga_gateway.config import Settings
@@ -191,10 +377,7 @@ async def test_create_app_boots_when_metrics_db_unwritable(tmp_path: Path) -> No
             db_path=str(tmp_path / "jobs.db"),
         )
     )
-    # Entering the lifespan must NOT raise despite the unopenable snapshot DB.
     async with app.router.lifespan_context(app):
-        # In-memory metrics stay fully wired (collector installed, live store present).
         assert app.state.collector is not None
         assert app.state.metric_store is not None
-    # Degraded mode created no snapshot file; the gateway lived.
     assert not unopenable.exists()
