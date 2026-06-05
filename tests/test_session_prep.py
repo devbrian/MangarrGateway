@@ -302,7 +302,7 @@ async def test_csrf_bootstrap_concurrent_acquire_collapses_to_single_get() -> No
 
 
 @pytest.mark.asyncio
-async def test_csrf_bootstrap_concurrent_force_refresh_collapses_to_single_get() -> None:
+async def test_csrf_bootstrap_concurrent_force_refresh_collapses_to_one_get() -> None:
     """A concurrent ``force_refresh=True`` herd also collapses to ONE re-GET.
 
     The cold-acquire test above exercises the double-checked-cache branch; this one
