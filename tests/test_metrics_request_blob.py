@@ -31,6 +31,7 @@ from manga_gateway.metrics.context import (
     current_source,
     source_scope,
     stash_request_blob,
+    stash_request_meta,
     stash_request_result,
 )
 from manga_gateway.metrics.event import MetricEvent
@@ -326,6 +327,95 @@ def test_stash_helpers_noop_without_request_scope(
     # Must not raise.
     stash_request_blob(method="GET", path="/x", query_string="", body=None)
     stash_request_result(result_count=1, warnings_summary=[])
+    stash_request_meta(manga_title="X", chapter_number=1.0)
+
+
+# ─────────────────────────── stash_request_meta (260605-nqo) ──────────────────
+
+
+def test_stash_request_meta_rides_request_event(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """stash_request_meta populates manga_title + chapter_number on the umbrella
+    request event (read back via _req_str/_req_float for kind=='request')."""
+    c, ring = collector
+    token = current_request.set(_request_scope())
+    try:
+        stash_request_meta(manga_title="Solo Leveling", chapter_number=1.0)
+        c.emit_request(outcome="ok", duration_ms=1.0, status=200)
+    finally:
+        current_request.reset(token)
+
+    ev = next(e for e in ring.iter_recent() if e.kind == "request")
+    assert ev.manga_title == "Solo Leveling"
+    assert ev.chapter_number == 1.0
+
+
+def test_stash_request_meta_skips_none_keys() -> None:
+    """A partial resolve (one arg None) leaves that key ABSENT — never clobbers."""
+    token = current_request.set(_request_scope())
+    try:
+        stash_request_meta(manga_title="Only Title", chapter_number=None)
+        req = current_request.get()
+        assert req is not None
+        assert req["manga_title"] == "Only Title"
+        assert "chapter_number" not in req
+    finally:
+        current_request.reset(token)
+
+
+def test_stash_request_meta_noop_without_scope() -> None:
+    """No request scope active → stash_request_meta is a no-op (does not raise)."""
+    current_request.set(None)
+    stash_request_meta(manga_title="X", chapter_number=2.0)
+    assert current_request.get() is None
+
+
+def test_metric_event_meta_fields_default_none() -> None:
+    """The 260605-nqo fields default None for a non-request emit."""
+    ev = MetricEvent(
+        ts=1.0,
+        kind="http",
+        request_id=1,
+        surface="search",
+        endpoint="POST /search",
+        source_key="comix",
+        op="get_json",
+        method="GET",
+        url="https://h/x",
+        status=200,
+        outcome="ok",
+        duration_ms=1.0,
+        attempt=1,
+    )
+    assert ev.manga_title is None
+    assert ev.chapter_number is None
+
+
+def test_meta_fields_none_for_non_request_kind(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """Even with manga_title/chapter_number stashed, a non-request emit reads None
+    (the read-back is gated on kind=='request')."""
+    c, ring = collector
+    token = current_request.set(_request_scope())
+    try:
+        stash_request_meta(manga_title="Solo Leveling", chapter_number=1.0)
+        c.emit_http(
+            op="get_json",
+            method="GET",
+            url="https://h/x",
+            status=200,
+            outcome="ok",
+            duration_ms=1.0,
+            attempt=1,
+        )
+    finally:
+        current_request.reset(token)
+
+    ev = next(e for e in ring.iter_recent() if e.kind == "http")
+    assert ev.manga_title is None
+    assert ev.chapter_number is None
 
 
 # ─────────────────────────── emit_source_result ──────────────────────────────

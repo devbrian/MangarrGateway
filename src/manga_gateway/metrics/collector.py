@@ -111,6 +111,14 @@ class Collector:
             warnings_summary=(
                 _req_list(req, "warnings_summary") if kind == "request" else None
             ),
+            # 260605-nqo: resolved manga_title/chapter_number stashed into
+            # current_request by the download routes (POST from the record;
+            # GET/DELETE-by-id from the persisted Job). Read back for the umbrella
+            # ``request`` event only — None for every other kind (keys are absent).
+            manga_title=_req_str(req, "manga_title") if kind == "request" else None,
+            chapter_number=(
+                _req_float(req, "chapter_number") if kind == "request" else None
+            ),
         )
         # O(1) hot path: update the rollup + get the ring-membership set, then a
         # plain queue append to the disk ring writer (no await, no disk I/O here —
@@ -339,6 +347,19 @@ def _req_str(req: dict[str, object] | None, key: str) -> str | None:
         return None
     val = req.get(key)
     return val if isinstance(val, str) else None
+
+
+def _req_float(req: dict[str, object] | None, key: str) -> float | None:
+    if req is None:
+        return None
+    val = req.get(key)
+    # bool is an int subclass — exclude it explicitly so a stashed True/False never
+    # coerces to 1.0/0.0. Accept int OR float and coerce to float; else None.
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int | float):
+        return float(val)
+    return None
 
 
 def _req_dict(req: dict[str, object] | None, key: str) -> dict[str, object] | None:
