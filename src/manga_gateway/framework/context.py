@@ -135,6 +135,7 @@ class SourceContext:
         source_health: SourceHealth | None = None,
         session_prep: SessionPrep | None = None,
         expected_pages: int | None = None,
+        candidates_enumerated: int | None = None,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -161,6 +162,12 @@ class SourceContext:
         # never resolves a manifest) and for sources that do not opt in — a source
         # reads ``ctx.expected_pages`` only if it wants the check (MangaBall does).
         self.expected_pages = expected_pages
+        # 260605-e9a deliverable 5: a title-search source reports how many of its
+        # ≤5 title candidates it actually deep-enumerated (fanned a chapter list
+        # out for). The route reads ``ctx.candidates_enumerated`` after ``search``
+        # and threads it onto the per-source ``source-result`` metric event.
+        # ``None`` for sources that do not deep-enumerate.
+        self.candidates_enumerated = candidates_enumerated
 
     @property
     def handle_store(self) -> HandleStore:

@@ -39,10 +39,12 @@ import contextlib
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
+from ..metrics.collector import get_collector
 from .solver_lifecycle import BrowserLifecycle
 
 if TYPE_CHECKING:
@@ -81,6 +83,41 @@ def _belongs_to_host(cookie: dict[str, Any], host: str) -> bool:
         return False
     domain = raw.lstrip(".").lower()
     return host == domain or host.endswith("." + domain)
+
+
+def _emit_browser(
+    *,
+    op: str,
+    url: str,
+    outcome: str,
+    duration_ms: float,
+    attempt: int,
+    error: str | None,
+) -> None:
+    """No-op-safe, failure-isolated ``emit_browser`` (#125, T-e9a-05).
+
+    Mirrors ``solver_lifecycle._emit_solve`` / ``context._emit_http``: a ``None``
+    collector short-circuits and any collector-side error is swallowed so a metric
+    failure can NEVER break a browser fetch. ``source_key`` + ``request_id``
+    self-attribute via the contextvars already bound by ``fanout._guarded`` (the
+    comix ``_series_chapters`` browser read runs inside ``_run_one`` inside the
+    fan-out's ``source_scope``). The url is redacted at the collector ingest
+    boundary (same path as ``emit_http``).
+    """
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        collector.emit_browser(
+            op=op,
+            url=url,
+            outcome=outcome,
+            duration_ms=duration_ms,
+            attempt=attempt,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001 — a metric failure must never break a fetch
+        pass
 
 
 class BrowserFetchError(RuntimeError):
@@ -472,7 +509,7 @@ class CloudflareSolver:
         """
         try:
             return await self._fetch_via_browser_once(
-                url, extract=extract, wait_for=wait_for, timeout=timeout
+                url, extract=extract, wait_for=wait_for, timeout=timeout, attempt=1
             )
         except BrowserFetchError as exc:
             if not _looks_like_dead_driver(exc):
@@ -492,7 +529,7 @@ class CloudflareSolver:
             )
             await self._lifecycle.recycle_now()
             return await self._fetch_via_browser_once(
-                url, extract=extract, wait_for=wait_for, timeout=timeout
+                url, extract=extract, wait_for=wait_for, timeout=timeout, attempt=2
             )
 
     async def _fetch_via_browser_once(
@@ -502,6 +539,7 @@ class CloudflareSolver:
         extract: str,
         wait_for: str | None = None,
         timeout: float = 30.0,  # noqa: ASYNC109 — same justification as fetch_via_browser
+        attempt: int = 1,
     ) -> Any:
         """One attempt of the goto + wait_for + evaluate sequence (no retry).
 
@@ -534,6 +572,13 @@ class CloudflareSolver:
             if self._log_browser_events:
                 _attach_browser_event_loggers(page, nav_url=url)
             timeout_ms = int(timeout * 1000)
+            # #125 / 260605-e9a: wrap the goto + wait_for + evaluate sequence in
+            # perf_counter and emit exactly ONE ``browser`` ring event per call
+            # (kind=browser), self-attributed to the source/request via contextvars.
+            # outcome "ok" on success, "error" on any BrowserFetchError (emitted in
+            # the except before re-raising). STRICTLY additive — never changes
+            # control flow / exception propagation / timing.
+            browser_start = time.perf_counter()
             try:
                 try:
                     # ``wait_until="commit"`` returns as soon as the response
@@ -556,7 +601,7 @@ class CloudflareSolver:
                             f"wait_for {wait_for!r} failed: {exc}"
                         ) from exc
                 try:
-                    return await asyncio.wait_for(
+                    result = await asyncio.wait_for(
                         page.evaluate("async () => { " + extract + " }"),
                         timeout=timeout,
                     )
@@ -566,6 +611,26 @@ class CloudflareSolver:
                     ) from exc
                 except Exception as exc:  # noqa: BLE001
                     raise BrowserFetchError(f"page.evaluate failed: {exc}") from exc
+            except BrowserFetchError as exc:
+                _emit_browser(
+                    op="fetch_via_browser",
+                    url=url,
+                    outcome="error",
+                    duration_ms=(time.perf_counter() - browser_start) * 1000.0,
+                    attempt=attempt,
+                    error=repr(exc),
+                )
+                raise
+            else:
+                _emit_browser(
+                    op="fetch_via_browser",
+                    url=url,
+                    outcome="ok",
+                    duration_ms=(time.perf_counter() - browser_start) * 1000.0,
+                    attempt=attempt,
+                    error=None,
+                )
+                return result
             finally:
                 with contextlib.suppress(Exception):
                     await page.close()

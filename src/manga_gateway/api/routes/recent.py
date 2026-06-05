@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 
 from ...deps import (
     get_handle_store,
@@ -37,6 +37,8 @@ from ...framework.registry import SourceRegistry
 from ...framework.session import SessionManager
 from ...framework.session_prep import SessionPrep
 from ...handles.store import HandleStore
+from ...metrics.collector import get_collector
+from ...metrics.context import stash_request_blob, stash_request_result
 from ...models.search import Release, ReleaseListResponse, SourceWarning
 from ..sorting import parse_publish_ts as _parse_ts
 from ..sorting import sort_newest_first
@@ -45,6 +47,21 @@ if TYPE_CHECKING:
     from ...framework.base import Source
 
 router = APIRouter()
+
+
+def _emit_source_result(result_count: int, candidates_enumerated: int | None) -> None:
+    """No-op-safe per-source summary emit (260605-e9a; mirrors search.py)."""
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        collector.emit_source_result(
+            result_count=result_count,
+            candidates_enumerated=candidates_enumerated,
+        )
+    except Exception:  # noqa: BLE001 — a metric failure must never break a source
+        pass
+
 
 # Contract ceiling for the recent feed (openapi.yaml: limit maximum 100, T-02-06).
 _MAX_LIMIT = 100
@@ -109,6 +126,7 @@ def _select_sources(
     response_model_by_alias=True,
 )
 async def get_recent(
+    request: Request,
     session: Annotated[SessionManager, Depends(get_session)],
     ratelimiter: Annotated[RateLimiter, Depends(get_ratelimiter)],
     registry: Annotated[SourceRegistry, Depends(get_registry)],
@@ -130,6 +148,15 @@ async def get_recent(
     ] = None,
 ) -> ReleaseListResponse:
     """Fan ``recent`` out across selected sources; newest-first (RCNT-01/02)."""
+    # 260605-e9a deliverable 1: capture the request blob (GET → body=None). Path +
+    # query come from request.url for the exact 1:1 reconstruction; stashed into
+    # current_request, emitted on the umbrella request event by the middleware.
+    stash_request_blob(
+        method="GET",
+        path=request.url.path,
+        query_string=request.url.query,
+        body=None,
+    )
     source_keys = _split_multi(sources)
     language_list = _split_multi(languages)
     clamped_limit = _parse_limit(limit)
@@ -156,12 +183,17 @@ async def get_recent(
             source_health=health_map.get(src.key),
             session_prep=session_prep,
         )
-        return await src.recent(
+        releases = await src.recent(
             languages=language_list,
             limit=clamped_limit,
             since=since,
             ctx=ctx,
         )
+        # 260605-e9a deliverables 3+5: per-source PRE-merge result_count +
+        # candidates_enumerated, self-attributed via current_source (bound by
+        # fanout._guarded). No-op-safe so a metric error never breaks the source.
+        _emit_source_result(len(releases), ctx.candidates_enumerated)
+        return releases
 
     releases, warning_tuples = await fan_out(selected, _run_one)
 
@@ -182,4 +214,13 @@ async def get_recent(
         SourceWarning(source_key=key, code=code, message=message)
         for key, code, message in warning_tuples
     ]
+    # 260605-e9a deliverables 2+4: final merged result_count + compact warnings
+    # summary ride the umbrella request event. Stashed BEFORE returning so the
+    # middleware finally-block emit reads a populated contextvar.
+    stash_request_result(
+        result_count=len(releases),
+        warnings_summary=[
+            {"source_key": key, "code": code} for key, code, _msg in warning_tuples
+        ],
+    )
     return ReleaseListResponse(releases=releases, warnings=warnings)

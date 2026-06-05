@@ -204,6 +204,8 @@ class MangadotSource(Source):
         candidates = [m for m in (manga_list or []) if isinstance(m, dict)][
             :_DEFAULT_MANGA_CANDIDATES
         ]
+        # 260605-e9a deliverable 5: how many manga candidates we deep-enumerate.
+        ctx.candidates_enumerated = len(candidates)
         wanted_langs = set(req.languages) if req.languages else None
         limit = req.limit or 50
 
