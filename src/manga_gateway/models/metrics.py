@@ -36,6 +36,45 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 
+class RequestBlob(BaseModel):
+    """Documents the request-blob captured on the umbrella ``request`` event.
+
+    Mirrors the dict :func:`manga_gateway.metrics.context.stash_request_blob`
+    builds (field order method/path/query_string/body/body_truncated). ``body`` is
+    a JSON object for a structured POST body, a string when truncated or non-dict,
+    or ``None`` for a body-less GET. ``body_truncated`` is ALWAYS present in the
+    stored blob (False by default, True when the body exceeded the size cap) — the
+    producer always sets it so the stored keyset matches this model.
+
+    ``extra="allow"`` inherits the same no-regression passthrough discipline as
+    :class:`MetricEventOut`: a future producer key degrades to "undocumented but
+    present", never dropped. The RequestBlob drift test guards the keyset against
+    ``stash_request_blob``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    method: str
+    path: str
+    query_string: str
+    body: dict[str, Any] | str | None = None
+    body_truncated: bool = False
+
+
+class WarningSummaryItem(BaseModel):
+    """Documents one compact warning summary entry on the ``request`` event.
+
+    Mirrors the ``{"source_key": key, "code": code}`` dict the search.py / recent.py
+    warning-summary producers build from the warning tuples. ``extra="allow"`` for
+    the same passthrough reason as :class:`RequestBlob`.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    source_key: str
+    code: str
+
+
 class MetricEventOut(BaseModel):
     """Documents one ``MetricEvent`` row on the wire (snake_case, passthrough).
 
@@ -66,10 +105,10 @@ class MetricEventOut(BaseModel):
     duration_ms: float
     attempt: int
     error: str | None = None
-    request_blob: dict[str, Any] | None = None
+    request_blob: RequestBlob | None = None
     result_count: int | None = None
     candidates_enumerated: int | None = None
-    warnings_summary: list[dict[str, Any]] | None = None
+    warnings_summary: list[WarningSummaryItem] | None = None
 
 
 class RequestBreakdownOut(BaseModel):

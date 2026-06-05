@@ -51,6 +51,10 @@ def _populated_event() -> MetricEvent:
             "path": "/api/v1/search",
             "query_string": "x=1",
             "body": {"type": "chapter", "query": "naruto"},
+            # stash_request_blob ALWAYS stores body_truncated (False default), so a
+            # stored-blob fixture must carry it or the model round-trip diverges
+            # (dump emits body_truncated: False; expected would lack it).
+            "body_truncated": False,
         },
         result_count=13,
         candidates_enumerated=5,
