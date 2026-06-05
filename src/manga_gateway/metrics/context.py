@@ -156,6 +156,29 @@ def stash_request_result(
     req["warnings_summary"] = warnings_summary
 
 
+def stash_request_meta(
+    *,
+    manga_title: str | None,
+    chapter_number: float | None,
+) -> None:
+    """Stash the RESOLVED ``manga_title`` + ``chapter_number`` into the request-scoped
+    dict IN PLACE (260605-nqo, read by the middleware emit). No-op without a request
+    scope, mirroring :func:`stash_request_result`.
+
+    Mangarr's download body sends ``title``/``mangaTitle``/``chapterNumbers`` null, so
+    the human-readable values live in the RESOLVED data — the ``ResolutionRecord``
+    (POST) and the persisted ``Job`` (GET/DELETE). Only sets a key when its value is
+    NOT None so a partial resolve never clobbers an already-stashed value.
+    """
+    req = current_request.get()
+    if req is None:
+        return
+    if manga_title is not None:
+        req["manga_title"] = manga_title
+    if chapter_number is not None:
+        req["chapter_number"] = chapter_number
+
+
 @contextmanager
 def source_scope(source_key: str) -> Iterator[None]:
     """Bind ``current_source`` for the duration of one fan-out child (Pattern 1).

@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL,
   completed_at     TEXT,
-  manga_title      TEXT
+  manga_title      TEXT,
+  chapter_number   REAL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_jobs_live_handle
   ON jobs(release_handle)
@@ -82,6 +83,7 @@ _COLUMNS = (
     "updated_at",
     "completed_at",
     "manga_title",
+    "chapter_number",
 )
 
 _INSERT_SQL = (
@@ -121,6 +123,7 @@ def _row_to_job(row: aiosqlite.Row) -> Job:
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
         manga_title=row["manga_title"],
+        chapter_number=row["chapter_number"],
     )
 
 
@@ -145,6 +148,7 @@ def _job_values(job: Job) -> tuple[object, ...]:
         job.updated_at,
         job.completed_at,
         job.manga_title,
+        job.chapter_number,
     )
 
 
@@ -306,13 +310,38 @@ async def _migrate_add_manga_title(conn: aiosqlite.Connection) -> None:
             raise
 
 
+async def _migrate_add_chapter_number(conn: aiosqlite.Connection) -> None:
+    """Idempotent additive migration: ensure the ``jobs.chapter_number`` column exists.
+
+    Mirrors :func:`_migrate_add_manga_title` VERBATIM (260605-nqo): there is NO
+    migration framework, so an EXISTING ``jobs.db`` (created before this column)
+    needs the additive ALTER. We PRAGMA-check the current columns and only
+    ``ALTER TABLE jobs ADD COLUMN chapter_number REAL`` when absent, so a re-open of
+    an already-migrated/fresh DB is a no-op and never raises. The duplicate-column
+    ``OperationalError`` is caught as a belt-and-suspenders race guard. SQLite appends
+    the column physically at the end — ``_COLUMNS`` (SELECT-by-name) stays the source
+    of truth for read order, not physical column position. Pre-migration rows read back
+    ``chapter_number=NULL`` (no backfill).
+    """
+    async with conn.execute("PRAGMA table_info(jobs)") as cur:
+        cols = {row["name"] for row in await cur.fetchall()}
+    if "chapter_number" in cols:
+        return
+    try:
+        await conn.execute("ALTER TABLE jobs ADD COLUMN chapter_number REAL")
+        await conn.commit()
+    except aiosqlite.OperationalError as exc:  # pragma: no cover - race guard
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
 async def open_store(path: str) -> JobStore:
     """Open (and schema-init) the job store at ``path``.
 
     Connects, enables WAL (Pitfall 7), sets a ``Row`` factory for dict-shaped
     reads, creates the table + partial unique index if absent, runs the idempotent
-    additive ``manga_title`` migration for pre-#16 DBs, and returns a ready
-    :class:`JobStore`.
+    additive ``manga_title`` (pre-#16) and ``chapter_number`` (pre-260605-nqo)
+    migrations, and returns a ready :class:`JobStore`.
     """
     conn = await aiosqlite.connect(path)
     conn.row_factory = aiosqlite.Row
@@ -323,4 +352,5 @@ async def open_store(path: str) -> JobStore:
     # framework — see _migrate_add_manga_title). Fresh DBs already have the column
     # from _CREATE_SCHEMA, so the PRAGMA check makes this a no-op there.
     await _migrate_add_manga_title(conn)
+    await _migrate_add_chapter_number(conn)
     return JobStore(conn)

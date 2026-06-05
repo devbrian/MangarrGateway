@@ -59,6 +59,8 @@ def _populated_event() -> MetricEvent:
         result_count=13,
         candidates_enumerated=5,
         warnings_summary=[{"source_key": "comix", "code": "timeout"}],
+        manga_title="Solo Leveling",
+        chapter_number=1.0,
     )
 
 

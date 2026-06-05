@@ -182,6 +182,14 @@ class JobManager:
             # #16: the series title lives on the resolved record (SubmitRequest has
             # none); persist it so the engine can bucket mangaId-less grabs per-series.
             manga_title=record.manga_title,
+            # 260605-nqo: persist the resolved chapter number so DELETE/GET-by-id
+            # telemetry carries it across a restart. record.chapter_number is a
+            # Decimal — float() at the Job boundary (None stays None).
+            chapter_number=(
+                float(record.chapter_number)
+                if record.chapter_number is not None
+                else None
+            ),
             # #83/IN-03: carry the record's declared page count so the engine can
             # forward it to fetch_manifest as an integrity hint (projection-only).
             page_count=record.page_count,

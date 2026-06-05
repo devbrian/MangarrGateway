@@ -27,7 +27,11 @@ from ...deps import get_handle_store, get_job_manager
 # dependency types cannot live under TYPE_CHECKING (search.py / recent.py convention).
 from ...handles.store import HandleStore
 from ...jobs.manager import JobManager
-from ...metrics.context import stash_request_blob, stash_request_result
+from ...metrics.context import (
+    stash_request_blob,
+    stash_request_meta,
+    stash_request_result,
+)
 from ...models.download import (
     DownloadJob,
     DownloadJobList,
@@ -144,6 +148,16 @@ async def submit_download(
             warnings_summary=[{"source_key": req.source_key, "code": "bad_handle"}],
         )
         return _reject("release no longer resolvable")
+    # 260605-nqo: Mangarr's body sends title/mangaTitle/chapterNumbers null, so the
+    # human-readable values live in the RESOLVED record — stash them onto the umbrella
+    # request event (chapter_number Decimal float()'d at the telemetry boundary). Only
+    # the success path has a record; rejection paths above add nothing.
+    stash_request_meta(
+        manga_title=record.manga_title,
+        chapter_number=(
+            float(record.chapter_number) if record.chapter_number is not None else None
+        ),
+    )
     job_id, status = await job_manager.submit(record, req)
     # SubmitResponse.status is the just-scheduled state (queued/resolving). An
     # idempotent return of an EXISTING live/completed job (DL-03) may carry any job
@@ -202,6 +216,10 @@ async def get_download(
     a 5xx would produce (T-03-14). Stashes a body-less ``request_blob`` for
     path/query reconstruction (260605-mnv); job-found vs 404 is already visible via
     the status code, so NO warnings_summary is added here.
+
+    260605-nqo: also stashes the resolved manga_title/chapter_number read from the
+    INTERNAL job (``job_manager.get`` — the wire DTO has no chapter_number). The 404
+    path (job None) adds nothing.
     """
     stash_request_blob(
         method="GET",
@@ -209,9 +227,14 @@ async def get_download(
         query_string=request.url.query,
         body=None,
     )
+    internal = job_manager.get(job_id)
     job = job_manager.get_dto(job_id)
-    if job is None:
+    if internal is None or job is None:
         raise HTTPException(status_code=404, detail="Unknown job id")
+    stash_request_meta(
+        manga_title=internal.manga_title,
+        chapter_number=internal.chapter_number,
+    )
     return job
 
 
@@ -250,6 +273,9 @@ async def remove_download(
     Stashes a body-less ``request_blob`` (260605-mnv); ``deleteData`` rides
     ``request_blob.query_string`` for free, so NO bespoke field is added; job-found vs
     404 is visible via the status code, so NO warnings_summary is added here.
+
+    260605-nqo: looks up the internal job BEFORE ``remove`` (remove deletes the row)
+    and stashes its resolved manga_title/chapter_number. The 404 path adds nothing.
     """
     stash_request_blob(
         method="DELETE",
@@ -257,6 +283,13 @@ async def remove_download(
         query_string=request.url.query,
         body=None,
     )
+    # MUST precede remove() — remove pops the projection / deletes the row.
+    internal = job_manager.get(job_id)
+    if internal is not None:
+        stash_request_meta(
+            manga_title=internal.manga_title,
+            chapter_number=internal.chapter_number,
+        )
     ok = await job_manager.remove(job_id, delete_data=_parse_delete_data(delete_data))
     if not ok:
         raise HTTPException(status_code=404, detail="Unknown job id")

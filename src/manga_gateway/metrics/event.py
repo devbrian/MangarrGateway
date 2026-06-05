@@ -57,3 +57,14 @@ class MetricEvent:
     warnings_summary: list[dict[str, object]] | None = (
         None  # [{source_key, code}, …] on the umbrella request event
     )
+    # ── 260605-nqo resolved download-telemetry fields (default None) ──────────
+    # Request-event-only in practice (download surface): POST reads them from the
+    # resolved ``ResolutionRecord``; GET/DELETE-by-id from the persisted ``Job``
+    # (Mangarr's body sends them null). Same posture as the e9a block above —
+    # additive + optional so asdict() round-trips unchanged and they ride
+    # ``json.dumps(asdict(MetricEvent))`` into ring_events.payload with NO new
+    # ring_events column and NO metrics-DB migration.
+    manga_title: str | None = None  # resolved series title (download request events)
+    chapter_number: float | None = (
+        None  # resolved chapter number (Decimal serialized to float)
+    )

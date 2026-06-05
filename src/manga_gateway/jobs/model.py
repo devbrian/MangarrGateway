@@ -89,6 +89,14 @@ class Job:
     # + an additive ALTER migration). Defaulted so existing ``Job(...)`` / test
     # ``_make_job`` call sites that omit it still construct.
     manga_title: str | None = None
+    # The resolved chapter number (260605-nqo, from ``ResolutionRecord.chapter_number``,
+    # a ``Decimal`` float()'d at the manager boundary). Like ``manga_title`` — and
+    # UNLIKE the projection-only ``downloaded_bytes``/``page_count`` — this IS
+    # submit-time DURABLE data persisted to its OWN SQLite column (store wires
+    # _CREATE_SCHEMA/_COLUMNS/_row_to_job/_job_values + an additive ALTER migration) so
+    # DELETE/GET-by-id telemetry keep it across a restart. Defaulted so existing
+    # ``Job(...)`` / test ``_make_job`` call sites that omit it still construct.
+    chapter_number: float | None = None
     # The resolved record's declared page count (``ResolutionRecord.page_count``),
     # forwarded to ``fetch_manifest`` as an integrity hint (#83 / IN-03) so a source
     # can assert the extracted manifest length matches what search declared. Unlike

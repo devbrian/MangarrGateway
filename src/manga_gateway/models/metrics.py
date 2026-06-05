@@ -130,6 +130,10 @@ class MetricEventOut(BaseModel):
     result_count: int | None = None
     candidates_enumerated: int | None = None
     warnings_summary: list[WarningSummaryItem] | None = None
+    # 260605-nqo resolved download-telemetry scalars (lockstep parity with
+    # MetricEvent — both default None, no new sub-model needed).
+    manga_title: str | None = None
+    chapter_number: float | None = None
 
 
 class RequestBreakdownOut(BaseModel):

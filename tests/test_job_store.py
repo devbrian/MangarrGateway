@@ -32,6 +32,7 @@ def _make_job(
     status: JobStatus = JobStatus.QUEUED,
     *,
     manga_title: str | None = None,
+    chapter_number: float | None = None,
 ) -> Job:
     ts = _now()
     return Job(
@@ -54,6 +55,7 @@ def _make_job(
         updated_at=ts,
         completed_at=None,
         manga_title=manga_title,
+        chapter_number=chapter_number,
     )
 
 
@@ -81,6 +83,37 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL,
   completed_at     TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_jobs_live_handle
+  ON jobs(release_handle)
+  WHERE status IN ('queued','resolving','downloading','archiving');
+"""
+
+
+# OLD schema (post-#16, pre-260605-nqo): HAS manga_title but LACKS chapter_number.
+# Used to prove the additive chapter_number ALTER in open_store on a DB that already
+# went through the manga_title migration. Kept inline as a fixed historical artifact.
+_OLD_SCHEMA_NO_CHAPTER_NUMBER = """
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id           TEXT PRIMARY KEY,
+  release_handle   TEXT NOT NULL,
+  source_key       TEXT NOT NULL,
+  title            TEXT NOT NULL,
+  status           TEXT NOT NULL,
+  manga_id         INTEGER,
+  output_format    TEXT NOT NULL,
+  chapter_id       TEXT,
+  language         TEXT,
+  total_pages      INTEGER,
+  downloaded_pages INTEGER,
+  total_bytes      INTEGER NOT NULL DEFAULT 0,
+  remaining_bytes  INTEGER NOT NULL DEFAULT 0,
+  output_path      TEXT,
+  message          TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL,
+  completed_at     TEXT,
+  manga_title      TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_jobs_live_handle
   ON jobs(release_handle)
@@ -152,6 +185,69 @@ async def test_insert_round_trips_manga_title(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_insert_round_trips_chapter_number(tmp_path: Path) -> None:
+    # 260605-nqo: chapter_number is durable submit-time data — it survives insert→get.
+    db = str(tmp_path / "jobs.db")
+    store = await open_store(db)
+    try:
+        await store.insert(_make_job("j_cn", "h-cn", chapter_number=1.5))
+        got = await store.get("j_cn")
+        assert got is not None
+        assert got.chapter_number == 1.5
+        # Fresh DB carries the column.
+        assert "chapter_number" in await _table_columns(db)
+    finally:
+        await store.close()
+
+
+async def test_open_store_alter_migrates_chapter_numberless_db(tmp_path: Path) -> None:
+    # 260605-nqo: an EXISTING jobs.db that has manga_title but predates chapter_number
+    # must gain the column via the idempotent additive ALTER in open_store.
+    db = str(tmp_path / "jobs.db")
+    seed = await aiosqlite.connect(db)
+    try:
+        await seed.executescript(_OLD_SCHEMA_NO_CHAPTER_NUMBER)
+        # Seed a legacy row (no chapter_number column) to prove it reads back NULL.
+        await seed.execute(
+            "INSERT INTO jobs (job_id, release_handle, source_key, title, status, "
+            "output_format, total_bytes, remaining_bytes, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)",
+            (
+                "j_legacy",
+                "h-legacy",
+                "mangadex",
+                "Chapter 1",
+                "completed",
+                "cbz",
+                _now(),
+                _now(),
+            ),
+        )
+        await seed.commit()
+    finally:
+        await seed.close()
+    # Sanity: the seeded DB lacks chapter_number (but has manga_title).
+    cols_before = await _table_columns(db)
+    assert "chapter_number" not in cols_before
+    assert "manga_title" in cols_before
+
+    store = await open_store(db)
+    try:
+        # open_store added the column.
+        assert "chapter_number" in await _table_columns(db)
+        # Pre-migration rows read back chapter_number=NULL (no backfill).
+        legacy = await store.get("j_legacy")
+        assert legacy is not None
+        assert legacy.chapter_number is None
+        # ...and read/write through the migrated column round-trips.
+        await store.insert(_make_job("j_cm", "h-cm", chapter_number=72.8))
+        got = await store.get("j_cm")
+        assert got is not None
+        assert got.chapter_number == 72.8
+    finally:
+        await store.close()
+
+
 async def test_open_store_alter_migrates_columnless_db(tmp_path: Path) -> None:
     # #16: an EXISTING production jobs.db created BEFORE the column must gain it via
     # the idempotent additive ALTER in open_store (no migration framework).
@@ -162,18 +258,25 @@ async def test_open_store_alter_migrates_columnless_db(tmp_path: Path) -> None:
         await seed.commit()
     finally:
         await seed.close()
-    # Sanity: the seeded DB lacks the column.
-    assert "manga_title" not in await _table_columns(db)
+    # Sanity: the seeded DB lacks both additive columns.
+    cols_before = await _table_columns(db)
+    assert "manga_title" not in cols_before
+    assert "chapter_number" not in cols_before
 
     store = await open_store(db)
     try:
-        # open_store added the column.
-        assert "manga_title" in await _table_columns(db)
-        # ...and read/write through it round-trips.
-        await store.insert(_make_job("j_m", "h-m", manga_title="Migrated Series"))
+        # open_store added BOTH additive columns (manga_title + chapter_number).
+        cols_after = await _table_columns(db)
+        assert "manga_title" in cols_after
+        assert "chapter_number" in cols_after
+        # ...and read/write through them round-trips.
+        await store.insert(
+            _make_job("j_m", "h-m", manga_title="Migrated Series", chapter_number=30.1)
+        )
         got = await store.get("j_m")
         assert got is not None
         assert got.manga_title == "Migrated Series"
+        assert got.chapter_number == 30.1
     finally:
         await store.close()
 

@@ -168,6 +168,9 @@ def test_metric_event_has_all_fields_incl_method() -> None:
         "result_count",
         "candidates_enumerated",
         "warnings_summary",
+        # 260605-nqo resolved download-telemetry fields (default None).
+        "manga_title",
+        "chapter_number",
     }
     assert field_names == expected
 
