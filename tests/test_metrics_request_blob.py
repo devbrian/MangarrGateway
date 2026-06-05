@@ -126,7 +126,8 @@ def test_request_blob_shape_lockstep_with_model() -> None:
         current_request.reset(token)
     assert isinstance(stored, dict)
     assert set(stored) == model_keys, (
-        f"RequestBlob/stash_request_blob keyset drift: {sorted(set(stored) ^ model_keys)}. "
+        "RequestBlob/stash_request_blob keyset drift: "
+        f"{sorted(set(stored) ^ model_keys)}. "
         "Keep src/manga_gateway/metrics/context.py::stash_request_blob and "
         "src/manga_gateway/models/metrics.py::RequestBlob in sync."
     )
