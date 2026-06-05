@@ -314,3 +314,59 @@ async def test_per_id_routes_stash_blob(
     assert del_blob["body"] is None
     # deleteData rides the request_blob.query_string for free — no bespoke field.
     assert "deleteData=true" in del_blob["query_string"]
+
+
+# ─────────────── POST carries resolved manga_title + chapter_number ───────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_post_carries_resolved_manga_title_and_chapter_number(
+    tel_app: FastAPI, tel_client: httpx.AsyncClient
+) -> None:
+    """A successful POST event carries the RESOLVED manga_title + chapter_number from
+    the ResolutionRecord, even though Mangarr's body omits them (260605-nqo)."""
+    _mock_at_home(pages=1)
+    handle = _mint_handle(tel_app)  # resolves to "Solo Leveling", chapter 1
+
+    resp = await tel_client.post(
+        "/downloads",
+        json={"releaseHandle": handle, "sourceKey": "mangadex", "mangaId": 42},
+    )
+    assert resp.status_code == 200
+
+    ev = await _read_request_event(tel_app, "POST /downloads")
+    assert ev["manga_title"] == "Solo Leveling"
+    assert ev["chapter_number"] == 1.0
+
+
+# ─────────────── GET/DELETE-by-id carry them from the persisted job ───────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_per_id_routes_carry_resolved_meta_from_job(
+    tel_app: FastAPI, tel_client: httpx.AsyncClient
+) -> None:
+    """After a completed job, GET and DELETE /downloads/{id} events both carry
+    manga_title + chapter_number read from the PERSISTED job (260605-nqo)."""
+    _mock_at_home(pages=1)
+    handle = _mint_handle(tel_app)
+    resp = await tel_client.post(
+        "/downloads",
+        json={"releaseHandle": handle, "sourceKey": "mangadex", "mangaId": 42},
+    )
+    job_id = resp.json()["jobId"]
+    await _poll_until(tel_client, job_id)
+
+    one = await tel_client.get(f"/downloads/{job_id}")
+    assert one.status_code == 200
+    get_ev = await _read_request_event(tel_app, "GET /downloads/{id}")
+    assert get_ev["manga_title"] == "Solo Leveling"
+    assert get_ev["chapter_number"] == 1.0
+
+    deleted = await tel_client.delete(f"/downloads/{job_id}?deleteData=true")
+    assert deleted.status_code == 204
+    del_ev = await _read_request_event(tel_app, "DELETE /downloads/{id}")
+    assert del_ev["manga_title"] == "Solo Leveling"
+    assert del_ev["chapter_number"] == 1.0
