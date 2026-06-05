@@ -62,6 +62,16 @@ _SURFACE_MAP: tuple[tuple[str, str, dict[str, str] | None, str], ...] = (
     ("/admin/metrics", "admin", None, "GET /admin/metrics"),
 )
 
+# Endpoint labels excluded from the dashboard's request metrics. The /version
+# health probe and /admin/metrics (the dashboard's OWN poll target) are
+# operational noise that would otherwise dominate the recent/failures/slow rings
+# and the request counters. Excluded requests still get their contextvar set (so
+# inward log lines + seam emits stay attributed) — only the per-request emit is
+# suppressed.
+_METRICS_EXCLUDED_ENDPOINTS: frozenset[str] = frozenset(
+    {"GET /version", "GET /admin/metrics"}
+)
+
 
 def _attribution(path: str, method: str = "GET") -> tuple[str | None, str | None]:
     """Derive ``(surface, endpoint)`` from ``(method, path)`` (longest-prefix wins).
@@ -125,7 +135,7 @@ class MetricsRequestMiddleware:
         finally:
             duration_ms = (time.perf_counter() - start) * 1000.0
             collector = get_collector()
-            if collector is not None:
+            if collector is not None and endpoint not in _METRICS_EXCLUDED_ENDPOINTS:
                 # WR-04: a 4xx (401 unauthorized, 404, 422 validation) is NOT a
                 # success — it must admit to the failures ring + error_rate so a
                 # flood of 401s/404s (the prime observability signal) is visible.

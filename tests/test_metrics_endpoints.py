@@ -66,8 +66,10 @@ async def _seed_request(app: FastAPI) -> int:
         base_url="http://testserver",
         headers={"X-Api-Key": TEST_API_KEY},
     ) as ac:
-        # A real /api/v1 call flows through the middleware (emits a `request` event).
-        await ac.get("/api/v1/version")
+        # A real /api/v1 call flows through the middleware (emits a `request`
+        # event). Must NOT be an endpoint excluded from dashboard metrics
+        # (/version, /admin/metrics) — those deliberately emit no request event.
+        await ac.get("/api/v1/status")
         store = app.state.metric_store
         request_event = next(
             e for e in store.recent_calls(50) if e["kind"] == "request"
@@ -79,7 +81,7 @@ async def _seed_request(app: FastAPI) -> int:
         collector = get_collector()
         assert collector is not None
         token = current_request.set(
-            {"request_id": request_id, "surface": "search", "endpoint": "GET /version"}
+            {"request_id": request_id, "surface": "search", "endpoint": "GET /status"}
         )
         try:
             collector.emit_http(
