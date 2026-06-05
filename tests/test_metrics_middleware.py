@@ -179,6 +179,45 @@ async def test_get_vs_post_downloads_attribute_distinctly(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "expected_endpoint"),
+    [
+        ("/api/v1/version", "GET /version"),
+        ("/admin/metrics/v1/summary", "GET /admin/metrics"),
+    ],
+)
+async def test_excluded_endpoints_emit_no_request_event(
+    store: InMemoryStore,
+    collector: Collector,
+    path: str,
+    expected_endpoint: str,
+) -> None:
+    """The /version probe and /admin/metrics poll are excluded from dashboard
+    metrics: no ``request`` event is emitted, but the contextvar is still set
+    (for inward log attribution) and reset afterwards."""
+    seen: dict[str, Any] = {}
+
+    async def downstream(
+        scope: MutableMapping[str, Any], receive: Any, send: Any
+    ) -> None:
+        seen["req"] = current_request.get()
+        await send({"type": "http.response.start", "status": 200})
+        await send({"type": "http.response.body", "body": b""})
+
+    mw = MetricsRequestMiddleware(downstream)
+    await mw(_http_scope(path), _noop_receive, _make_send())
+
+    # Contextvar was set inward with the expected attribution, then reset.
+    assert seen["req"] is not None
+    assert seen["req"]["endpoint"] == expected_endpoint
+    assert current_request.get() is None
+
+    # No request event reached the dashboard rings.
+    request_events = [e for e in store.recent_calls(10) if e["kind"] == "request"]
+    assert request_events == []
+
+
+@pytest.mark.asyncio
 async def test_non_http_scope_short_circuits() -> None:
     """A lifespan/websocket scope passes straight through, untouched."""
     called: dict[str, Any] = {}
