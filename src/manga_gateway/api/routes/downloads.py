@@ -27,6 +27,7 @@ from ...deps import get_handle_store, get_job_manager
 # dependency types cannot live under TYPE_CHECKING (search.py / recent.py convention).
 from ...handles.store import HandleStore
 from ...jobs.manager import JobManager
+from ...metrics.context import stash_request_blob, stash_request_result
 from ...models.download import (
     DownloadJob,
     DownloadJobList,
@@ -71,22 +72,77 @@ async def submit_download(
     endpoint — a ``SubmitResponse{jobId:null}`` — instead of the generic ``Error``
     envelope FastAPI's validation handler would emit (CTRT-01: openapi documents the
     POST 400 as a SubmitResponse, HDL-02).
+
+    Telemetry parity (260605-mnv): the parsed body (incl. ``chapterNumbers``) is
+    stashed onto the umbrella ``request`` event via the existing enrichment seam, and
+    the finer reject reason / idempotent-hit ride ``warnings_summary`` — both reuse
+    ``stash_request_blob`` / ``stash_request_result``, NO new schema.
     """
     try:
         payload = await request.json()
     except (ValueError, TypeError):
+        # Body is unparseable → no model to dump; capture path/query only and convey
+        # the finer reason via warnings_summary (out-of-contract telemetry only).
+        stash_request_blob(
+            method="POST",
+            path=request.url.path,
+            query_string=request.url.query,
+            body=None,
+        )
+        stash_request_result(
+            result_count=0,
+            warnings_summary=[{"source_key": "_request", "code": "malformed_body"}],
+        )
         return _reject("malformed request body")
     if not isinstance(payload, dict):
+        stash_request_blob(
+            method="POST",
+            path=request.url.path,
+            query_string=request.url.query,
+            body=None,
+        )
+        stash_request_result(
+            result_count=0,
+            warnings_summary=[{"source_key": "_request", "code": "malformed_body"}],
+        )
         return _reject("malformed request body")
     try:
         req = SubmitRequest.model_validate(payload)
     except ValidationError:
+        # The model did not validate → no model_dump; convey invalid_request.
+        stash_request_blob(
+            method="POST",
+            path=request.url.path,
+            query_string=request.url.query,
+            body=None,
+        )
+        stash_request_result(
+            result_count=0,
+            warnings_summary=[{"source_key": "_request", "code": "invalid_request"}],
+        )
         return _reject("invalid submit request")
+
+    # Stash the parsed body ONCE, BEFORE the early-return rejection paths below
+    # (mirroring search.py's "stashed before the SRCH-05 early return so a 400 is
+    # still reconstructable"). This carries chapterNumbers/mangaTitle/title/sourceKey/
+    # outputFormat so the chapter number becomes visible in telemetry with zero schema
+    # change. releaseHandle is a gateway-issued opaque token; redact_blob masks
+    # denylisted keys at stash time and the body is capped at REQUEST_BLOB_BODY_CAP.
+    stash_request_blob(
+        method="POST",
+        path=request.url.path,
+        query_string=request.url.query,
+        body=req.model_dump(by_alias=True),
+    )
 
     record = handle_store.resolve(req.release_handle)
     if record is None:
         # Expired/unknown handle → SubmitResponse{jobId:null} at 400 (HDL-02), NOT the
         # {error:{code,message}} envelope (RESEARCH Anti-Patterns).
+        stash_request_result(
+            result_count=0,
+            warnings_summary=[{"source_key": req.source_key, "code": "bad_handle"}],
+        )
         return _reject("release no longer resolvable")
     job_id, status = await job_manager.submit(record, req)
     # SubmitResponse.status is the just-scheduled state (queued/resolving). An
@@ -94,6 +150,14 @@ async def submit_download(
     # status, which is NOT a valid wire value here — surface only the scheduled states,
     # else omit the field (a null status would violate the non-nullable enum, CTRT-01).
     scheduled = status if status in ("queued", "resolving") else None
+    if scheduled is None:
+        # The manager returned an EXISTING job (DL-03 idempotent hit) rather than
+        # scheduling a fresh one — convey that via warnings_summary. On the clean
+        # new-submit path warnings_summary is OMITTED (parity: search omits it).
+        stash_request_result(
+            result_count=1,
+            warnings_summary=[{"source_key": req.source_key, "code": "idempotent_hit"}],
+        )
     return JSONResponse(
         content=_submit_body(SubmitResponse(job_id=job_id, status=scheduled))
     )
@@ -108,8 +172,15 @@ async def submit_download(
 async def get_downloads(
     job_manager: Annotated[JobManager, Depends(get_job_manager)],
 ) -> DownloadJobList:
-    """List live + finished jobs from the in-memory projection (DL-04/05)."""
-    return DownloadJobList(jobs=job_manager.list())
+    """List live + finished jobs from the in-memory projection (DL-04/05).
+
+    Reports ``result_count == len(jobs)`` on the umbrella ``request`` event (parity
+    with search's merged result_count). The listing is computed ONCE over the
+    in-memory projection — NO disk/SQLite read per poll (DL-05, poll-friendliness).
+    """
+    jobs = job_manager.list()
+    stash_request_result(result_count=len(jobs), warnings_summary=[])
+    return DownloadJobList(jobs=jobs)
 
 
 @router.get(
@@ -120,6 +191,7 @@ async def get_downloads(
 )
 async def get_download(
     job_id: str,
+    request: Request,
     job_manager: Annotated[JobManager, Depends(get_job_manager)],
 ) -> DownloadJob:
     """Return one job (DL-06) or a 404 for an unknown id (Pitfall 8, issue #2).
@@ -127,8 +199,16 @@ async def get_download(
     The 404 is raised as an ``HTTPException`` so ``errors.py``'s ``_http_exc``
     serializes it as the contract Error envelope
     ``{error:{code:not_found,message}}`` — never the ``code: internal`` envelope
-    a 5xx would produce (T-03-14).
+    a 5xx would produce (T-03-14). Stashes a body-less ``request_blob`` for
+    path/query reconstruction (260605-mnv); job-found vs 404 is already visible via
+    the status code, so NO warnings_summary is added here.
     """
+    stash_request_blob(
+        method="GET",
+        path=request.url.path,
+        query_string=request.url.query,
+        body=None,
+    )
     job = job_manager.get_dto(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown job id")
@@ -156,6 +236,7 @@ def _parse_delete_data(raw: str | None) -> bool:
 )
 async def remove_download(
     job_id: str,
+    request: Request,
     job_manager: Annotated[JobManager, Depends(get_job_manager)],
     delete_data: Annotated[str | None, Query(alias="deleteData")] = None,
 ) -> Response:
@@ -165,7 +246,17 @@ async def remove_download(
     gateway-computed output + staging temps, never a client-supplied path (T-03-12).
     ``deleteData`` is parsed tolerantly so a malformed value never surfaces an
     undocumented 400 (only 204/404 are documented). Returns an empty 204 on success.
+
+    Stashes a body-less ``request_blob`` (260605-mnv); ``deleteData`` rides
+    ``request_blob.query_string`` for free, so NO bespoke field is added; job-found vs
+    404 is visible via the status code, so NO warnings_summary is added here.
     """
+    stash_request_blob(
+        method="DELETE",
+        path=request.url.path,
+        query_string=request.url.query,
+        body=None,
+    )
     ok = await job_manager.remove(job_id, delete_data=_parse_delete_data(delete_data))
     if not ok:
         raise HTTPException(status_code=404, detail="Unknown job id")
