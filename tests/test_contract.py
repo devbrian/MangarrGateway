@@ -123,7 +123,7 @@ def _stub_source_hosts(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     the app via ``starlette TestClient``, which starts a fresh lifespan (and a fresh
     real ``CloudflareSolver``) for EVERY generated case. Without this patch each
     case would launch a Patchright browser to solve Cloudflare before the (stubbed)
-    HTTP call, adding ~8 s × 200 cases = ~1600 s to the gate (D-42 regression).
+    HTTP call, adding ~8 s x 200 cases = ~1600 s to the gate (D-42 regression).
     The patch is scoped to this module so the ``test_solver_lifecycle`` tests that
     exercise ``get_clearance`` against injected fake lifecycles are unaffected.
     """
