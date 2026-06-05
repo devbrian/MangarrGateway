@@ -271,9 +271,7 @@ async def test_open_store_alter_migrates_columnless_db(tmp_path: Path) -> None:
         assert "chapter_number" in cols_after
         # ...and read/write through them round-trips.
         await store.insert(
-            _make_job(
-                "j_m", "h-m", manga_title="Migrated Series", chapter_number=30.1
-            )
+            _make_job("j_m", "h-m", manga_title="Migrated Series", chapter_number=30.1)
         )
         got = await store.get("j_m")
         assert got is not None

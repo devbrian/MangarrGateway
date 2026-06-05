@@ -155,9 +155,7 @@ async def submit_download(
     stash_request_meta(
         manga_title=record.manga_title,
         chapter_number=(
-            float(record.chapter_number)
-            if record.chapter_number is not None
-            else None
+            float(record.chapter_number) if record.chapter_number is not None else None
         ),
     )
     job_id, status = await job_manager.submit(record, req)
