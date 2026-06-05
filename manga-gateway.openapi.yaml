@@ -56,8 +56,8 @@ paths:
       summary: Recent-release feed (RSS-sync peer of IIndexer.FetchRecent)
       operationId: getRecent
       parameters:
-        - { name: sources,   in: query, schema: { type: string }, description: "CSV of source keys; omit = all enabled" }
-        - { name: languages, in: query, schema: { type: string }, description: "CSV of BCP-47 codes" }
+        - { name: sources,   in: query, schema: { type: array, items: { type: string } }, description: "Source keys as repeated params (?sources=a&sources=b); a single CSV value is also accepted. Omit = all enabled" }
+        - { name: languages, in: query, schema: { type: array, items: { type: string } }, description: "BCP-47 codes as repeated params; a single CSV value is also accepted" }
         - { name: limit,     in: query, schema: { type: integer, default: 100, maximum: 100 } }
         - { name: since,     in: query, schema: { type: string, format: date-time }, description: "Return items newer than this (optimization)" }
       responses:

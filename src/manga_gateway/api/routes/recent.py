@@ -55,11 +55,19 @@ _MAX_LIMIT = 100
 # cut below unchanged.
 
 
-def _split_csv(raw: str | None) -> list[str] | None:
-    """Parse a comma-separated query value into a trimmed, non-empty list."""
+def _split_multi(raw: list[str] | None) -> list[str] | None:
+    """Flatten a multi-valued query param into a trimmed, non-empty list.
+
+    Accepts BOTH encodings (Postel's law): repeated params
+    (``?sources=a&sources=b`` → ``["a", "b"]``), a single CSV value
+    (``?sources=a,b`` → ``["a,b"]``), and any mix (``["a,b", "c"]``). Mangarr sends
+    the repeated-param form; the contract historically documented CSV — accepting
+    both means neither silently drops sources. FastAPI binds a repeated query param
+    into a ``list[str]``; here we additionally split commas inside each element.
+    """
     if not raw:
         return None
-    items = [part.strip() for part in raw.split(",") if part.strip()]
+    items = [part.strip() for value in raw for part in value.split(",") if part.strip()]
     return items or None
 
 
@@ -108,16 +116,22 @@ async def get_recent(
     solver: Annotated[AntiBotSolver, Depends(get_solver)],
     health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
-    sources: Annotated[str | None, Query(description="CSV of source keys")] = None,
-    languages: Annotated[str | None, Query(description="CSV of BCP-47 codes")] = None,
+    sources: Annotated[
+        list[str] | None,
+        Query(description="Source keys: repeated param (?sources=a&sources=b) or CSV"),
+    ] = None,
+    languages: Annotated[
+        list[str] | None,
+        Query(description="BCP-47 codes: repeated param or CSV"),
+    ] = None,
     limit: Annotated[str | None, Query(description="Max items; clamped <=100")] = None,
     since: Annotated[
         str | None, Query(description="Return items newer than this")
     ] = None,
 ) -> ReleaseListResponse:
     """Fan ``recent`` out across selected sources; newest-first (RCNT-01/02)."""
-    source_keys = _split_csv(sources)
-    language_list = _split_csv(languages)
+    source_keys = _split_multi(sources)
+    language_list = _split_multi(languages)
     clamped_limit = _parse_limit(limit)
     selected = _select_sources(registry, source_keys)
 
