@@ -18,6 +18,13 @@ the 401-without-key guard (SEC-01/AUTH-01, T-08-16). ``?limit=`` is clamped with
 The served JSON is already redacted: the URL/error of every ring event was scrubbed
 by ``redact_url`` at the collector ingest boundary (Plan 02, Pitfall 5), so no secret
 reaches the dashboard (T-08-04).
+
+The four event-feed endpoints (``getMetricsRecent``/``getFailures``/``getSlow`` →
+``list[MetricEventOut]``; ``getRequestBreakdown`` → ``RequestBreakdownOut``) carry a
+``response_model`` so the runtime ``/openapi.json`` documents the snake_case event
+shape. The models keep snake_case fields with NO aliases and set ``extra="allow"``,
+so the served bytes are byte-identical to the raw ``json.loads(payload)`` echo — the
+``response_model`` documents the shape without altering it (see ``models/metrics.py``).
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from typing import Annotated, Any, cast
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..deps import get_metric_ring_store, get_metric_store
+from ..models.metrics import MetricEventOut, RequestBreakdownOut
 from .snapshot import MetricSnapshotStore
 from .store import InMemoryStore
 
@@ -57,7 +65,11 @@ async def get_per_source_endpoint(store: StoreDep) -> list[dict[str, Any]]:
     return store.per_source_per_endpoint()
 
 
-@router.get("/failures", operation_id="getFailures")
+@router.get(
+    "/failures",
+    operation_id="getFailures",
+    response_model=list[MetricEventOut],
+)
 async def get_failures(
     ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
 ) -> list[dict[str, Any]]:
@@ -67,7 +79,11 @@ async def get_failures(
     return await ring.latest_failures(limit)
 
 
-@router.get("/slow", operation_id="getSlow")
+@router.get(
+    "/slow",
+    operation_id="getSlow",
+    response_model=list[MetricEventOut],
+)
 async def get_slow(
     ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
 ) -> list[dict[str, Any]]:
@@ -77,7 +93,11 @@ async def get_slow(
     return await ring.latest_slow(limit)
 
 
-@router.get("/recent", operation_id="getMetricsRecent")
+@router.get(
+    "/recent",
+    operation_id="getMetricsRecent",
+    response_model=list[MetricEventOut],
+)
 async def get_recent(
     ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
 ) -> list[dict[str, Any]]:
@@ -87,7 +107,11 @@ async def get_recent(
     return await ring.recent_calls(limit)
 
 
-@router.get("/requests/{request_id}", operation_id="getRequestBreakdown")
+@router.get(
+    "/requests/{request_id}",
+    operation_id="getRequestBreakdown",
+    response_model=RequestBreakdownOut,
+)
 async def get_request_calls(ring: RingDep, request_id: int) -> dict[str, Any]:
     """The per-request breakdown: the child calls made under one ``request_id``.
 
