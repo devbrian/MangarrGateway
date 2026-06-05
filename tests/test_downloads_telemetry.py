@@ -10,8 +10,8 @@ the request event:
 
 * POST /downloads → ``request_blob.body`` carries camelCase ``chapterNumbers``, even
   on the rejection/expired-handle path; the finer reject reason / idempotent hit ride
-  ``warnings_summary`` (bad_handle / malformed_body / invalid_request), omitted on the
-  clean new-submit path.
+  ``warnings_summary`` (bad_handle / malformed_body / invalid_request / idempotent_hit),
+  omitted on the clean new-submit path.
 * GET /downloads → ``result_count == len(jobs)`` with no disk read.
 * GET/DELETE /downloads/{id} → a body-less ``request_blob`` (``deleteData`` rides
   ``query_string`` for free).
@@ -206,6 +206,50 @@ async def test_clean_submit_omits_warnings_summary(
     assert ev["request_blob"] is not None
     # warnings_summary is None/absent on the clean path (parity with search).
     assert not ev.get("warnings_summary")
+
+
+# ─────────────────────────── idempotent-hit reason code ──────────────────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_idempotent_submit_reason_code(
+    tel_app: FastAPI, tel_client: httpx.AsyncClient
+) -> None:
+    """A DL-03 idempotent re-submit conveys the idempotent_hit reason code.
+
+    ``idempotent_hit`` fires ONLY when ``job_manager.submit`` returns an EXISTING
+    job whose status is NOT a just-scheduled state (``queued``/``resolving``) — i.e.
+    when ``scheduled is None`` in the route. Posting the same handle twice
+    back-to-back does NOT trigger it: the first job is still ``queued``/``resolving``,
+    so the second submit returns the LIVE job with a scheduled status and the route
+    OMITS warnings_summary (the clean path). To reach the idempotent branch
+    deterministically we drive the first job to terminal ``completed`` (its CBZ on
+    disk), then re-submit — JobManager branch (2) returns the completed job
+    (status ``completed``), so ``scheduled is None`` and the route stashes the
+    idempotent_hit code.
+    """
+    _mock_at_home(pages=1)
+    handle = _mint_handle(tel_app)
+
+    payload = {"releaseHandle": handle, "sourceKey": "mangadex", "mangaId": 42}
+    first = await tel_client.post("/downloads", json=payload)
+    assert first.status_code == 200
+    job = await _poll_until(tel_client, first.json()["jobId"])
+    assert job["status"] == "completed"
+
+    # Re-submit the SAME handle: the completed job + its on-disk output make this an
+    # idempotent return (DL-03), not a fresh schedule.
+    second = await tel_client.post("/downloads", json=payload)
+    assert second.status_code == 200
+    # An idempotent return surfaces the existing job id with no scheduled status.
+    assert second.json()["jobId"] == first.json()["jobId"]
+    assert "status" not in second.json()
+
+    ev = await _read_request_event(tel_app, "POST /downloads")
+    assert ev["warnings_summary"] == [
+        {"source_key": "mangadex", "code": "idempotent_hit"}
+    ]
 
 
 # ─────────────────────────── GET list reports result_count ───────────────────
