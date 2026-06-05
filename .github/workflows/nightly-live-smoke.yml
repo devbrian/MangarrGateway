@@ -55,9 +55,23 @@ jobs:
     # Xvfb virtual display clears it (proven 2-4s vs headless 46s timeout). So pin
     # GATEWAY_CLOUDFLARE_HEADLESS=false; the solver auto-starts Xvfb via
     # pyvirtualdisplay (the ``xvfb`` apt package below provides the binary).
+    #
+    # Residential proxy (PROXY-01, #65; debug session nightly-cf-warm-127-128 →
+    # issues #127/#128): the ubuntu-latest datacenter (Azure ASN) IP can no longer
+    # earn cf_clearance from comix.to/mangadot.net — an IP/ASN-reputation block, not
+    # a code or fingerprint regression (warm path byte-identical across the
+    # good→bad commit range). The #65 proxy seam was merged but never wired here, so
+    # every nightly egressed bare and comix+mangadot timed out nightly. These route
+    # BOTH the stealth-browser CF clearance AND the httpx image fetch through one
+    # residential proxy (cf_clearance is IP-bound, so both legs MUST share the IP).
+    # cloudflare_proxy_server is None when the secret is unset → today's bare-egress
+    # behavior is preserved on forks / unconfigured repos.
     env:
       GATEWAY_CLOUDFLARE_ENGINE: patchright
       GATEWAY_CLOUDFLARE_HEADLESS: "false"
+      GATEWAY_CLOUDFLARE_PROXY_SERVER: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_SERVER }}
+      GATEWAY_CLOUDFLARE_PROXY_USERNAME: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_USERNAME }}
+      GATEWAY_CLOUDFLARE_PROXY_PASSWORD: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_PASSWORD }}
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.

@@ -266,6 +266,31 @@ class Settings(BaseSettings):
                 )
         return origins
 
+    @field_validator(
+        "cloudflare_proxy_server",
+        "cloudflare_proxy_username",
+        "cloudflare_proxy_password",
+        mode="before",
+    )
+    @classmethod
+    def _empty_proxy_field_is_none(cls, value: object) -> object:
+        """Treat an empty/whitespace proxy env value as UNSET (None).
+
+        GitHub Actions (and most CI) substitute an UNSET secret as the empty
+        string ``""``, not as a missing var — so ``GATEWAY_CLOUDFLARE_PROXY_SERVER:
+        ${{ secrets.X }}`` with no secret configured reaches us as ``""``, not
+        absent. Without this, ``""`` is a truthy-vs-None mismatch: ``build_proxy``
+        keys off ``server is None``, so an empty string would build a BROKEN proxy
+        (``httpx.Proxy(url="")`` / ``{"server": ""}``) instead of the documented
+        "unconfigured ⇒ no proxy, bare egress" #65 contract — and an empty
+        username/password would forge bogus auth. Normalizing ``""`` → ``None``
+        here keeps the invariant "configured == cloudflare_proxy_server is not
+        None" true regardless of how the empty value arrived (CodeRabbit, #138).
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @model_validator(mode="after")
     def _reject_camoufox_parallel(self) -> Settings:
         """Fail fast on the camoufox + parallel-fetch misconfiguration (#64).
