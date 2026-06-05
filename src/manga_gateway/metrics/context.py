@@ -99,31 +99,37 @@ def stash_request_blob(
     (no new contextvar, no token churn) — the middleware finally-block ``_ingest``
     reads it back. No-op when no request scope is active (defensive).
 
-    The body is serialized to a JSON-safe form and SIZE-CAPPED at
-    :data:`REQUEST_BLOB_BODY_CAP`: an oversized body is dropped to a marker string
-    and ``body_truncated: true`` is set inside the blob (T-e9a-02). Secrets are
-    redacted via :func:`redact_blob` AT STASH TIME so they never enter the
-    contextvar (defense in depth, T-e9a-01).
+    Secrets are redacted via :func:`redact_blob` AT STASH TIME (defense in depth,
+    T-e9a-01) so they never enter the contextvar — and redaction runs BEFORE the
+    size cap, because truncation serializes a dict body to a string that
+    ``redact_blob`` can no longer key-redact (CodeRabbit #129). The already-redacted
+    body is then SIZE-CAPPED at :data:`REQUEST_BLOB_BODY_CAP`: an oversized body is
+    truncated to a string and ``body_truncated: true`` is set inside the blob.
     """
     req = current_request.get()
     if req is None:
         return
-    safe_body = _json_safe(body)
-    truncated = False
-    if safe_body is not None:
-        serialized = json.dumps(safe_body)
-        if len(serialized) > REQUEST_BLOB_BODY_CAP:
-            safe_body = serialized[:REQUEST_BLOB_BODY_CAP]
-            truncated = True
-    blob: dict[str, object] = {
-        "method": method,
-        "path": path,
-        "query_string": query_string,
-        "body": safe_body,
-    }
-    if truncated:
-        blob["body_truncated"] = True
-    req["request_blob"] = redact_blob(blob)
+    # Redact BEFORE size-capping (CodeRabbit #129): truncation serializes a dict
+    # body to a string, after which redact_blob can no longer mask denylisted keys
+    # — so an oversized dict body would leak raw auth/token data. Redact the
+    # dict-shaped blob first, THEN truncate the already-redacted body.
+    blob: dict[str, object] = redact_blob(
+        {
+            "method": method,
+            "path": path,
+            "query_string": query_string,
+            "body": _json_safe(body),
+        }
+    )
+    body_val = blob.get("body")
+    if body_val is not None:
+        encoded = json.dumps(body_val).encode("utf-8")
+        if len(encoded) > REQUEST_BLOB_BODY_CAP:
+            blob["body"] = encoded[:REQUEST_BLOB_BODY_CAP].decode(
+                "utf-8", errors="ignore"
+            )
+            blob["body_truncated"] = True
+    req["request_blob"] = blob
 
 
 def stash_request_result(

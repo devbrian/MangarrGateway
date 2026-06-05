@@ -184,6 +184,43 @@ def test_request_blob_body_size_capped_and_flagged(
     assert len(json.dumps(blob["body"])) <= REQUEST_BLOB_BODY_CAP + 256
 
 
+def test_request_blob_redaction_survives_truncation(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """Regression (CodeRabbit #129): an OVERSIZED dict body must STILL be redacted.
+
+    Redaction runs before the size cap, so a denylisted key is masked even when the
+    body is too large to keep verbatim — the raw secret value must never appear in
+    the blob. (The prior order truncated the dict to a string first, which let
+    redact_blob silently no-op on the now-non-dict body.)
+    """
+    c, ring = collector
+    token = current_request.set(_request_scope())
+    try:
+        # Secret key first (dict insertion order) so its masked value lands within
+        # the cap; the oversized filler forces truncation to a string.
+        big_secret_body = {
+            "authorization": "SUPERSECRETVALUE",
+            "filler": "x" * (REQUEST_BLOB_BODY_CAP + 5000),
+        }
+        stash_request_blob(
+            method="POST",
+            path="/api/v1/search",
+            query_string="",
+            body=big_secret_body,
+        )
+        c.emit_request(outcome="ok", duration_ms=1.0, status=200)
+    finally:
+        current_request.reset(token)
+
+    blob = next(e for e in ring.iter_recent() if e.kind == "request").request_blob
+    assert blob is not None
+    assert blob.get("body_truncated") is True
+    # The raw secret never survives, even though the body was truncated to a string.
+    assert "SUPERSECRETVALUE" not in str(blob["body"])
+    assert "***" in str(blob["body"])
+
+
 def test_stash_request_result_rides_request_event(
     collector: tuple[Collector, CapturingRingWriter],
 ) -> None:
