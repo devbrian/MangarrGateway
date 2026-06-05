@@ -205,6 +205,69 @@ async def test_limit_zero_is_rejected(metrics_client: httpx.AsyncClient) -> None
 
 
 @pytest.mark.asyncio
+async def test_read_endpoints_echo_enriched_fields(metrics_app: FastAPI) -> None:
+    """The read endpoints echo the new payload-only fields (request_blob,
+    result_count, candidates_enumerated, warnings_summary) VERBATIM — they read
+    payload as-is, so an enriched event in the ring surfaces with no code change
+    (260605-e9a)."""
+    transport = httpx.ASGITransport(app=metrics_app)
+    async with metrics_app.router.lifespan_context(metrics_app):
+        ring = metrics_app.state.metric_snapshot
+        collector = get_collector()
+        assert collector is not None
+        # Emit an enriched umbrella request event under a known request_id by
+        # stashing the blob/result into current_request (the route's path) then
+        # emitting (the middleware's path).
+        token = current_request.set(
+            {
+                "request_id": 4242,
+                "surface": "search",
+                "endpoint": "POST /search",
+                "request_blob": {
+                    "method": "POST",
+                    "path": "/api/v1/search",
+                    "query_string": "x=1",
+                    "body": {"type": "chapter", "query": "naruto"},
+                },
+                "result_count": 13,
+                "warnings_summary": [{"source_key": "comix", "code": "timeout"}],
+            }
+        )
+        try:
+            collector.emit_request(status=200, outcome="ok", duration_ms=5.0)
+            # A per-source summary event for the same request.
+            from manga_gateway.metrics.context import source_scope
+
+            with source_scope("comix"):
+                collector.emit_source_result(result_count=172, candidates_enumerated=5)
+        finally:
+            current_request.reset(token)
+        await ring.flush()
+
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=_ADMIN,
+            headers={"X-Api-Key": TEST_API_KEY},
+        ) as ac:
+            recent = await ac.get("/recent?limit=200")
+            breakdown = await ac.get("/requests/4242")
+
+    rec_body = recent.json()
+    req_ev = next(
+        e for e in rec_body if e["kind"] == "request" and e["request_id"] == 4242
+    )
+    assert req_ev["result_count"] == 13
+    assert req_ev["warnings_summary"] == [{"source_key": "comix", "code": "timeout"}]
+    assert req_ev["request_blob"]["body"] == {"type": "chapter", "query": "naruto"}
+
+    assert breakdown.status_code == 200
+    calls = breakdown.json()["calls"]
+    src_ev = next(c for c in calls if c["kind"] == "source-result")
+    assert src_ev["result_count"] == 172
+    assert src_ev["candidates_enumerated"] == 5
+
+
+@pytest.mark.asyncio
 async def test_served_json_is_redacted(metrics_app: FastAPI) -> None:
     """The url in a served ring event has secrets masked (SEC-01)."""
     transport = httpx.ASGITransport(app=metrics_app)

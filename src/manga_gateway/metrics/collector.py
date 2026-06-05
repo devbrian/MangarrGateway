@@ -74,8 +74,18 @@ class Collector:
         duration_ms: float,
         attempt: int,
         error: str | None,
+        result_count: int | None = None,
+        candidates_enumerated: int | None = None,
     ) -> None:
         req = current_request.get()
+        # 260605-e9a: the umbrella ``request`` event's request_blob / result_count /
+        # warnings_summary are stashed into ``current_request`` by the route handler
+        # (the middleware calls emit_request with no knowledge of them) — read them
+        # back here, mirroring how request_id/surface/endpoint are read from the
+        # contextvar. For non-request kinds these are None (the keys are absent).
+        # A per-source ``source-result`` event passes result_count /
+        # candidates_enumerated directly (they are NOT request-level), so the
+        # explicit args win over the contextvar for those.
         ev = MetricEvent(
             ts=time.time(),
             kind=kind,
@@ -91,6 +101,16 @@ class Collector:
             duration_ms=duration_ms,
             attempt=attempt,
             error=error,
+            request_blob=_req_dict(req, "request_blob") if kind == "request" else None,
+            result_count=(
+                result_count
+                if result_count is not None
+                else (_req_int(req, "result_count") if kind == "request" else None)
+            ),
+            candidates_enumerated=candidates_enumerated,
+            warnings_summary=(
+                _req_list(req, "warnings_summary") if kind == "request" else None
+            ),
         )
         # O(1) hot path: update the rollup + get the ring-membership set, then a
         # plain queue append to the disk ring writer (no await, no disk I/O here —
@@ -245,6 +265,67 @@ class Collector:
             error=error,
         )
 
+    def emit_source_result(
+        self,
+        *,
+        result_count: int,
+        candidates_enumerated: int | None = None,
+    ) -> None:
+        """Emit a per-source summary event (260605-e9a deliverables 3+5).
+
+        kind=``source-result``, op=``result``. ``source_key`` self-attributes via
+        ``current_source`` (already bound by ``fanout._guarded``) — ZERO new
+        attribution plumbing. Carries the source's PRE-MERGE ``result_count`` (the
+        172/154/50/5 numbers) and ``candidates_enumerated`` (how many ≤5 title
+        candidates were deep-enumerated). A dedicated per-source event (NOT a nested
+        map on the umbrella request event) so each ring read stays a single indexed
+        query + the breakdown shows it as one flat row per source.
+        """
+        self._ingest(
+            kind="source-result",
+            op="result",
+            method=None,
+            url=None,
+            status=None,
+            outcome="ok",
+            duration_ms=0.0,
+            attempt=1,
+            error=None,
+            result_count=result_count,
+            candidates_enumerated=candidates_enumerated,
+        )
+
+    def emit_browser(
+        self,
+        *,
+        op: str,
+        url: str,
+        status: int | None = None,
+        outcome: str,
+        duration_ms: float,
+        attempt: int = 1,
+        error: str | None = None,
+    ) -> None:
+        """Emit a browser-read event (#125, kind=``browser``).
+
+        For comix per-candidate ``fetch_via_browser`` chapter reads. ``url`` is
+        redacted at the ingest boundary (same path as ``emit_http``);
+        ``source_key`` + ``request_id`` self-attribute via the contextvars already
+        bound by ``fanout._guarded`` (the browser read runs inside ``_run_one``
+        inside the fan-out's ``source_scope``).
+        """
+        self._ingest(
+            kind="browser",
+            op=op,
+            method=None,
+            url=url,
+            status=status,
+            outcome=outcome,
+            duration_ms=duration_ms,
+            attempt=attempt,
+            error=error,
+        )
+
 
 def _req_int(req: dict[str, object] | None, key: str) -> int | None:
     if req is None:
@@ -258,3 +339,19 @@ def _req_str(req: dict[str, object] | None, key: str) -> str | None:
         return None
     val = req.get(key)
     return val if isinstance(val, str) else None
+
+
+def _req_dict(req: dict[str, object] | None, key: str) -> dict[str, object] | None:
+    if req is None:
+        return None
+    val = req.get(key)
+    return val if isinstance(val, dict) else None
+
+
+def _req_list(
+    req: dict[str, object] | None, key: str
+) -> list[dict[str, object]] | None:
+    if req is None:
+        return None
+    val = req.get(key)
+    return val if isinstance(val, list) else None

@@ -13,7 +13,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from ...deps import (
@@ -39,6 +39,8 @@ from ...framework.registry import SourceRegistry
 from ...framework.session import SessionManager
 from ...framework.session_prep import SessionPrep
 from ...handles.store import HandleStore
+from ...metrics.collector import get_collector
+from ...metrics.context import stash_request_blob, stash_request_result
 from ...models.search import (
     Release,
     ReleaseListResponse,
@@ -53,6 +55,27 @@ if TYPE_CHECKING:
 _log = logging.getLogger("manga_gateway.api.search")
 
 router = APIRouter()
+
+
+def _emit_source_result(result_count: int, candidates_enumerated: int | None) -> None:
+    """No-op-safe per-source summary emit (260605-e9a deliverables 3+5).
+
+    Mirrors ``context.py:_emit_http``: a ``None`` collector short-circuits and any
+    collector-side error is swallowed so a metric failure can never break a source
+    run. ``source_key`` self-attributes via ``current_source`` (bound by
+    ``fanout._guarded``); ``request_id`` via ``current_request``.
+    """
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        collector.emit_source_result(
+            result_count=result_count,
+            candidates_enumerated=candidates_enumerated,
+        )
+    except Exception:  # noqa: BLE001 — a metric failure must never break a source
+        pass
+
 
 # Id keys that count as "usable search input" for the SRCH-05 guard (D-23).
 USABLE_ID_KEYS = {"mangadexId", "anilistId", "malId"}
@@ -95,6 +118,7 @@ def _select_sources(
 )
 async def search(
     req: SearchRequest,
+    request: Request,
     session: Annotated[SessionManager, Depends(get_session)],
     ratelimiter: Annotated[RateLimiter, Depends(get_ratelimiter)],
     registry: Annotated[SourceRegistry, Depends(get_registry)],
@@ -104,6 +128,22 @@ async def search(
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
 ) -> ReleaseListResponse | JSONResponse:
     """Fan out the search across selected sources; isolate failures into warnings[]."""
+    # 260605-e9a deliverable 1: capture the request blob (method/path/query from
+    # request.url for the exact 1:1 reconstruction; body = the parsed model
+    # serialized to the wire shape). Stashed into current_request; the middleware
+    # finally-block emits it on the umbrella request event. NO body-buffering — the
+    # parsed model is already in hand. Secrets are redacted at stash time.
+    #
+    # Stashed BEFORE the SRCH-05 early return (CodeRabbit #129 outside-diff) so a
+    # 400 bad_request is still reconstructable — a malformed search is exactly the
+    # kind of request you want to debug from telemetry.
+    stash_request_blob(
+        method="POST",
+        path=request.url.path,
+        query_string=request.url.query,
+        body=req.model_dump(by_alias=True),
+    )
+
     # SRCH-05 / D-23: neither query nor a usable id → 400 bad_request.
     if not _has_usable_search_input(req):
         return JSONResponse(
@@ -144,6 +184,10 @@ async def search(
         # a source that warned then raised is already represented by the
         # hard-failure entry, so the soft tail would never be read anyway.
         soft_warnings[src.key] = list(ctx.warnings)
+        # 260605-e9a deliverables 3+5: per-source PRE-merge result_count + how many
+        # candidates were deep-enumerated, self-attributed via current_source (bound
+        # by fanout._guarded). Uses the SAME len(releases) the INFO log reports.
+        _emit_source_result(len(releases), ctx.candidates_enumerated)
         elapsed = time.perf_counter() - started
         # #21: one INFO per source dispatched. Per-source warnings count helps
         # an operator spot a degraded source without re-parsing the response.
@@ -176,4 +220,14 @@ async def search(
         SourceWarning(source_key=key, code=code, message=message)
         for key, code, message in warning_tuples
     ]
+    # 260605-e9a deliverables 2+4: the final merged result_count + a compact
+    # warnings summary ride the umbrella request event (one value per request).
+    # Stashed BEFORE returning so the middleware finally-block emit (which runs
+    # after the handler returns) reads a populated contextvar.
+    stash_request_result(
+        result_count=len(releases),
+        warnings_summary=[
+            {"source_key": key, "code": code} for key, code, _msg in warning_tuples
+        ],
+    )
     return ReleaseListResponse(releases=releases, warnings=warnings)

@@ -886,6 +886,9 @@ class ComixSource(Source):
             else _DEFAULT_SERIES_CANDIDATES
         )
         series = await self._search_series(req.query or "", count, ctx)
+        # 260605-e9a deliverable 5: report how many series candidates we deep-
+        # enumerate (one ``_series_chapters`` browser fan-out each).
+        ctx.candidates_enumerated = len(series)
 
         feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
 

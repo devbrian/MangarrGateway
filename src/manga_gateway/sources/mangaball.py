@@ -531,6 +531,8 @@ class MangaBallSource(Source):
         candidates = [t for t in titles if isinstance(t, dict)][
             :_DEFAULT_TITLE_CANDIDATES
         ]
+        # 260605-e9a deliverable 5: how many title candidates we deep-enumerate.
+        ctx.candidates_enumerated = len(candidates)
         wanted_langs = set(req.languages) if req.languages else None
         per_candidate_limit = req.limit or 50
 
