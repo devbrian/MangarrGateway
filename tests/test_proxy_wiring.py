@@ -51,6 +51,34 @@ def test_build_proxy_returns_none_pair_when_unconfigured() -> None:
     assert hx is None
 
 
+def test_empty_string_proxy_secrets_normalize_to_none() -> None:
+    """Unset CI secrets arrive as ``""`` (not absent); they must be treated as
+    UNSET so ``build_proxy`` returns ``(None, None)`` — bare egress, NOT a broken
+    ``httpx.Proxy(url="")`` / ``{"server": ""}`` (CodeRabbit, #138).
+
+    Also guards the mixed case (server set, blank creds) → server-only, no auth.
+    """
+    s = _settings(
+        cloudflare_proxy_server="",
+        cloudflare_proxy_username="",
+        cloudflare_proxy_password="",
+    )
+    assert s.cloudflare_proxy_server is None
+    assert s.cloudflare_proxy_username is None
+    assert s.cloudflare_proxy_password is None
+    assert build_proxy(s) == (None, None)
+
+    # Whitespace-only is also unset; blank creds with a real server ⇒ no auth.
+    s2 = _settings(
+        cloudflare_proxy_server=_FAKE_SERVER,
+        cloudflare_proxy_username="   ",
+        cloudflare_proxy_password="",
+    )
+    pw, hx = build_proxy(s2)
+    assert pw == {"server": _FAKE_SERVER}
+    assert hx == _FAKE_SERVER
+
+
 def test_build_proxy_server_only_omits_credentials() -> None:
     """Server only ⇒ Playwright dict has NO username/password keys; the httpx
     value is the plain server URL with no embedded credentials."""
