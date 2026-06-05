@@ -20,8 +20,9 @@ the residential IP recon was run from — no interactive challenge fired on any 
 endpoint, so ``antibot = "none"`` is correct. A datacenter IP MAY trip a managed
 challenge; the escalation path is the existing Patchright clearance seam (flip
 ``antibot`` to ``"cloudflare"`` + set ``cloudflare_challenge_url``). The
-``rate_limit_per_minute = 30`` is a conservative start (real ceiling unprobed —
-live-tune, RECON Open Q3).
+``rate_limit_per_minute = 480`` is a conservative ~50%-of-floor value set from the
+2026-06-04 probe (no hard limit found; manifest/image sustained 960/min at c=8),
+mirroring the mangadot precedent (#101).
 
 ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md`` / GAP-1 probe):
 
@@ -474,8 +475,22 @@ class MangaBallSource(Source):
         "ru",
         "vi",
     ]
-    # Conservative start — real ceiling unprobed (RECON Open Q3); live-tune.
-    rate_limit_per_minute = 30
+    # Probe-tuned (2026-06-04, PR #102 harness): two sweeps, ~6000 requests across
+    # 6 residential proxy IPs found NO hard limit on MangaBall — zero
+    # 429/403/Cloudflare-challenge/Retry-After on any endpoint (consistent with
+    # ``antibot = "none"``). The manifest + image endpoints sustained 960/min cleanly
+    # at concurrency 8 (a FLOOR — the true ceiling is higher). ``480`` is the
+    # conservative ~50%-of-floor value, the same shape as the mangadot precedent
+    # (#101). The CSRF-bootstrap ``search`` path (~3-5.5s/call) was latency/proxy-bound,
+    # NOT a site throttle, so ``480`` here is gated by latency, not a rate ceiling.
+    rate_limit_per_minute = 480
+    # Per-source download-job concurrency (D-30 override): the 2026-06-04 probe
+    # found manifest + image sustaining 960/min cleanly at concurrency 8 with zero
+    # throttling, so chapter downloads (manifest/image paths) parallelize safely.
+    # 3 mirrors the mangadot precedent (#101); the job manager clamps it to the
+    # global max_concurrent_chapters. (The CSRF-bootstrap search path stays
+    # sequential — this override governs downloads, not search.)
+    max_concurrent_jobs = 3
     # Passive Cloudflare only on a residential IP (D-07/D-12) — see module
     # docstring's anti-bot caveat. No decrypt (plain .jpg, D-06).
     antibot = "none"

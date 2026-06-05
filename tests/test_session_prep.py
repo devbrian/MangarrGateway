@@ -301,6 +301,49 @@ async def test_csrf_bootstrap_concurrent_acquire_collapses_to_single_get() -> No
     assert isinstance(results[0], SessionCredentials)
 
 
+@pytest.mark.asyncio
+async def test_csrf_bootstrap_concurrent_force_refresh_collapses_to_single_get() -> None:
+    """A concurrent ``force_refresh=True`` herd also collapses to ONE re-GET.
+
+    The cold-acquire test above exercises the double-checked-cache branch; this one
+    exercises the DISTINCT ``force_refresh`` stale-reference branch — the realistic
+    case where a mid-fan-out CSRF-403 makes K candidates all re-prepare at once.
+    Each captures the same stale creds reference before blocking on the lock; the
+    first re-mints, and the rest see a cache object different from their stale ref
+    and REUSE it instead of re-GETting. Asserts the storm collapses to a single
+    bootstrap GET and one shared creds object (T-RNM-01)."""
+    transport = _SlowGetTransport(html_token=_TOKEN, session_cookie="abc123")
+    prep = CsrfBootstrap(
+        keys={"mangaball"},
+        session=SessionManager(transport),  # type: ignore[arg-type]
+        bootstrap_urls={"mangaball": _HTML_URL},
+        ratelimiter=RateLimiter(),
+        rates={"mangaball": 6000},
+    )
+
+    # Warm the cache with one un-gated acquire, then reset the gate so the forced
+    # refreshes are what pile onto the lock (not the initial cold mint).
+    transport.release.set()
+    await prep.prepare("mangaball")
+    transport.gate = asyncio.Event()
+    transport.release = asyncio.Event()
+    transport.html_gets = 0
+
+    k = 5
+    callers = [
+        asyncio.create_task(prep.prepare("mangaball", force_refresh=True))
+        for _ in range(k)
+    ]
+    await transport.gate.wait()
+    await asyncio.sleep(0)  # let the other K-1 forced refreshes reach the lock
+    transport.release.set()
+
+    results = await asyncio.gather(*callers)
+    assert transport.html_gets == 1  # the forced-refresh herd collapsed to one re-GET
+    assert all(r is results[0] for r in results)  # one shared re-minted creds object
+    assert isinstance(results[0], SessionCredentials)
+
+
 def test_session_prep_protocol_is_runtime_checkable() -> None:
     assert isinstance(NoSessionPrep(), SessionPrep)
 
