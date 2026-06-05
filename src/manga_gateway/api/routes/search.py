@@ -128,24 +128,28 @@ async def search(
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
 ) -> ReleaseListResponse | JSONResponse:
     """Fan out the search across selected sources; isolate failures into warnings[]."""
-    # SRCH-05 / D-23: neither query nor a usable id → 400 bad_request.
-    if not _has_usable_search_input(req):
-        return JSONResponse(
-            status_code=400,
-            content=_error("bad_request", "query or a usable id is required"),
-        )
-
     # 260605-e9a deliverable 1: capture the request blob (method/path/query from
     # request.url for the exact 1:1 reconstruction; body = the parsed model
     # serialized to the wire shape). Stashed into current_request; the middleware
     # finally-block emits it on the umbrella request event. NO body-buffering — the
     # parsed model is already in hand. Secrets are redacted at stash time.
+    #
+    # Stashed BEFORE the SRCH-05 early return (CodeRabbit #129 outside-diff) so a
+    # 400 bad_request is still reconstructable — a malformed search is exactly the
+    # kind of request you want to debug from telemetry.
     stash_request_blob(
         method="POST",
         path=request.url.path,
         query_string=request.url.query,
         body=req.model_dump(by_alias=True),
     )
+
+    # SRCH-05 / D-23: neither query nor a usable id → 400 bad_request.
+    if not _has_usable_search_input(req):
+        return JSONResponse(
+            status_code=400,
+            content=_error("bad_request", "query or a usable id is required"),
+        )
 
     sources = _select_sources(registry, req.sources)
     # Per-source soft warnings (D-14): a source that partially degrades emits

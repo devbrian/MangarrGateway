@@ -23,6 +23,7 @@ from typing import cast
 
 import pytest
 from fastapi import Request
+from starlette.responses import JSONResponse
 
 from manga_gateway.api.routes.recent import get_recent
 from manga_gateway.api.routes.search import search
@@ -213,6 +214,51 @@ async def test_search_emits_per_source_and_final_counts(
     assert src_evs["alpha"].candidates_enumerated == 5
     assert src_evs["beta"].result_count == 5
     assert src_evs["beta"].candidates_enumerated == 2
+
+
+@pytest.mark.asyncio
+async def test_search_bad_request_still_stashes_request_blob(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """SRCH-05: a 400 bad_request (no query, no usable id) must STILL stash the
+    request blob. The stash runs BEFORE the early return (CodeRabbit #129), so a
+    malformed search is reconstructable from telemetry like any other request."""
+    c, ring = collector
+    registry = _FakeRegistry({})
+    deps = _deps()
+    req = SearchRequest(type="chapter")  # no query, no ids → not usable → 400
+    http_request = _make_request("POST", "/api/v1/search", "")
+
+    token = current_request.set(
+        {"request_id": 9, "surface": "search", "endpoint": "POST /search"}
+    )
+    try:
+        resp = await search(
+            req=req,
+            request=http_request,
+            session=cast("SessionManager", deps["session"]),
+            ratelimiter=cast("RateLimiter", deps["ratelimiter"]),
+            registry=cast("object", registry),  # type: ignore[arg-type]
+            handle_store=cast("HandleStore", deps["handle_store"]),
+            solver=cast("object", deps["solver"]),  # type: ignore[arg-type]
+            health_map=cast("dict", deps["health_map"]),  # type: ignore[arg-type]
+            session_prep=cast("object", deps["session_prep"]),  # type: ignore[arg-type]
+        )
+        c.emit_request(outcome="client_error", duration_ms=1.0, status=400)
+    finally:
+        current_request.reset(token)
+
+    # The early return fired (400), NOT a release list.
+    assert isinstance(resp, JSONResponse)
+    assert resp.status_code == 400
+
+    # ...but the umbrella request event still carries the reconstruction blob.
+    req_ev = next(e for e in ring.iter_recent() if e.kind == "request")
+    blob = req_ev.request_blob
+    assert blob is not None
+    assert blob["method"] == "POST"
+    assert blob["path"] == "/api/v1/search"
+    assert isinstance(blob["body"], dict)
 
 
 # ───────────────────────────── /recent ───────────────────────────────────────
