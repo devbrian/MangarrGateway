@@ -36,6 +36,7 @@ from manga_gateway.metrics.context import (
 from manga_gateway.metrics.event import MetricEvent
 from manga_gateway.metrics.redact import redact_blob
 from manga_gateway.metrics.snapshot import MetricSnapshotStore
+from manga_gateway.models.metrics import RequestBlob, WarningSummaryItem
 
 from ._metrics_helpers import CapturingRingWriter
 
@@ -95,6 +96,80 @@ def test_metric_event_new_fields_default_none() -> None:
     assert ev.result_count is None
     assert ev.candidates_enumerated is None
     assert ev.warnings_summary is None
+
+
+# ─────────────────────────── drift guards (model ⇔ producer) ─────────────────
+
+
+def test_request_blob_shape_lockstep_with_model() -> None:
+    """RequestBlob ⇔ stash_request_blob keyset parity (the drift guard).
+
+    Drives the REAL ``stash_request_blob`` producer for BOTH an untruncated and a
+    truncated body, reads the stored dict back from ``current_request``, and asserts
+    its keyset equals ``RequestBlob.model_fields`` (body_truncated present, and
+    True/False on the respective path). A drift fails with an actionable message
+    naming the offending key(s) AND the two files to keep in sync.
+    """
+    model_keys = set(RequestBlob.model_fields)
+
+    # — untruncated body: body_truncated must be present and False —
+    token = current_request.set(_request_scope())
+    try:
+        stash_request_blob(
+            method="POST",
+            path="/api/v1/search",
+            query_string="x=1",
+            body={"type": "chapter", "query": "naruto"},
+        )
+        stored = current_request.get()["request_blob"]  # type: ignore[index]
+    finally:
+        current_request.reset(token)
+    assert isinstance(stored, dict)
+    assert set(stored) == model_keys, (
+        f"RequestBlob/stash_request_blob keyset drift: {sorted(set(stored) ^ model_keys)}. "
+        "Keep src/manga_gateway/metrics/context.py::stash_request_blob and "
+        "src/manga_gateway/models/metrics.py::RequestBlob in sync."
+    )
+    assert stored["body_truncated"] is False
+
+    # — truncated body: same keyset, body_truncated True —
+    token = current_request.set(_request_scope())
+    try:
+        stash_request_blob(
+            method="POST",
+            path="/api/v1/search",
+            query_string="",
+            body={"q": "x" * (REQUEST_BLOB_BODY_CAP + 5000)},
+        )
+        stored_big = current_request.get()["request_blob"]  # type: ignore[index]
+    finally:
+        current_request.reset(token)
+    assert isinstance(stored_big, dict)
+    assert set(stored_big) == model_keys, (
+        f"RequestBlob/stash_request_blob keyset drift (truncated path): "
+        f"{sorted(set(stored_big) ^ model_keys)}. Keep "
+        "src/manga_gateway/metrics/context.py::stash_request_blob and "
+        "src/manga_gateway/models/metrics.py::RequestBlob in sync."
+    )
+    assert stored_big["body_truncated"] is True
+
+
+def test_warning_summary_item_shape_lockstep() -> None:
+    """WarningSummaryItem ⇔ the search.py/recent.py producer shape (drift guard).
+
+    The producers build ``{"source_key": key, "code": code}`` from the warning
+    tuples (no shared helper to import), so assert the model field set against that
+    literal shape plus a validating round-trip. A drift fails with an actionable
+    message naming the producers AND the model.
+    """
+    assert set(WarningSummaryItem.model_fields) == {"source_key", "code"}, (
+        f"WarningSummaryItem shape drift: "
+        f"{sorted(set(WarningSummaryItem.model_fields) ^ {'source_key', 'code'})}. "
+        "Keep src/manga_gateway/api/routes/search.py + recent.py warning-summary "
+        "producers and src/manga_gateway/models/metrics.py::WarningSummaryItem in sync."
+    )
+    item = WarningSummaryItem.model_validate({"source_key": "comix", "code": "timeout"})
+    assert item.model_dump() == {"source_key": "comix", "code": "timeout"}
 
 
 # ─────────────────────────── request-blob round-trip ─────────────────────────
