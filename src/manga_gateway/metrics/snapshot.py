@@ -283,16 +283,21 @@ class MetricSnapshotStore:
                 await self._conn.executemany(_ROLLUP_INSERT, rollup_rows)
             await self._conn.commit()
 
-    async def rehydrate(self) -> InMemoryStore:
+    async def rehydrate(self, *, slow_factor: float) -> InMemoryStore:
         """Reload the last ROLLUP snapshot into a fresh ``InMemoryStore``.
 
         Rings are NEVER loaded into memory under the disk-as-source-of-truth model
         (260604-wm2) — the ring read path is this store's indexed queries. This
         only restores the in-memory rollups so summary/per-source survive restart.
+
+        ``slow_factor`` is forwarded from ``Settings.metrics_slow_factor`` so the
+        returned store classifies "slow" consistently with the live store if it is
+        ever used for ingest. (Today the caller only drains its rollups, but we
+        thread the setting through end-to-end rather than baking in a constant.)
         """
         async with self._conn.execute("SELECT * FROM rollups") as cur:
             rollup_rows = await cur.fetchall()
-        mem = InMemoryStore(slow_factor=3.0)
+        mem = InMemoryStore(slow_factor=slow_factor)
         for row in rollup_rows:
             # WR-02: salvage a partially-valid snapshot — a single corrupt /
             # schema-drifted rollup row is skipped rather than aborting the whole

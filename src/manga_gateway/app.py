@@ -333,19 +333,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings.metrics_db_path,
             exc_info=True,
         )
+    # `rehydrated` is a TRANSIENT carrier: only its rollups are drained into the
+    # live store below (rings are not rehydrated into memory — 260604-wm2). Its
+    # slow_factor is therefore never consulted for classification, but we still
+    # thread settings.metrics_slow_factor through (not a hardcoded constant) so the
+    # carrier is consistent with the live store on every path.
     if metric_snapshot is None:
-        rehydrated = InMemoryStore(slow_factor=1.0)
+        rehydrated = InMemoryStore(slow_factor=settings.metrics_slow_factor)
     else:
         # The batch-size flush trigger comes from Settings (260604-wm2).
         metric_snapshot.configure(flush_max_batch=settings.metrics_ring_flush_max_batch)
         try:
-            rehydrated = await metric_snapshot.rehydrate()
+            rehydrated = await metric_snapshot.rehydrate(
+                slow_factor=settings.metrics_slow_factor
+            )
         except Exception:  # noqa: BLE001 — bad snapshot must not break the service
             _log.warning(
                 "metrics rehydrate failed; starting with an empty metric store",
                 exc_info=True,
             )
-            rehydrated = InMemoryStore(slow_factor=1.0)
+            rehydrated = InMemoryStore(slow_factor=settings.metrics_slow_factor)
+    # The LIVE store: this is the one handed to the Collector, so its slow_factor
+    # (from Settings) is what actually drives "slow" classification at runtime.
     metric_store = InMemoryStore(slow_factor=settings.metrics_slow_factor)
     # Re-admit the rehydrated ROLLUPS verbatim (rollups stay in memory + survive
     # restart). Ring events are NOT rehydrated into memory anymore — they are the

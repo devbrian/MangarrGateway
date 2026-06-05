@@ -83,7 +83,7 @@ async def test_open_fresh_db_rehydrates_empty(tmp_path: Path) -> None:
     db = str(tmp_path / "metrics.db")
     snap = await open_metric_store(db)
     try:
-        mem = await snap.rehydrate()
+        mem = await snap.rehydrate(slow_factor=3.0)
         assert mem.summary()["total_calls"] == 0
         assert mem.rollups() == []
         # Fresh ring is empty too.
@@ -104,7 +104,7 @@ async def test_snapshot_rehydrate_roundtrips_rollups(tmp_path: Path) -> None:
         }
         before_summary = mem.summary()
         await snap.snapshot(mem)
-        restored = await snap.rehydrate()
+        restored = await snap.rehydrate(slow_factor=3.0)
         after = {
             (r["surface"], r["source"], r["endpoint"], r["op"]): r
             for r in restored.rollups()
@@ -131,7 +131,7 @@ async def test_snapshot_is_idempotent_over_resnapshot(tmp_path: Path) -> None:
         mem = _make_rollup_store()
         await snap.snapshot(mem)
         await snap.snapshot(mem)
-        restored = await snap.rehydrate()
+        restored = await snap.rehydrate(slow_factor=3.0)
         assert restored.summary() == mem.summary()
     finally:
         await snap.close()
