@@ -61,6 +61,7 @@ import asyncio
 import json
 import posixpath
 import re
+from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
@@ -99,6 +100,13 @@ _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
 # ``req.interactive`` does NOT change the candidate count (each candidate is a full
 # chapter-listing fan-out, so the count is held fixed regardless of interactivity).
 _DEFAULT_TITLE_CANDIDATES = 5
+
+# Bounds the per-candidate ``chapter-listing-by-title-id`` fan-out in ``search`` —
+# at most this many chapter-listing fetches run concurrently. The candidates were
+# fetched serially before this change (the IDENTICAL shape MangaDot had before the
+# #101 fix); 6 collapses the wall-clock while staying well under the per-source rate
+# budget. Mirrors MangaDot's ``_CHAPTERS_FANOUT_CONCURRENCY``.
+_CHAPTERS_FANOUT_CONCURRENCY = 6
 
 # Floor for empty/malformed timestamps so they sort oldest and never crash the
 # `since` comparison (mirrors recent.py:_TS_FLOOR / _parse_ts).
@@ -511,28 +519,52 @@ class MangaBallSource(Source):
         wanted_langs = set(req.languages) if req.languages else None
         per_candidate_limit = req.limit or 50
 
-        releases: list[Release] = []
+        # Bound the per-candidate chapter-listing fan-out (one Semaphore shared across
+        # the dispatch; constructed HERE so it binds to the running loop, never at
+        # import time).
+        sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
+
+        async def _fetch_candidate(title_id: str, manga_title: str) -> list[Release]:
+            async with sem:
+                listing = await ctx.post_json(
+                    f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id/",
+                    data={"title_id": title_id, "userSettingsEnabled": "false"},
+                )
+            all_chapters, _ = _items_and_pagination(listing)
+            return self._chapters_to_releases(
+                all_chapters,
+                title_id,
+                manga_title,
+                wanted_langs,
+                per_candidate_limit,
+                ctx,
+            )
+
+        # Pre-filter candidates lacking a usable ``_id`` BEFORE dispatching tasks — a
+        # candidate with no ``_id`` must not produce a task (preserves the old
+        # ``if not title_id: continue`` skip).
+        tasks: list[Coroutine[Any, Any, list[Release]]] = []
         for title in candidates:
             title_id = title.get("_id")
             if not title_id:
                 continue
             title_id = str(title_id)
             manga_title = _strip_html(title.get("name")) or "Unknown"
-            listing = await ctx.post_json(
-                f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id/",
-                data={"title_id": title_id, "userSettingsEnabled": "false"},
-            )
-            all_chapters, _ = _items_and_pagination(listing)
-            releases.extend(
-                self._chapters_to_releases(
-                    all_chapters,
-                    title_id,
-                    manga_title,
-                    wanted_langs,
-                    per_candidate_limit,
-                    ctx,
-                )
-            )
+            tasks.append(_fetch_candidate(title_id, manga_title))
+
+        # gather, NOT TaskGroup: gather (return_exceptions=False) re-raises the FIRST
+        # child exception UNCHANGED, so a SourceError from ctx.post_json propagates out
+        # of search() exactly as the old sequential loop did, and framework/fanout.py's
+        # ``except SourceError`` classifies it as the source's own code. TaskGroup wraps
+        # child exceptions in an ExceptionGroup → fanout's ``except Exception`` →
+        # "unexpected error" (changed classification, regression). gather also returns
+        # results in submission order, so cross-candidate aggregation order is
+        # byte-identical to the old loop.
+        results = await asyncio.gather(*tasks)
+
+        releases: list[Release] = []
+        for chunk in results:
+            releases.extend(chunk)
         return releases
 
     def _chapters_to_releases(
