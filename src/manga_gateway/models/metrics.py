@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RequestBlob(BaseModel):
@@ -57,7 +57,28 @@ class RequestBlob(BaseModel):
     method: str
     path: str
     query_string: str
-    body: dict[str, Any] | str | None = None
+    # `body` is intentionally open-typed (dict | str | None) — it's the captured
+    # request payload, which varies by endpoint and can be a truncated string. The
+    # description + example document WHAT it is so /docs isn't just Swagger's
+    # free-form `additionalProp1: {}` placeholder. Schema-only metadata — it does
+    # NOT serialize into responses, so the no-regression byte-identity holds.
+    body: dict[str, Any] | str | None = Field(
+        default=None,
+        description=(
+            "The captured request body. A JSON object for POST endpoints (e.g. the "
+            "/search payload); null for body-less GET endpoints (their params are in "
+            "query_string); or a truncated string when the body exceeded the size "
+            "cap (then body_truncated=true)."
+        ),
+        examples=[
+            {
+                "type": "chapter",
+                "query": "The Forgotten Field",
+                "sources": ["mangadex", "comix"],
+                "limit": 50,
+            }
+        ],
+    )
     body_truncated: bool = False
 
 

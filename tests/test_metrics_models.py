@@ -201,6 +201,14 @@ def test_openapi_documents_request_blob_and_warning_models() -> None:
     )
     blob_props = set(schemas["RequestBlob"]["properties"])
     assert {"method", "path", "query_string", "body", "body_truncated"} <= blob_props
+    # `body` is open-typed, so document WHAT it is via a description + example so the
+    # docs aren't just Swagger's free-form `additionalProp1: {}` placeholder.
+    body_schema = schemas["RequestBlob"]["properties"]["body"]
+    assert body_schema.get("description"), (
+        "RequestBlob.body lost its description — re-add Field(description=...) in "
+        "models/metrics.py so /docs explains the open-typed body"
+    )
+    assert body_schema.get("examples"), "RequestBlob.body lost its example(s)"
     warn_props = set(schemas["WarningSummaryItem"]["properties"])
     assert {"source_key", "code"} <= warn_props
 
