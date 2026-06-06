@@ -167,6 +167,13 @@ class SingleFlightCache[V]:
         except BaseException as exc:  # D-05: propagate to awaiters, never cache
             if not future.done():
                 future.set_exception(exc)
+                # WR-02: on the common solo-miss error path nothing ever awaits this
+                # future (the leader awaits ``fetch_fn`` directly; followers exist
+                # only under contention), so without retrieving the exception
+                # ``Future.__del__`` would log a spurious ERROR-level "Future
+                # exception was never retrieved" with a traceback on every transient
+                # upstream failure. Mark it retrieved to keep the failure signal clean.
+                future.exception()
             raise
         else:
             self._cache[key] = value
