@@ -87,6 +87,15 @@ class Settings(BaseSettings):
     cloudflare_breaker_threshold: int = Field(
         default=5, ge=1
     )  # D-36: N consecutive failures flips is_enabled False
+    # #153: eager-warm cold-start flake absorber. On a fresh container deploy the
+    # first Cloudflare warm for a cloudflare-gated source occasionally fails fast
+    # (cold persistent-context / browser-launch race) even though an on-demand
+    # warm succeeds seconds later. ``warm()`` retries each source this many times
+    # (linear backoff ``cloudflare_warm_retry_seconds * attempt``) BEFORE reporting
+    # it failed and letting the lifespan force_disable it (D-33). 1 ⇒ historic
+    # single-attempt behavior.
+    cloudflare_warm_attempts: int = Field(default=3, ge=1)
+    cloudflare_warm_retry_seconds: float = Field(default=2.0, ge=0.0)
     cloudflare_solve_concurrency: int = Field(
         default=1, ge=1
     )  # D-33/Pattern 7: solve cap; default 1 collapses to single-flight

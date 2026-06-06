@@ -8,7 +8,9 @@ wobble self-heals while a hard-down source stops being advertised
 
 ``force_disabled`` is the D-33 eager-launch-failed escape hatch: if the eager
 Patchright launch at startup fails, the source is held disabled regardless of the
-failure counter until it is cleared.
+failure counter. It is no longer a one-way latch (#153): ``record_success`` clears
+it, so the first genuine success (on-demand warm or a watchdog re-probe) self-heals
+the source and flips ``/caps`` back to ``enabled=true`` in the same poll.
 
 No asyncio primitives: the counter mutations are synchronous and cheap, and the
 single-process model (R1) means there is no cross-process contention to guard.
@@ -44,10 +46,20 @@ class SourceHealth:
             )
 
     def record_success(self) -> None:
-        """Reset the consecutive-failure counter (the breaker self-heals)."""
-        was_tripped = not self.is_enabled and not self.force_disabled
+        """Reset the breaker on a genuine success — clearing BOTH disable paths.
+
+        A clean success (on-demand warm, a served request, or a watchdog re-probe)
+        PROVES the source works, so it must clear the consecutive-failure counter
+        AND the D-33 ``force_disabled`` eager-launch latch (#153). Previously a
+        cold-start eager-warm flake latched ``force_disabled`` and nothing cleared
+        it, so ``/caps`` advertised the source ``enabled=false`` for up to 12h even
+        though on-demand warms succeeded immediately after. Self-healing here means
+        the next success re-enables the source in the same ``/caps`` poll.
+        """
+        was_disabled = not self.is_enabled
         self.consecutive_failures = 0
-        if was_tripped:
+        self.force_disabled = False
+        if was_disabled:
             _log.info("health breaker RECOVERED")
 
     @property

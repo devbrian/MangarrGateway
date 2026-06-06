@@ -407,6 +407,8 @@ class CloudflareSolver:
         log_browser_events: bool = False,
         proxy: dict[str, str] | None = None,
         lifecycle: BrowserLifecycle | None = None,
+        warm_attempts: int = 1,
+        warm_retry_seconds: float = 2.0,
     ) -> None:
         self._user_data_dir = user_data_dir
         self._headless = headless
@@ -428,6 +430,13 @@ class CloudflareSolver:
         self._challenge_urls = dict(challenge_urls or {})
         self._cloudflare_keys = frozenset(cloudflare_keys)
         self._engine: AntibotEngine = engine
+        # #153: eager-warm retry budget. ``warm()`` retries each source up to
+        # ``warm_attempts`` times (linear backoff ``warm_retry_seconds * attempt``)
+        # before reporting it failed, absorbing the cold-start launch flake. The
+        # default 1 keeps the historic single-attempt behavior for direct
+        # construction; the lifespan wires the configured values.
+        self._warm_attempts = warm_attempts
+        self._warm_retry_seconds = warm_retry_seconds
         # #54 diagnostic: when True, attach pageerror/console/requestfailed
         # loggers to every page opened by ``_fetch_via_browser_once`` so the
         # JS throw site behind the Playwright Firefox handler crash can be
@@ -497,7 +506,11 @@ class CloudflareSolver:
             return None  # MangaDex et al. — no clearance needed
         return await self._lifecycle.solve(source_key, force=force_resolve)
 
-    async def warm(self) -> list[str]:
+    async def warm(
+        self,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> list[str]:
         """Best-effort eager solve at startup (D-33) + start the recycle watchdog.
 
         Called as a fire-and-forget task by the lifespan so a slow/failed solve never
@@ -511,16 +524,69 @@ class CloudflareSolver:
         ones down. Each key's solve is therefore wrapped in its own try/except and
         only the failing keys are returned; a TOTAL failure (e.g. the browser never
         launches) naturally surfaces as every key failing.
+
+        #153: each source is retried up to ``self._warm_attempts`` times with a
+        linear backoff before being reported failed — a cold-deploy launch flake
+        (the warm dies <1s but an on-demand warm works seconds later) is absorbed
+        rather than latching the source disabled for the 12h ``/caps`` window. The
+        underlying exception is logged with ``exc_info`` so the real cause (browser
+        launch error / cold-profile race / CF challenge) is no longer swallowed.
+        ``sleep`` is injectable so tests assert the retry without real waiting.
         """
         self._lifecycle.start_recycle_watchdog()
         failed: list[str] = []
         for key in self._cloudflare_keys:
-            try:
-                await self.get_clearance(key)
-            except Exception:  # noqa: BLE001 — isolate per-domain warm failures
-                _log.warning("CloudflareSolver warm failed for source %r (D-33)", key)
+            if not await self._warm_one(key, sleep=sleep):
                 failed.append(key)
         return failed
+
+    async def _warm_one(
+        self,
+        key: str,
+        *,
+        sleep: Callable[[float], Awaitable[None]],
+    ) -> bool:
+        """Eager-solve ONE source with bounded retry/backoff (#153).
+
+        Returns ``True`` as soon as a solve succeeds, ``False`` once every attempt
+        is exhausted. Every failed attempt is logged with ``exc_info`` so the real
+        cause surfaces (criterion #1); the final give-up is logged once at WARNING.
+        """
+        last_exc: BaseException | None = None
+        for attempt in range(1, self._warm_attempts + 1):
+            try:
+                await self.get_clearance(key)
+            except Exception as exc:  # noqa: BLE001 — isolate per-domain warm failures
+                last_exc = exc
+                _log.warning(
+                    "CloudflareSolver warm attempt %d/%d failed for source "
+                    "%r: %r (D-33/#153)",
+                    attempt,
+                    self._warm_attempts,
+                    key,
+                    exc,
+                    exc_info=True,
+                )
+                if attempt < self._warm_attempts:
+                    await sleep(self._warm_retry_seconds * attempt)
+                continue
+            if attempt > 1:
+                _log.info(
+                    "CloudflareSolver warm recovered for source %r on "
+                    "attempt %d/%d (#153)",
+                    key,
+                    attempt,
+                    self._warm_attempts,
+                )
+            return True
+        _log.warning(
+            "CloudflareSolver warm exhausted %d attempt(s) for source %r "
+            "— disabling (D-33/#153)",
+            self._warm_attempts,
+            key,
+            exc_info=last_exc,
+        )
+        return False
 
     # ``timeout`` here is the per-call Playwright operation budget (goto/
     # wait_for/evaluate each receive ``timeout`` in ms), NOT a cancellation
