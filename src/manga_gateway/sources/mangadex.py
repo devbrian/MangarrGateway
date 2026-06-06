@@ -14,7 +14,6 @@ no pre-merge). Chapter numbers are parsed via ``Decimal`` (Pitfall 1, SRCH-06).
 
 from __future__ import annotations
 
-import math
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -119,52 +118,41 @@ class MangaDexSource(Source):
             manga_ids = [c.manga_id for c in candidates]
 
         releases: list[Release] = []
-        # Chapter-specific (type=chapter AND a chapter set) → BOUNDED walk that stops
-        # once the asc cursor floors past the requested family; every other request
-        # (type=manga, OR type=chapter with chapter=None) → PAGINATE-ALL.
-        stop_floor = (
-            math.floor(req.chapter)
-            if (req.type == "chapter" and req.chapter is not None)
-            else None
-        )
         for manga_id in manga_ids:
-            # Layer 2 (CACHE-02/03): cache the COMPLETE walked chapter feed per
-            # (manga_id, languages, walk-window). The walk's output depends on the
-            # WHOLE window it covers — its mode (paginate-all vs bounded early-stop,
-            # carried by ``stop_floor``) and its ``req.offset`` start cursor — so both
-            # ride the Layer-2 key as the ``extra`` discriminator (CR-01): a HIT keyed
-            # on a narrower/older window can never serve a stale or truncated page
-            # (offset paging returns the correct page; a larger request is a MISS, not
-            # a truncated HIT). A HIT still costs no upstream call and no rate-limit
-            # token — the limiter lives inside ``_fetch_chapter_feed`` (via
-            # ``get_json``), one level deeper than the cache check.
-            enum_key = ctx.cached_enumerate_key(
-                manga_id, languages, extra=(stop_floor, req.offset)
-            )
+            # Layer 2 (CACHE-02/03): cache the COMPLETE, paginate-all chapter feed per
+            # (manga_id, languages) — keyed on the series + language ONLY, NEVER the
+            # per-request walk window. This mirrors comix/mangaball (IN-02): a repeat
+            # search for the SAME series but a DIFFERENT chapter/type/offset is a cache
+            # HIT served from the one cached feed (re-filtered post-cache), not a fresh
+            # ``/chapter`` walk. The earlier ``(stop_floor, offset)`` window key made
+            # every differently-targeted repeat a MISS, so a series with zero matching
+            # results re-hit ``/chapter`` on every Mangarr chapter search while comix &
+            # mangaball served the cached feed (debug ``mangadex-search-not-cached``).
+            # The walk is ALWAYS paginate-all, so the cached Enumeration is complete
+            # (``exhausted=True``) and answers any chapter/offset query. A HIT costs no
+            # upstream call and no rate-limit token — the limiter lives inside
+            # ``_fetch_chapter_feed`` (via ``get_json``), below the cache check.
+            enum_key = ctx.cached_enumerate_key(manga_id, languages)
 
             async def _feed_fn(_mid: str = manga_id) -> Enumeration:
-                # The walk is COMPLETE for its mode (paginate-all exhausts the feed;
-                # a chapter-specific walk stops only once the asc cursor floors past
-                # the requested family), so it handles floor-bounding and exhaustion
-                # internally — there is no completeness-refetch path anymore (CR-01).
-                chapters = await self._walk_chapter_feed(
-                    _mid, languages, req.offset, ctx, stop_floor=stop_floor
-                )
+                chapters = await self._walk_chapter_feed(_mid, languages, ctx)
                 return self._build_enumeration(chapters)
 
             enum = await ctx.cached_enumerate(enum_key, _feed_fn)
-            for chapter in enum.items:
-                rel = self._to_release(manga_id, chapter, ctx)
-                # 260606-2ff: under type=chapter+chapter, keep only the requested
-                # whole-number/floor family (gate-off = pass-through). chapter_matches
-                # is now applied over the FULLY-WALKED feed — bounded for a
-                # chapter-specific request, paginate-all otherwise — so a floor-family
-                # member living on a later feed page is no longer missed (#144).
-                # Per-page size is the _MAX_FEED_LIMIT ceiling inside the walker;
-                # req.limit truncation happens at the route (search.py:218), so the
-                # source must NOT pre-truncate to req.limit.
-                if rel is not None and self.chapter_matches(req, rel.chapter_number):
-                    releases.append(rel)
+            # CACHE-02: the chapter_matches floor filter + the req.offset window are
+            # applied AFTER the cache (at the enumeration boundary), exactly like comix
+            # — never baked into the cache key. Under type=chapter+chapter this keeps
+            # only the requested whole-number/floor family (gate-off type=manga =
+            # pass-through, #144); a floor-family member on a later feed page is never
+            # missed because the WHOLE feed is cached. req.limit truncation stays at the
+            # route (search.py), so the source still must NOT pre-truncate to req.limit.
+            matched = [
+                rel
+                for chapter in enum.items
+                if (rel := self._to_release(manga_id, chapter, ctx)) is not None
+                and self.chapter_matches(req, rel.chapter_number)
+            ]
+            releases.extend(matched[req.offset :] if req.offset else matched)
         return releases
 
     async def recent(
@@ -318,35 +306,25 @@ class MangaDexSource(Source):
         self,
         manga_id: str,
         languages: list[str],
-        start_offset: int,
         ctx: SourceContext,
-        *,
-        stop_floor: int | None,
     ) -> list[dict[str, Any]]:
-        """Walk the chapter-ordered feed page by page; return the collected rows.
+        """PAGINATE-ALL walk of the chapter-ordered feed; return the collected rows.
 
-        The feed is ordered ``order[chapter]=asc``, so once a real parsed chapter
-        floors past the target family no later chapter can match; None/unparseable
-        numbers never stop the walk; continue while pages are full and the cursor
-        floor has not exceeded the target.
-
-        ``stop_floor`` non-None → BOUNDED: stop after the first page that contains a
-        parsed chapter whose floor exceeds it. ``stop_floor`` None → PAGINATE-ALL:
-        walk until the feed is exhausted. Both modes are hard-bounded by
-        ``_MAX_FEED_PAGES`` so a pathological/looping feed can never spin unbounded.
-        The walker does NOT filter — ``chapter_matches`` still runs in ``search``.
+        The feed is ordered ``order[chapter]=asc`` and walked from offset 0 until it
+        is exhausted (a short page, or the upstream ``total`` is reached), hard-bounded
+        by ``_MAX_FEED_PAGES`` so a pathological/looping feed can never spin unbounded.
+        The walk returns the COMPLETE feed — no per-request early-stop or offset window
+        — so the cached enumeration can answer any chapter/offset query; the
+        ``chapter_matches`` floor filter + the offset window run in ``search`` AFTER the
+        cache (CACHE-02), exactly like comix/mangaball. The walker does NOT filter.
         """
         collected: list[dict[str, Any]] = []
-        offset = start_offset
+        offset = 0
         for _ in range(_MAX_FEED_PAGES):
             page, total = await self._fetch_chapter_feed(
                 manga_id, languages, _MAX_FEED_LIMIT, offset, ctx
             )
             collected.extend(page)
-            # Bounded early-stop: the asc cursor has floored past the target family,
-            # so no later page can hold a match — even if this page was full.
-            if stop_floor is not None and self._page_passed_floor(page, stop_floor):
-                break
             # Exhaustion: a short page is the last page.
             if len(page) < _MAX_FEED_LIMIT:
                 break
@@ -355,24 +333,6 @@ class MangaDexSource(Source):
             if total is not None and offset >= total:
                 break
         return collected
-
-    def _page_passed_floor(self, page: list[dict[str, Any]], stop_floor: int) -> bool:
-        """True iff a PARSED chapter on the page floors strictly past ``stop_floor``.
-
-        Defensive: a None/unparseable chapter number never returns True, so it can
-        never trigger a premature stop that would skip a real later-page match (the
-        locked guard against a premature stop).
-        """
-        for chapter in page:
-            # ``_fetch_chapter_feed`` admits ``{"attributes": None}`` rows; guard the
-            # dereference so a malformed row can't AttributeError the bounded walk
-            # (CodeRabbit) — a non-dict attributes simply contributes no floor.
-            if not isinstance((attrs := chapter.get("attributes")), dict):
-                continue
-            number = self._parse_decimal(attrs.get("chapter"))
-            if number is not None and math.floor(number) > stop_floor:
-                return True
-        return False
 
     async def _fetch_chapter_feed(
         self,
@@ -402,7 +362,7 @@ class MangaDexSource(Source):
         # Keep only well-shaped rows: a dict whose ``attributes`` is absent or a
         # dict. A malformed row like ``{"attributes": []}`` would otherwise pass
         # the top-level dict check and then crash on ``.get(...)`` in
-        # ``_page_passed_floor`` / ``_to_release`` (WR-06 defensive parsing).
+        # ``_build_enumeration`` / ``_to_release`` (WR-06 defensive parsing).
         page = [
             c
             for c in chapters
@@ -416,13 +376,12 @@ class MangaDexSource(Source):
     def _build_enumeration(self, chapters: list[dict[str, Any]]) -> Enumeration:
         """Wrap the FULLY-WALKED chapter feed in a COMPLETE :class:`Enumeration`.
 
-        ``_walk_chapter_feed`` returns the complete feed for its mode (paginate-all
-        exhausts the feed; a bounded chapter-specific walk stops only once the asc
-        cursor floors past the requested family), so the cached enumeration is always
-        ``exhausted=True`` — the obsolete completeness-refetch path (and its
-        ``feed_limit`` arg) is gone (CR-01). ``chapter_numbers`` carries every parsed
-        ``Decimal`` chapter (rows with an unparseable/absent chapter are skipped) so
-        ``Enumeration.covers_floor`` stays well-defined for any other caller.
+        ``_walk_chapter_feed`` always paginate-all walks the whole feed, so the cached
+        enumeration is always ``exhausted=True`` — it covers any chapter/offset query,
+        which is why the Layer-2 cache can key on ``(manga_id, languages)`` ALONE and
+        re-filter post-cache (no per-request walk window). ``chapter_numbers`` carries
+        every parsed ``Decimal`` chapter (rows with an unparseable/absent chapter are
+        skipped) so ``Enumeration.covers_floor`` stays well-defined for any caller.
         """
         chapter_numbers = tuple(
             d
