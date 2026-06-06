@@ -611,8 +611,12 @@ class MangaBallSource(Source):
                     requested_limit=per_candidate_limit,
                 )
 
+            # IN-02: the ALL_CHAPTERS listing is the whole title's feed and does NOT
+            # depend on ``languages`` (the language filter is applied post-cache), so
+            # key on ``[]`` — different-language requests for one title share the
+            # cached listing instead of re-fetching byte-identical data per language.
             enum = await ctx.cached_enumerate(
-                ctx.cached_enumerate_key(title_id, req.languages or []), _enum_fn
+                ctx.cached_enumerate_key(title_id, []), _enum_fn
             )
             # _chapters_to_releases is UNCHANGED — the chapter_matches filter +
             # newest-first sort + [:limit] + GAP-2 mint-after-slice all stay; it

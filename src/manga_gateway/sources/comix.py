@@ -950,8 +950,13 @@ class ComixSource(Source):
                     requested_limit=feed_limit,
                 )
 
+            # IN-02: Comix's chapter enumeration is language-AGNOSTIC — the
+            # browser-DOM read is English-only and the language filter is applied
+            # post-cache (in ``search()``), so the cached walk does not depend on
+            # ``languages``. Key on ``[]`` so different-language requests for the
+            # same series share the one cached (expensive) browser walk.
             return await ctx.cached_enumerate(
-                ctx.cached_enumerate_key(series_hid, languages), _enum_fn
+                ctx.cached_enumerate_key(series_hid, []), _enum_fn
             )
 
         # Parallel fan-out across series candidates. ``return_exceptions=True``

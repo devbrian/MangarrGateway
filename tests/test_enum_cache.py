@@ -189,6 +189,24 @@ async def test_kill_switch_bypasses_cache() -> None:
     assert cache._inflight == {}
 
 
+async def test_none_value_is_cached_as_present_not_refetched() -> None:
+    """IN-01: a fetch_fn returning None is a present value, not mistaken for absence."""
+    cache: SingleFlightCache[str | None] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+
+    async def fetch() -> None:
+        nonlocal calls
+        calls += 1
+        return None
+
+    key = ("src", "a", ())
+    assert await cache.get_or_fetch(key, fetch) is None
+    # The _MISSING sentinel distinguishes a cached None from absence.
+    assert cache.contains(key) is True
+    assert await cache.get_or_fetch(key, fetch) is None
+    assert calls == 1  # the None HIT did not re-fetch
+
+
 async def test_empty_list_payload_is_not_cached() -> None:
     """WR-03: a valid-but-empty candidate list is returned but never cached."""
     cache: SingleFlightCache[list[str]] = SingleFlightCache(ttl=1800, maxsize=8)

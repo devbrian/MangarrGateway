@@ -38,7 +38,7 @@ import math
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from cachetools import TLRUCache
 
@@ -50,6 +50,13 @@ if TYPE_CHECKING:
 _DEFAULT_TTL = 1800  # 30 min — ≤ the 60-min handle TTL (D-09, blueprint R5)
 _DEFAULT_MAXSIZE = 512  # D-07 memory bound
 _MAX_TTL = 3600  # hard ceiling = the 60-min handle TTL (D-09)
+
+# IN-01: distinct absence sentinel. ``self._cache.get(key)`` defaults to ``None``,
+# but ``None`` is a value a future ``fetch_fn`` could legitimately return — under an
+# ``is not None`` presence check that value would be indistinguishable from absence
+# (re-fetched every call, always classified "miss"). A unique object can never
+# collide with any cached value, so it cleanly means "not present".
+_MISSING = object()
 
 # The uniform cache-key shape ALL layers use: a heterogeneous tuple whose first
 # element is the ``source_key`` (read by ``_ttu`` for per-source TTL overrides).
@@ -147,10 +154,12 @@ class SingleFlightCache[V]:
             # D-08 kill-switch: bare fetch, no cache state, no single-flight.
             return await fetch_fn()
 
-        # Fast path: a live cache HIT returns without invoking fetch_fn.
-        hit = self._cache.get(key)
-        if hit is not None:
-            return hit
+        # Fast path: a live cache HIT returns without invoking fetch_fn. The
+        # ``_MISSING`` sentinel (IN-01) distinguishes a genuinely absent key from a
+        # cached ``None`` value a future ``fetch_fn`` might return.
+        hit = self._cache.get(key, _MISSING)
+        if hit is not _MISSING:
+            return cast("V", hit)
 
         # Snapshot the in-flight future BEFORE awaiting so the leader's ``finally``
         # cannot pop it between the .done() check and the await (single-flight race).
@@ -198,7 +207,7 @@ class SingleFlightCache[V]:
     def contains(self, key: CacheKey) -> bool:
         """Return whether ``key`` has a live (non-expired) entry — the HIT check
         used to classify a cache event before ``get_or_fetch`` runs."""
-        return self._cache.get(key) is not None
+        return self._cache.get(key, _MISSING) is not _MISSING
 
 
 def _is_empty_payload(value: Any) -> bool:

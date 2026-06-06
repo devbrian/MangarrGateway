@@ -280,8 +280,12 @@ class MangadotSource(Source):
                     requested_limit=limit,
                 )
 
+            # IN-02: ``/chapters/list`` returns the whole manga's feed and does NOT
+            # depend on ``languages`` (the language filter is applied post-cache), so
+            # key on ``[]`` — different-language requests for one manga share the
+            # cached listing instead of re-fetching byte-identical data per language.
             enum = await ctx.cached_enumerate(
-                ctx.cached_enumerate_key(manga_id, req.languages or []), _enum_fn
+                ctx.cached_enumerate_key(manga_id, []), _enum_fn
             )
             # _chapters_to_releases is UNCHANGED — the chapter_matches filter +
             # newest-first sort + [:limit] + GAP-2 mint-after-slice all stay; it
