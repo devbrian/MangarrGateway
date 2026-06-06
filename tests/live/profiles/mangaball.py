@@ -74,15 +74,16 @@ confirms / tunes:
 
 Alt-title live smoke (#139)
 ---------------------------
-``alt_title_query`` / ``alt_title_expected_substring`` are intentionally left at
-their ``None`` default: no native/alt title is yet CONFIRMED to resolve live for
-a stable mangaball series via ``search-advanced`` (the ``alternateName`` field is
-a ``/``-separated HTML blob whose native-vs-romaji split is parsed offline, but a
-live native-name search has not been verified to return the right leading hit).
-The alt-title live smoke for mangaball is therefore PENDING a verified native
-query; until then ``test_search_alt_title_smoke.py`` skips this source. Follow-up:
-pin a native query whose leading hit's title contains a known English substring on
-the first deploy-host smoke, then populate both fields here (mirrors comix.py).
+``alt_title_query`` / ``alt_title_expected_substring`` populated (#139): a
+2026-06-05 live recon (CSRF-bootstrap + ``POST /api/v1/title/search-advanced/``)
+confirmed mangaball matches native/alt names server-side and the ``alternateName``
+``/``-separated HTML blob carries them — querying the Korean native title of Solo
+Leveling (``나 혼자만 레벨업``) returns the "Solo Leveling" series (its
+``alternateName`` leads with that exact string). High-traffic, stable → a
+deterministic alt-title smoke. The query matches ONLY via the alt name (the
+English main name "Solo Leveling" does not contain the Korean string), so a
+release whose title contains "Solo Leveling" proves the ``_split_alt`` +
+alt-title-aware prune path resolves end-to-end through the gateway.
 """
 
 from __future__ import annotations
@@ -108,4 +109,7 @@ LIVE_SMOKE = LiveSmokeProfile(
     # pins the real chapter-detail / search shapes (mirrors comix.py).
     fixture_drift_paths=[],
     perf_budget_s=None,
+    # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
+    alt_title_query="나 혼자만 레벨업",
+    alt_title_expected_substring="Solo Leveling",
 )
