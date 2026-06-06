@@ -140,9 +140,18 @@ class SourceContext:
         expected_pages: int | None = None,
         candidates_enumerated: int | None = None,
         enum_cache: EnumerationCache | None = None,
+        retry_attempts: int = 4,
     ) -> None:
         self._source_key = source_key
         self._session = session
+        # 260606-lyb Change 1: per-context tenacity attempt budget. A class-level
+        # ``@tenacity.retry`` decorator is evaluated ONCE at import and cannot read
+        # ``self``, so each HTTP method drives its retryer from this value at call
+        # time (see ``_retrying``). Default 4 preserves the historic budget for the
+        # download/job contexts and EVERY caller that does not pass it; the SEARCH
+        # path (search.py / recent.py) builds contexts with ``retry_attempts=2`` so
+        # a down source fails fast on a repeat search (1 retry, not 3).
+        self._retry_attempts = retry_attempts
         # Shared across search + (future) download paths (SRC-03).
         self._limiter: AsyncLimiter = ratelimiter.for_source(
             source_key, rate_limit_per_minute
@@ -409,12 +418,25 @@ class SourceContext:
 
     # ─────────────────────────── HTTP ───────────────────────────
 
-    @tenacity.retry(
-        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
-        stop=tenacity.stop_after_attempt(4),
-        retry=tenacity.retry_if_exception(_is_retryable),
-        reraise=True,
-    )
+    def _retrying(self) -> tenacity.AsyncRetrying:
+        """A FRESH tenacity retryer per call, honoring the per-context attempt budget.
+
+        260606-lyb Change 1: the retry POLICY is byte-for-byte the historic
+        class-level decorator (exp backoff + jitter; retry transport errors / 5xx via
+        :func:`_is_retryable`; reraise the final exception) — the ONLY change is
+        ``stop_after_attempt(self._retry_attempts)`` reading the per-instance budget
+        instead of the hardcoded ``4``. A decorator is import-time and cannot read
+        ``self``, so each HTTP method builds a retryer here and drives its body closure
+        through it. A new instance per call keeps tenacity's internal attempt state
+        un-shared across concurrent requests.
+        """
+        return tenacity.AsyncRetrying(
+            wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
+            stop=tenacity.stop_after_attempt(self._retry_attempts),
+            retry=tenacity.retry_if_exception(_is_retryable),
+            reraise=True,
+        )
+
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         """GET ``url`` with ``params`` → parsed JSON, rate-limited + retried.
 
@@ -426,23 +448,21 @@ class SourceContext:
         the failure-feeding ``try`` so a malformed-shape ``200`` (a non-object body →
         ``SourceError`` from :meth:`_parse_json_object`) also trips ``_feed_failure``.
         """
-        try:
-            body = await self._request_bytes(
-                url, params=params, limited=True, op="get_json"
-            )
-            result = self._parse_json_object(body)
-        except SourceError:
-            self._feed_failure()
-            raise
-        self._feed_success()
-        return result
 
-    @tenacity.retry(
-        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
-        stop=tenacity.stop_after_attempt(4),
-        retry=tenacity.retry_if_exception(_is_retryable),
-        reraise=True,
-    )
+        async def _attempt() -> dict[str, Any]:
+            try:
+                body = await self._request_bytes(
+                    url, params=params, limited=True, op="get_json"
+                )
+                result = self._parse_json_object(body)
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return result
+
+        return await self._retrying()(_attempt)
+
     async def get_json_array(self, url: str, **params: Any) -> list[Any]:
         """GET ``url`` with ``params`` → parsed top-level JSON ARRAY, like
         :meth:`get_json` but parsing a bare list body rather than an object.
@@ -460,23 +480,21 @@ class SourceContext:
         non-array ``200`` body also trips ``_feed_failure``. Additive: the existing
         object-bodied call paths (comix/mangadex/mangaball) are untouched.
         """
-        try:
-            body = await self._request_bytes(
-                url, params=params, limited=True, op="get_json_array"
-            )
-            result = self._parse_json_array(body)
-        except SourceError:
-            self._feed_failure()
-            raise
-        self._feed_success()
-        return result
 
-    @tenacity.retry(
-        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
-        stop=tenacity.stop_after_attempt(4),
-        retry=tenacity.retry_if_exception(_is_retryable),
-        reraise=True,
-    )
+        async def _attempt() -> list[Any]:
+            try:
+                body = await self._request_bytes(
+                    url, params=params, limited=True, op="get_json_array"
+                )
+                result = self._parse_json_array(body)
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return result
+
+        return await self._retrying()(_attempt)
+
     async def post_json(self, url: str, *, data: dict[str, Any]) -> dict[str, Any]:
         """POST ``data`` as a form body → parsed JSON, rate-limited + retried.
 
@@ -491,23 +509,26 @@ class SourceContext:
         ``try`` so a non-object ``200`` body also trips ``_feed_failure``. Sources add
         ZERO networking glue (SRC-02).
         """
-        try:
-            body = await self._request_bytes(
-                url, params=None, limited=True, method="POST", data=data, op="post_json"
-            )
-            result = self._parse_json_object(body)
-        except SourceError:
-            self._feed_failure()
-            raise
-        self._feed_success()
-        return result
 
-    @tenacity.retry(
-        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
-        stop=tenacity.stop_after_attempt(4),
-        retry=tenacity.retry_if_exception(_is_retryable),
-        reraise=True,
-    )
+        async def _attempt() -> dict[str, Any]:
+            try:
+                body = await self._request_bytes(
+                    url,
+                    params=None,
+                    limited=True,
+                    method="POST",
+                    data=data,
+                    op="post_json",
+                )
+                result = self._parse_json_object(body)
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return result
+
+        return await self._retrying()(_attempt)
+
     async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
         """Identical to :meth:`get_json` but BYPASSES the decrypt seam (D-39).
 
@@ -520,23 +541,21 @@ class SourceContext:
         including the parse running INSIDE the failure-feeding ``try`` so a non-object
         ``200`` body also trips ``_feed_failure``) stays identical to ``get_json``.
         """
-        try:
-            body = await self._request_bytes(
-                url, params=params, limited=True, decrypt=False, op="get_json_plain"
-            )
-            result = self._parse_json_object(body)
-        except SourceError:
-            self._feed_failure()
-            raise
-        self._feed_success()
-        return result
 
-    @tenacity.retry(
-        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
-        stop=tenacity.stop_after_attempt(4),
-        retry=tenacity.retry_if_exception(_is_retryable),
-        reraise=True,
-    )
+        async def _attempt() -> dict[str, Any]:
+            try:
+                body = await self._request_bytes(
+                    url, params=params, limited=True, decrypt=False, op="get_json_plain"
+                )
+                result = self._parse_json_object(body)
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return result
+
+        return await self._retrying()(_attempt)
+
     async def get_bytes(self, url: str) -> bytes:
         """GET ``url`` → decrypted response bytes, retried like ``get_json`` but NOT
         rate-limited.
@@ -548,22 +567,20 @@ class SourceContext:
         Raises ``SourceError`` on a permanent 4xx; lets transport errors / 5xx bubble
         to tenacity. Bytes are decrypted (D-39) but never recompressed (PKG-04).
         """
-        try:
-            body = await self._request_bytes(
-                url, params=None, limited=False, op="get_bytes"
-            )
-        except SourceError:
-            self._feed_failure()
-            raise
-        self._feed_success()
-        return body
 
-    @tenacity.retry(
-        wait=tenacity.wait_exponential_jitter(initial=0.5, max=8),
-        stop=tenacity.stop_after_attempt(4),
-        retry=tenacity.retry_if_exception(_is_retryable),
-        reraise=True,
-    )
+        async def _attempt() -> bytes:
+            try:
+                body = await self._request_bytes(
+                    url, params=None, limited=False, op="get_bytes"
+                )
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return body
+
+        return await self._retrying()(_attempt)
+
     async def get_bytes_plain(self, url: str) -> bytes:
         """Identical to :meth:`get_bytes` but BYPASSES the decrypt seam (D-39).
 
@@ -576,15 +593,19 @@ class SourceContext:
         bytes. Everything else (clearance injection, retry, 403 reconciliation,
         health feed) stays identical to :meth:`get_bytes`.
         """
-        try:
-            body = await self._request_bytes(
-                url, params=None, limited=False, decrypt=False, op="get_bytes_plain"
-            )
-        except SourceError:
-            self._feed_failure()
-            raise
-        self._feed_success()
-        return body
+
+        async def _attempt() -> bytes:
+            try:
+                body = await self._request_bytes(
+                    url, params=None, limited=False, decrypt=False, op="get_bytes_plain"
+                )
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return body
+
+        return await self._retrying()(_attempt)
 
     async def _request_bytes(
         self,

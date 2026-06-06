@@ -179,6 +179,10 @@ async def search(
             source_health=health_map.get(src.key),
             session_prep=session_prep,
             enum_cache=enum_cache,
+            # 260606-lyb Change 1: the SEARCH path retries once (2 attempts) so a
+            # down source fails fast on a repeat search; downloads/jobs keep the
+            # default 4-attempt budget (they never pass retry_attempts).
+            retry_attempts=2,
         )
         started = time.perf_counter()
         releases = await src.search(req, ctx)

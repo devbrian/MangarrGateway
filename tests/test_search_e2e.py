@@ -225,7 +225,7 @@ class _SequenceTransport:
         pass
 
 
-def _ctx_over(transport: _SequenceTransport) -> object:
+def _ctx_over(transport: _SequenceTransport, retry_attempts: int = 4) -> object:
     from manga_gateway.framework.context import SourceContext
     from manga_gateway.framework.ratelimit import RateLimiter
     from manga_gateway.framework.session import SessionManager
@@ -236,6 +236,7 @@ def _ctx_over(transport: _SequenceTransport) -> object:
         session=SessionManager(transport),
         ratelimiter=RateLimiter(),
         handle_store=HandleStore(),
+        retry_attempts=retry_attempts,
     )
 
 
@@ -265,6 +266,31 @@ async def test_context_does_not_retry_permanent_4xx() -> None:
     with pytest.raises(SourceError):
         await ctx.get_json("https://x/api")  # type: ignore[attr-defined]
     assert transport.calls == 1  # no retry on a permanent 4xx
+
+
+@pytest.mark.asyncio
+async def test_context_attempt_count_is_per_context_search_two_download_four() -> None:
+    # 260606-lyb Change 1: the retry budget is now per-context, not a static
+    # import-time constant. A SEARCH-path context (retry_attempts=2) makes exactly
+    # 2 transport calls on a PERSISTENT retryable 5xx (1 retry); a default context
+    # (4) makes 4. Proves search=2 / download=4 from the same code path.
+    req = httpx.Request("GET", "https://x/api")
+
+    search_transport = _SequenceTransport(
+        [httpx.Response(503, request=req) for _ in range(2)]
+    )
+    search_ctx = _ctx_over(search_transport, retry_attempts=2)
+    with pytest.raises(httpx.HTTPStatusError):
+        await search_ctx.get_json("https://x/api")  # type: ignore[attr-defined]
+    assert search_transport.calls == 2  # 1 retry → 2 attempts
+
+    download_transport = _SequenceTransport(
+        [httpx.Response(503, request=req) for _ in range(4)]
+    )
+    download_ctx = _ctx_over(download_transport)  # default retry_attempts=4
+    with pytest.raises(httpx.HTTPStatusError):
+        await download_ctx.get_json("https://x/api")  # type: ignore[attr-defined]
+    assert download_transport.calls == 4  # 3 retries → 4 attempts
 
 
 # ─────────────────────────── E2E POST /search (Task 3) ──────────────────────────

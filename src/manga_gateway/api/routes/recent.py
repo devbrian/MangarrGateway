@@ -182,6 +182,9 @@ async def get_recent(
             decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
             source_health=health_map.get(src.key),
             session_prep=session_prep,
+            # 260606-lyb Change 1: the SEARCH/recent path retries once (2 attempts)
+            # so a down source fails fast; downloads/jobs keep the default 4.
+            retry_attempts=2,
         )
         releases = await src.recent(
             languages=language_list,
