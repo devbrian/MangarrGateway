@@ -14,7 +14,9 @@ Two layers:
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -292,3 +294,61 @@ async def test_mangadot_ambiguous_query_fans_out_to_five() -> None:
 
     assert len(ctx.array_calls) == 5  # _DEFAULT_MANGA_CANDIDATES, unchanged
     assert ctx.candidates_enumerated == 5
+
+
+# --- comix alt-title acceptance (real fixture) -------------------------------
+
+_COMIX_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "comix" / "search_the_forgotten_field.json"
+)
+
+
+def _comix_series_tuples() -> list[tuple[str, str, str, list[str]]]:
+    """Build the ``_search_series`` 4-tuples from the real comix search fixture.
+
+    Mirrors ``ComixSource._search_series``'s parse: skip ``hasChapters is False``
+    items and emit ``(hid, slug, title, alt_titles)`` from the same payload that
+    already carries ``altTitles``.
+    """
+    data = json.loads(_COMIX_FIXTURE.read_text(encoding="utf-8"))
+    out: list[tuple[str, str, str, list[str]]] = []
+    for item in data["result"]["items"]:
+        if not isinstance(item, dict):
+            continue
+        hid = item.get("hid")
+        if not hid:
+            continue
+        if item.get("hasChapters") is False:
+            continue
+        title = str(item.get("title") or "")
+        slug = str(item.get("url") or "")
+        alt_titles = [s for s in (item.get("altTitles") or []) if isinstance(s, str)]
+        out.append((str(hid), slug, title, alt_titles))
+    return out
+
+
+def _comix_keys(t: tuple[str, str, str, list[str]]) -> list[str | None]:
+    return [t[2], *t[3]]
+
+
+def test_comix_alt_title_korean_prunes_to_forgotten_field() -> None:
+    # The Korean alt title of "The Forgotten Field" (hid mr3m0, altTitles
+    # ["잊혀진 들판"]) must prune the per-candidate browser fan-out to that ONE
+    # series — even though no MAIN title matches the Korean query (#139).
+    series = _comix_series_tuples()
+    assert len(series) > 1  # the fixture has many same-keyword series
+    result = prune_candidates(series, "잊혀진 들판", keys=_comix_keys, cap=len(series))
+    assert len(result) == 1
+    assert result[0][2] == "The Forgotten Field"
+    assert result[0][0] == "mr3m0"
+
+
+def test_comix_main_title_prunes_to_forgotten_field() -> None:
+    # Parity with #126: the English MAIN title also prunes to the one series.
+    series = _comix_series_tuples()
+    result = prune_candidates(
+        series, "the forgotten field", keys=_comix_keys, cap=len(series)
+    )
+    assert len(result) == 1
+    assert result[0][2] == "The Forgotten Field"
+    assert result[0][0] == "mr3m0"

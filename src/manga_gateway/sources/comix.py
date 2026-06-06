@@ -1214,7 +1214,7 @@ class ComixSource(Source):
     async def _search_series(
         self, query: str, limit: int, ctx: SourceContext
     ) -> list[tuple[str, str, str, list[str]]]:
-        """PLAINTEXT search → ``(hid, slug, title, alt_titles)`` (D-46) via ``/api/v1/manga``.
+        """PLAINTEXT search → ``(hid, slug, title, alt_titles)`` via ``/api/v1/manga``.
 
         Returns ``(hid, slug, title, alt_titles)`` tuples. The 5-char ``hid`` is
         the canonical series identifier; the ``slug`` is extracted from the
