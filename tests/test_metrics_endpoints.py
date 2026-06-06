@@ -154,9 +154,7 @@ async def _seed_routed_and_unrouted(app: FastAPI, *, outcome: str = "ok") -> Non
         current_request.reset(routed_token)
 
     # Unrouted: endpoint key ABSENT → endpoint=null in the payload.
-    unrouted_token = current_request.set(
-        {"request_id": 9002, "surface": "search"}
-    )
+    unrouted_token = current_request.set({"request_id": 9002, "surface": "search"})
     try:
         collector.emit_http(
             op="get_json",

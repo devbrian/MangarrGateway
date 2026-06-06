@@ -285,9 +285,7 @@ async def test_limit_applies_to_filtered_set(tmp_path: Path) -> None:
             )
         # 3 routed with OLDER timestamps.
         for i in range(3):
-            snap.enqueue(
-                _ev(duration_ms=100.0, request_id=i, ts=float(i)), {"recent"}
-            )
+            snap.enqueue(_ev(duration_ms=100.0, request_id=i, ts=float(i)), {"recent"})
         await snap.flush()
 
         filtered = await snap.recent_calls(3, include_unrouted=False)
@@ -318,9 +316,7 @@ async def test_latest_failures_and_slow_honor_include_unrouted(tmp_path: Path) -
         snap.enqueue(unrouted, {"recent", "failures", "slow"})
         # A routed failure/slow event in the same rings so the filtered output is
         # non-empty (proves the filter hides ONLY the unrouted row).
-        routed = _ev(
-            duration_ms=9000.0, outcome="error", request_id=7, ts=50.0
-        )
+        routed = _ev(duration_ms=9000.0, outcome="error", request_id=7, ts=50.0)
         snap.enqueue(routed, {"recent", "failures", "slow"})
         await snap.flush()
 
