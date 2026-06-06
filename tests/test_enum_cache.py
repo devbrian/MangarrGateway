@@ -12,9 +12,16 @@ Network-free. Exercises:
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
-from manga_gateway.framework.enum_cache import Enumeration, EnumerationCache
+import pytest
+
+from manga_gateway.framework.enum_cache import (
+    Enumeration,
+    EnumerationCache,
+    SingleFlightCache,
+)
 
 # ───────────────────────────── Enumeration / covers_floor ────────────────────
 
@@ -69,3 +76,177 @@ def test_keys_are_language_order_insensitive() -> None:
     c = EnumerationCache.resolve_key("mangadex", "q", ["ja", "en"])
     d = EnumerationCache.resolve_key("mangadex", "q", ["en", "ja"])
     assert c == d
+
+
+# ───────────────────────────── SingleFlightCache ─────────────────────────────
+
+
+async def test_cold_key_fetches_once_and_caches() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+
+    async def fetch() -> str:
+        nonlocal calls
+        calls += 1
+        return "value"
+
+    key = ("src", "a", ())
+    assert await cache.get_or_fetch(key, fetch) == "value"
+    # warm key: returns the stored value WITHOUT calling fetch again
+    assert await cache.get_or_fetch(key, fetch) == "value"
+    assert calls == 1
+
+
+async def test_concurrent_same_key_collapses_to_one_fetch() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+    gate = asyncio.Event()
+
+    async def fetch() -> str:
+        nonlocal calls
+        calls += 1
+        await gate.wait()
+        return "v"
+
+    key = ("src", "a", ())
+    t1 = asyncio.create_task(cache.get_or_fetch(key, fetch))
+    t2 = asyncio.create_task(cache.get_or_fetch(key, fetch))
+    await asyncio.sleep(0)  # let both reach the gate
+    gate.set()
+    r1, r2 = await asyncio.gather(t1, t2)
+    assert r1 == r2 == "v"
+    assert calls == 1  # single-flight collapse (D-04)
+
+
+async def test_concurrent_different_keys_each_fetch() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+
+    async def fetch() -> str:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return "v"
+
+    await asyncio.gather(
+        cache.get_or_fetch(("src", "a", ()), fetch),
+        cache.get_or_fetch(("src", "b", ()), fetch),
+    )
+    assert calls == 2
+
+
+async def test_fetch_error_is_not_cached_and_inflight_popped() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+
+    async def boom() -> str:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("upstream down")
+
+    key = ("src", "a", ())
+    with pytest.raises(RuntimeError):
+        await cache.get_or_fetch(key, boom)
+    # failure never cached; inflight cleaned up (D-05 / T-09-03)
+    assert cache._inflight == {}
+    with pytest.raises(RuntimeError):
+        await cache.get_or_fetch(key, boom)
+    assert calls == 2  # the next caller re-fetches
+
+
+async def test_concurrent_error_propagates_to_all_awaiters() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=8)
+    gate = asyncio.Event()
+
+    async def boom() -> str:
+        await gate.wait()
+        raise RuntimeError("boom")
+
+    key = ("src", "a", ())
+    t1 = asyncio.create_task(cache.get_or_fetch(key, boom))
+    t2 = asyncio.create_task(cache.get_or_fetch(key, boom))
+    await asyncio.sleep(0)
+    gate.set()
+    results = await asyncio.gather(t1, t2, return_exceptions=True)
+    assert all(isinstance(r, RuntimeError) for r in results)
+    assert cache._inflight == {}
+
+
+async def test_kill_switch_bypasses_cache() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(
+        ttl=1800, maxsize=8, enabled=False
+    )
+    calls = 0
+
+    async def fetch() -> str:
+        nonlocal calls
+        calls += 1
+        return "v"
+
+    key = ("src", "a", ())
+    await cache.get_or_fetch(key, fetch)
+    await cache.get_or_fetch(key, fetch)
+    assert calls == 2  # fetch runs every time
+    assert len(cache._cache) == 0  # nothing written (D-08)
+    assert cache._inflight == {}
+
+
+async def test_replace_overwrites_cached_value() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=8)
+    key = ("src", "a", ())
+
+    async def fetch() -> str:
+        return "first"
+
+    assert await cache.get_or_fetch(key, fetch) == "first"
+    cache.replace(key, "second")
+
+    async def fail() -> str:  # pragma: no cover - must not run on a hit
+        raise AssertionError("fetch must not run after replace")
+
+    assert await cache.get_or_fetch(key, fail) == "second"
+
+
+async def test_maxsize_is_bounded() -> None:
+    cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=2)
+
+    async def fetch() -> str:
+        return "v"
+
+    for i in range(5):
+        await cache.get_or_fetch(("src", str(i), ()), fetch)
+    assert len(cache._cache) <= 2
+
+
+async def test_per_source_ttl_override_and_clamp() -> None:
+    now = [0.0]
+    cache: SingleFlightCache[str] = SingleFlightCache(
+        ttl=1800,
+        maxsize=16,
+        ttl_overrides={"slow": 60, "big": 99_999},
+        clock=lambda: now[0],
+    )
+    calls = 0
+
+    async def fetch() -> str:
+        nonlocal calls
+        calls += 1
+        return "v"
+
+    slow_key = ("slow", "x", ())
+    default_key = ("fast", "y", ())
+    big_key = ("big", "z", ())
+    await cache.get_or_fetch(slow_key, fetch)  # ttl 60
+    await cache.get_or_fetch(default_key, fetch)  # ttl 1800 (default)
+    await cache.get_or_fetch(big_key, fetch)  # 99999 clamped to 3600
+    assert calls == 3
+
+    now[0] = 61.0
+    await cache.get_or_fetch(slow_key, fetch)  # expired → re-fetch
+    assert calls == 4
+    await cache.get_or_fetch(default_key, fetch)  # still warm
+    assert calls == 4
+
+    now[0] = 3601.0
+    await cache.get_or_fetch(big_key, fetch)  # clamped to 3600 → expired
+    assert calls == 5
