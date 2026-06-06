@@ -293,3 +293,32 @@ def test_env_overrides_enum_cache_knobs(
     assert settings.enum_cache_enabled is False
     assert settings.enum_cache_ttl_seconds == 900
     assert settings.enum_cache_maxsize == 64
+
+
+def test_warm_retry_defaults() -> None:
+    """#153: eager-warm retry defaults — 3 attempts, 2.0s base backoff."""
+    settings = Settings(api_key=_DUMMY_KEY)
+    assert settings.cloudflare_warm_attempts == 3
+    assert settings.cloudflare_warm_retry_seconds == 2.0
+
+
+def test_warm_attempts_rejects_non_positive() -> None:
+    """#153: ge=1 — at least one attempt is required."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=_DUMMY_KEY, cloudflare_warm_attempts=0)
+
+
+def test_env_overrides_warm_retry_knobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-11/#153: GATEWAY_CLOUDFLARE_WARM_* env vars override the defaults."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'api_key = "{_DUMMY_KEY}"\n', encoding="utf-8")
+
+    monkeypatch.setenv("GATEWAY_CLOUDFLARE_WARM_ATTEMPTS", "5")
+    monkeypatch.setenv("GATEWAY_CLOUDFLARE_WARM_RETRY_SECONDS", "0.5")
+
+    settings = load_settings(cfg)
+
+    assert settings.cloudflare_warm_attempts == 5
+    assert settings.cloudflare_warm_retry_seconds == 0.5

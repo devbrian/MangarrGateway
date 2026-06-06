@@ -57,6 +57,18 @@ def test_force_disabled_overrides_healthy_counter() -> None:
     assert h.is_enabled is False  # D-33: eager Patchright launch failed
 
 
+def test_success_clears_force_disabled_latch() -> None:
+    # #153: a genuine success (on-demand warm / watchdog re-probe) must clear the
+    # D-33 eager-launch latch so /caps self-heals — previously force_disabled was
+    # sticky until a manual restart.
+    h = SourceHealth(threshold=5)
+    h.force_disabled = True
+    assert h.is_enabled is False
+    h.record_success()
+    assert h.force_disabled is False
+    assert h.is_enabled is True
+
+
 # ─────────────────────────────── source_cap(health) ─────────────────────────────
 
 

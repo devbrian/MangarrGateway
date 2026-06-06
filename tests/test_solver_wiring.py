@@ -162,3 +162,92 @@ async def test_watchdog_cancellable() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_watchdog_reenables_force_disabled_source_on_probe_recovery() -> None:
+    # #153: an eager-launch-flake (force_disabled) source now recovers OFF the
+    # request path — a successful watchdog re-probe clears the D-33 latch
+    # (record_success resets force_disabled), instead of staying down until restart.
+    health = SourceHealth(threshold=5)
+    health.force_disabled = True
+    assert health.is_enabled is False
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    async def probe() -> bool:
+        return True
+
+    await _recovery_watchdog(
+        health, backoff_hours=(1, 6), sleep=fake_sleep, probe=probe
+    )
+    assert health.force_disabled is False
+    assert health.is_enabled is True
+
+
+# ──────────────────── eager-warm bounded retry (#153) ────────────────────
+#
+# These exercise ``_warm_one`` directly — the unit holding all the new retry /
+# backoff / give-up logic. ``warm()`` itself is a trivial loop that appends the
+# keys ``_warm_one`` reports failed, and the conftest autouse fixture stubs
+# ``warm`` to a no-op for every deterministic test, so hitting ``_warm_one`` is
+# both the honest unit boundary and stub-proof.
+
+
+async def test_warm_one_retry_absorbs_cold_start_flake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #153: a transient first-attempt warm failure is absorbed by retry, so the
+    # source is NOT reported failed and the lifespan never force_disables it.
+    solver = CloudflareSolver(cloudflare_keys=("comix",), warm_attempts=3)
+
+    attempts: list[int] = []
+
+    async def flaky_clearance(key: str) -> None:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("cold persistent-context launch race")
+        return None  # success on the second attempt
+
+    monkeypatch.setattr(solver, "get_clearance", flaky_clearance)
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    ok = await solver._warm_one("comix", sleep=fake_sleep)
+
+    assert ok is True  # absorbed → comix stays enabled
+    assert len(attempts) == 2  # one retry
+    assert slept == [2.0]  # one backoff between attempts (warm_retry_seconds * 1)
+
+
+async def test_warm_one_reports_failed_after_exhausting_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #153: when every attempt fails the source is reported failed (warm() then
+    # surfaces it so the lifespan force_disables it) — but only AFTER the bounded
+    # retry budget is spent, and with backoff ONLY between attempts.
+    solver = CloudflareSolver(
+        cloudflare_keys=("comix",), warm_attempts=2, warm_retry_seconds=1.0
+    )
+
+    attempts: list[int] = []
+
+    async def always_boom(key: str) -> None:
+        attempts.append(1)
+        raise RuntimeError("patchright failed to launch")
+
+    monkeypatch.setattr(solver, "get_clearance", always_boom)
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    ok = await solver._warm_one("comix", sleep=fake_sleep)
+
+    assert ok is False  # exhausted → warm() reports it failed
+    assert len(attempts) == 2  # both attempts spent
+    assert slept == [1.0]  # backoff only BETWEEN attempts (no trailing sleep)
