@@ -13,7 +13,9 @@ HTTP/fetch stack:
 4. A global ``Semaphore(max_concurrent_chapters)`` bounds concurrent running jobs;
    extras stay queued until a slot frees (D-30).
 5. ``rehydrate()`` populates the projection from store rows reflecting the
-   store's in-flight→failed flip (PLAT-03).
+   store's in-flight→requeued flip, and ``resume_interrupted()`` re-spawns the
+   requeued jobs so interrupted work survives a restart (PLAT-03,
+   download-jobs-failed-23).
 """
 
 from __future__ import annotations
@@ -330,7 +332,9 @@ async def test_per_source_bound_honors_source_override_and_clamps(
 
 
 @pytest.mark.asyncio
-async def test_rehydrate_populates_projection_from_store(tmp_path: Path) -> None:
+async def test_rehydrate_requeues_live_job_into_projection(tmp_path: Path) -> None:
+    # download-jobs-failed-23: an unclean shutdown leaves a live row; rehydrate
+    # REQUEUES it (resume on restart) and projects it as ``queued``, NOT ``failed``.
     db = str(tmp_path / "jobs.db")
     store = await open_store(db)
     try:
@@ -341,16 +345,75 @@ async def test_rehydrate_populates_projection_from_store(tmp_path: Path) -> None
         # Simulate an unclean shutdown: close without draining the in-flight task.
         await store.close()
 
-    # Reopen — rehydrate flips the live job to failed and projects it.
+    # Reopen — rehydrate requeues the live job and projects it (no re-spawn here).
     store2 = await open_store(db)
     try:
         mgr2 = await _make_manager(store2)
+        mgr2._engine = _NoopEngine()  # type: ignore[assignment]
         await mgr2.rehydrate()
         jobs = mgr2.list()
         assert len(jobs) == 1
-        assert jobs[0].status == "failed"
+        assert jobs[0].status == "queued"
     finally:
         await store2.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_interrupted_respawns_requeued_jobs(tmp_path: Path) -> None:
+    # download-jobs-failed-23: after rehydrate requeues interrupted jobs,
+    # resume_interrupted re-spawns each ``queued`` row so the work actually resumes
+    # ("jobs SHOULD survive restart"). Two live jobs are interrupted, then resumed.
+    db = str(tmp_path / "jobs.db")
+    store = await open_store(db)
+    try:
+        mgr = await _make_manager(store)
+        mgr._engine = _GatedEngine(asyncio.Event())  # never completes; stays live
+        await mgr.submit(_record(), _req("h_a"))
+        await mgr.submit(_record(), _req("h_b"))
+    finally:
+        await store.close()
+
+    store2 = await open_store(db)
+    try:
+        mgr2 = await _make_manager(store2)
+        engine = _CountingEngine()
+        mgr2._engine = engine  # type: ignore[assignment]
+        await mgr2.rehydrate()
+        # Both requeued rows are projected ``queued`` but nothing runs until resume.
+        assert {j.status for j in mgr2.list()} == {"queued"}
+        assert engine.peak_concurrent == 0
+
+        resumed = mgr2.resume_interrupted()
+        assert resumed == 2
+        await asyncio.sleep(0.05)
+        assert engine.peak_concurrent >= 1  # the resumed jobs are now running
+
+        engine.release_all()
+        await mgr2.drain()
+        assert engine.total_completed == 2
+        assert {j.status for j in mgr2.list()} == {"completed"}
+    finally:
+        await store2.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_interrupted_ignores_terminal_rows(tmp_path: Path) -> None:
+    # resume_interrupted must spawn ONLY queued rows — terminal history is left alone.
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        mgr = await _make_manager(store)
+        engine = _CountingEngine()
+        mgr._engine = engine  # type: ignore[assignment]
+        mgr._projection = {
+            "j_done": _tel_job("j_done", JobStatus.COMPLETED),
+            "j_fail": _tel_job("j_fail", JobStatus.FAILED),
+        }
+
+        assert mgr.resume_interrupted() == 0
+        await asyncio.sleep(0.05)
+        assert engine.peak_concurrent == 0
+    finally:
+        await store.close()
 
 
 # ─────────────── 6. rehydrate trims terminal history (IN-05) ─────────────────
@@ -371,7 +434,13 @@ async def test_rehydrate_prunes_terminal_history_to_max_history_jobs(
         mgr._engine = _NoopEngine()  # type: ignore[assignment]
         for i in range(5):
             await mgr.submit(_record(), _req(f"h{i}"))
-        await mgr.drain()  # all five terminate
+        await mgr.drain()  # all five terminate (in memory)
+        # _NoopEngine completes in memory only; persist the terminal status so the
+        # store rows are genuinely TERMINAL for the reopen. Otherwise requeue-on-
+        # restart (download-jobs-failed-23) keeps the still-live rows and nothing
+        # prunes — this seeds the real terminal-history the test means to cap.
+        for job in mgr._projection.values():
+            await store.update(job)
         assert len(mgr.list()) == 5
     finally:
         await store.close()

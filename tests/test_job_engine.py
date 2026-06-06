@@ -409,8 +409,10 @@ async def test_unexpected_error_logs_traceback_but_wire_message_stays_generic(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A non-SourceError escaping the engine (issue #70) must record its full
-    traceback to the INTERNAL log while the wire-visible ``job.message`` stays
-    generic — internals are never leaked over the API."""
+    traceback to the INTERNAL log while the wire-visible ``job.message`` carries
+    ONLY the generic prefix + the exception TYPE — never the internal message/
+    traceback (download-jobs-failed-23: the type survives a restart that wipes the
+    logs, while internals are still never leaked over the API)."""
     store = await open_store(str(tmp_path / "jobs.db"))
     try:
         urls = ["http://node/data/h/p1.png"]
@@ -429,8 +431,9 @@ async def test_unexpected_error_logs_traceback_but_wire_message_stays_generic(
             await engine.run(job)
 
         assert job.status == JobStatus.FAILED
-        # Wire-visible message is generic — the internal cause is NOT reflected.
-        assert job.message == "job failed"
+        # Wire-visible message carries the generic prefix + the exception TYPE only.
+        assert job.message == "job failed: RuntimeError"
+        # The internal cause (the exception's MESSAGE) is NEVER reflected on the wire.
         assert secret not in (job.message or "")
 
         # The internal log records the cause WITH a traceback (exc_info attached).

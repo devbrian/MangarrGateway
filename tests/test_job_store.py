@@ -3,8 +3,8 @@
 Covers the schema + the partial unique index (one LIVE job per ``releaseHandle``,
 D-27), write-through round-trip (insert/get/update/delete/find_live_by_handle),
 the duplicate-live-handle integrity guard, the re-grab-after-terminal allowance,
-and the restart rehydration that flips live jobs to ``failed`` while preserving
-terminal jobs (D-28).
+and the restart rehydration that REQUEUES live jobs (resume on restart) while
+preserving terminal jobs (D-28, download-jobs-failed-23).
 
 aiosqlite is async-native, so every store call is awaited; tests run under
 ``asyncio_mode = "auto"`` (pyproject) with no explicit event-loop plumbing.
@@ -436,13 +436,25 @@ async def test_all_returns_every_row(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_rehydrate_flips_live_to_failed(tmp_path: Path) -> None:
+async def test_rehydrate_requeues_live_jobs(tmp_path: Path) -> None:
+    # download-jobs-failed-23: a redeploy/crash must RESUME interrupted jobs, not
+    # leave them permanently failed. rehydrate requeues every live status back to
+    # ``queued`` and clears the transient in-flight progress so the resumed job
+    # starts from a clean baseline.
     db = str(tmp_path / "jobs.db")
     store = await open_store(db)
     try:
         await store.insert(_make_job("j_q", "h-q", JobStatus.QUEUED))
         await store.insert(_make_job("j_r", "h-r", JobStatus.RESOLVING))
-        await store.insert(_make_job("j_d", "h-d", JobStatus.DOWNLOADING))
+        # Seed a downloading job with mid-flight progress that must be reset.
+        dl = _make_job("j_d", "h-d", JobStatus.DOWNLOADING)
+        await store.insert(dl)
+        dl.total_pages = 20
+        dl.downloaded_pages = 7
+        dl.total_bytes = 1234
+        dl.remaining_bytes = 4321
+        dl.message = "in progress"
+        await store.update(dl)
         await store.insert(_make_job("j_a", "h-a", JobStatus.ARCHIVING))
     finally:
         await store.close()
@@ -453,8 +465,18 @@ async def test_rehydrate_flips_live_to_failed(tmp_path: Path) -> None:
         projected = await store2.rehydrate()
         by_id = {j.job_id: j for j in projected}
         for jid in ("j_q", "j_r", "j_d", "j_a"):
-            assert by_id[jid].status is JobStatus.FAILED
-            assert by_id[jid].message == "interrupted by restart"
+            # Resumed, not failed.
+            assert by_id[jid].status is JobStatus.QUEUED
+            # Transient progress cleared back to a clean baseline.
+            assert by_id[jid].message is None
+            assert by_id[jid].total_pages is None
+            assert by_id[jid].downloaded_pages is None
+            assert by_id[jid].total_bytes == 0
+            assert by_id[jid].remaining_bytes == 0
+            assert by_id[jid].output_path is None
+            # The durable resolution snapshot survives so the engine can re-run it.
+            assert by_id[jid].chapter_id is not None
+            assert by_id[jid].release_handle
     finally:
         await store2.close()
 
