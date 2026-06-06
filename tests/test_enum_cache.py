@@ -189,6 +189,59 @@ async def test_kill_switch_bypasses_cache() -> None:
     assert cache._inflight == {}
 
 
+async def test_empty_list_payload_is_not_cached() -> None:
+    """WR-03: a valid-but-empty candidate list is returned but never cached."""
+    cache: SingleFlightCache[list[str]] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+
+    async def fetch() -> list[str]:
+        nonlocal calls
+        calls += 1
+        return []
+
+    key = ("src", "a", ())
+    assert await cache.get_or_fetch(key, fetch) == []
+    assert cache.contains(key) is False  # empty not written
+    assert await cache.get_or_fetch(key, fetch) == []
+    assert calls == 2  # re-fetched — no negative caching of the empty body
+
+
+async def test_empty_enumeration_payload_is_not_cached() -> None:
+    """WR-03: an Enumeration with no items is returned but never cached."""
+    cache: SingleFlightCache[Enumeration] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+
+    async def fetch() -> Enumeration:
+        nonlocal calls
+        calls += 1
+        return Enumeration(
+            items=[], chapter_numbers=(), exhausted=True, requested_limit=0
+        )
+
+    key = ("src", "a", ())
+    await cache.get_or_fetch(key, fetch)
+    assert cache.contains(key) is False
+    await cache.get_or_fetch(key, fetch)
+    assert calls == 2
+
+
+async def test_nonempty_payload_is_cached() -> None:
+    """WR-03 control: a non-empty payload IS cached (one fetch)."""
+    cache: SingleFlightCache[list[str]] = SingleFlightCache(ttl=1800, maxsize=8)
+    calls = 0
+
+    async def fetch() -> list[str]:
+        nonlocal calls
+        calls += 1
+        return ["x"]
+
+    key = ("src", "a", ())
+    await cache.get_or_fetch(key, fetch)
+    assert cache.contains(key) is True
+    await cache.get_or_fetch(key, fetch)
+    assert calls == 1
+
+
 async def test_replace_overwrites_cached_value() -> None:
     cache: SingleFlightCache[str] = SingleFlightCache(ttl=1800, maxsize=8)
     key = ("src", "a", ())
