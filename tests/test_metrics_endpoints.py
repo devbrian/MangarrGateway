@@ -120,6 +120,151 @@ async def _seed_request(app: FastAPI) -> int:
         return request_id
 
 
+async def _seed_routed_and_unrouted(app: FastAPI, *, outcome: str = "ok") -> None:
+    """Emit one ROUTED http event (endpoint set) and one UNROUTED http event
+    (endpoint absent → endpoint=null in the served payload), both flushed to the
+    lifespan disk ring (260606-0mq).
+
+    An unrouted event is produced by setting ``current_request`` WITHOUT an
+    ``endpoint`` key — the collector reads endpoint from the contextvar
+    (``_req_str`` returns None when the key is absent), exactly as a request that
+    mapped to NO contract route logs today.
+    """
+    ring = app.state.metric_snapshot
+    collector = get_collector()
+    assert collector is not None
+
+    status = 200 if outcome == "ok" else 404
+
+    # Routed: endpoint set.
+    routed_token = current_request.set(
+        {"request_id": 9001, "surface": "search", "endpoint": "GET /search"}
+    )
+    try:
+        collector.emit_http(
+            op="get_json",
+            method="GET",
+            url="https://comix.example/routed",
+            status=200,
+            outcome="ok",
+            duration_ms=5.0,
+            attempt=1,
+        )
+    finally:
+        current_request.reset(routed_token)
+
+    # Unrouted: endpoint key ABSENT → endpoint=null in the payload.
+    unrouted_token = current_request.set(
+        {"request_id": 9002, "surface": "search"}
+    )
+    try:
+        collector.emit_http(
+            op="get_json",
+            method="GET",
+            url="https://comix.example/unrouted",
+            status=status,
+            outcome=outcome,
+            duration_ms=5.0,
+            attempt=1,
+        )
+    finally:
+        current_request.reset(unrouted_token)
+
+    await ring.flush()
+
+
+@pytest.mark.asyncio
+async def test_recent_hides_unrouted_by_default(metrics_app: FastAPI) -> None:
+    """GET /recent at the default excludes endpoint=null events; the
+    ?include_unrouted=true opt-in restores them (260606-0mq)."""
+    transport = httpx.ASGITransport(app=metrics_app)
+    async with metrics_app.router.lifespan_context(metrics_app):
+        await _seed_routed_and_unrouted(metrics_app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=_ADMIN,
+            headers={"X-Api-Key": TEST_API_KEY},
+        ) as ac:
+            default = (await ac.get("/recent?limit=200")).json()
+            opted_in = (await ac.get("/recent?limit=200&include_unrouted=true")).json()
+
+    # Default: the unrouted (endpoint=null) event is hidden; the routed one stays.
+    assert all(e["endpoint"] is not None for e in default)
+    assert any(e["request_id"] == 9001 for e in default)
+    assert all(e["request_id"] != 9002 for e in default)
+    # Opt-in: the unrouted event is restored.
+    assert any(e["request_id"] == 9002 and e["endpoint"] is None for e in opted_in)
+
+
+@pytest.mark.asyncio
+async def test_failures_hides_unrouted_by_default(metrics_app: FastAPI) -> None:
+    """A 404/client_error unrouted event (endpoint=null) in the failures ring is
+    hidden from /failures by default and restored by ?include_unrouted=true."""
+    transport = httpx.ASGITransport(app=metrics_app)
+    async with metrics_app.router.lifespan_context(metrics_app):
+        await _seed_routed_and_unrouted(metrics_app, outcome="client_error")
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=_ADMIN,
+            headers={"X-Api-Key": TEST_API_KEY},
+        ) as ac:
+            default = (await ac.get("/failures?limit=200")).json()
+            opted_in = (
+                await ac.get("/failures?limit=200&include_unrouted=true")
+            ).json()
+
+    # The unrouted client_error event is hidden by default …
+    assert all(e["endpoint"] is not None for e in default)
+    assert all(e["request_id"] != 9002 for e in default)
+    # … and restored by the opt-in.
+    assert any(e["request_id"] == 9002 and e["endpoint"] is None for e in opted_in)
+
+
+@pytest.mark.asyncio
+async def test_slow_accepts_include_unrouted_default_false(
+    metrics_app: FastAPI,
+) -> None:
+    """GET /slow accepts the param and defaults to hiding unrouted events (the
+    third feed gains the same opt-in)."""
+    transport = httpx.ASGITransport(app=metrics_app)
+    async with metrics_app.router.lifespan_context(metrics_app):
+        ring = metrics_app.state.metric_snapshot
+        collector = get_collector()
+        assert collector is not None
+        # Force an unrouted event into the slow ring by enqueuing it directly onto
+        # the disk ring (the route-level filter is what we are testing, not the
+        # live slow classifier's per-baseline threshold).
+        from manga_gateway.metrics.event import MetricEvent
+
+        unrouted_slow = MetricEvent(
+            ts=1.0,
+            kind="http",
+            request_id=9003,
+            surface="search",
+            endpoint=None,
+            source_key="comix",
+            op="get_json",
+            method="GET",
+            url="https://comix.example/slow",
+            status=200,
+            outcome="ok",
+            duration_ms=9000.0,
+            attempt=1,
+        )
+        ring.enqueue(unrouted_slow, {"recent", "slow"})
+        await ring.flush()
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url=_ADMIN,
+            headers={"X-Api-Key": TEST_API_KEY},
+        ) as ac:
+            default = (await ac.get("/slow?limit=200")).json()
+            opted_in = (await ac.get("/slow?limit=200&include_unrouted=true")).json()
+
+    assert all(e["request_id"] != 9003 for e in default)
+    assert any(e["request_id"] == 9003 for e in opted_in)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", [*_ENDPOINTS, "/requests/1"])
 async def test_requires_api_key(metrics_app: FastAPI, path: str) -> None:
