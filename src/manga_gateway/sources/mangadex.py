@@ -18,8 +18,9 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from ..framework.base import Source
+from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
-from ..framework.relevance import prune_candidates
+from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -75,30 +76,69 @@ class MangaDexSource(Source):
                 if req.interactive
                 else _DEFAULT_MANGA_CANDIDATES
             )
-            candidates = await self._search_manga_titles(req.query or "", count, ctx)
-            # Prune obviously-irrelevant candidates BEFORE the per-candidate
-            # chapter-feed fan-out (#126): an exact-match query enumerates only
-            # the one correct series; ambiguous queries still fan out to ``count``
-            # (the prune falls back to the historic ``candidates[:count]``). Each
-            # candidate is scored over its MAIN *or* any ALTERNATE/native title
-            # (#139) — a query matching only the native name still prunes to it.
-            candidates = prune_candidates(
-                candidates,
-                req.query or "",
-                keys=lambda c: c.titles,
-                cap=count,
+
+            async def _resolve_fn() -> list[_MangaCandidate]:
+                found = await self._search_manga_titles(req.query or "", count, ctx)
+                # Prune obviously-irrelevant candidates BEFORE the per-candidate
+                # chapter-feed fan-out (#126): an exact-match query enumerates only
+                # the one correct series; ambiguous queries still fan out to
+                # ``count`` (the prune falls back to the historic
+                # ``candidates[:count]``). Each candidate is scored over its MAIN
+                # *or* any ALTERNATE/native title (#139) — a query matching only the
+                # native name still prunes to it.
+                return prune_candidates(
+                    found,
+                    req.query or "",
+                    keys=lambda c: c.titles,
+                    cap=count,
+                )
+
+            # Layer 1 (D-01): cache the title→candidate-id resolution so a repeat
+            # chapter search on the same (query, languages) skips the /manga?title=
+            # call entirely (genuinely zero upstream calls on a HIT). The ID-first
+            # branch above caches NEITHER layer (D-02 — already one resolved
+            # candidate). The key normalizes the query the SAME way the relevance
+            # scorer does so punctuation/case variants collapse onto one entry.
+            resolve_key = ctx.cached_resolve_key(_normalize(req.query or ""), languages)
+            candidates: list[_MangaCandidate] = await ctx.cached_resolve(
+                resolve_key, _resolve_fn
             )
-            # 260605-e9a deliverable 5: how many manga we deep-enumerate.
+            # 260605-e9a deliverable 5: how many manga we deep-enumerate (HIT too).
             ctx.candidates_enumerated = len(candidates)
             manga_ids = [c.manga_id for c in candidates]
 
         releases: list[Release] = []
         feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
         for manga_id in manga_ids:
-            chapters = await self._fetch_chapter_feed(
-                manga_id, languages, feed_limit, req.offset, ctx
-            )
-            for chapter in chapters:
+            # Layer 2 (CACHE-02/03): cache the UNFILTERED chapter-feed enumeration
+            # per (manga_id, languages). A HIT costs no upstream call and no
+            # rate-limit token — the limiter lives inside ``_fetch_chapter_feed``
+            # (via ``get_json``), one level deeper than the cache check.
+            enum_key = ctx.cached_enumerate_key(manga_id, languages)
+
+            async def _feed_fn(_mid: str = manga_id) -> Enumeration:
+                chapters = await self._fetch_chapter_feed(
+                    _mid, languages, feed_limit, req.offset, ctx
+                )
+                return self._build_enumeration(chapters, feed_limit)
+
+            enum = await ctx.cached_enumerate(enum_key, _feed_fn)
+            # Completeness refetch (CACHE-04): a type=chapter floor query for a
+            # chapter BELOW the cached (non-exhausted) window means older chapters
+            # we never fetched — refetch deeper (clamped to ``_MAX_FEED_LIMIT`` so
+            # MangaDex never 400s) and replace the cached window rather than serve a
+            # false-empty.
+            if (
+                req.type == "chapter"
+                and req.chapter is not None
+                and not enum.covers_floor(req.chapter)
+            ):
+                deeper = await self._fetch_chapter_feed(
+                    manga_id, languages, _MAX_FEED_LIMIT, req.offset, ctx
+                )
+                enum = self._build_enumeration(deeper, _MAX_FEED_LIMIT)
+                ctx.cache_replace(enum_key, enum)
+            for chapter in enum.items:
                 rel = self._to_release(manga_id, chapter, ctx)
                 # 260606-2ff: under type=chapter+chapter, keep only the requested
                 # whole-number/floor family (gate-off = pass-through). v1 limitation:
@@ -276,6 +316,31 @@ class MangaDexSource(Source):
         data = await ctx.get_json(f"{self.base_url}/chapter", **params)
         chapters = data.get("data", [])
         return [c for c in chapters if isinstance(c, dict)]
+
+    def _build_enumeration(
+        self, chapters: list[dict[str, Any]], feed_limit: int
+    ) -> Enumeration:
+        """Wrap a fetched chapter page in an :class:`Enumeration` with the
+        completeness facts the Layer-2 cache needs (CACHE-04).
+
+        ``exhausted`` is ``len(chapters) < feed_limit`` — a short page means the
+        feed has no more rows, so a below-window floor query needs no deeper
+        refetch. ``chapter_numbers`` carries every parsed ``Decimal`` chapter
+        (rows with an unparseable/absent chapter are skipped) for the
+        ``covers_floor`` window math.
+        """
+        chapter_numbers = tuple(
+            d
+            for c in chapters
+            if (d := self._parse_decimal(c.get("attributes", {}).get("chapter")))
+            is not None
+        )
+        return Enumeration(
+            items=chapters,
+            chapter_numbers=chapter_numbers,
+            exhausted=len(chapters) < feed_limit,
+            requested_limit=feed_limit,
+        )
 
     # ─────────────────────────── Release normalization ───────────────────────────
 
