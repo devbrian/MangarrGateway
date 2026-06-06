@@ -247,9 +247,7 @@ async def test_paginated_stops_when_click_adds_no_new_rows() -> None:
     pages = [[{"id": "1", "chapter": "1"}], [{"id": "2", "chapter": "2"}]]
     # Next is always present but clicking does NOT advance the page index, so
     # the rendered id-set never changes → bounded poll budget exhausts → stop.
-    page = _FakePaginatePage(
-        pages, next_always_present=True, click_advances=False
-    )
+    page = _FakePaginatePage(pages, next_always_present=True, click_advances=False)
     ctx = _FakePaginateContext(page)
     solver = _solver_with(ctx)
 
