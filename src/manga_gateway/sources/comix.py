@@ -895,7 +895,9 @@ class ComixSource(Source):
         series = prune_candidates(
             series,
             req.query or "",
-            key=lambda t: t[2],
+            # Score over the series title (t[2]) OR any alt title (t[3]) (#139):
+            # a query matching only the native/alt name still prunes to it.
+            keys=lambda t: [t[2], *t[3]],
             cap=count,
         )
         # 260605-e9a deliverable 5: report how many series candidates we deep-
@@ -913,12 +915,12 @@ class ComixSource(Source):
         # (concurrency=1) runs these one-at-a-time exactly as before.
         coros = [
             self._series_chapters(series_hid, series_slug, feed_limit, req.offset, ctx)
-            for series_hid, series_slug, _series_title in series
+            for series_hid, series_slug, _series_title, _alt in series
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
 
         releases: list[Release] = []
-        for (series_hid, series_slug, series_title), result in zip(
+        for (series_hid, series_slug, series_title, _alt), result in zip(
             series, results, strict=True
         ):
             if isinstance(result, BaseException):
@@ -1211,17 +1213,20 @@ class ComixSource(Source):
 
     async def _search_series(
         self, query: str, limit: int, ctx: SourceContext
-    ) -> list[tuple[str, str, str]]:
-        """PLAINTEXT search → ``(hid, slug, title)`` (D-46) via ``/api/v1/manga``.
+    ) -> list[tuple[str, str, str, list[str]]]:
+        """PLAINTEXT search → ``(hid, slug, title, alt_titles)`` (D-46) via ``/api/v1/manga``.
 
-        Returns ``(hid, slug, title)`` tuples. The 5-char ``hid`` is the canonical
-        series identifier; the ``slug`` is extracted from the item's ``url`` field
-        (``/title/{hid}-{slug}`` per live recon); the ``title`` is the rendered
-        series title and is threaded through to ``_to_release`` so the per-
-        chapter Release carries the manga title (the browser-DOM chapter rows do
-        not repeat the series title — it's on the series-page header). Plain
-        query params; the ``order[relevance]=desc`` and
-        ``content_rating=suggestive`` match what the public site sends.
+        Returns ``(hid, slug, title, alt_titles)`` tuples. The 5-char ``hid`` is
+        the canonical series identifier; the ``slug`` is extracted from the
+        item's ``url`` field (``/title/{hid}-{slug}`` per live recon); the
+        ``title`` is the rendered series title and is threaded through to
+        ``_to_release`` so the per-chapter Release carries the manga title (the
+        browser-DOM chapter rows do not repeat the series title — it's on the
+        series-page header). ``alt_titles`` are the item's ``altTitles`` (a clean
+        ``list[str]`` from the same payload, e.g. the Korean native name) and feed
+        the alt-title-aware prune (#139) — nothing extra is fetched. Plain query
+        params; the ``order[relevance]=desc`` and ``content_rating=suggestive``
+        match what the public site sends.
         """
         params: dict[str, Any] = {
             "keyword": query,
@@ -1236,7 +1241,7 @@ class ComixSource(Source):
         # decrypt seam stays out of this path.
         data = await ctx.get_json_plain(f"{self.base_url}/api/v1/manga", **params)
         items = self._result_items(data)
-        out: list[tuple[str, str, str]] = []
+        out: list[tuple[str, str, str, list[str]]] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1252,7 +1257,10 @@ class ComixSource(Source):
                 continue
             slug = self._slug_from_item(item)
             title = str(item.get("title") or "")
-            out.append((str(hid), slug, title))
+            alt_titles = [
+                s for s in (item.get("altTitles") or []) if isinstance(s, str)
+            ]
+            out.append((str(hid), slug, title, alt_titles))
         return out
 
     @staticmethod
