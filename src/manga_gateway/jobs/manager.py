@@ -41,6 +41,24 @@ from .model import Job, JobStatus
 
 _log = logging.getLogger("manga_gateway.jobs.manager")
 
+# 260605-wab telemetry queue-item ordering + cap.
+#
+# Lower rank sorts FIRST → most-progressed lifecycle stages lead and ``queued``
+# items sit at the bottom, so they are dropped first when the projection exceeds
+# the cap. ``failed`` is placed among the terminal/top tier (the user did not name
+# it) so terminal RESULTS are retained over a long queued backlog.
+_TELEMETRY_TIER: dict[JobStatus, int] = {
+    JobStatus.COMPLETED: 0,
+    JobStatus.FAILED: 1,
+    JobStatus.ARCHIVING: 2,
+    JobStatus.DOWNLOADING: 3,
+    JobStatus.RESOLVING: 4,
+    JobStatus.QUEUED: 5,
+}
+# Cap the per-item telemetry list so a huge queued backlog cannot bloat the ring
+# payload; queued items (highest tier) are dropped first by the ordering above.
+_TELEMETRY_QUEUE_CAP = 50
+
 if TYPE_CHECKING:
     from ..config import Settings
     from ..framework.antibot import AntiBotSolver
@@ -216,6 +234,41 @@ class JobManager:
         return job_id, JobStatus.QUEUED.value
 
     # ─────────────────────────── read model (DL-05) ───────────────────────────
+
+    def telemetry_items(self) -> list[dict[str, object]]:
+        """Per-item GET /downloads telemetry list (260605-wab) — most-progressed first.
+
+        Built from the INTERNAL projection (``self._projection``), NOT the wire DTOs:
+        ``DownloadJob`` has no ``manga_title``/``chapter_number``, but the operator
+        wants to see the actual queue (jobId + manga title + chapter + status). Each
+        entry is a flat JSON-native map ``{jobId, mangaTitle, chapterNumber, status}``
+        with camelCase INNER keys (these ride the JSON payload the read endpoints echo).
+
+        Ordering is by ``_TELEMETRY_TIER`` (completed/failed → archiving → downloading
+        → resolving → queued). ``sorted`` is STABLE, so same-tier items keep their
+        projection insertion order; the list is then capped at
+        ``_TELEMETRY_QUEUE_CAP`` so a long queued backlog is dropped FIRST.
+
+        Poll-friendly (DL-05): O(n log n) over the in-memory projection only — NO
+        disk/SQLite read. The route uses this so the route layer stays thin and the
+        ordering/cap is unit-testable in isolation.
+
+        Defined BEFORE ``list`` so the ``list[...]`` return annotation resolves to the
+        builtin, not this class's ``list`` method (mypy ``valid-type``).
+        """
+        ordered = sorted(
+            self._projection.values(),
+            key=lambda j: _TELEMETRY_TIER[j.status],
+        )
+        return [
+            {
+                "jobId": j.job_id,
+                "mangaTitle": j.manga_title,
+                "chapterNumber": j.chapter_number,
+                "status": j.status.value,
+            }
+            for j in ordered[:_TELEMETRY_QUEUE_CAP]
+        ]
 
     def list(self) -> list[DownloadJob]:
         """Project every in-memory job to its wire DTO — no store/disk read (DL-05)."""

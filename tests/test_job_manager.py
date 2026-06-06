@@ -386,6 +386,92 @@ async def test_rehydrate_prunes_terminal_history_to_max_history_jobs(
         await store2.close()
 
 
+# ─────────────── 7. telemetry_items: order + cap (260605-wab) ────────────────
+
+
+def _tel_job(
+    job_id: str,
+    status: JobStatus,
+    *,
+    manga_title: str | None = "Solo Leveling",
+    chapter_number: float | None = 1.0,
+) -> Job:
+    """A minimal synthetic Job for telemetry_items() ordering/cap assertions."""
+    return Job(
+        job_id=job_id,
+        release_handle="h_" + job_id,
+        source_key="mangadex",
+        title="t",
+        status=status,
+        manga_id=None,
+        output_format="cbz",
+        chapter_id=None,
+        language="en",
+        total_pages=None,
+        downloaded_pages=None,
+        total_bytes=0,
+        remaining_bytes=0,
+        output_path=None,
+        message=None,
+        created_at="2026-06-05T00:00:00+00:00",
+        updated_at="2026-06-05T00:00:00+00:00",
+        completed_at=None,
+        manga_title=manga_title,
+        chapter_number=chapter_number,
+    )
+
+
+@pytest.mark.asyncio
+async def test_telemetry_items_orders_most_progressed_first_and_caps(
+    tmp_path: Path,
+) -> None:
+    """``telemetry_items`` orders most-progressed-first (queued dropped first) and
+    caps at exactly 50, reading the in-memory projection only (260605-wab)."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        mgr = await _make_manager(store)
+        # Insertion-ordered projection: one of each terminal/in-flight stage, then a
+        # long queued backlog (60 queued) so the cap must drop queued first.
+        proj: dict[str, Job] = {}
+        proj["j_done"] = _tel_job("j_done", JobStatus.COMPLETED)
+        proj["j_fail"] = _tel_job("j_fail", JobStatus.FAILED)
+        proj["j_arch"] = _tel_job("j_arch", JobStatus.ARCHIVING)
+        proj["j_dl"] = _tel_job("j_dl", JobStatus.DOWNLOADING)
+        proj["j_res"] = _tel_job("j_res", JobStatus.RESOLVING)
+        for i in range(60):
+            proj[f"j_q{i}"] = _tel_job(f"j_q{i}", JobStatus.QUEUED)
+        mgr._projection = proj
+
+        items = mgr.telemetry_items()
+
+        # (1) exactly 50 items (capped from 65).
+        assert len(items) == 50
+        # (2) the most-progressed stages lead; queued entries are the ones dropped.
+        assert [it["jobId"] for it in items[:5]] == [
+            "j_done",
+            "j_fail",
+            "j_arch",
+            "j_dl",
+            "j_res",
+        ]
+        # 45 queued survive (5 non-queued + 45 queued = 50); the LATEST queued are
+        # dropped (stable order keeps the earliest-inserted queued).
+        queued_ids = [it["jobId"] for it in items if it["status"] == "queued"]
+        assert len(queued_ids) == 45
+        # (3) within the queued tier, projection insertion order is preserved.
+        assert queued_ids == [f"j_q{i}" for i in range(45)]
+        # (4) each item carries exactly the four camelCase keys with status as .value.
+        for it in items:
+            assert set(it) == {"jobId", "mangaTitle", "chapterNumber", "status"}
+        done = items[0]
+        assert done["status"] == "completed"
+        assert done["mangaTitle"] == "Solo Leveling"
+        assert done["chapterNumber"] == 1.0
+        # No store/disk read happened — the projection was set directly.
+    finally:
+        await store.close()
+
+
 # ─────────────────────────── stub engines ───────────────────────────
 
 

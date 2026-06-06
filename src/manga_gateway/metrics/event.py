@@ -68,3 +68,13 @@ class MetricEvent:
     chapter_number: float | None = (
         None  # resolved chapter number (Decimal serialized to float)
     )
+    # ── 260605-wab per-item queue contents (default None) ─────────────────────
+    # Additive + optional, payload-only — same posture as the nqo block above: it
+    # rides ``json.dumps(asdict(MetricEvent))`` into ring_events.payload with NO new
+    # ring_events column and NO metrics-DB migration, and surfaces through the read
+    # endpoints automatically. Carried ONLY on the umbrella GET /downloads request
+    # event: each entry is a flat JSON-native map
+    # ``{jobId, mangaTitle, chapterNumber, status}`` (camelCase INNER keys), built
+    # from the INTERNAL Job projection, ordered most-progressed-first and capped at
+    # 50 so a long queued backlog is dropped first.
+    queue_items: list[dict[str, object]] | None = None
