@@ -14,6 +14,12 @@ the helper only narrows to a single candidate when the query is *unambiguous*
 (an exact normalized-title match, or a clearly dominant top score); otherwise it
 falls back to the historic ``candidates[:cap]`` behavior byte-for-byte.
 
+Each candidate is scored over its MAIN *or* any ALTERNATE title (issue #139):
+a query that matches only a series' native/alt title (e.g. the Korean name of an
+English-display series) prunes exactly as a main-title match would. Callers pass
+``keys=`` to supply ``[main, *alt_titles]`` per candidate; the legacy single-
+title ``key=`` form is retained unchanged for backward compatibility.
+
 All three source candidate lists are ALREADY relevance-sorted upstream, so the
 ordering is trusted and the scoring here is cheap (stdlib only — no new
 dependency).
@@ -91,15 +97,20 @@ def prune_candidates[T](
     candidates: Sequence[T],
     query: str,
     *,
-    key: Callable[[T], str | None],
+    key: Callable[[T], str | None] | None = None,
+    keys: Callable[[T], Sequence[str | None]] | None = None,
     cap: int,
 ) -> list[T]:
     """Narrow a relevance-sorted candidate list before the chapter fan-out.
 
-    Returns a sub-list of the SAME items in the SAME (relevance-sorted) order:
+    Returns a sub-list of the SAME items in the SAME (relevance-sorted) order.
+    Each candidate is scored against its MAIN *or* any ALTERNATE title — its
+    per-candidate score is ``max(_score(t, query) for t in titles)`` (#139), and
+    a candidate counts as an exact match when ANY of its normalized titles equals
+    the normalized query:
 
-    * **Exact match** — when exactly ONE candidate's normalized title equals the
-      normalized query, return only that candidate (length 1).
+    * **Exact match** — when exactly ONE candidate matches exactly (via its main
+      OR an alt title), return only that candidate (length 1).
     * **Dominant score** — when no single exact match applies but the top
       candidate's score clears :data:`_DOMINANT_MIN_SCORE` AND leads the
       next-best by more than :data:`_RELEVANCE_GAP_THRESHOLD`, return only the
@@ -108,14 +119,35 @@ def prune_candidates[T](
       unchanged, byte-identical to the historic per-source slice (#126: fan out
       when in doubt).
 
-    Empty and single-candidate lists pass through unchanged. A candidate whose
-    ``key(item)`` is ``None``/empty scores zero and never wins any prune branch.
+    Empty and single-candidate lists pass through unchanged. A title that is
+    ``None``/empty is dropped; a candidate with no usable titles scores zero and
+    never wins any prune branch.
+
+    Exactly ONE of ``key`` / ``keys`` must be supplied:
+
+    * ``key`` — legacy single-title extractor (may return ``None``).
+    * ``keys`` — multi-title extractor returning ``[main, *alt_titles]`` (entries
+      may be ``None``/empty and are dropped).
 
     :param candidates: relevance-sorted candidate items (highest first).
     :param query: the user's raw search query.
-    :param key: extracts a candidate's title (may return ``None``).
+    :param key: extracts a candidate's single title (mutually exclusive w/ keys).
+    :param keys: extracts a candidate's title list (mutually exclusive w/ key).
     :param cap: the existing per-source candidate ceiling for the fan-out.
+    :raises ValueError: if neither or both of ``key`` / ``keys`` are supplied.
     """
+    if (key is None) == (keys is None):
+        raise ValueError("prune_candidates requires exactly one of key= or keys=")
+
+    if keys is not None:
+        extract = keys
+    else:
+        # key is not None here (validated above); wrap the single title as a list.
+        single = key
+
+        def extract(item: T) -> Sequence[str | None]:
+            return [single(item)]  # type: ignore[misc]
+
     if len(candidates) <= 1:
         return list(candidates)
 
@@ -123,19 +155,30 @@ def prune_candidates[T](
     if not normalized_query:
         return list(candidates[:cap])
 
-    normalized_titles = [_normalize(key(item)) for item in candidates]
+    # Per-candidate normalized title list (None/empty dropped) — normalize each
+    # title once and reuse it for both the exact and score branches.
+    candidate_titles = [
+        [norm for norm in (_normalize(t) for t in extract(item)) if norm]
+        for item in candidates
+    ]
 
-    # Exact-match branch: prune ONLY when exactly one candidate matches exactly
-    # (two exact matches is genuine ambiguity — fall through to fan out).
+    # Exact-match branch: a candidate is exact iff ANY of its titles == the
+    # query. Prune ONLY when exactly one CANDIDATE is exact (two exact
+    # candidates — whether via main or alt — is genuine ambiguity → fan out).
     exact_indices = [
-        i for i, title in enumerate(normalized_titles) if title == normalized_query
+        i
+        for i, titles in enumerate(candidate_titles)
+        if any(t == normalized_query for t in titles)
     ]
     if len(exact_indices) == 1:
         return [candidates[exact_indices[0]]]
 
     # Dominant-score branch: the relevance ordering is trusted, so the leader is
-    # candidates[0]. Compare its score against the best of the remainder.
-    scores = [_score(title, normalized_query) for title in normalized_titles]
+    # candidates[0]. Each candidate's score is the best over its titles.
+    scores = [
+        max((_score(t, normalized_query) for t in titles), default=0.0)
+        for titles in candidate_titles
+    ]
     top_score = scores[0]
     runner_up_score = max(scores[1:])
     if (

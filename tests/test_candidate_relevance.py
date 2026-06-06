@@ -135,9 +135,7 @@ def test_keys_exact_on_alt_title_prunes_to_one() -> None:
         {"title": "Forgotten Tales", "alt_titles": []},
         {"title": "A Field Guide", "alt_titles": ["A Different Native Name"]},
     ]
-    result = prune_candidates(
-        candidates, "잊혀진 들판", keys=_by_titles, cap=5
-    )
+    result = prune_candidates(candidates, "잊혀진 들판", keys=_by_titles, cap=5)
     assert len(result) == 1
     assert result[0]["title"] == "The Forgotten Field"
 
@@ -149,9 +147,7 @@ def test_keys_main_title_still_wins() -> None:
         {"title": "Forgotten Tales", "alt_titles": []},
         {"title": "A Field Guide", "alt_titles": []},
     ]
-    result = prune_candidates(
-        candidates, "the forgotten field", keys=_by_titles, cap=5
-    )
+    result = prune_candidates(candidates, "the forgotten field", keys=_by_titles, cap=5)
     assert len(result) == 1
     assert result[0]["title"] == "The Forgotten Field"
 
@@ -173,9 +169,7 @@ def test_keys_and_key_are_mutually_exclusive() -> None:
     candidates = [{"title": "A"}, {"title": "B"}]
     # Both → error.
     with pytest.raises((TypeError, ValueError)):
-        prune_candidates(
-            candidates, "a", key=_by_title, keys=_by_titles, cap=5
-        )
+        prune_candidates(candidates, "a", key=_by_title, keys=_by_titles, cap=5)
     # Neither → error.
     with pytest.raises((TypeError, ValueError)):
         prune_candidates(candidates, "a", cap=5)
