@@ -351,7 +351,16 @@ class MangaDexSource(Source):
         }
         data = await ctx.get_json(f"{self.base_url}/chapter", **params)
         chapters = data.get("data", [])
-        page = [c for c in chapters if isinstance(c, dict)]
+        # Keep only well-shaped rows: a dict whose ``attributes`` is absent or a
+        # dict. A malformed row like ``{"attributes": []}`` would otherwise pass
+        # the top-level dict check and then crash on ``.get(...)`` in
+        # ``_page_passed_floor`` / ``_to_release`` (WR-06 defensive parsing).
+        page = [
+            c
+            for c in chapters
+            if isinstance(c, dict)
+            and (c.get("attributes") is None or isinstance(c.get("attributes"), dict))
+        ]
         raw_total = data.get("total")
         total = raw_total if isinstance(raw_total, int) else None
         return page, total

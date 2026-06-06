@@ -13,6 +13,7 @@ REL-01/02 (DTO aliasing), SRCH-06 (decimal >=3 places), and (Task 3) D-18/D-21/D
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from decimal import Decimal
 
 import httpx
@@ -633,7 +634,7 @@ def _filler_rows(manga_id: str, chapters: list[str]) -> list[dict]:
 
 def _paginated_chapter_side_effect(
     pages: dict[int, list[dict]], total: int, recorder: list[int]
-):
+) -> Callable[[httpx.Request], httpx.Response]:
     """respx side_effect serving ``GET /chapter`` from an offset-keyed page dict.
 
     Records every requested ``offset`` into ``recorder`` so a test can assert WHICH
@@ -778,6 +779,39 @@ async def test_search_paginate_all_walks_every_page(
     assert resp.status_code == 200
     assert recorder == [0, 100]  # the full feed was walked
     assert len(resp.json()["releases"]) == 150
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_skips_rows_with_malformed_attributes(
+    client: httpx.AsyncClient,
+) -> None:
+    """A row whose ``attributes`` is present but not a dict is skipped, not crashed.
+
+    Malformed upstream rows like ``{"attributes": []}`` would otherwise pass the
+    top-level dict check and then crash on ``.get(...)`` in the walker's floor
+    check / release normalization (CodeRabbit, WR-06 defensive parsing). The good
+    rows are still returned.
+    """
+    manga_id = str(uuid.uuid4())
+    bad_row = {"id": str(uuid.uuid4()), "type": "chapter", "attributes": []}
+    page0 = [*_filler_rows(manga_id, ["1", "2"]), bad_row]
+    recorder: list[int] = []
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        side_effect=_paginated_chapter_side_effect(
+            {0: page0}, total=3, recorder=recorder
+        )
+    )
+
+    resp = await client.post(
+        "/search",
+        json={"type": "manga", "query": "Solo Leveling", "sources": ["mangadex"]},
+    )
+    assert resp.status_code == 200
+    assert _returned_chapter_set(resp.json()) == {Decimal("1"), Decimal("2")}
 
 
 @respx.mock
