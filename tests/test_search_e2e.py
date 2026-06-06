@@ -728,14 +728,17 @@ async def test_search_walks_to_later_page_for_chapter_family(
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_search_bounded_walk_stops_after_family_on_full_page(
+async def test_search_chapter_specific_paginate_all_then_filters_family(
     client: httpx.AsyncClient,
 ) -> None:
-    """Bounded early-stop: a FULL page whose cursor floors past the target stops.
+    """A chapter-specific search PAGINATE-ALL walks the whole feed, then filters.
 
-    Page 0 is a FULL 100-row page [5, 5.5, 6, 7, ..., 103] — chapter 6 floors past the
-    requested 5, so the walk STOPS after page 0 even though it was full. Page 1 is
-    configured but must NEVER be requested.
+    debug mangadex-search-not-cached: the per-request bounded early-stop walk was
+    removed so the Layer-2 cache can key on ``(manga_id, languages)`` ALONE (and serve
+    repeats from cache like comix/mangaball). A type=chapter chapter=5 search now walks
+    the COMPLETE feed (page 0 full → page 1 offset 100, then exhausted at total=200)
+    and applies the ``chapter_matches`` family filter POST-walk — returning exactly the
+    family-5 members regardless of which page they land on.
     """
     manga_id = str(uuid.uuid4())
     page0_numbers = ["5", "5.5", *[str(i) for i in range(6, 104)]]  # exactly 100 rows
@@ -763,7 +766,8 @@ async def test_search_bounded_walk_stops_after_family_on_full_page(
         },
     )
     assert resp.status_code == 200
-    assert recorder == [0]  # page 2 NEVER fetched despite a full page 1
+    assert recorder == [0, 100]  # paginate-all walks the full feed (both pages)
+    # The family-5 filter still returns exactly {5, 5.5}, applied post-walk.
     assert _returned_chapter_set(resp.json()) == {Decimal("5"), Decimal("5.5")}
 
 
