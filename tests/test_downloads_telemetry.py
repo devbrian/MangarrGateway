@@ -278,6 +278,42 @@ async def test_get_list_reports_result_count(
     assert ev["result_count"] == n_jobs
 
 
+# ─────────────── GET list carries per-item queue_items (260605-wab) ───────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_list_carries_queue_items(
+    tel_app: FastAPI, tel_client: httpx.AsyncClient
+) -> None:
+    """GET /downloads telemetry carries queue_items with per-job
+    {jobId, mangaTitle, chapterNumber, status}, and result_count is the FULL count
+    (unchanged), not the capped list length (260605-wab)."""
+    _mock_at_home(pages=1)
+    handle = _mint_handle(tel_app)  # resolves to "Solo Leveling", chapter 1
+    resp = await tel_client.post(
+        "/downloads",
+        json={"releaseHandle": handle, "sourceKey": "mangadex", "mangaId": 42},
+    )
+    job_id = resp.json()["jobId"]
+    await _poll_until(tel_client, job_id)
+
+    listing = await tel_client.get("/downloads")
+    n_jobs = len(listing.json()["jobs"])
+    assert n_jobs >= 1
+
+    ev = await _read_request_event(tel_app, "GET /downloads")
+    items = ev["queue_items"]
+    assert items, "GET /downloads request event carries no queue_items"
+    entry = next(it for it in items if it["jobId"] == job_id)
+    assert entry["mangaTitle"] == "Solo Leveling"
+    assert entry["chapterNumber"] == 1.0
+    assert entry["status"] == "completed"
+    assert set(entry) == {"jobId", "mangaTitle", "chapterNumber", "status"}
+    # result_count stays the FULL job count (not the capped queue_items length).
+    assert ev["result_count"] == n_jobs
+
+
 # ─────────────────────────── per-id routes stash a body-less blob ────────────
 
 

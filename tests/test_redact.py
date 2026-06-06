@@ -171,6 +171,8 @@ def test_metric_event_has_all_fields_incl_method() -> None:
         # 260605-nqo resolved download-telemetry fields (default None).
         "manga_title",
         "chapter_number",
+        # 260605-wab per-item GET /downloads queue contents (default None).
+        "queue_items",
     }
     assert field_names == expected
 

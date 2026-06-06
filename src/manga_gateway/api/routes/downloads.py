@@ -30,6 +30,7 @@ from ...jobs.manager import JobManager
 from ...metrics.context import (
     stash_request_blob,
     stash_request_meta,
+    stash_request_queue,
     stash_request_result,
 )
 from ...models.download import (
@@ -191,9 +192,17 @@ async def get_downloads(
     Reports ``result_count == len(jobs)`` on the umbrella ``request`` event (parity
     with search's merged result_count). The listing is computed ONCE over the
     in-memory projection — NO disk/SQLite read per poll (DL-05, poll-friendliness).
+
+    260605-wab: also stashes the per-item ``queue_items`` (each
+    ``{jobId, mangaTitle, chapterNumber, status}``) read from the INTERNAL jobs via
+    ``job_manager.telemetry_items()`` — ordered most-progressed-first and capped at
+    50 — so the operator sees the actual queue contents on the telemetry surface.
+    Still O(n log n) over the in-memory projection with NO disk read per poll (DL-05);
+    the Mangarr-facing response body (``DownloadJobList``) is unchanged.
     """
     jobs = job_manager.list()
     stash_request_result(result_count=len(jobs), warnings_summary=[])
+    stash_request_queue(queue_items=job_manager.telemetry_items())
     return DownloadJobList(jobs=jobs)
 
 

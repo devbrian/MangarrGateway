@@ -134,6 +134,12 @@ class MetricEventOut(BaseModel):
     # MetricEvent — both default None, no new sub-model needed).
     manga_title: str | None = None
     chapter_number: float | None = None
+    # 260605-wab per-item queue contents on the GET /downloads request event.
+    # Lockstep parity with MetricEvent: an open list of flat scalar maps
+    # ({jobId, mangaTitle, chapterNumber, status}). Like warnings_summary this is a
+    # list, but each item is a flat scalar map so list[dict[str, object]] (matching
+    # the dataclass type exactly) keeps mypy-strict clean with no extra sub-model.
+    queue_items: list[dict[str, object]] | None = None
 
 
 class RequestBreakdownOut(BaseModel):
