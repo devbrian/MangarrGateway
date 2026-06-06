@@ -923,7 +923,18 @@ class ComixSource(Source):
         # enumerate (one browser fan-out each; correct on a HIT too).
         ctx.candidates_enumerated = len(series)
 
-        feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
+        # Per-series OUTPUT window — honors the CALLER's requested limit, NOT the
+        # per-page upstream fetch ceiling. ``_MAX_FEED_LIMIT`` is the page size the
+        # ``route_limit_rewrite`` requests from upstream (the ``/chapters`` API), so
+        # reusing it to clamp the result window capped EVERY comix search at 100
+        # chapters regardless of ``req.limit`` (debug comix-page-walker-100-cap).
+        # The canonical ``req.limit`` truncation is the route's
+        # ``releases[: req.limit]`` over the merged, newest-first result (the same
+        # point MangaDex relies on) — the source must NOT pre-clamp to the fetch
+        # ceiling. Per-series windowing to ``req.limit`` still bounds handle minting
+        # (the merged top-``limit`` can never need more than ``limit`` from any one
+        # series) without starving a >100-chapter series.
+        result_window = req.limit or _MAX_FEED_LIMIT
 
         # Layer 2 (CACHE-02/03): cache the UNFILTERED, newest-first raw chapter list
         # per (series_hid, languages). The browser-DOM read is the SINGLE biggest cost
@@ -947,7 +958,11 @@ class ComixSource(Source):
                     items=items,
                     chapter_numbers=tuple(parsed),
                     exhausted=True,
-                    requested_limit=feed_limit,
+                    # The per-page upstream fetch ceiling (the route_limit_rewrite
+                    # target), NOT the output window — the browser walk is the
+                    # COMPLETE enumeration so this is informational only
+                    # (``covers_floor`` short-circuits on ``exhausted=True``).
+                    requested_limit=_MAX_FEED_LIMIT,
                 )
 
             # IN-02: Comix's chapter enumeration is language-AGNOSTIC — the
@@ -1003,7 +1018,7 @@ class ComixSource(Source):
                     req, self._parse_decimal(c.get("chapter") or c.get("number"))
                 )
             ]
-            for chapter in chapters[req.offset : req.offset + feed_limit]:
+            for chapter in chapters[req.offset : req.offset + result_window]:
                 # Inject the series-page-known title into the chapter dict so the
                 # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /
                 # ``series`` / ``title`` keys) does not need to know whether the
