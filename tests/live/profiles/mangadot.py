@@ -54,6 +54,17 @@ LIVE-TUNE items (refine from the first deploy-host smoke)
   ``MangadotSource.fetch_image`` (the fetch_image docstring flags this).
 * **fixture_drift_paths** — empty until the first live smoke pins the real
   search / chapters-list / images shapes (mirrors comix.py / mangaball.py).
+
+Alt-title live smoke (#139)
+---------------------------
+``alt_title_query`` / ``alt_title_expected_substring`` are intentionally left at
+their ``None`` default: no native/alt title is yet CONFIRMED to resolve live for
+a stable mangadot series (the catalog mixes junk/aggregated entries — RESEARCH
+§provenance — so an unverified native query risks a flaky smoke). The alt-title
+live smoke for mangadot is therefore PENDING a verified native query; until then
+``test_search_alt_title_smoke.py`` skips this source. Follow-up: pin a native
+query whose leading hit's title contains a known English substring on the first
+deploy-host smoke, then populate both fields here (mirrors comix.py / mangadex.py).
 """
 
 from __future__ import annotations

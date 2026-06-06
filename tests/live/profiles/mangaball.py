@@ -71,6 +71,18 @@ confirms / tunes:
   ``chapter-listing-by-title-id`` flat shape match the recon (A7 fixture anchors).
 * **fixture_drift_paths** — empty until the first live smoke pins the real
   chapter-detail / search shapes; add anchors then (mirrors comix.py).
+
+Alt-title live smoke (#139)
+---------------------------
+``alt_title_query`` / ``alt_title_expected_substring`` are intentionally left at
+their ``None`` default: no native/alt title is yet CONFIRMED to resolve live for
+a stable mangaball series via ``search-advanced`` (the ``alternateName`` field is
+a ``/``-separated HTML blob whose native-vs-romaji split is parsed offline, but a
+live native-name search has not been verified to return the right leading hit).
+The alt-title live smoke for mangaball is therefore PENDING a verified native
+query; until then ``test_search_alt_title_smoke.py`` skips this source. Follow-up:
+pin a native query whose leading hit's title contains a known English substring on
+the first deploy-host smoke, then populate both fields here (mirrors comix.py).
 """
 
 from __future__ import annotations

@@ -43,3 +43,11 @@ class LiveSmokeProfile:
     expected_release_pattern: dict[str, str] = field(default_factory=dict)
     fixture_drift_paths: list[Path] = field(default_factory=list)
     perf_budget_s: float | None = None
+    # Alt-title live smoke (#139). OPTIONAL: populate ONLY for sources where a
+    # real native/alt title is known to resolve live. A non-``None``
+    # ``alt_title_query`` opts the source into ``test_search_alt_title_smoke.py``;
+    # ``None`` (the default) skips it. ``alt_title_expected_substring`` is the
+    # case-insensitive substring at least one returned release's ``title`` must
+    # contain — proving the alt/native query resolved to the right series live.
+    alt_title_query: str | None = None
+    alt_title_expected_substring: str | None = None

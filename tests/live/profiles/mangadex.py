@@ -52,4 +52,11 @@ LIVE_SMOKE = LiveSmokeProfile(
     expected_release_pattern={"sourceKey": "mangadex"},
     fixture_drift_paths=[],
     perf_budget_s=None,
+    # Alt-title live smoke (#139): Solo Leveling's Korean native title
+    # (나 혼자만 레벨업) is carried in MangaDex's ``altTitles`` and is a stable,
+    # high-traffic series. A live search for the native name must resolve to a
+    # release whose title contains "Solo Leveling" — proving alt-title matching
+    # works end-to-end against the real MangaDex search.
+    alt_title_query="나 혼자만 레벨업",
+    alt_title_expected_substring="Solo Leveling",
 )
