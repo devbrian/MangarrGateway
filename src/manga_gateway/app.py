@@ -224,6 +224,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Firefox cannot run parallel CF navs).
         "fetch_concurrency": settings.cloudflare_fetch_concurrency,
         "cloudflare_keys": cloudflare_keys,
+        # #153: bounded eager-warm retry so a cold-deploy launch flake is absorbed
+        # before a source is force_disabled (and so advertised down in /caps for 12h).
+        "warm_attempts": settings.cloudflare_warm_attempts,
+        "warm_retry_seconds": settings.cloudflare_warm_retry_seconds,
         # #35 / #40: select the stealth-browser engine. patchright (Chromium,
         # patched CDP leaks) is the DEFAULT since the comix-parallel-engine-probe
         # finding (2026-06-01) — only Chromium runs concurrent CF navigations, so
@@ -270,8 +274,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             failed = await solver.warm()  # eager best-effort solve + recycle watchdog
         except Exception:  # noqa: BLE001 — total failure: cloudflare sources boot disabled, gateway lives
             failed = list(cloudflare_keys)
+            # #153: surface the real cause (exc_info) — a catastrophic warm()
+            # raise (launch/watchdog path) was previously logged with no traceback.
             _log.warning(
-                "CloudflareSolver warm failed; cloudflare-gated sources disabled (D-33)"
+                "CloudflareSolver warm failed; cloudflare-gated sources "
+                "disabled (D-33)",
+                exc_info=True,
             )
         for key in failed:
             source_health[key].force_disabled = True
@@ -446,12 +454,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         else None
     )
 
-    # D-37 recovery supervisor: once a cloudflare-gated breaker trips, re-probe
-    # on the escalating +1h/+6h schedule (off the request path), then stay down
-    # until a manual restart. Strong-ref'd (manager.py:247-251 idiom) so each
-    # fire-and-forget task is never GC'd. A ``force_disabled`` (eager-launch-
-    # failed) source is left down. One supervisor task per cloudflare-gated
-    # source so they recover independently.
+    # D-37 recovery supervisor: once a cloudflare-gated source is DOWN (breaker
+    # tripped OR D-33 force_disabled), re-probe on the escalating +1h/+6h schedule
+    # (off the request path). Strong-ref'd (manager.py:247-251 idiom) so each
+    # fire-and-forget task is never GC'd. #153: a ``force_disabled`` (eager-launch-
+    # flake) source is NOW re-probed too — a successful re-solve clears the latch
+    # (record_success resets force_disabled), so a cold-start flake self-heals
+    # instead of pinning /caps disabled until a manual restart. One supervisor
+    # task per cloudflare-gated source so they recover independently.
     async def _probe_source(source_key: str) -> bool:
         try:
             clearance = await solver.get_clearance(source_key, force_resolve=True)
@@ -463,8 +473,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         health = source_health[source_key]
         while True:
             await asyncio.sleep(_RECOVERY_POLL_SECONDS)
-            # eager-launch-failed (stay down) or healthy — nothing to do
-            if health.force_disabled or health.is_enabled:
+            # Healthy — nothing to do. #153: a ``force_disabled`` source (D-33
+            # eager-launch flake) is NO LONGER left down until restart — it is
+            # re-probed on the watchdog schedule so a successful re-solve clears
+            # the stale latch off the request path (record_success() now resets
+            # force_disabled). This guarantees recovery even if Mangarr stops
+            # querying the source because /caps reported it disabled.
+            if health.is_enabled:
                 continue
             await _recovery_watchdog(
                 health,
