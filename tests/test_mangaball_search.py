@@ -58,6 +58,28 @@ class _FakeCtxForSearch:
         self._listings = listings
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
+    # Enum-cache seam (09-06): mirror the real SourceContext's default-None
+    # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
+    # tests exercise byte-for-byte the pre-cache behavior they were written for.
+    def cached_resolve_key(
+        self, normalized_query: str, languages: list[str]
+    ) -> tuple[Any, ...]:
+        return ("mangaball", normalized_query, tuple(sorted(languages)))
+
+    def cached_enumerate_key(
+        self, series_id: str, languages: list[str]
+    ) -> tuple[Any, ...]:
+        return ("mangaball", series_id, tuple(sorted(languages)))
+
+    async def cached_resolve(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    def cache_replace(self, key: tuple[Any, ...], enum: Any) -> None:
+        return None
+
     async def post_json(self, url: str, *, data: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((url, data))
         if url == _SEARCH_ADVANCED:
