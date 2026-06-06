@@ -142,6 +142,24 @@ class _GatedBrowserSolver:
             if self._gate is not None:
                 self._gate.release()
 
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        # #146: present so ``_solver_from_ctx``'s hasattr guard passes. These
+        # DOWNLOAD-path tests drive RESOLVED composites only, so the deferred
+        # always-walk enumeration never runs — this stub is never invoked.
+        raise AssertionError(  # pragma: no cover — never called on the resolved path
+            f"fetch_via_browser_paginated unexpectedly called ({url!r})"
+        )
+
 
 def _comix_record(idx: int) -> ResolutionRecord:
     """A comix ResolutionRecord whose composite chapter id resolves to a live

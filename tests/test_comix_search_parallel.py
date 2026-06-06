@@ -105,16 +105,8 @@ class _SlowComixSolver:
     async def get_clearance(self, source_key: str) -> Clearance:
         return Clearance(cookies=dict(_CF_COOKIE), user_agent=_CF_UA)
 
-    async def fetch_via_browser(
-        self,
-        url: str,
-        *,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
-    ) -> object:
-        _ = (extract, wait_for, timeout)
-        self.browser_fetch_calls.append(url)
+    async def _gated_fetch(self, url: str) -> object:
+        """Shared in-flight/gate/delay accounting for the browser primitives."""
         if self._gate is not None:
             await self._gate.acquire()
         try:
@@ -125,13 +117,44 @@ class _SlowComixSolver:
                 if url in self.browser_errors:
                     raise self.browser_errors[url]
                 if url not in self.browser_results:
-                    raise AssertionError(f"unmocked fetch_via_browser({url!r})")
+                    raise AssertionError(f"unmocked browser fetch({url!r})")
                 return self.browser_results[url]
             finally:
                 self.in_flight -= 1
         finally:
             if self._gate is not None:
                 self._gate.release()
+
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        _ = (extract, wait_for, timeout)
+        self.browser_fetch_calls.append(url)
+        return await self._gated_fetch(url)
+
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        # #146: ``_series_chapters`` always-walks via the paginated primitive, so
+        # the parallel-concurrency bounding test must exercise THIS method (the
+        # one the source actually calls). Same in-flight/gate/delay accounting as
+        # the one-shot fetch so the max_in_flight / wall-clock assertions hold.
+        _ = (extract, wait_for, next_selector, route_limit_rewrite, max_pages, timeout)
+        self.browser_fetch_calls.append(url)
+        return await self._gated_fetch(url)
 
 
 @pytest.fixture

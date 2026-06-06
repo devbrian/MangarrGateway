@@ -1194,20 +1194,31 @@ class ComixSource(Source):
 
     @staticmethod
     def _solver_from_ctx(ctx: SourceContext) -> Any:
-        """Pull the AntiBotSolver out of ``ctx`` for the browser-fetch path.
+        """Pull the AntiBotSolver out of ``ctx`` for the browser-fetch paths.
 
         The framework wires the solver into ``SourceContext`` for any
         ``cloudflare*`` source (D-40 clearance injection). For Comix's browser-
-        DOM read we ALSO need ``solver.fetch_via_browser`` — distinct from the
-        request-clearance use, same instance. Raises ``SourceError`` when the
-        solver is missing OR lacks the primitive (a wiring bug, not a runtime
-        condition).
+        DOM reads we ALSO need TWO off-Protocol browser primitives (D-41), same
+        instance, distinct from the request-clearance use:
+
+        * ``fetch_via_browser_paginated`` — the always-walk chapter-list
+          enumeration in :meth:`_series_chapters` (#146); and
+        * ``fetch_via_browser`` — the one-shot chapter-pages manifest read in
+          :meth:`fetch_manifest`.
+
+        Raises ``SourceError`` when the solver is missing OR lacks EITHER
+        primitive (a wiring bug, not a runtime condition).
         """
         solver = getattr(ctx, "_solver", None)
-        if solver is None or not hasattr(solver, "fetch_via_browser"):
+        if (
+            solver is None
+            or not hasattr(solver, "fetch_via_browser")
+            or not hasattr(solver, "fetch_via_browser_paginated")
+        ):
             raise SourceError(
                 "source_unavailable",
-                "comix browser-fetch requires a solver with fetch_via_browser",
+                "comix browser-fetch requires a solver with fetch_via_browser "
+                "and fetch_via_browser_paginated",
             )
         return solver
 
@@ -1304,19 +1315,24 @@ class ComixSource(Source):
         ctx: SourceContext,
         req: SearchRequest | None = None,
     ) -> list[dict[str, Any]]:
-        """Browser-DOM read of the series page chapter list (Plan 04-04 Option A).
+        """Browser-DOM read of the FULL paginated series chapter list (#146).
 
         Navigates ``{base_url}/title/{hid}-{slug}`` in the warm Patchright
-        browser, waits for the chapter-list anchors to hydrate, and reads
-        ``[{id, chapter, lang, groups, publishedAtRelative}, …]`` off the
-        rendered DOM. The numeric chapter id (URL leading segment) and chapter
-        number (URL trailing segment after ``-chapter-``) are load-bearing —
-        group/lang/date are best-effort extracted and the live smoke pins
-        selector refinements.
+        browser and ALWAYS walks the FULL paginated chapter list via
+        ``solver.fetch_via_browser_paginated`` — reading
+        ``[{id, chapter, lang, groups, publishedAtRelative}, …]`` off every
+        pagination page, not just the ~20 rows on first paint. Before #146 this
+        was a one-shot read of the first render (mostly the newest chapter's
+        group-uploads), so a low/old chapter that only appears on a later
+        pagination page was never enumerated. The numeric chapter id (URL
+        leading segment) and chapter number (URL trailing segment after
+        ``-chapter-``) are load-bearing — group/lang/date are best-effort
+        extracted and the live smoke pins selector refinements.
 
         We sort newest-first by chapter number and slice the
-        ``offset..offset+limit`` window so the contract behaves identically to
-        the prior encrypted-API path. A failed browser fetch surfaces as
+        ``offset..offset+limit`` window AFTER the full enumeration so the
+        contract behaves identically to the prior path (now over the complete
+        list). A failed browser fetch surfaces as
         ``SourceError("source_unavailable")`` → per-source warning (WR-06).
 
         Scanlation-group extraction: each chapter row is a
@@ -1335,15 +1351,35 @@ class ComixSource(Source):
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
         try:
-            raw = await solver.fetch_via_browser(
+            # #146: ALWAYS walk the FULL paginated chapter list, not just the
+            # ~20 rows on first paint. The series page renders only the newest
+            # chapter's group-uploads initially, so a low/old chapter (e.g. #5)
+            # lives on a later pagination page and was never enumerated by the
+            # old one-shot read. The generic paginated primitive (a) rewrites
+            # the chapter-list request's ``limit`` to 100 via ``page.route()``
+            # before goto, and (b) walks the in-page Next control WITHIN ONE
+            # page nav (no extra goto, no extra Cloudflare cost; see PERF NOTE
+            # below). All comix-side literals — the ``/chapters`` URL substring,
+            # the ``100`` target limit, the ``button[aria-label*="Next"]``
+            # selector — live HERE, never in the framework. ALWAYS walk
+            # regardless of ``req``/type: the chapter-filter/slice below runs
+            # AFTER the full enumeration.
+            #
+            # PERF NOTE (accepted, user direction 2026-06-06): always-walking
+            # adds ~3-4 in-page Next-clicks per series (a ~320-chapter series at
+            # 100 rows/page) WITHIN one navigation — a handful of JS-clicks +
+            # bounded DOM polls, no extra goto/clearance. Bounded by the 30s
+            # primitive timeout (≤ the framework's now-30s per-source fan-out
+            # timeout, ``framework/fanout.py::_DEFAULT_TIMEOUT``) with headroom
+            # over the ~7-18s live baseline; the per-source aiolimiter still
+            # bounds outer cadence.
+            raw = await solver.fetch_via_browser_paginated(
                 series_url,
                 extract=_CHAPTER_LIST_EXTRACT_JS,
                 wait_for=_CHAPTER_LIST_WAIT_FOR,
-                # Series page renders the first 20 chapters in <2s on a warm
-                # context (recon-measured). Cap at 15s so the call stays inside
-                # the framework's 20s per-source fan-out timeout when search
-                # enumerates a series' chapters.
-                timeout=15.0,
+                next_selector='button[aria-label*="Next"]',
+                route_limit_rewrite=("/chapters", _MAX_FEED_LIMIT),
+                timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as typed source failure
             raise SourceError(

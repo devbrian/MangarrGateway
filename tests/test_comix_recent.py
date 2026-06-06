@@ -262,7 +262,11 @@ def test_make_deferred_composite_decimal_chapter_roundtrips() -> None:
 
 class _FakeSolver:
     """Records the ``chapter_url`` passed to ``fetch_via_browser`` so the test
-    can assert the deferred branch resolved the sentinel before navigating."""
+    can assert the deferred branch resolved the sentinel before navigating.
+
+    Also backs the #146 always-walk paginated primitive: tests that exercise the
+    REAL deferred path (no ``_series_chapters`` monkeypatch) stage the full
+    series chapter list on ``paginated_results`` keyed by the series URL."""
 
     def __init__(self, urls: list[str] | None = None) -> None:
         self.last_url: str | None = None
@@ -270,6 +274,11 @@ class _FakeSolver:
             "https://jdpw.wowpic1.store/si/AAAAAAAAAAAAAAAAAAAA/01.webp",
             "https://jdpw.wowpic1.store/si/AAAAAAAAAAAAAAAAAAAA/02.webp",
         ]
+        self.paginated_results: dict[str, list[dict[str, Any]]] = {}
+        self.paginated_fetch_calls: list[str] = []
+
+    def stage_browser_paginated(self, url: str, result: list[dict[str, Any]]) -> None:
+        self.paginated_results[url] = result
 
     async def fetch_via_browser(
         self,
@@ -281,6 +290,26 @@ class _FakeSolver:
     ) -> list[str]:
         self.last_url = url
         return self._urls
+
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: Any = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
+    ) -> list[dict[str, Any]]:
+        _ = (extract, wait_for, next_selector, route_limit_rewrite, max_pages, timeout)
+        self.paginated_fetch_calls.append(url)
+        if url not in self.paginated_results:
+            raise AssertionError(
+                f"unmocked fetch_via_browser_paginated({url!r}); "
+                f"call stage_browser_paginated first"
+            )
+        return self.paginated_results[url]
 
 
 class _FakeCtxForFetchManifest:
@@ -420,6 +449,38 @@ async def test_fetch_manifest_resolved_composite_skips_deferred_branch(
     # URL uses the search-path numeric id verbatim.
     assert solver.last_url is not None
     assert "/9938735-chapter-23" in solver.last_url
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_deferred_resolves_against_full_walked_list() -> None:
+    """#146 + deferred (locked decision 4): the deferred branch re-reads the
+    FULL paginated chapter list via the REAL ``_series_chapters`` (NO monkeypatch)
+    and strict-matches a chapter that lives DEEP in the list. Proves the always-
+    walk paginated primitive feeds ``_resolve_deferred`` the complete enumeration,
+    so a low/old chapter promised by a recent-feed handle is still resolvable."""
+    source = ComixSource()
+    composite = _make_deferred_composite("mr3m0", "the-forgotten-field", "5")
+
+    solver = _FakeSolver()
+    series_url = f"{ComixSource.base_url}/title/mr3m0-the-forgotten-field"
+    # 30-chapter full list; chapter 5 sits deep (would render only on a later
+    # pagination page on the live site — the #146 failure mode). The fake
+    # paginated primitive returns the FULL merged list the real primitive walks.
+    full_list = [
+        {"id": f"99388{n:02d}", "chapter": str(n), "groups": []}
+        for n in range(30, 0, -1)
+    ]
+    solver.stage_browser_paginated(series_url, full_list)
+
+    urls = await source.fetch_manifest(composite, _ctx_for_fetch(solver))
+    assert urls  # the fake returns a non-empty allowed-CDN list
+    # The always-walk primitive was the enumeration path (not the one-shot read).
+    assert solver.paginated_fetch_calls == [series_url]
+    # Chapter 5's numeric id (9938805) was resolved from the deep row and used to
+    # build the chapter URL — NOT the DEFERRED sentinel.
+    assert solver.last_url is not None
+    assert "/9938805-chapter-5" in solver.last_url
+    assert "DEFERRED" not in solver.last_url
 
 
 # ───────────────────────── recent() shape (Task 3) ──────────────────────────
