@@ -24,6 +24,7 @@ import pytest
 from manga_gateway.framework.relevance import prune_candidates
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.models.search import SearchRequest
+from manga_gateway.sources.mangadex import MangaDexSource
 from manga_gateway.sources.mangadot import MangadotSource
 
 
@@ -352,3 +353,137 @@ def test_comix_main_title_prunes_to_forgotten_field() -> None:
     assert len(result) == 1
     assert result[0][2] == "The Forgotten Field"
     assert result[0][0] == "mr3m0"
+
+
+# --- mangadex source integration (#139, fourth source) ----------------------
+
+_MANGADEX_BASE = "https://api.mangadex.org"
+_MANGADEX_SEARCH = f"{_MANGADEX_BASE}/manga"
+_MANGADEX_FEED = f"{_MANGADEX_BASE}/chapter"
+
+
+class _FakeMangaDexCtx:
+    """``SourceContext`` stand-in for the MangaDex title-fallback fan-out.
+
+    Records one ``feed_calls`` entry per ``GET /chapter`` enumeration so the
+    prune count is ``len(ctx.feed_calls)`` — the MangaDex analog of mangadot's
+    ``array_calls`` / comix's per-candidate nav count.
+    """
+
+    def __init__(self, *, search_data: list[dict[str, Any]]) -> None:
+        self.handle_store = HandleStore()
+        self._search_data = search_data
+        self.feed_calls: list[str] = []
+        self.candidates_enumerated: int | None = None
+
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        if url == _MANGADEX_SEARCH:
+            return {"result": "ok", "data": self._search_data}
+        if url == _MANGADEX_FEED:
+            # Record one enumeration per fan-out candidate; return a single
+            # plausible chapter so _to_release has something to mint.
+            self.feed_calls.append(str(params.get("manga")))
+            return {"result": "ok", "data": [_mangadex_chapter()]}
+        raise AssertionError(f"unexpected get_json url: {url}")
+
+
+def _mangadex_item(
+    *, manga_id: str, title: str, alt_titles: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
+    """One ``GET /manga?title=`` search item with localized title + altTitles."""
+    return {
+        "id": manga_id,
+        "type": "manga",
+        "attributes": {
+            "title": {"en": title},
+            "altTitles": alt_titles or [],
+            "availableTranslatedLanguages": ["en"],
+        },
+        "relationships": [],
+    }
+
+
+def _mangadex_chapter() -> dict[str, Any]:
+    return {
+        "id": "chapter-uuid",
+        "type": "chapter",
+        "attributes": {
+            "volume": None,
+            "chapter": "1",
+            "title": None,
+            "translatedLanguage": "en",
+            "externalUrl": None,
+            "isUnavailable": False,
+            "publishAt": "2026-05-29T13:57:18+00:00",
+            "readableAt": "2026-05-29T13:57:18+00:00",
+            "pages": 2,
+        },
+        "relationships": [
+            {"id": "grp", "type": "scanlation_group", "attributes": {"name": "G"}},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_mangadex_alt_title_match_prunes_fanout_to_one() -> None:
+    # The correct manga matches the query ONLY via its native/alt title; the
+    # distractors share the keyword but neither main nor alt matches → prune the
+    # per-candidate chapter-feed fan-out to that ONE manga_id (#139).
+    search_data = [
+        _mangadex_item(
+            manga_id="correct",
+            title="The Forgotten Field",
+            alt_titles=[{"ko": "잊혀진 들판"}],
+        ),
+        _mangadex_item(manga_id="d1", title="Forgotten Tales"),
+        _mangadex_item(
+            manga_id="d2",
+            title="A Field Guide",
+            alt_titles=[{"ja": "別の名前"}],
+        ),
+    ]
+    ctx = _FakeMangaDexCtx(search_data=search_data)
+
+    await MangaDexSource().search(
+        SearchRequest(type="chapter", query="잊혀진 들판"), ctx
+    )
+
+    assert ctx.feed_calls == ["correct"]
+    assert ctx.candidates_enumerated == 1
+
+
+@pytest.mark.asyncio
+async def test_mangadex_main_title_match_prunes_fanout_to_one() -> None:
+    # Parity with #126: the exact MAIN title query also prunes to one fan-out.
+    search_data = [
+        _mangadex_item(
+            manga_id="correct",
+            title="Solo Leveling",
+            alt_titles=[{"ko": "나 혼자만 레벨업"}],
+        ),
+        _mangadex_item(manga_id="d1", title="Solo Camping"),
+        _mangadex_item(manga_id="d2", title="Leveling Up Alone"),
+    ]
+    ctx = _FakeMangaDexCtx(search_data=search_data)
+
+    await MangaDexSource().search(
+        SearchRequest(type="chapter", query="Solo Leveling"), ctx
+    )
+
+    assert ctx.feed_calls == ["correct"]
+    assert ctx.candidates_enumerated == 1
+
+
+@pytest.mark.asyncio
+async def test_mangadex_ambiguous_query_fans_out_to_full_set() -> None:
+    # Several candidates merely share a common word — no exact match, no
+    # dominant gap → fan out to every candidate (#126 conservative behavior).
+    search_data = [
+        _mangadex_item(manga_id=f"m{i}", title=f"Dragon Tale {i}") for i in range(4)
+    ]
+    ctx = _FakeMangaDexCtx(search_data=search_data)
+
+    await MangaDexSource().search(SearchRequest(type="chapter", query="dragon"), ctx)
+
+    assert len(ctx.feed_calls) == 4
+    assert ctx.candidates_enumerated == 4
