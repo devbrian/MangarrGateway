@@ -75,18 +75,19 @@ class Source(ABC):
 
         Gate OFF (pass-through, returns ``True`` for everything):
           * ``req.type != "chapter"`` — a ``type=manga`` search is untouched.
-          * ``req.chapter is None`` — a chapterless ``type=chapter`` search is untouched.
+          * ``req.chapter is None`` — a chapterless ``type=chapter`` search is
+            untouched.
 
         Gate ON (``req.type == "chapter"`` and ``req.chapter is not None``):
           * ``chapter_number is None`` → ``False`` (locked 3: a release with no parsed
             chapter cannot match a requested chapter).
-          * else keep iff ``floor(chapter_number) == floor(req.chapter)`` (locked 1+2:
-            the whole-number / floor family — ``179`` and ``179.5`` both floor to ``179``,
-            so each returns the full ``179.x`` family; it is a floor match, not exact).
+          * else keep iff ``floor(chapter_number) == floor(req.chapter)`` (locked
+            1+2: the whole-number / floor family — ``179`` and ``179.5`` both floor to
+            ``179``, so each returns the full ``179.x`` family; floor, not exact).
 
-        ``req.chapter`` is ``float`` and ``chapter_number`` is ``Decimal``; ``math.floor``
-        returns ``int`` for both, so the comparison is ``int == int`` (mypy-strict clean,
-        no cast / no ``# type: ignore``).
+        ``req.chapter`` is ``float`` and ``chapter_number`` is ``Decimal``;
+        ``math.floor`` returns ``int`` for both, so the comparison is ``int == int``
+        (mypy-strict clean, no cast / no ``# type: ignore``).
         """
         if req.type != "chapter" or req.chapter is None:
             return True

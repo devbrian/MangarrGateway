@@ -644,7 +644,7 @@ class MangaBallSource(Source):
                 continue
             number = self._parse_decimal(chapter.get("number_float"))
             # 260606-2ff: drop a non-matching chapter (all its translations) BEFORE it
-            # enters `rows` → before the newest-first sort / [:limit] slice / handle mint
+            # enters `rows` → before the newest-first sort / [:limit] slice / mint
             # (preserves the GAP-2 mint-after-slice ordering). Gate-off = pass-through.
             if not self.chapter_matches(req, number):
                 continue

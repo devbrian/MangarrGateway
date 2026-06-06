@@ -60,7 +60,7 @@ def test_gate_on_integer_request_excludes_other_floors(
 def test_gate_on_decimal_request_matches_same_floor_family(
     chapter_number: Decimal,
 ) -> None:
-    # locked 2: a decimal request still matches its whole-number family (floor, not exact).
+    # locked 2: a decimal request matches its whole-number family (floor, not exact).
     req = SearchRequest(type="chapter", query="X", chapter=179.5)
     assert Source.chapter_matches(req, chapter_number) is True
 

@@ -441,6 +441,127 @@ async def test_search_truncates_to_limit(client: httpx.AsyncClient) -> None:
     assert len(resp.json()["releases"]) == 2  # merged total truncated to limit
 
 
+def _floor_family_feed_payload(manga_id: str) -> dict:
+    """A chapter feed exercising the 179.x floor-family + a 180 + a null-chapter row.
+
+    The null-chapter row still produces a Release (mangadex ``_to_release`` only drops
+    on missing externalUrl/chapter id), so it reaches ``Source.chapter_matches`` and is
+    dropped THERE under an active gate (locked 3).
+    """
+
+    def _ch(chapter: str | None, chapter_id: str) -> dict:
+        return {
+            "id": chapter_id,
+            "type": "chapter",
+            "attributes": {
+                "volume": None,
+                "chapter": chapter,
+                "title": None,
+                "translatedLanguage": "en",
+                "externalUrl": None,
+                "isUnavailable": False,
+                "publishAt": "2026-05-29T13:57:18+00:00",
+                "readableAt": "2026-05-29T13:57:18+00:00",
+                "pages": 2,
+            },
+            "relationships": [
+                {"id": "grp", "type": "scanlation_group", "attributes": {"name": "G"}},
+                {
+                    "id": manga_id,
+                    "type": "manga",
+                    "attributes": {"title": {"en": "Solo Leveling"}},
+                },
+            ],
+        }
+
+    data = [
+        _ch("179", str(uuid.uuid4())),
+        _ch("179.5", str(uuid.uuid4())),
+        _ch("179.9", str(uuid.uuid4())),
+        _ch("180", str(uuid.uuid4())),
+        _ch(None, str(uuid.uuid4())),  # null chapter → Release with chapterNumber None
+    ]
+    return {
+        "result": "ok",
+        "response": "collection",
+        "data": data,
+        "total": len(data),
+        "limit": 100,
+        "offset": 0,
+    }
+
+
+def _returned_chapter_set(body: dict) -> set[Decimal]:
+    # Compare via Decimal(str(...)) to avoid float drift (matches the 1.005 idiom).
+    return {
+        Decimal(str(r["chapterNumber"]))
+        for r in body["releases"]
+        if r["chapterNumber"] is not None
+    }
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_chapter_filter_floors_to_requested_family(
+    client: httpx.AsyncClient,
+) -> None:
+    """A type=chapter search honors the `chapter` param via Source.chapter_matches.
+
+    chapter=179 AND chapter=179.5 both return ONLY the 179.x floor-family (179, 179.5,
+    179.9); 180 is excluded and the null-chapter row is dropped. A chapterless control
+    is unfiltered (gate off) — 180 is present and nothing is dropped.
+    """
+    manga_id = str(uuid.uuid4())
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        return_value=httpx.Response(200, json=_floor_family_feed_payload(manga_id))
+    )
+
+    family = {Decimal("179"), Decimal("179.5"), Decimal("179.9")}
+
+    # (a) integer request → the floor-179 family, 180 excluded, null dropped.
+    resp = await client.post(
+        "/search",
+        json={
+            "type": "chapter",
+            "query": "Solo Leveling",
+            "chapter": 179,
+            "sources": ["mangadex"],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert _returned_chapter_set(body) == family
+    assert Decimal("180") not in _returned_chapter_set(body)
+    # 4 non-null + 1 null in the feed; only the 3-member family survives → null dropped.
+    assert len(body["releases"]) == 3
+
+    # (b) decimal request → the SAME family (proves floor/whole-number, not exact).
+    resp = await client.post(
+        "/search",
+        json={
+            "type": "chapter",
+            "query": "Solo Leveling",
+            "chapter": 179.5,
+            "sources": ["mangadex"],
+        },
+    )
+    assert resp.status_code == 200
+    assert _returned_chapter_set(resp.json()) == family
+
+    # (c) control: no `chapter` → gate off, NOT filtered; 180 IS present.
+    resp = await client.post(
+        "/search",
+        json={"type": "chapter", "query": "Solo Leveling", "sources": ["mangadex"]},
+    )
+    assert resp.status_code == 200
+    control = _returned_chapter_set(resp.json())
+    assert Decimal("180") in control
+    assert family <= control
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_search_minted_handle_resolves_in_store(
