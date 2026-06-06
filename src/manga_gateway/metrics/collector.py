@@ -119,6 +119,11 @@ class Collector:
             chapter_number=(
                 _req_float(req, "chapter_number") if kind == "request" else None
             ),
+            # 260605-wab: per-item GET /downloads queue contents stashed into
+            # current_request by the route. Read back for the umbrella ``request``
+            # event only — None for every other kind. Reuses the existing _req_list
+            # accessor (already returns list[dict[str, object]] | None).
+            queue_items=_req_list(req, "queue_items") if kind == "request" else None,
         )
         # O(1) hot path: update the rollup + get the ring-membership set, then a
         # plain queue append to the disk ring writer (no await, no disk I/O here —

@@ -61,6 +61,14 @@ def _populated_event() -> MetricEvent:
         warnings_summary=[{"source_key": "comix", "code": "timeout"}],
         manga_title="Solo Leveling",
         chapter_number=1.0,
+        queue_items=[
+            {
+                "jobId": "j_x",
+                "mangaTitle": "Solo Leveling",
+                "chapterNumber": 1.0,
+                "status": "completed",
+            }
+        ],
     )
 
 

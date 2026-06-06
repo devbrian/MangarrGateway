@@ -179,6 +179,23 @@ def stash_request_meta(
         req["chapter_number"] = chapter_number
 
 
+def stash_request_queue(*, queue_items: list[dict[str, object]]) -> None:
+    """Stash the per-item ``queue_items`` into the request-scoped dict IN PLACE
+    (260605-wab, read by the middleware emit). No-op without a request scope,
+    mirroring :func:`stash_request_result`.
+
+    NOT redacted: like the nqo ``manga_title``/``chapter_number`` event-level fields
+    (which do NOT pass through :func:`redact_blob` — only the ``request_blob`` body
+    dict is keyed-redacted), ``queue_items`` is operator-facing queue detail (jobId +
+    resolved manga title + chapter + status), not a secret, and rides the same
+    unredacted path.
+    """
+    req = current_request.get()
+    if req is None:
+        return
+    req["queue_items"] = queue_items
+
+
 @contextmanager
 def source_scope(source_key: str) -> Iterator[None]:
     """Bind ``current_source`` for the duration of one fan-out child (Pattern 1).
