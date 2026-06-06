@@ -110,8 +110,9 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from ..framework.base import Source
+from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
-from ..framework.relevance import prune_candidates
+from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -880,31 +881,73 @@ class ComixSource(Source):
         testing only Camoufox and is REFUTED. See ``config.py`` and the README
         for the engine/concurrency constraint.
         """
-        _ = req.languages  # Comix is English-only (live recon); honored downstream
+        # Comix is English-only (live recon); ``languages`` is honored downstream
+        # and is the language half of both cache keys (T-09-01).
+        languages = req.languages or []
         count = (
             _INTERACTIVE_SERIES_CANDIDATES
             if req.interactive
             else _DEFAULT_SERIES_CANDIDATES
         )
-        series = await self._search_series(req.query or "", count, ctx)
-        # Prune obviously-irrelevant candidates BEFORE the per-candidate browser
-        # chapter fan-out (#126) — each wasted candidate is a 7-18s nav (#101).
-        # An exact-match query narrows to the one correct series; ambiguous
-        # queries still fan out to ``count`` (the prune only narrows, never
-        # widens, so the ``req.interactive`` 15-candidate path is preserved).
-        series = prune_candidates(
-            series,
-            req.query or "",
-            # Score over the series title (t[2]) OR any alt title (t[3]) (#139):
-            # a query matching only the native/alt name still prunes to it.
-            keys=lambda t: [t[2], *t[3]],
-            cap=count,
+
+        # Layer 1 (D-01): cache the title → pruned-candidate resolution so a repeat
+        # search on the same (query, languages) skips the PLAINTEXT ``/api/v1/manga``
+        # call entirely (genuinely zero upstream calls on a HIT). The key normalizes
+        # the query the SAME way the relevance scorer does so punctuation/case
+        # variants collapse onto one entry.
+        async def _resolve_fn() -> list[tuple[str, str, str, list[str]]]:
+            found = await self._search_series(req.query or "", count, ctx)
+            # Prune obviously-irrelevant candidates BEFORE the per-candidate browser
+            # chapter fan-out (#126) — each wasted candidate is a 7-18s nav (#101).
+            # An exact-match query narrows to the one correct series; ambiguous
+            # queries still fan out to ``count`` (the prune only narrows, never
+            # widens, so the ``req.interactive`` 15-candidate path is preserved).
+            return prune_candidates(
+                found,
+                req.query or "",
+                # Score over the series title (t[2]) OR any alt title (t[3]) (#139):
+                # a query matching only the native/alt name still prunes to it.
+                keys=lambda t: [t[2], *t[3]],
+                cap=count,
+            )
+
+        series = await ctx.cached_resolve(
+            ctx.cached_resolve_key(_normalize(req.query or ""), languages), _resolve_fn
         )
         # 260605-e9a deliverable 5: report how many series candidates we deep-
-        # enumerate (one ``_series_chapters`` browser fan-out each).
+        # enumerate (one browser fan-out each; correct on a HIT too).
         ctx.candidates_enumerated = len(series)
 
         feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
+
+        # Layer 2 (CACHE-02/03): cache the UNFILTERED, newest-first raw chapter list
+        # per (series_hid, languages). The browser-DOM read is the SINGLE biggest cost
+        # on this source (7-18s/nav), so a HIT here is the headline win — a repeat
+        # same-series chapter search skips the navigation entirely. The DOM read is the
+        # COMPLETE v1 enumeration (there is no deeper-limit fetch on Comix), so the
+        # Enumeration is marked ``exhausted=True`` — ``covers_floor`` therefore never
+        # forces a pointless re-nav for a below-window chapter.
+        async def _enum_for(series_hid: str, series_slug: str) -> Enumeration:
+            async def _enum_fn() -> Enumeration:
+                items = await self._fetch_series_chapters_raw(
+                    series_hid, series_slug, ctx
+                )
+                parsed = [
+                    d
+                    for c in items
+                    if (d := self._parse_decimal(c.get("chapter") or c.get("number")))
+                    is not None
+                ]
+                return Enumeration(
+                    items=items,
+                    chapter_numbers=tuple(parsed),
+                    exhausted=True,
+                    requested_limit=feed_limit,
+                )
+
+            return await ctx.cached_enumerate(
+                ctx.cached_enumerate_key(series_hid, languages), _enum_fn
+            )
 
         # Parallel fan-out across series candidates. ``return_exceptions=True``
         # isolates per-candidate failures — a SourceError on one candidate
@@ -912,11 +955,11 @@ class ComixSource(Source):
         # so the other candidates still flow. The actual concurrency is bounded
         # by the framework's ``CloudflareSolver._browser_lock`` Semaphore
         # (``cloudflare_fetch_concurrency``), so the default deployment
-        # (concurrency=1) runs these one-at-a-time exactly as before.
+        # (concurrency=1) runs these one-at-a-time exactly as before. A cache HIT
+        # never reaches the solver, so concurrent same-series misses collapse to ONE
+        # nav via the SingleFlightCache (D-04) on top of that Semaphore.
         coros = [
-            self._series_chapters(
-                series_hid, series_slug, feed_limit, req.offset, ctx, req=req
-            )
+            _enum_for(series_hid, series_slug)
             for series_hid, series_slug, _series_title, _alt in series
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
@@ -937,11 +980,26 @@ class ComixSource(Source):
                     result,
                 )
                 continue
-            for chapter in result:
+            # CACHE-02: the ``chapter_matches`` floor filter lives in search() at the
+            # enumeration boundary (never the engine/cache) — keep only the requested
+            # whole-number/floor family BEFORE the offset/feed_limit window so matches
+            # are not starved (gate-off type=manga = pass-through). This mirrors the
+            # filter+slice the pre-cache ``_series_chapters`` applied, now over the
+            # cached raw rows.
+            chapters = [
+                c
+                for c in result.items
+                if self.chapter_matches(
+                    req, self._parse_decimal(c.get("chapter") or c.get("number"))
+                )
+            ]
+            for chapter in chapters[req.offset : req.offset + feed_limit]:
                 # Inject the series-page-known title into the chapter dict so the
                 # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /
                 # ``series`` / ``title`` keys) does not need to know whether the
-                # data came from the browser DOM or the legacy encrypted API.
+                # data came from the browser DOM or the legacy encrypted API. Each
+                # surviving chapter mints a FRESH handle per serve (CACHE-03/05) — the
+                # cache stores only raw rows, never minted handles.
                 if "seriesTitle" not in chapter and series_title:
                     chapter = {**chapter, "seriesTitle": series_title}
                 rel = self._to_release(series_hid, series_slug, chapter, ctx)
@@ -1295,6 +1353,53 @@ class ComixSource(Source):
             return _title_to_slug(title)
         return "manga"  # last-resort placeholder; bare URL would still 404 cleanly
 
+    async def _fetch_series_chapters_raw(
+        self,
+        series_hid: str,
+        series_slug: str,
+        ctx: SourceContext,
+    ) -> list[dict[str, Any]]:
+        """The RAW, newest-first chapter list off the warm series page (no filter).
+
+        This is the EXPENSIVE unit (a 7-18s browser navigation) and so the unit
+        the Layer-2 enumeration cache stores: it navigates
+        ``{base_url}/title/{hid}-{slug}`` in the warm Patchright browser, waits
+        for the chapter-list anchors to hydrate, normalizes the rows to the dict
+        shape ``_to_release`` consumes, and sorts newest-first by chapter number.
+        It applies NEITHER the ``chapter_matches`` floor filter NOR the
+        offset/limit slice — those live one level up (``_series_chapters`` for the
+        ``fetch_manifest`` path; ``search()`` for the cached search path) so the
+        cached enumeration is the complete, unfiltered window (CACHE-02).
+        """
+        solver = self._solver_from_ctx(ctx)
+        series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
+        try:
+            raw = await solver.fetch_via_browser(
+                series_url,
+                extract=_CHAPTER_LIST_EXTRACT_JS,
+                wait_for=_CHAPTER_LIST_WAIT_FOR,
+                # Series page renders the first 20 chapters in <2s on a warm
+                # context (recon-measured). Cap at 15s so the call stays inside
+                # the framework's 20s per-source fan-out timeout when search
+                # enumerates a series' chapters.
+                timeout=15.0,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as typed source failure
+            raise SourceError(
+                "source_unavailable", f"browser chapter-list fetch failed: {exc}"
+            ) from exc
+        if not isinstance(raw, list):
+            raise SourceError("source_unavailable", "malformed chapter list")
+        # Normalize to the dict shape ``_to_release`` already consumes (the
+        # encrypted-API path produced the same shape, so the consumer is
+        # source-agnostic). Sort newest-first by chapter number when parseable.
+        chapters: list[dict[str, Any]] = [c for c in raw if isinstance(c, dict)]
+        chapters.sort(
+            key=lambda c: self._parse_decimal(c.get("chapter")) or Decimal(0),
+            reverse=True,
+        )
+        return chapters
+
     async def _series_chapters(
         self,
         series_hid: str,
@@ -1332,34 +1437,7 @@ class ComixSource(Source):
         funnels it through :func:`_parse_relative_time` to approximate the
         REL-01 ISO 8601 ``publishDate``.
         """
-        solver = self._solver_from_ctx(ctx)
-        series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
-        try:
-            raw = await solver.fetch_via_browser(
-                series_url,
-                extract=_CHAPTER_LIST_EXTRACT_JS,
-                wait_for=_CHAPTER_LIST_WAIT_FOR,
-                # Series page renders the first 20 chapters in <2s on a warm
-                # context (recon-measured). Cap at 15s so the call stays inside
-                # the framework's 20s per-source fan-out timeout when search
-                # enumerates a series' chapters.
-                timeout=15.0,
-            )
-        except Exception as exc:  # noqa: BLE001 — surface as typed source failure
-            raise SourceError(
-                "source_unavailable", f"browser chapter-list fetch failed: {exc}"
-            ) from exc
-        if not isinstance(raw, list):
-            raise SourceError("source_unavailable", "malformed chapter list")
-        # Normalize to the dict shape ``_to_release`` already consumes (the
-        # encrypted-API path produced the same shape, so the consumer is
-        # source-agnostic). Sort newest-first by chapter number when parseable;
-        # then apply the offset/limit window.
-        chapters: list[dict[str, Any]] = [c for c in raw if isinstance(c, dict)]
-        chapters.sort(
-            key=lambda c: self._parse_decimal(c.get("chapter")) or Decimal(0),
-            reverse=True,
-        )
+        chapters = await self._fetch_series_chapters_raw(series_hid, series_slug, ctx)
         # 260606-2ff: in the SEARCH path (req is not None), keep only the requested
         # whole-number/floor family BEFORE the offset/feed_limit slice so matches are
         # not starved by the window. The deferred-id-resolution path (fetch_manifest)
