@@ -145,7 +145,12 @@ async def test_fetch_error_is_not_cached_and_inflight_popped() -> None:
     key = ("src", "a", ())
     with pytest.raises(RuntimeError):
         await cache.get_or_fetch(key, boom)
-    # failure never cached; inflight cleaned up (D-05 / T-09-03)
+    # failure never cached; inflight cleaned up (D-05 / T-09-03). Cache integrity
+    # holds AFTER the 260606-lyb WR-03 reversal: only successful results (incl.
+    # empties) are cached — a hard failure is still never written. This is DISTINCT
+    # from the Task-3 per-source cooldown: the enum cache never holds an error; the
+    # cooldown is the separate source-wide negative cache, and a post-expiry call
+    # re-fetches (this test re-invokes ``boom`` below).
     assert cache._inflight == {}
     with pytest.raises(RuntimeError):
         await cache.get_or_fetch(key, boom)
@@ -207,8 +212,12 @@ async def test_none_value_is_cached_as_present_not_refetched() -> None:
     assert calls == 1  # the None HIT did not re-fetch
 
 
-async def test_empty_list_payload_is_not_cached() -> None:
-    """WR-03: a valid-but-empty candidate list is returned but never cached."""
+async def test_empty_list_payload_is_cached_wr03_reversal() -> None:
+    """260606-lyb (WR-03 reversal): a valid-but-empty candidate list IS now cached.
+
+    A repeat NO-MATCH search serves the empty result from cache with zero upstream
+    calls (calls stays 1). Reverses the prior WR-03 "empty not cached" policy.
+    """
     cache: SingleFlightCache[list[str]] = SingleFlightCache(ttl=1800, maxsize=8)
     calls = 0
 
@@ -219,13 +228,13 @@ async def test_empty_list_payload_is_not_cached() -> None:
 
     key = ("src", "a", ())
     assert await cache.get_or_fetch(key, fetch) == []
-    assert cache.contains(key) is False  # empty not written
+    assert cache.contains(key) is True  # empty IS written (reversal)
     assert await cache.get_or_fetch(key, fetch) == []
-    assert calls == 2  # re-fetched — no negative caching of the empty body
+    assert calls == 1  # served from cache — NOT re-fetched
 
 
-async def test_empty_enumeration_payload_is_not_cached() -> None:
-    """WR-03: an Enumeration with no items is returned but never cached."""
+async def test_empty_enumeration_payload_is_cached() -> None:
+    """260606-lyb (WR-03 reversal): an Enumeration with no items IS now cached."""
     cache: SingleFlightCache[Enumeration] = SingleFlightCache(ttl=1800, maxsize=8)
     calls = 0
 
@@ -238,13 +247,13 @@ async def test_empty_enumeration_payload_is_not_cached() -> None:
 
     key = ("src", "a", ())
     await cache.get_or_fetch(key, fetch)
-    assert cache.contains(key) is False
+    assert cache.contains(key) is True  # empty Enumeration IS cached (reversal)
     await cache.get_or_fetch(key, fetch)
-    assert calls == 2
+    assert calls == 1  # served from cache
 
 
 async def test_nonempty_payload_is_cached() -> None:
-    """WR-03 control: a non-empty payload IS cached (one fetch)."""
+    """A non-empty payload IS cached (one fetch) — same as empties post-reversal."""
     cache: SingleFlightCache[list[str]] = SingleFlightCache(ttl=1800, maxsize=8)
     calls = 0
 
