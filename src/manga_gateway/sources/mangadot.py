@@ -246,7 +246,7 @@ class MangadotSource(Source):
                     f"{self.base_url}/api/manga/{manga_id}/chapters/list"
                 )
             return self._chapters_to_releases(
-                rows, manga_id, manga_title, wanted_langs, limit, ctx
+                rows, manga_id, manga_title, wanted_langs, limit, ctx, req
             )
 
         # Pre-filter candidates lacking a usable ``id`` BEFORE dispatching tasks — a
@@ -283,6 +283,7 @@ class MangadotSource(Source):
         wanted_langs: set[str] | None,
         limit: int,
         ctx: SourceContext,
+        req: SearchRequest,
     ) -> list[Release]:
         """Walk one manga's bare chapter array → per-row Releases (mangaball GAP-2).
 
@@ -304,6 +305,12 @@ class MangadotSource(Source):
                 continue  # no resolve unit → _to_release would drop it anyway
             language = str(row.get("language") or "en")
             if wanted_langs is not None and language not in wanted_langs:
+                continue
+            # 260606-2ff: drop a non-matching chapter BEFORE it enters `sortable` →
+            # before the newest-first sort / [:limit] slice / handle mint (preserves
+            # the GAP-2 mint-after-slice ordering). Gate-off = pass-through.
+            chapter_number = self._parse_decimal(row.get("chapter_number"))
+            if not self.chapter_matches(req, chapter_number):
                 continue
             sortable.append((self._parse_ts(row.get("date_added")), row))
         sortable.sort(key=lambda item: item[0], reverse=True)  # newest-first

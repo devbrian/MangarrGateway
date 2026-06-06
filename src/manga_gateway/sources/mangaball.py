@@ -583,6 +583,7 @@ class MangaBallSource(Source):
                 wanted_langs,
                 per_candidate_limit,
                 ctx,
+                req,
             )
 
         # Pre-filter candidates lacking a usable ``_id`` BEFORE dispatching tasks — a
@@ -620,6 +621,7 @@ class MangaBallSource(Source):
         wanted_langs: set[str] | None,
         limit: int,
         ctx: SourceContext,
+        req: SearchRequest,
     ) -> list[Release]:
         """Walk one candidate's flat ``ALL_CHAPTERS`` → per-translation Releases.
 
@@ -641,6 +643,11 @@ class MangaBallSource(Source):
             if not isinstance(chapter, dict):
                 continue
             number = self._parse_decimal(chapter.get("number_float"))
+            # 260606-2ff: drop a non-matching chapter (all its translations) BEFORE it
+            # enters `rows` → before the newest-first sort / [:limit] slice / handle mint
+            # (preserves the GAP-2 mint-after-slice ordering). Gate-off = pass-through.
+            if not self.chapter_matches(req, number):
+                continue
             for translation in chapter.get("translations") or []:
                 if not isinstance(translation, dict):
                     continue
