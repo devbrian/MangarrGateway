@@ -333,13 +333,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         source_health=source_health,
         session_prep=session_prep,
     )
-    await job_manager.rehydrate()  # flip in-flight->failed + project rows (PLAT-03)
+    # download-jobs-failed-23: REQUEUE in-flight jobs (not fail them) + project rows
+    # (PLAT-03). The re-spawn happens AFTER the staging sweep below.
+    await job_manager.rehydrate()
     # Restart staging sweep (PLAT-03 / T-03-13): clear orphan *.tmp archives left by a
     # crash mid-package; completed output files are never touched. Blocking FS walk is
-    # offloaded off the event loop (Pitfall 2).
+    # offloaded off the event loop (Pitfall 2). MUST run BEFORE resume_interrupted so a
+    # resumed job's fresh *.tmp can never be swept away by the previous run's cleanup.
     swept = await asyncio.to_thread(_sweep_staging, settings.output_root)
     if swept:
         _log.info("Swept %d orphan staging artifact(s) on startup", swept)
+    # download-jobs-failed-23: resume the jobs a redeploy/crash interrupted — they were
+    # requeued by rehydrate above; re-spawn them so they finish ("jobs SHOULD survive
+    # restart"). Bounded by the same global/per-source semaphores as a fresh submit.
+    resumed = job_manager.resume_interrupted()
+    if resumed:
+        _log.info("Resumed %d job(s) interrupted by restart", resumed)
     app.state.job_manager = job_manager
 
     # Metrics system (OBS-04/05/06): open the SEPARATE snapshot DB, rehydrate the

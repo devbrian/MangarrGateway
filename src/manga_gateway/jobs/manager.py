@@ -338,12 +338,18 @@ class JobManager:
     async def rehydrate(self) -> None:
         """Load store rows into the projection at startup (PLAT-03).
 
-        Order matters (IN-05): (1) ``store.rehydrate`` flips any live row left
-        by an unclean shutdown to ``failed`` so it counts as terminal; (2) we
-        then prune terminal rows down to ``Settings.max_history_jobs`` so a
-        long-running gateway does not grow the projection / ``GET /downloads``
-        payload without bound; (3) finally we read the surviving rows into the
-        in-memory read model. Live jobs are never pruned.
+        Order matters (IN-05): (1) ``store.rehydrate`` REQUEUES any live row left
+        by an unclean shutdown back to ``queued`` (clearing its transient progress)
+        so the gateway can resume it — "jobs SHOULD survive restart"; (2) we then
+        prune TERMINAL rows down to ``Settings.max_history_jobs`` so a long-running
+        gateway does not grow the projection / ``GET /downloads`` payload without
+        bound (requeued live rows are never pruned); (3) finally we read the
+        surviving rows into the in-memory read model.
+
+        This method does NOT re-spawn the requeued jobs — that is
+        :meth:`resume_interrupted`, called by the lifespan AFTER the orphan-staging
+        sweep so a resumed job's fresh ``*.tmp`` archive can never be swept away by
+        the previous run's cleanup.
         """
         await self._store.rehydrate()
         pruned = await self._store.prune_terminal(self._settings.max_history_jobs)
@@ -355,6 +361,29 @@ class JobManager:
             )
         rows = await self._store.all()
         self._projection = {row.job_id: row for row in rows}
+
+    def resume_interrupted(self) -> int:
+        """Re-spawn every ``queued`` projection row so interrupted jobs resume.
+
+        Called by the lifespan once, AFTER :meth:`rehydrate` (which requeued the
+        jobs a redeploy/crash interrupted) and AFTER the orphan-staging sweep. Each
+        requeued job is scheduled exactly like a fresh ``submit`` (``_spawn`` →
+        global + per-source semaphores → engine), so the global concurrency bound
+        keeps a large resumed backlog from saturating the box — extras stay
+        ``queued`` until a slot frees (D-30). Returns the count resumed.
+
+        A job that fails again ends ``terminal`` (``failed``) and is therefore NOT
+        requeued on the next restart, so a genuinely-broken release can never cause
+        a resume loop (per-job isolation in :meth:`JobEngine.run`).
+        """
+        resumed = [
+            job_id
+            for job_id, job in self._projection.items()
+            if job.status is JobStatus.QUEUED
+        ]
+        for job_id in resumed:
+            self._spawn(job_id)
+        return len(resumed)
 
     async def drain(self) -> None:
         """Await all in-flight background tasks (lifespan shutdown + test sync)."""

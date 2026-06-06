@@ -11,9 +11,11 @@ Two structural guarantees:
   ``release_handle`` restricted to live statuses. A duplicate live insert raises
   ``aiosqlite.IntegrityError``; once a job reaches a TERMINAL status the handle is
   freed so the release can be re-grabbed (DELETE/failure path).
-* **Restart rehydration (PLAT-03/D-28)** — :meth:`rehydrate` flips every job left
-  in a live status by an unclean shutdown to ``failed`` ("interrupted by restart")
-  and projects all rows; TERMINAL jobs survive untouched.
+* **Restart rehydration (PLAT-03/D-28)** — :meth:`rehydrate` REQUEUES every job
+  left in a live status by an unclean shutdown back to ``queued`` (clearing its
+  transient progress) so the gateway can RESUME it ("jobs SHOULD survive restart");
+  the :class:`~manga_gateway.jobs.manager.JobManager` re-spawns the requeued rows.
+  TERMINAL jobs survive untouched.
 
 NO at-home ``baseUrl``/cookie column exists (HDL-01/D-17) — volatile tokens are
 never persisted. Writes are serialized behind a single ``asyncio.Lock`` and run
@@ -238,18 +240,32 @@ class JobStore:
         return [_row_to_job(r) for r in rows]
 
     async def rehydrate(self) -> list[Job]:
-        """Restart recovery (PLAT-03/D-28): flip live jobs to ``failed``, project all.
+        """Restart recovery (PLAT-03/D-28): REQUEUE live jobs, project all.
 
-        Every job left in a live status by an unclean shutdown is marked
-        ``failed`` with message ``"interrupted by restart"``; terminal jobs
-        (completed/failed) are untouched and survive the restart. Returns all
-        rows projected for rehydrating the in-memory queue.
+        Every job left in a live status by an unclean shutdown (a redeploy/crash)
+        is set back to ``queued`` so the gateway can RESUME it rather than leaving
+        it permanently ``failed`` — the CLAUDE.md edge case "jobs SHOULD survive
+        restart". A requeued job re-runs identically to a fresh submit: the engine
+        drives the manifest off the durable ``chapter_id`` column (no dependency on
+        the volatile in-memory HandleStore, which is wiped on restart), and the
+        atomic-publish writers (D-26) mean a partially-fetched/archived job simply
+        re-fetches with no partial-CBZ risk. The transient in-flight progress
+        (``message``, ``total_pages``/``downloaded_pages``, byte counters,
+        ``output_path``) is cleared so the resumed job starts from a clean baseline;
+        the durable resolution snapshot (chapter id, title, manga/series ids,
+        handle, format) is preserved. TERMINAL jobs (completed/failed) are untouched
+        and survive the restart.
+
+        Returns all rows projected for rehydrating the in-memory queue; the
+        :class:`~manga_gateway.jobs.manager.JobManager` re-spawns the now-``queued``
+        rows via :meth:`~manga_gateway.jobs.manager.JobManager.resume_interrupted`.
         """
         async with self._write_lock:
             await self._conn.execute(
-                f"UPDATE jobs SET status = 'failed', "
-                f"message = 'interrupted by restart', updated_at = ? "
-                f"WHERE status IN {_LIVE_SET_SQL}",
+                "UPDATE jobs SET status = 'queued', message = NULL, "
+                "total_pages = NULL, downloaded_pages = NULL, "
+                "total_bytes = 0, remaining_bytes = 0, output_path = NULL, "
+                f"updated_at = ? WHERE status IN {_LIVE_SET_SQL}",
                 (_now_iso(),),
             )
             await self._conn.commit()
