@@ -100,7 +100,13 @@ class MangaDexSource(Source):
             )
             for chapter in chapters:
                 rel = self._to_release(manga_id, chapter, ctx)
-                if rel is not None:
+                # 260606-2ff: under type=chapter+chapter, keep only the requested
+                # whole-number/floor family (gate-off = pass-through). v1 limitation:
+                # the feed is upstream-paged via the API `limit`, so this is
+                # best-effort within the fetched page — a 179.x chapter beyond the
+                # fetched page could RARELY be missed. Acceptable for v1; no
+                # pagination-chasing.
+                if rel is not None and self.chapter_matches(req, rel.chapter_number):
                     releases.append(rel)
         return releases
 

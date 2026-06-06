@@ -914,7 +914,9 @@ class ComixSource(Source):
         # (``cloudflare_fetch_concurrency``), so the default deployment
         # (concurrency=1) runs these one-at-a-time exactly as before.
         coros = [
-            self._series_chapters(series_hid, series_slug, feed_limit, req.offset, ctx)
+            self._series_chapters(
+                series_hid, series_slug, feed_limit, req.offset, ctx, req=req
+            )
             for series_hid, series_slug, _series_title, _alt in series
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
@@ -1300,6 +1302,7 @@ class ComixSource(Source):
         limit: int,
         offset: int,
         ctx: SourceContext,
+        req: SearchRequest | None = None,
     ) -> list[dict[str, Any]]:
         """Browser-DOM read of the series page chapter list (Plan 04-04 Option A).
 
@@ -1357,6 +1360,19 @@ class ComixSource(Source):
             key=lambda c: self._parse_decimal(c.get("chapter")) or Decimal(0),
             reverse=True,
         )
+        # 260606-2ff: in the SEARCH path (req is not None), keep only the requested
+        # whole-number/floor family BEFORE the offset/feed_limit slice so matches are
+        # not starved by the window. The deferred-id-resolution path (fetch_manifest)
+        # passes req=None → never chapter-filtered (a specific chapter still resolves).
+        # Gate-off (type=manga / chapterless) = pass-through.
+        if req is not None:
+            chapters = [
+                c
+                for c in chapters
+                if self.chapter_matches(
+                    req, self._parse_decimal(c.get("chapter") or c.get("number"))
+                )
+            ]
         feed_limit = min(limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
         return chapters[offset : offset + feed_limit]
 
