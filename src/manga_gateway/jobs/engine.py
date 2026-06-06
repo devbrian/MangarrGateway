@@ -139,6 +139,23 @@ def _page_filename(url: str) -> str:
 _HANDLE_LOG_PREFIX = 8
 
 
+def _leaf_exc_name(exc: BaseException) -> str:
+    """The most meaningful exception TYPE name for the durable failure message.
+
+    A non-``SourceError`` escaping the per-page ``asyncio.TaskGroup`` (the realistic
+    generic-failure shape — see ``_fetch_pages_once``: ``except* SourceError`` lets
+    any OTHER exception re-raise wrapped) arrives at ``run`` inside a
+    ``BaseExceptionGroup``. Recursively unwrap to the first leaf so the persisted
+    ``"job failed: <Type>"`` names the ACTUAL cause (e.g. ``RuntimeError``,
+    ``TimeoutError``) rather than the opaque ``"ExceptionGroup"`` wrapper. Type
+    names ONLY — never the exception message (which can carry a URL/handle); the
+    full message + traceback stay in the internal ``_log.exception`` record.
+    """
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return type(exc).__name__
+
+
 def _release_identity(job: Job) -> str:
     """A compact, non-secret release identity for INTERNAL logs (issue #70).
 
@@ -205,7 +222,7 @@ class JobEngine:
             await self._run_inner(job)
         except SourceError as exc:
             await self._fail(job, str(exc) or exc.code)
-        except Exception:  # noqa: BLE001 — isolation: a job failure must not poison others
+        except Exception as exc:  # noqa: BLE001 — isolation: a job failure must not poison others
             # #70: capture the cause + traceback to the INTERNAL log only. Without
             # this the cause is swallowed entirely and a failed job has neither a
             # cause nor (without _fail's identity) an identity in any artifact.
@@ -215,7 +232,16 @@ class JobEngine:
                 job.source_key,
                 _release_identity(job),
             )
-            await self._fail(job, "job failed")
+            # download-jobs-failed-23 (issue #70 follow-up): the traceback above is
+            # INTERNAL and EPHEMERAL — a container redeploy wipes the logs, leaving a
+            # genuinely-failed job's durable row carrying only the opaque "job failed"
+            # with no recoverable cause. Persist the exception TYPE on the wire-visible
+            # message so the failure CLASS survives a restart. The type name is a code
+            # identifier (never a URL/handle/secret/page byte), so this respects the
+            # SSRF/info-leak discipline — the full str(exc) + traceback stay in the
+            # internal log above and never cross the wire. _leaf_exc_name unwraps the
+            # per-page TaskGroup's ExceptionGroup to name the ACTUAL cause.
+            await self._fail(job, f"job failed: {_leaf_exc_name(exc)}")
 
     # ─────────────────────────── state machine ───────────────────────────
 
