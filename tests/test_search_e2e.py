@@ -13,6 +13,7 @@ REL-01/02 (DTO aliasing), SRCH-06 (decimal >=3 places), and (Task 3) D-18/D-21/D
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from decimal import Decimal
 
 import httpx
@@ -594,6 +595,223 @@ async def test_search_chapter_filter_floors_to_requested_family(
     control = _returned_chapter_set(resp.json())
     assert Decimal("180") in control
     assert family <= control
+
+
+# ──────────────── Feed-walking: bounded + paginate-all (#144) ───────────────────
+
+
+def _chapter_row(manga_id: str, chapter: str | None) -> dict:
+    """One MangaDex chapter row (same shape as ``_floor_family_feed_payload._ch``)."""
+    return {
+        "id": str(uuid.uuid4()),
+        "type": "chapter",
+        "attributes": {
+            "volume": None,
+            "chapter": chapter,
+            "title": None,
+            "translatedLanguage": "en",
+            "externalUrl": None,
+            "isUnavailable": False,
+            "publishAt": "2026-05-29T13:57:18+00:00",
+            "readableAt": "2026-05-29T13:57:18+00:00",
+            "pages": 2,
+        },
+        "relationships": [
+            {"id": "grp", "type": "scanlation_group", "attributes": {"name": "G"}},
+            {
+                "id": manga_id,
+                "type": "manga",
+                "attributes": {"title": {"en": "Solo Leveling"}},
+            },
+        ],
+    }
+
+
+def _filler_rows(manga_id: str, chapters: list[str]) -> list[dict]:
+    """Build ascending-numbered chapter rows; a list of 100 makes a FULL page."""
+    return [_chapter_row(manga_id, ch) for ch in chapters]
+
+
+def _paginated_chapter_side_effect(
+    pages: dict[int, list[dict]], total: int, recorder: list[int]
+) -> Callable[[httpx.Request], httpx.Response]:
+    """respx side_effect serving ``GET /chapter`` from an offset-keyed page dict.
+
+    Records every requested ``offset`` into ``recorder`` so a test can assert WHICH
+    feed pages the walker actually fetched (proves early-stop vs paginate-all).
+    """
+
+    def _side_effect(request: httpx.Request) -> httpx.Response:
+        offset = int(request.url.params.get("offset", 0))
+        recorder.append(offset)
+        return httpx.Response(
+            200,
+            json={
+                "result": "ok",
+                "response": "collection",
+                "data": pages.get(offset, []),
+                "total": total,
+                "limit": 100,
+                "offset": offset,
+            },
+        )
+
+    return _side_effect
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_walks_to_later_page_for_chapter_family(
+    client: httpx.AsyncClient,
+) -> None:
+    """#144 regression: the 179-family lives on feed page 2 and is still returned.
+
+    Page 0 is a FULL 100-row page of lower chapters (1..100) — none floors past 179 so
+    the walk continues — and page 1 (offset 100) holds the 179.x family + a 180. The
+    walker must fetch BOTH pages; the family is returned and 180 is excluded.
+    """
+    manga_id = str(uuid.uuid4())
+    page0 = _filler_rows(manga_id, [str(i) for i in range(1, 101)])
+    page1 = _filler_rows(manga_id, ["179", "179.5", "179.9", "180"])
+    recorder: list[int] = []
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        side_effect=_paginated_chapter_side_effect(
+            {0: page0, 100: page1}, total=104, recorder=recorder
+        )
+    )
+
+    resp = await client.post(
+        "/search",
+        json={
+            "type": "chapter",
+            "query": "Solo Leveling",
+            "chapter": 179,
+            "limit": 1000,
+            "sources": ["mangadex"],
+        },
+    )
+    assert resp.status_code == 200
+    assert recorder == [0, 100]  # page 2 WAS fetched (the #144 fix)
+    returned = _returned_chapter_set(resp.json())
+    assert {Decimal("179"), Decimal("179.5"), Decimal("179.9")} <= returned
+    assert Decimal("180") not in returned
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_bounded_walk_stops_after_family_on_full_page(
+    client: httpx.AsyncClient,
+) -> None:
+    """Bounded early-stop: a FULL page whose cursor floors past the target stops.
+
+    Page 0 is a FULL 100-row page [5, 5.5, 6, 7, ..., 103] — chapter 6 floors past the
+    requested 5, so the walk STOPS after page 0 even though it was full. Page 1 is
+    configured but must NEVER be requested.
+    """
+    manga_id = str(uuid.uuid4())
+    page0_numbers = ["5", "5.5", *[str(i) for i in range(6, 104)]]  # exactly 100 rows
+    assert len(page0_numbers) == 100
+    page0 = _filler_rows(manga_id, page0_numbers)
+    page1 = _filler_rows(manga_id, [str(i) for i in range(104, 204)])
+    recorder: list[int] = []
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        side_effect=_paginated_chapter_side_effect(
+            {0: page0, 100: page1}, total=200, recorder=recorder
+        )
+    )
+
+    resp = await client.post(
+        "/search",
+        json={
+            "type": "chapter",
+            "query": "Solo Leveling",
+            "chapter": 5,
+            "limit": 1000,
+            "sources": ["mangadex"],
+        },
+    )
+    assert resp.status_code == 200
+    assert recorder == [0]  # page 2 NEVER fetched despite a full page 1
+    assert _returned_chapter_set(resp.json()) == {Decimal("5"), Decimal("5.5")}
+
+
+@respx.mock
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "req_body",
+    [
+        {"type": "manga", "query": "Solo Leveling"},
+        {"type": "chapter", "query": "Solo Leveling"},  # chapter=None → paginate-all
+    ],
+)
+async def test_search_paginate_all_walks_every_page(
+    client: httpx.AsyncClient, req_body: dict
+) -> None:
+    """Non-chapter-specific search walks EVERY page and returns the complete set.
+
+    Page 0 = 100 filler chapters (FULL), page 1 (offset 100) = 50 (short → exhausted).
+    Both pages are fetched and all 150 releases are returned (limit:1000 avoids the
+    route's newest-first truncation).
+    """
+    manga_id = str(uuid.uuid4())
+    page0 = _filler_rows(manga_id, [str(i) for i in range(1, 101)])
+    page1 = _filler_rows(manga_id, [str(i) for i in range(101, 151)])
+    recorder: list[int] = []
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        side_effect=_paginated_chapter_side_effect(
+            {0: page0, 100: page1}, total=150, recorder=recorder
+        )
+    )
+
+    resp = await client.post(
+        "/search",
+        json={**req_body, "limit": 1000, "sources": ["mangadex"]},
+    )
+    assert resp.status_code == 200
+    assert recorder == [0, 100]  # the full feed was walked
+    assert len(resp.json()["releases"]) == 150
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_skips_rows_with_malformed_attributes(
+    client: httpx.AsyncClient,
+) -> None:
+    """A row whose ``attributes`` is present but not a dict is skipped, not crashed.
+
+    Malformed upstream rows like ``{"attributes": []}`` would otherwise pass the
+    top-level dict check and then crash on ``.get(...)`` in the walker's floor
+    check / release normalization (CodeRabbit, WR-06 defensive parsing). The good
+    rows are still returned.
+    """
+    manga_id = str(uuid.uuid4())
+    bad_row = {"id": str(uuid.uuid4()), "type": "chapter", "attributes": []}
+    page0 = [*_filler_rows(manga_id, ["1", "2"]), bad_row]
+    recorder: list[int] = []
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        side_effect=_paginated_chapter_side_effect(
+            {0: page0}, total=3, recorder=recorder
+        )
+    )
+
+    resp = await client.post(
+        "/search",
+        json={"type": "manga", "query": "Solo Leveling", "sources": ["mangadex"]},
+    )
+    assert resp.status_code == 200
+    assert _returned_chapter_set(resp.json()) == {Decimal("1"), Decimal("2")}
 
 
 @respx.mock
