@@ -720,3 +720,127 @@ async def test_comix_search_walks_full_list_finds_low_chapter(
     # And the enumeration went through the always-walk paginated primitive.
     assert len(solver.paginated_fetch_calls) == 1
     assert solver.paginated_fetch_calls[0][4] == ("/chapters", 100)
+
+
+# ─── (debug comix-page-walker-100-cap) a >100-chapter series honors req.limit ──
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_comix_search_returns_more_than_100_when_limit_is_higher(
+    comix_client: httpx.AsyncClient, solver: _ComixSolver
+) -> None:
+    """Regression (debug comix-page-walker-100-cap): a comix series with MORE
+    than 100 chapters must return more than 100 releases when the caller asks
+    for a higher ``limit``.
+
+    Before the fix ``search()`` clamped its per-series output window to
+    ``min(req.limit, _MAX_FEED_LIMIT)`` — and ``_MAX_FEED_LIMIT`` is the
+    per-PAGE upstream fetch ceiling (the ``route_limit_rewrite`` target), NOT a
+    result cap. Conflating the two capped EVERY comix search at 100 chapters no
+    matter how many the series had or how high ``req.limit`` was. The canonical
+    ``req.limit`` truncation lives at the route (``api/routes/search.py``:
+    ``releases[: req.limit]``), exactly as MangaDex relies on — the source must
+    NOT pre-clamp the window to the fetch ceiling.
+
+    The fake paginated primitive returns the FULL walked list (150 chapters);
+    the route rewrite stays pinned at the 100/page fetch ceiling (asserted), so
+    the only behaviour under test is that the per-series window honours
+    ``req.limit`` rather than the fetch ceiling.
+    """
+    respx.get(f"{_COMIX}/api/v1/manga").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {
+                            "id": 116210,
+                            "hid": _SERIES_ID,
+                            "title": "Cipher Tales",
+                            "url": f"/title/{_SERIES_ID}-cipher-tales",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    # 150 chapters, newest-first — more than the 100/page fetch ceiling.
+    full_list = [
+        {
+            "id": f"chap-{n}",
+            "chapter": str(n),
+            "lang": "en",
+            "groups": [{"name": "TeamX"}],
+        }
+        for n in range(150, 0, -1)
+    ]
+    series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
+    solver.stage_browser_paginated(series_url, full_list)
+
+    resp = await comix_client.post(
+        "/search",
+        json={
+            "type": "chapter",
+            "query": "Cipher",
+            "sources": ["comix"],
+            "limit": 150,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    releases = body["releases"]
+    # The cap is gone: all 150 chapters flow through (route truncation is 150).
+    assert len(releases) == 150, (
+        f"expected 150 releases for a 150-chapter series at limit=150, "
+        f"got {len(releases)} (warnings={body.get('warnings')})"
+    )
+    # The per-PAGE fetch ceiling is UNCHANGED — the fix decouples the result
+    # window from the fetch size, it does not widen the upstream page request.
+    assert len(solver.paginated_fetch_calls) == 1
+    assert solver.paginated_fetch_calls[0][4] == ("/chapters", 100)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_comix_search_default_limit_still_truncates_at_route(
+    comix_client: httpx.AsyncClient, solver: _ComixSolver
+) -> None:
+    """The route — not the source — owns ``req.limit`` truncation. With the
+    default ``limit`` (50) a 150-chapter series yields exactly 50 releases,
+    proving the source returns its req.limit-wide window and the route's
+    ``releases[: req.limit]`` makes the final cut (mirrors MangaDex)."""
+    respx.get(f"{_COMIX}/api/v1/manga").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {
+                            "id": 116210,
+                            "hid": _SERIES_ID,
+                            "title": "Cipher Tales",
+                            "url": f"/title/{_SERIES_ID}-cipher-tales",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    full_list = [
+        {"id": f"chap-{n}", "chapter": str(n), "lang": "en", "groups": []}
+        for n in range(150, 0, -1)
+    ]
+    series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
+    solver.stage_browser_paginated(series_url, full_list)
+
+    resp = await comix_client.post(
+        "/search",
+        json={"type": "chapter", "query": "Cipher", "sources": ["comix"]},
+    )
+    assert resp.status_code == 200, resp.text
+    releases = resp.json()["releases"]
+    # Default req.limit is 50 — the route truncates the 150-wide window to 50.
+    assert len(releases) == 50, f"expected default-limit 50, got {len(releases)}"
