@@ -209,33 +209,28 @@ async def test_paginate_all_walk_spans_multiple_feed_pages() -> None:
         await transport.aclose()
 
 
-# ─────── CR-01 regression: a different offset is NOT served the stale window ────────
+# ── window-agnostic Layer-2 cache: same-series searches share ONE cached feed ──────
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_different_offset_not_served_first_calls_stale_window() -> None:
-    """CR-01: a second search with a DIFFERENT offset re-fetches its own page.
+async def test_offset_is_post_cache_slice_over_cached_feed() -> None:
+    """debug mangadex-search-not-cached: ``req.offset`` is a POST-cache slice over the
+    COMPLETE cached feed — NOT a walk-window discriminator that re-fetches.
 
-    The pre-fix Layer-2 key omitted the walk window, so request 2 (offset=50) hit
-    request 1's (offset=0) cached window and silently returned page 1's content.
-    With (stop_floor, offset) in the key, offset=50 is a MISS and fetches its own
-    page — never the stale offset-0 window.
+    The walk always paginate-all walks the whole feed from offset 0 and caches it
+    keyed on ``(manga_id, languages)`` ONLY. A second search with a different offset
+    therefore HITs the cache (zero new ``/chapter`` calls, mirroring comix/mangaball)
+    and the offset is applied to the cached releases.
     """
     manga_id = str(uuid.uuid4())
     manga_route = respx.get(f"{MANGADEX}/manga").mock(
         return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
     )
-    seen_offsets: list[str | None] = []
-
-    def _chapter_responder(request: httpx.Request) -> httpx.Response:
-        offset = request.url.params.get("offset")
-        seen_offsets.append(offset)
-        rows = ["1", "2", "3"] if offset == "0" else ["51", "52"]
-        return httpx.Response(200, json=_chapter_feed_payload(manga_id, rows))
-
     chapter_route = respx.get(f"{MANGADEX}/chapter").mock(
-        side_effect=_chapter_responder
+        return_value=httpx.Response(
+            200, json=_chapter_feed_payload(manga_id, ["1", "2", "3", "4", "5"])
+        )
     )
     src = MangaDexSource()
     ctx, transport = _build_ctx(EnumerationCache())
@@ -243,29 +238,31 @@ async def test_different_offset_not_served_first_calls_stale_window() -> None:
         page1 = await src.search(
             SearchRequest(type="manga", query="Solo Leveling", offset=0), ctx
         )
-        assert sorted(str(r.chapter_number) for r in page1) == ["1", "2", "3"]
+        assert sorted(str(r.chapter_number) for r in page1) == ["1", "2", "3", "4", "5"]
         manga_after = manga_route.call_count
         chapter_after = chapter_route.call_count
 
         page2 = await src.search(
-            SearchRequest(type="manga", query="Solo Leveling", offset=50), ctx
+            SearchRequest(type="manga", query="Solo Leveling", offset=2), ctx
         )
-        # Layer 1 still HITs (same query) — no second /manga call — but the Layer-2
-        # window key differs, so the offset=50 page is fetched fresh (one /chapter
-        # call) and returns its OWN rows, not the stale [1, 2, 3] window.
+        # Both layers HIT (same query AND window-agnostic Layer-2 key): NO new upstream
+        # calls. The offset=2 slice drops the first two ascending chapters post-cache.
         assert manga_route.call_count - manga_after == 0
-        assert chapter_route.call_count - chapter_after == 1
-        assert seen_offsets[-1] == "50"
-        assert sorted(str(r.chapter_number) for r in page2) == ["51", "52"]
+        assert chapter_route.call_count - chapter_after == 0
+        assert sorted(str(r.chapter_number) for r in page2) == ["3", "4", "5"]
     finally:
         await transport.aclose()
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_chapter_specific_search_keys_distinctly_from_manga_search() -> None:
-    """CR-01: a chapter-specific (bounded, stop_floor) walk does not collide with the
-    paginate-all (type=manga) window — distinct ``stop_floor`` → distinct cache key."""
+async def test_chapter_specific_search_served_from_manga_feed_cache() -> None:
+    """A chapter-specific search is served from the type=manga complete-feed cache.
+
+    The Layer-2 key is ``(manga_id, languages)`` ONLY (no ``stop_floor``/offset), so a
+    type=chapter search after a type=manga search of the same series is a cache HIT
+    (zero new ``/chapter`` calls) and the ``chapter_matches`` floor filter is applied
+    post-cache — exactly the comix/mangaball model."""
     manga_id = str(uuid.uuid4())
     respx.get(f"{MANGADEX}/manga").mock(
         return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
@@ -280,13 +277,60 @@ async def test_chapter_specific_search_keys_distinctly_from_manga_search() -> No
     try:
         await src.search(SearchRequest(type="manga", query="Solo Leveling"), ctx)
         chapter_after = chapter_route.call_count
-        # chapter=5 → stop_floor=5 → different key than the type=manga walk
-        # (stop_floor=None), so this is a MISS that does its own bounded walk.
+        # type=chapter chapter=5 shares the (manga_id, languages) cache entry → HIT,
+        # no new /chapter call; chapter_matches filters the cached feed to family 5.
         result = await src.search(
             SearchRequest(type="chapter", query="Solo Leveling", chapter=5), ctx
         )
-        assert chapter_route.call_count - chapter_after == 1
+        assert chapter_route.call_count - chapter_after == 0
         assert sorted(str(r.chapter_number) for r in result) == ["5"]
+    finally:
+        await transport.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_zero_result_repeat_search_served_from_cache() -> None:
+    """debug mangadex-search-not-cached (headline regression): a series FOUND on
+    MangaDex whose chapters all filter to ZERO results must NOT re-hit ``/chapter`` on
+    every differently-targeted repeat — it serves the cached feed like comix/mangaball.
+
+    Pre-fix, the Layer-2 key baked in ``(stop_floor, req.offset)``, so each distinct
+    chapter search re-walked ``/chapter`` (logged ~0.11s while comix/mangaball were
+    0.00s cache hits). With the window-agnostic key, the feed is walked ONCE and every
+    subsequent same-series search (any chapter) is a cache HIT.
+    """
+    manga_id = str(uuid.uuid4())
+    # The manga is found (Layer-1 resolve HITs on repeat), but every chapter is an
+    # off-site (externalUrl) row → _to_release drops it → zero matching results.
+    feed = _chapter_feed_payload(manga_id, ["1", "2", "3"])
+    for row in feed["data"]:
+        row["attributes"]["externalUrl"] = "https://example.test/ch"
+    respx.get(f"{MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    chapter_route = respx.get(f"{MANGADEX}/chapter").mock(
+        return_value=httpx.Response(200, json=feed)
+    )
+    src = MangaDexSource()
+    ctx, transport = _build_ctx(EnumerationCache())
+    try:
+        first = await src.search(
+            SearchRequest(type="manga", query="Solo Leveling"), ctx
+        )
+        assert first == []  # zero matching results
+        chapter_after = chapter_route.call_count
+        assert chapter_after == 1  # the feed was walked exactly once
+
+        # Repeated same-series searches at DIFFERENT chapters — every one a HIT.
+        for chapter in (5, 6, 5, 7):
+            again = await src.search(
+                SearchRequest(type="chapter", query="Solo Leveling", chapter=chapter),
+                ctx,
+            )
+            assert again == []
+        # The headline assertion: ZERO additional /chapter calls across all repeats.
+        assert chapter_route.call_count - chapter_after == 0
     finally:
         await transport.aclose()
 
@@ -390,9 +434,9 @@ async def test_attributes_none_row_does_not_crash_search() -> None:
         numbers = {str(r.chapter_number) for r in result}
         assert numbers == {"10", "11"}
 
-        # Also exercise the BOUNDED (type=chapter) walk so the malformed row passes
-        # through _page_passed_floor too (distinct stop_floor key → cache MISS →
-        # fresh bounded walk). Must not raise (CodeRabbit Major).
+        # Also exercise a type=chapter search over the same cached feed so the
+        # malformed row passes through the post-cache _to_release/chapter_matches path
+        # (window-agnostic key → cache HIT, no re-walk). Must not raise (CodeRabbit).
         bounded = await src.search(
             SearchRequest(type="chapter", query="Solo Leveling", chapter=10), ctx
         )
