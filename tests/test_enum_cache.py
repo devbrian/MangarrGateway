@@ -250,3 +250,173 @@ async def test_per_source_ttl_override_and_clamp() -> None:
     now[0] = 3601.0
     await cache.get_or_fetch(big_key, fetch)  # clamped to 3600 → expired
     assert calls == 5
+
+
+# ───────────────────── EnumerationCache two-layer + emit ──────────────────────
+
+
+class _FakeCollector:
+    """Records emit_cache calls; everything else is a no-op."""
+
+    def __init__(self) -> None:
+        self.cache_calls: list[dict[str, object]] = []
+
+    def emit_cache(
+        self, *, op: str, outcome: str, source_key: str | None = None
+    ) -> None:
+        self.cache_calls.append(
+            {"op": op, "outcome": outcome, "source_key": source_key}
+        )
+
+
+class _RaisingCollector(_FakeCollector):
+    def emit_cache(
+        self, *, op: str, outcome: str, source_key: str | None = None
+    ) -> None:
+        raise RuntimeError("collector exploded")
+
+
+def _enum(items: list) -> Enumeration:
+    return Enumeration(
+        items=items, chapter_numbers=(), exhausted=True, requested_limit=10
+    )
+
+
+async def test_cached_enumerate_emits_miss_then_hit() -> None:
+    from manga_gateway.metrics.collector import set_collector
+
+    fake = _FakeCollector()
+    set_collector(fake)  # type: ignore[arg-type]
+    try:
+        cache = EnumerationCache(ttl=1800, maxsize=8)
+        key = EnumerationCache.enum_key("mangadex", "series-123", ["en"])
+        calls = 0
+
+        async def fetch() -> Enumeration:
+            nonlocal calls
+            calls += 1
+            return _enum([1, 2])
+
+        first = await cache.cached_enumerate(key, fetch)
+        second = await cache.cached_enumerate(key, fetch)
+        assert first is second
+        assert calls == 1  # second served from cache
+        assert fake.cache_calls == [
+            {"op": "enumerate", "outcome": "miss", "source_key": "mangadex"},
+            {"op": "enumerate", "outcome": "hit", "source_key": "mangadex"},
+        ]
+    finally:
+        set_collector(None)
+
+
+async def test_cache_replace_emits_refetch() -> None:
+    from manga_gateway.metrics.collector import set_collector
+
+    fake = _FakeCollector()
+    set_collector(fake)  # type: ignore[arg-type]
+    try:
+        cache = EnumerationCache(ttl=1800, maxsize=8)
+        key = EnumerationCache.enum_key("comix", "hid-abc", ["en"])
+        cache.cache_replace(key, _enum([9]))
+        assert fake.cache_calls == [
+            {"op": "enumerate", "outcome": "refetch", "source_key": "comix"}
+        ]
+    finally:
+        set_collector(None)
+
+
+async def test_cached_resolve_emits_resolve_op() -> None:
+    from manga_gateway.metrics.collector import set_collector
+
+    fake = _FakeCollector()
+    set_collector(fake)  # type: ignore[arg-type]
+    try:
+        cache = EnumerationCache(ttl=1800, maxsize=8)
+        key = EnumerationCache.resolve_key("mangadex", "one piece", ["en"])
+
+        async def fetch() -> list:
+            return ["id-1", "id-2"]
+
+        await cache.cached_resolve(key, fetch)
+        await cache.cached_resolve(key, fetch)
+        assert [c["op"] for c in fake.cache_calls] == ["resolve", "resolve"]
+        assert [c["outcome"] for c in fake.cache_calls] == ["miss", "hit"]
+        assert all(c["source_key"] == "mangadex" for c in fake.cache_calls)
+    finally:
+        set_collector(None)
+
+
+async def test_emit_carries_source_key_but_no_url() -> None:
+    from typing import cast
+
+    from manga_gateway.metrics.collector import Collector, set_collector
+    from manga_gateway.metrics.snapshot import MetricSnapshotStore
+    from manga_gateway.metrics.store import InMemoryStore
+
+    from ._metrics_helpers import CapturingRingWriter
+
+    ring = CapturingRingWriter()
+    c = Collector(
+        InMemoryStore(slow_factor=3.0),
+        ring_writer=cast("MetricSnapshotStore", ring),
+    )
+    set_collector(c)
+    try:
+        cache = EnumerationCache(ttl=1800, maxsize=8)
+        key = EnumerationCache.enum_key("mangadex", "secret-series-id", ["en"])
+
+        async def fetch() -> Enumeration:
+            return _enum([1])
+
+        await cache.cached_enumerate(key, fetch)
+        events = [e for e in ring.iter_recent() if e.kind == "cache"]
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.url is None  # D-06: raw series-id NEVER recorded
+        assert ev.source_key == "mangadex"
+        assert ev.op == "enumerate"
+        assert ev.outcome == "miss"
+        # the raw key / series-id appears nowhere on the event
+        assert "secret-series-id" not in repr(ev)
+    finally:
+        set_collector(None)
+
+
+async def test_raising_collector_does_not_break_cached_call() -> None:
+    from manga_gateway.metrics.collector import set_collector
+
+    set_collector(_RaisingCollector())  # type: ignore[arg-type]
+    try:
+        cache = EnumerationCache(ttl=1800, maxsize=8)
+        key = EnumerationCache.enum_key("mangadex", "s", ["en"])
+
+        async def fetch() -> Enumeration:
+            return _enum([1])
+
+        result = await cache.cached_enumerate(key, fetch)  # must NOT raise
+        assert result.items == [1]
+    finally:
+        set_collector(None)
+
+
+async def test_disabled_emits_nothing_and_bare_fetches() -> None:
+    from manga_gateway.metrics.collector import set_collector
+
+    fake = _FakeCollector()
+    set_collector(fake)  # type: ignore[arg-type]
+    try:
+        cache = EnumerationCache(ttl=1800, maxsize=8, enabled=False)
+        key = EnumerationCache.enum_key("mangadex", "s", ["en"])
+        calls = 0
+
+        async def fetch() -> Enumeration:
+            nonlocal calls
+            calls += 1
+            return _enum([1])
+
+        await cache.cached_enumerate(key, fetch)
+        await cache.cached_enumerate(key, fetch)
+        assert calls == 2  # no caching when disabled
+        assert fake.cache_calls == []  # no emit when disabled (D-08)
+    finally:
+        set_collector(None)
