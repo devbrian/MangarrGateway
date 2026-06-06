@@ -27,6 +27,7 @@ from .api import api_router
 from .config import Settings
 from .errors import register_error_handlers
 from .framework.antibot import CloudflareSolver
+from .framework.enum_cache import EnumerationCache
 from .framework.health import SourceHealth
 from .framework.proxy import build_proxy
 from .framework.ratelimit import RateLimiter
@@ -285,6 +286,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # bootstrap GET shares the per-source limiter — see above.)
     app.state.caps_cache = TTLCache(maxsize=1, ttl=_CAPS_TTL_SECONDS)  # PLAT-04
     app.state.handle_store = HandleStore()  # opaque downloadHandle store (HDL-01/02)
+    # CACHE-01: ONE process-wide enumeration cache for the whole lifespan (R1), built
+    # from settings exactly like RateLimiter()/HandleStore() above. The per-source TTL
+    # override map (D-09) is harvested from the registry the SAME way cf_sources /
+    # csrf_bootstrap_keys are derived — anything declaring ``enum_cache_ttl_seconds``
+    # contributes an override; the framework clamps each entry to the 60-min handle TTL
+    # (CACHE-05). The POST /search route threads this into its SourceContext; the recent
+    # + download paths leave the default None (CACHE-05).
+    enum_cache_ttl_overrides: dict[str, int] = {
+        key: cls.enum_cache_ttl_seconds
+        for key, cls in registry.items()
+        if cls.enum_cache_ttl_seconds is not None
+    }
+    app.state.enum_cache = EnumerationCache(
+        maxsize=settings.enum_cache_maxsize,
+        ttl=settings.enum_cache_ttl_seconds,
+        enabled=settings.enum_cache_enabled,
+        ttl_overrides=enum_cache_ttl_overrides,
+    )
     # Download surface: aiosqlite job store + lifespan-owned JobManager (PLAT-03).
     store = await open_store(settings.db_path)
     job_manager = JobManager(

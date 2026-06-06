@@ -60,6 +60,30 @@ class _FakeCtxForSearch:
         self.json_calls: list[tuple[str, dict[str, Any]]] = []
         self.array_calls: list[str] = []
 
+    # Enum-cache seam (09-06): mirror the real SourceContext's default-None
+    # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
+    # tests exercise byte-for-byte the pre-cache behavior they were written for.
+    def cached_resolve_key(
+        self, normalized_query: str, languages: list[str], *, extra: object = None
+    ) -> tuple[Any, ...]:
+        base = ("mangadot", normalized_query, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
+
+    def cached_enumerate_key(
+        self, series_id: str, languages: list[str], *, extra: object = None
+    ) -> tuple[Any, ...]:
+        base = ("mangadot", series_id, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
+
+    async def cached_resolve(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    def cache_replace(self, key: tuple[Any, ...], enum: Any) -> None:
+        return None
+
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         self.json_calls.append((url, params))
         if url == _SEARCH:

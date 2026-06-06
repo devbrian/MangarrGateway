@@ -19,8 +19,9 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from ..framework.base import Source
+from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
-from ..framework.relevance import prune_candidates
+from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -80,20 +81,40 @@ class MangaDexSource(Source):
                 if req.interactive
                 else _DEFAULT_MANGA_CANDIDATES
             )
-            candidates = await self._search_manga_titles(req.query or "", count, ctx)
-            # Prune obviously-irrelevant candidates BEFORE the per-candidate
-            # chapter-feed fan-out (#126): an exact-match query enumerates only
-            # the one correct series; ambiguous queries still fan out to ``count``
-            # (the prune falls back to the historic ``candidates[:count]``). Each
-            # candidate is scored over its MAIN *or* any ALTERNATE/native title
-            # (#139) — a query matching only the native name still prunes to it.
-            candidates = prune_candidates(
-                candidates,
-                req.query or "",
-                keys=lambda c: c.titles,
-                cap=count,
+
+            async def _resolve_fn() -> list[_MangaCandidate]:
+                found = await self._search_manga_titles(req.query or "", count, ctx)
+                # Prune obviously-irrelevant candidates BEFORE the per-candidate
+                # chapter-feed fan-out (#126): an exact-match query enumerates only
+                # the one correct series; ambiguous queries still fan out to
+                # ``count`` (the prune falls back to the historic
+                # ``candidates[:count]``). Each candidate is scored over its MAIN
+                # *or* any ALTERNATE/native title (#139) — a query matching only the
+                # native name still prunes to it.
+                return prune_candidates(
+                    found,
+                    req.query or "",
+                    keys=lambda c: c.titles,
+                    cap=count,
+                )
+
+            # Layer 1 (D-01): cache the title→candidate-id resolution so a repeat
+            # chapter search on the same (query, languages) skips the /manga?title=
+            # call entirely (genuinely zero upstream calls on a HIT). The ID-first
+            # branch above caches NEITHER layer (D-02 — already one resolved
+            # candidate). The key normalizes the query the SAME way the relevance
+            # scorer does so punctuation/case variants collapse onto one entry.
+            # WR-01: the resolved candidate set widens with ``req.interactive``
+            # (``count`` is 15 vs 5), so ``count`` rides the key — an interactive
+            # search after a non-interactive one (or vice-versa) is a MISS, not a
+            # HIT served the wrong-width candidate list.
+            resolve_key = ctx.cached_resolve_key(
+                _normalize(req.query or ""), languages, extra=count
             )
-            # 260605-e9a deliverable 5: how many manga we deep-enumerate.
+            candidates: list[_MangaCandidate] = await ctx.cached_resolve(
+                resolve_key, _resolve_fn
+            )
+            # 260605-e9a deliverable 5: how many manga we deep-enumerate (HIT too).
             ctx.candidates_enumerated = len(candidates)
             manga_ids = [c.manga_id for c in candidates]
 
@@ -107,10 +128,32 @@ class MangaDexSource(Source):
             else None
         )
         for manga_id in manga_ids:
-            chapters = await self._walk_chapter_feed(
-                manga_id, languages, req.offset, ctx, stop_floor=stop_floor
+            # Layer 2 (CACHE-02/03): cache the COMPLETE walked chapter feed per
+            # (manga_id, languages, walk-window). The walk's output depends on the
+            # WHOLE window it covers — its mode (paginate-all vs bounded early-stop,
+            # carried by ``stop_floor``) and its ``req.offset`` start cursor — so both
+            # ride the Layer-2 key as the ``extra`` discriminator (CR-01): a HIT keyed
+            # on a narrower/older window can never serve a stale or truncated page
+            # (offset paging returns the correct page; a larger request is a MISS, not
+            # a truncated HIT). A HIT still costs no upstream call and no rate-limit
+            # token — the limiter lives inside ``_fetch_chapter_feed`` (via
+            # ``get_json``), one level deeper than the cache check.
+            enum_key = ctx.cached_enumerate_key(
+                manga_id, languages, extra=(stop_floor, req.offset)
             )
-            for chapter in chapters:
+
+            async def _feed_fn(_mid: str = manga_id) -> Enumeration:
+                # The walk is COMPLETE for its mode (paginate-all exhausts the feed;
+                # a chapter-specific walk stops only once the asc cursor floors past
+                # the requested family), so it handles floor-bounding and exhaustion
+                # internally — there is no completeness-refetch path anymore (CR-01).
+                chapters = await self._walk_chapter_feed(
+                    _mid, languages, req.offset, ctx, stop_floor=stop_floor
+                )
+                return self._build_enumeration(chapters)
+
+            enum = await ctx.cached_enumerate(enum_key, _feed_fn)
+            for chapter in enum.items:
                 rel = self._to_release(manga_id, chapter, ctx)
                 # 260606-2ff: under type=chapter+chapter, keep only the requested
                 # whole-number/floor family (gate-off = pass-through). chapter_matches
@@ -321,7 +364,12 @@ class MangaDexSource(Source):
         locked guard against a premature stop).
         """
         for chapter in page:
-            number = self._parse_decimal(chapter.get("attributes", {}).get("chapter"))
+            # ``_fetch_chapter_feed`` admits ``{"attributes": None}`` rows; guard the
+            # dereference so a malformed row can't AttributeError the bounded walk
+            # (CodeRabbit) — a non-dict attributes simply contributes no floor.
+            if not isinstance((attrs := chapter.get("attributes")), dict):
+                continue
+            number = self._parse_decimal(attrs.get("chapter"))
             if number is not None and math.floor(number) > stop_floor:
                 return True
         return False
@@ -365,12 +413,42 @@ class MangaDexSource(Source):
         total = raw_total if isinstance(raw_total, int) else None
         return page, total
 
+    def _build_enumeration(self, chapters: list[dict[str, Any]]) -> Enumeration:
+        """Wrap the FULLY-WALKED chapter feed in a COMPLETE :class:`Enumeration`.
+
+        ``_walk_chapter_feed`` returns the complete feed for its mode (paginate-all
+        exhausts the feed; a bounded chapter-specific walk stops only once the asc
+        cursor floors past the requested family), so the cached enumeration is always
+        ``exhausted=True`` — the obsolete completeness-refetch path (and its
+        ``feed_limit`` arg) is gone (CR-01). ``chapter_numbers`` carries every parsed
+        ``Decimal`` chapter (rows with an unparseable/absent chapter are skipped) so
+        ``Enumeration.covers_floor`` stays well-defined for any other caller.
+        """
+        chapter_numbers = tuple(
+            d
+            for c in chapters
+            if isinstance((attrs := c.get("attributes")), dict)
+            and (d := self._parse_decimal(attrs.get("chapter"))) is not None
+        )
+        return Enumeration(
+            items=chapters,
+            chapter_numbers=chapter_numbers,
+            exhausted=True,
+            requested_limit=len(chapters),
+        )
+
     # ─────────────────────────── Release normalization ───────────────────────────
 
     def _to_release(
         self, manga_id: str, chapter: dict[str, Any], ctx: SourceContext
     ) -> Release | None:
-        attrs = chapter.get("attributes", {})
+        # ``_fetch_chapter_feed`` admits malformed ``{"attributes": None}`` rows; such
+        # a row carries no chapter data, so DROP it rather than mint a degenerate
+        # handle with ``chapter_number=None`` (CodeRabbit). A ``.get(..., {})`` default
+        # would not catch this — the key is present with a ``None`` value.
+        attrs = chapter.get("attributes")
+        if not isinstance(attrs, dict):
+            return None
         # Skip off-site chapters this phase (Open Q 2) — Phase 3 resolution would
         # fail; note carried forward for Phase 3.
         if attrs.get("externalUrl"):

@@ -65,6 +65,13 @@ class Source(ABC):
     # explicitly (e.g. mangadot=3); the job manager clamps it to the global bound.
     # Sources with a parallelism constraint (e.g. comix CF-nav) leave it None.
     max_concurrent_jobs: int | None = None
+    # D-09 per-source enumeration-cache TTL override (seconds). ``None`` = use the
+    # global ``settings.enum_cache_ttl_seconds`` default. A source whose feed is
+    # unusually volatile/stable can shorten/lengthen its cache window; the app
+    # lifespan collects every non-None value into the EnumerationCache's
+    # ``ttl_overrides`` map, and the framework clamps each entry to the 60-min handle
+    # TTL ceiling (CACHE-05) regardless of the override.
+    enum_cache_ttl_seconds: int | None = None
 
     @staticmethod
     def chapter_matches(req: SearchRequest, chapter_number: Decimal | None) -> bool:

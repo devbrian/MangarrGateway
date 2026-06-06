@@ -39,3 +39,14 @@ output_root = "/data/manga"
 # cloudflare_proxy_server = "http://host:port"
 # cloudflare_proxy_username = "<proxy username>"
 # cloudflare_proxy_password = "<from env GATEWAY_CLOUDFLARE_PROXY_PASSWORD; do not hand-edit>"
+
+# ── Search-result / chapter-link caching (Phase 9) ────────────────────────────
+# The source-agnostic enumeration cache (env > TOML > default).
+# enum_cache_enabled: kill-switch (D-08), default true. Set false to disable
+#   caching entirely while debugging stale/wrong results.
+# enum_cache_maxsize: max cached series enumerations (≥1). Caps cache memory.
+# enum_cache_ttl_seconds: cache TTL; default 1800 (30 min). MUST stay ≤ 3600 (the
+#   60-min downloadHandle TTL) — the gateway fails fast at startup otherwise (D-09).
+enum_cache_enabled = true
+enum_cache_maxsize = 512
+enum_cache_ttl_seconds = 1800

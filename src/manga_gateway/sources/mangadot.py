@@ -79,8 +79,9 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from ..framework.base import Source
+from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
-from ..framework.relevance import prune_candidates
+from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -209,28 +210,41 @@ class MangadotSource(Source):
         aggregation preserves submission order (``asyncio.gather`` returns results
         in task order). ZERO networking glue — both calls ride ``ctx`` (SRC-01/02).
         """
-        envelope = await ctx.get_json(
-            f"{self.base_url}/api/search",
-            search=req.query or "",
-            sortBy="relevance",
-            page=1,
+
+        async def _resolve_fn() -> list[dict[str, Any]]:
+            envelope = await ctx.get_json(
+                f"{self.base_url}/api/search",
+                search=req.query or "",
+                sortBy="relevance",
+                page=1,
+            )
+            manga_list = envelope.get("manga_list")
+            dict_candidates = [m for m in (manga_list or []) if isinstance(m, dict)]
+            # Prune obviously-irrelevant candidates BEFORE the per-candidate
+            # chapters/list fan-out (#126): an exact-match query enumerates only the
+            # one correct series; ambiguous queries still fan out to the cap (the
+            # prune falls back to the historic ``[:_DEFAULT_MANGA_CANDIDATES]``).
+            return prune_candidates(
+                dict_candidates,
+                req.query or "",
+                # Score over the main title OR any alternate/native title (#139). The
+                # alt-title field is absent from the current mangadot search payload,
+                # so ``or []`` keeps behavior byte-identical until/if it appears.
+                keys=lambda m: [m.get("title"), *(m.get("alt_titles") or [])],
+                cap=_DEFAULT_MANGA_CANDIDATES,
+            )
+
+        # Layer 1 (D-01): cache the title→pruned-candidate resolution so a repeat
+        # chapter search on the same (query, languages) skips the ``/api/search``
+        # call entirely (genuinely zero upstream calls on a HIT). The key normalizes
+        # the query the SAME way the relevance scorer does so case/punctuation
+        # variants collapse onto one entry (T-09-01: never keys on type/chapter).
+        candidates: list[dict[str, Any]] = await ctx.cached_resolve(
+            ctx.cached_resolve_key(_normalize(req.query or ""), req.languages or []),
+            _resolve_fn,
         )
-        manga_list = envelope.get("manga_list")
-        dict_candidates = [m for m in (manga_list or []) if isinstance(m, dict)]
-        # Prune obviously-irrelevant candidates BEFORE the per-candidate
-        # chapters/list fan-out (#126): an exact-match query enumerates only the
-        # one correct series; ambiguous queries still fan out to the cap (the
-        # prune falls back to the historic ``[:_DEFAULT_MANGA_CANDIDATES]``).
-        candidates = prune_candidates(
-            dict_candidates,
-            req.query or "",
-            # Score over the main title OR any alternate/native title (#139). The
-            # alt-title field is absent from the current mangadot search payload,
-            # so ``or []`` keeps behavior byte-identical until/if it appears.
-            keys=lambda m: [m.get("title"), *(m.get("alt_titles") or [])],
-            cap=_DEFAULT_MANGA_CANDIDATES,
-        )
-        # 260605-e9a deliverable 5: how many manga candidates we deep-enumerate.
+        # 260605-e9a deliverable 5: how many manga candidates we deep-enumerate (HIT
+        # too — set AFTER the resolve).
         ctx.candidates_enumerated = len(candidates)
         wanted_langs = set(req.languages) if req.languages else None
         limit = req.limit or 50
@@ -241,12 +255,44 @@ class MangadotSource(Source):
         sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
 
         async def _fetch_candidate(manga_id: str, manga_title: str) -> list[Release]:
-            async with sem:
-                rows = await ctx.get_json_array(
-                    f"{self.base_url}/api/manga/{manga_id}/chapters/list"
+            # Layer 2 (CACHE-02/03): cache the UNFILTERED per-candidate chapters/list
+            # enumeration per (manga_id, languages). The ``async with sem:`` + the
+            # ``get_json_array`` upstream fetch live INSIDE ``_enum_fn`` so a HIT
+            # acquires NEITHER the fan-out semaphore NOR a rate-limit token (the
+            # limiter lives inside ``get_json_array``, one level below the cache
+            # check). ``exhausted=True``: ``/chapters/list`` returns the COMPLETE feed,
+            # so ``covers_floor`` is always True and no deeper refetch exists.
+            async def _enum_fn() -> Enumeration:
+                async with sem:
+                    rows = await ctx.get_json_array(
+                        f"{self.base_url}/api/manga/{manga_id}/chapters/list"
+                    )
+                return Enumeration(
+                    items=rows,
+                    chapter_numbers=tuple(
+                        d
+                        for r in rows
+                        if isinstance(r, dict)
+                        and (d := self._parse_decimal(r.get("chapter_number")))
+                        is not None
+                    ),
+                    exhausted=True,
+                    requested_limit=limit,
                 )
+
+            # IN-02: ``/chapters/list`` returns the whole manga's feed and does NOT
+            # depend on ``languages`` (the language filter is applied post-cache), so
+            # key on ``[]`` — different-language requests for one manga share the
+            # cached listing instead of re-fetching byte-identical data per language.
+            enum = await ctx.cached_enumerate(
+                ctx.cached_enumerate_key(manga_id, []), _enum_fn
+            )
+            # _chapters_to_releases is UNCHANGED — the chapter_matches filter +
+            # newest-first sort + [:limit] + GAP-2 mint-after-slice all stay; it
+            # simply consumes ``enum.items`` (the cached raw rows) instead of the
+            # raw fetch result.
             return self._chapters_to_releases(
-                rows, manga_id, manga_title, wanted_langs, limit, ctx, req
+                enum.items, manga_id, manga_title, wanted_langs, limit, ctx, req
             )
 
         # Pre-filter candidates lacking a usable ``id`` BEFORE dispatching tasks — a

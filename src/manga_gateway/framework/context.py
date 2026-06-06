@@ -41,11 +41,14 @@ from .decrypt import decrypt
 from .errors import SourceError
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from aiolimiter import AsyncLimiter
 
     from ..handles.store import HandleStore
     from ..models.caps import AntibotLevel
     from .antibot import AntiBotSolver
+    from .enum_cache import CacheKey, Enumeration, EnumerationCache
     from .health import SourceHealth
     from .ratelimit import RateLimiter
     from .session import SessionManager
@@ -136,6 +139,7 @@ class SourceContext:
         session_prep: SessionPrep | None = None,
         expected_pages: int | None = None,
         candidates_enumerated: int | None = None,
+        enum_cache: EnumerationCache | None = None,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -168,6 +172,12 @@ class SourceContext:
         # and threads it onto the per-source ``source-result`` metric event.
         # ``None`` for sources that do not deep-enumerate.
         self.candidates_enumerated = candidates_enumerated
+        # Phase-9 enumeration-cache seam (CACHE-01, default-off → MangaDex/Comix and
+        # every non-app unit test stay byte-for-byte unchanged, matching the
+        # solver/session_prep default-None seams). ONE process-wide EnumerationCache
+        # is threaded in by the POST /search route; the recent + download paths leave
+        # it None (recent is never cached, download resolves one handle — CACHE-05).
+        self._enum_cache = enum_cache
 
     @property
     def handle_store(self) -> HandleStore:
@@ -329,6 +339,73 @@ class SourceContext:
                 f"non-array JSON body (got {type(result).__name__})",
             )
         return result
+
+    # ─────────────────────────── enumeration cache ───────────────────────────
+
+    async def cached_enumerate(
+        self, key: CacheKey, fetch_fn: Callable[[], Awaitable[Enumeration]]
+    ) -> Enumeration:
+        """Layer-2 chapter-feed enumeration through the injected cache (CACHE-01/03).
+
+        A thin pass-through: with ``enum_cache=None`` (the default seam) this is a bare
+        ``await fetch_fn()`` — byte-for-byte the pre-seam path, no caching. With a cache
+        injected a HIT returns the cached :class:`Enumeration` WITHOUT re-running
+        ``fetch_fn`` (and therefore without acquiring ``self._limiter`` — the limiter
+        lives inside ``fetch_fn``, one level deeper than the cache check, so a HIT costs
+        no upstream call and no token, CACHE-03).
+        """
+        if self._enum_cache is None:
+            return await fetch_fn()
+        return await self._enum_cache.cached_enumerate(key, fetch_fn)
+
+    async def cached_resolve(
+        self, key: CacheKey, fetch_fn: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        """Layer-1 title/query → series-id resolution through the cache (D-01).
+
+        Same HIT / miss / ``None``-default semantics as :meth:`cached_enumerate`; the
+        limiter stays inside ``fetch_fn`` (CACHE-03).
+        """
+        if self._enum_cache is None:
+            return await fetch_fn()
+        return await self._enum_cache.cached_resolve(key, fetch_fn)
+
+    def cache_replace(self, key: CacheKey, enum: Enumeration) -> None:
+        """Overwrite the Layer-2 window after a completeness-driven deeper refetch
+        (CACHE-04). A no-op when ``enum_cache`` is absent/disabled."""
+        if self._enum_cache is None:
+            return
+        self._enum_cache.cache_replace(key, enum)
+
+    def cached_enumerate_key(
+        self, series_id: str, languages: list[str], *, extra: Any = None
+    ) -> CacheKey:
+        """Build the canonical Layer-2 cache key for THIS source (T-09-01).
+
+        Delegates to :meth:`EnumerationCache.enum_key` so the source cannot
+        accidentally key on ``type``/``chapter`` — only
+        ``(source_key, series_id, sorted(languages)[, extra])``. ``extra`` carries
+        a source-supplied discriminator (e.g. MangaDex's ``(stop_floor, offset)``
+        window, CR-01); language-agnostic sources pass ``languages=[]`` (IN-02).
+        """
+        from .enum_cache import EnumerationCache  # noqa: PLC0415
+
+        return EnumerationCache.enum_key(
+            self._source_key, series_id, languages, extra=extra
+        )
+
+    def cached_resolve_key(
+        self, normalized_query: str, languages: list[str], *, extra: Any = None
+    ) -> CacheKey:
+        """Build the canonical Layer-1 cache key for THIS source (D-01/T-09-01).
+
+        ``extra`` carries a source-supplied discriminator (e.g. the interactive
+        candidate count on MangaDex/Comix, WR-01) appended to the key tuple."""
+        from .enum_cache import EnumerationCache  # noqa: PLC0415
+
+        return EnumerationCache.resolve_key(
+            self._source_key, normalized_query, languages, extra=extra
+        )
 
     # ─────────────────────────── HTTP ───────────────────────────
 
