@@ -46,6 +46,19 @@ _MAX_LIMIT = 1000
 _DEFAULT_LIMIT = 25
 
 LimitQuery = Annotated[int, Query(ge=1, le=_MAX_LIMIT)]
+# 260606-0mq: default False = filter unrouted noise (events whose ``endpoint`` is
+# null — 404s to unknown paths, /openapi.json, /docs, admin-metrics polling) out of
+# the three event feeds. ``?include_unrouted=true`` restores the full output. The
+# filter is applied IN SQL in the store so LIMIT bounds the filtered set.
+IncludeUnroutedQuery = Annotated[
+    bool,
+    Query(
+        description=(
+            "Include unrouted events (endpoint=null: 404s to unknown paths, "
+            "/openapi.json, /docs, admin-metrics polling). Default false hides them."
+        )
+    ),
+]
 StoreDep = Annotated[InMemoryStore, Depends(get_metric_store)]
 # The disk ring store (recent/failures/slow/requests-{id}); ``None`` in the
 # degraded mode where the snapshot DB could not be opened — handlers then return
@@ -71,12 +84,14 @@ async def get_per_source_endpoint(store: StoreDep) -> list[dict[str, Any]]:
     response_model=list[MetricEventOut],
 )
 async def get_failures(
-    ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
+    ring: RingDep,
+    limit: LimitQuery = _DEFAULT_LIMIT,
+    include_unrouted: IncludeUnroutedQuery = False,
 ) -> list[dict[str, Any]]:
     """The most recent failed calls, newest first (the failures feed)."""
     if ring is None:
         return []
-    return await ring.latest_failures(limit)
+    return await ring.latest_failures(limit, include_unrouted=include_unrouted)
 
 
 @router.get(
@@ -85,12 +100,14 @@ async def get_failures(
     response_model=list[MetricEventOut],
 )
 async def get_slow(
-    ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
+    ring: RingDep,
+    limit: LimitQuery = _DEFAULT_LIMIT,
+    include_unrouted: IncludeUnroutedQuery = False,
 ) -> list[dict[str, Any]]:
     """The most recent baseline-relative slow calls, newest first."""
     if ring is None:
         return []
-    return await ring.latest_slow(limit)
+    return await ring.latest_slow(limit, include_unrouted=include_unrouted)
 
 
 @router.get(
@@ -99,12 +116,14 @@ async def get_slow(
     response_model=list[MetricEventOut],
 )
 async def get_recent(
-    ring: RingDep, limit: LimitQuery = _DEFAULT_LIMIT
+    ring: RingDep,
+    limit: LimitQuery = _DEFAULT_LIMIT,
+    include_unrouted: IncludeUnroutedQuery = False,
 ) -> list[dict[str, Any]]:
     """The most recent calls of any outcome, newest first (live activity)."""
     if ring is None:
         return []
-    return await ring.recent_calls(limit)
+    return await ring.recent_calls(limit, include_unrouted=include_unrouted)
 
 
 @router.get(
