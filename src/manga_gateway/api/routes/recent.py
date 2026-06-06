@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Annotated
 from fastapi import APIRouter, Depends, Query, Request
 
 from ...deps import (
+    get_failure_cooldown,
     get_handle_store,
     get_ratelimiter,
     get_registry,
@@ -30,6 +31,7 @@ from ...deps import (
 # dependency types cannot live under TYPE_CHECKING (Plan 01 deviation precedent).
 from ...framework.antibot import AntiBotSolver
 from ...framework.context import SourceContext
+from ...framework.cooldown import SourceFailureCooldown
 from ...framework.fanout import fan_out
 from ...framework.health import SourceHealth
 from ...framework.ratelimit import RateLimiter
@@ -134,6 +136,9 @@ async def get_recent(
     solver: Annotated[AntiBotSolver, Depends(get_solver)],
     health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
+    failure_cooldown: Annotated[
+        SourceFailureCooldown, Depends(get_failure_cooldown)
+    ],
     sources: Annotated[
         list[str] | None,
         Query(description="Source keys: repeated param (?sources=a&sources=b) or CSV"),
@@ -198,7 +203,9 @@ async def get_recent(
         _emit_source_result(len(releases), ctx.candidates_enumerated)
         return releases
 
-    releases, warning_tuples = await fan_out(selected, _run_one)
+    releases, warning_tuples = await fan_out(
+        selected, _run_one, cooldown=failure_cooldown
+    )
 
     # RCNT-02: defensive client-side `since` cut — the contract guarantee holds even if
     # a source ignored the upstream hint (RESEARCH A3). Datetime-parsed compare (WR-02):

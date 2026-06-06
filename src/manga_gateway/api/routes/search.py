@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 
 from ...deps import (
     get_enum_cache,
+    get_failure_cooldown,
     get_handle_store,
     get_ratelimiter,
     get_registry,
@@ -33,6 +34,7 @@ from ...errors import _error
 # dependency types cannot live under TYPE_CHECKING.
 from ...framework.antibot import AntiBotSolver
 from ...framework.context import SourceContext
+from ...framework.cooldown import SourceFailureCooldown
 from ...framework.enum_cache import EnumerationCache
 from ...framework.fanout import fan_out
 from ...framework.health import SourceHealth
@@ -129,6 +131,9 @@ async def search(
     health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
     enum_cache: Annotated[EnumerationCache, Depends(get_enum_cache)],
+    failure_cooldown: Annotated[
+        SourceFailureCooldown, Depends(get_failure_cooldown)
+    ],
 ) -> ReleaseListResponse | JSONResponse:
     """Fan out the search across selected sources; isolate failures into warnings[]."""
     # 260605-e9a deliverable 1: capture the request blob (method/path/query from
@@ -213,6 +218,7 @@ async def search(
         sources,
         _run_one,
         collect_warnings=lambda src: soft_warnings.get(src.key, []),
+        cooldown=failure_cooldown,
     )
     # #99: merge newest-first by publishDate across ALL sources BEFORE truncating —
     # mirroring /recent (RCNT-01). fan_out concatenates results in source order, so
