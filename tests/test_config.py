@@ -308,6 +308,12 @@ def test_warm_attempts_rejects_non_positive() -> None:
         Settings(api_key=_DUMMY_KEY, cloudflare_warm_attempts=0)
 
 
+def test_warm_retry_seconds_rejects_negative() -> None:
+    """#153: ge=0.0 — negative backoff is rejected at construction."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=_DUMMY_KEY, cloudflare_warm_retry_seconds=-1.0)
+
+
 def test_env_overrides_warm_retry_knobs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
