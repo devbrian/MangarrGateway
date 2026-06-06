@@ -136,9 +136,7 @@ async def get_recent(
     solver: Annotated[AntiBotSolver, Depends(get_solver)],
     health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
-    failure_cooldown: Annotated[
-        SourceFailureCooldown, Depends(get_failure_cooldown)
-    ],
+    failure_cooldown: Annotated[SourceFailureCooldown, Depends(get_failure_cooldown)],
     sources: Annotated[
         list[str] | None,
         Query(description="Source keys: repeated param (?sources=a&sources=b) or CSV"),
