@@ -376,6 +376,28 @@ class _FakeMangaDexCtx:
         self.feed_calls: list[str] = []
         self.candidates_enumerated: int | None = None
 
+    # Enum-cache seam (09-04): mirror the real SourceContext's default-None
+    # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
+    # integration tests exercise byte-for-byte the pre-cache behavior.
+    def cached_resolve_key(
+        self, normalized_query: str, languages: list[str]
+    ) -> tuple[Any, ...]:
+        return ("mangadex", normalized_query, tuple(sorted(languages)))
+
+    def cached_enumerate_key(
+        self, series_id: str, languages: list[str]
+    ) -> tuple[Any, ...]:
+        return ("mangadex", series_id, tuple(sorted(languages)))
+
+    async def cached_resolve(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    def cache_replace(self, key: tuple[Any, ...], enum: Any) -> None:
+        return None
+
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         if url == _MANGADEX_SEARCH:
             return {"result": "ok", "data": self._search_data}
