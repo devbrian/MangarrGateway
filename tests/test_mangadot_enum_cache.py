@@ -95,14 +95,16 @@ class _CountingCtx:
 
     # Enum-cache seam — delegate to the real cache (mirrors SourceContext).
     def cached_resolve_key(
-        self, normalized_query: str, languages: list[str]
+        self, normalized_query: str, languages: list[str], *, extra: object = None
     ) -> tuple[Any, ...]:
-        return ("mangadot", normalized_query, tuple(sorted(languages)))
+        base = ("mangadot", normalized_query, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
 
     def cached_enumerate_key(
-        self, series_id: str, languages: list[str]
+        self, series_id: str, languages: list[str], *, extra: object = None
     ) -> tuple[Any, ...]:
-        return ("mangadot", series_id, tuple(sorted(languages)))
+        base = ("mangadot", series_id, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
 
     async def cached_resolve(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await self._enum_cache.cached_resolve(key, fetch_fn)

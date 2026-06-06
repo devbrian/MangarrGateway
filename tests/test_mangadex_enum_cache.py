@@ -6,9 +6,11 @@ success criteria:
 * **Test A** (criterion 1) — a type=manga search then a same-series type=chapter
   search through ONE ``SourceContext`` + ``EnumerationCache`` issues ZERO upstream
   ``/manga`` and ``/chapter`` calls on the second search (both layers HIT).
-* **Test B** (criterion 2) — a type=chapter floor query BELOW a cached non-exhausted
-  window triggers exactly one deeper ``/chapter`` refetch clamped to ``limit=100``
-  (completeness refetch, CACHE-04), instead of a false-empty.
+* **Test B** (criterion 2) — a type=manga search PAGINATE-ALL walks the full chapter
+  feed across multiple ``/chapter`` pages (page size ``_MAX_FEED_LIMIT=100``) and
+  caches the COMPLETE feed. The obsolete completeness-refetch path is gone (CR-01):
+  the walk handles exhaustion internally, so a deep chapter is never truncated and
+  never needs a deeper refetch.
 * **Test C** (criterion 4) — two ``recent()`` calls each hit ``/chapter``; recent is
   never cached (CACHE-05).
 * **Test D** (kill-switch) — ``EnumerationCache(enabled=False)`` restores the
@@ -156,31 +158,36 @@ async def test_second_same_series_chapter_search_zero_upstream_calls() -> None:
         await transport.aclose()
 
 
-# ──────────────── Test B: below-window floor query refetches at 100 ────────────────
+# ──────────── Test B: paginate-all walk spans multiple feed pages, no refetch ───────
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_below_window_chapter_search_refetches_deeper_at_100() -> None:
-    """criterion 2: a floor below the cached window refetches deeper, limit=100."""
+async def test_paginate_all_walk_spans_multiple_feed_pages() -> None:
+    """criterion 2: a type=manga search walks the full feed across pages at limit=100.
+
+    The completeness-refetch path is gone (CR-01): the walk pages through the whole
+    feed itself (page size ``_MAX_FEED_LIMIT``=100, advancing ``offset``), caches the
+    COMPLETE feed, and never truncates — so no deeper refetch is ever needed.
+    """
     manga_id = str(uuid.uuid4())
     respx.get(f"{MANGADEX}/manga").mock(
         return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
     )
-    seen_limits: list[str | None] = []
+    seen: list[tuple[str | None, str | None]] = []
 
     def _chapter_responder(request: httpx.Request) -> httpx.Response:
         limit = request.url.params.get("limit")
-        seen_limits.append(limit)
-        if limit == "100":
-            # the deeper refetch reaches the older chapters that cover floor 5
-            return httpx.Response(
-                200, json=_chapter_feed_payload(manga_id, ["1", "2", "3", "4", "5"])
-            )
-        # the initial (limit=3) page is a non-exhausted window of 50..60
-        return httpx.Response(
-            200, json=_chapter_feed_payload(manga_id, ["50", "55", "60"])
-        )
+        offset = request.url.params.get("offset")
+        seen.append((limit, offset))
+        if offset == "0":
+            # a FULL page (100 rows) → the walker must fetch a second page.
+            payload = _chapter_feed_payload(manga_id, [str(n) for n in range(1, 101)])
+        else:
+            # a SHORT second page (50 rows) → exhaustion, the walk stops.
+            payload = _chapter_feed_payload(manga_id, [str(n) for n in range(101, 151)])
+        payload["total"] = 150
+        return httpx.Response(200, json=payload)
 
     chapter_route = respx.get(f"{MANGADEX}/chapter").mock(
         side_effect=_chapter_responder
@@ -188,20 +195,16 @@ async def test_below_window_chapter_search_refetches_deeper_at_100() -> None:
     src = MangaDexSource()
     ctx, transport = _build_ctx(EnumerationCache())
     try:
-        # limit=3 returns exactly 3 rows → exhausted=False → a real cached window.
-        await src.search(
-            SearchRequest(type="manga", query="Solo Leveling", limit=3), ctx
+        result = await src.search(
+            SearchRequest(type="manga", query="Solo Leveling"), ctx
         )
-        assert seen_limits == ["3"]
-        chapter_before = chapter_route.call_count
-
-        # chapter=5 floors below the cached [50, 60] window (not exhausted) → one
-        # deeper refetch clamped to _MAX_FEED_LIMIT (100), not a false-empty.
-        await src.search(
-            SearchRequest(type="chapter", query="Solo Leveling", chapter=5), ctx
-        )
-        assert chapter_route.call_count - chapter_before == 1
-        assert seen_limits[-1] == "100"  # clamped deeper refetch (CACHE-04 / T-09-08)
+        # The walk paged TWICE — every page at the _MAX_FEED_LIMIT=100 ceiling,
+        # advancing the offset cursor — then stopped on the short page. No refetch.
+        assert seen == [("100", "0"), ("100", "100")]
+        assert chapter_route.call_count == 2
+        # The cached enumeration holds the COMPLETE 150-chapter feed (mangadex does
+        # NOT pre-truncate to req.limit — the route does that, search.py:218).
+        assert len(result) == 150
     finally:
         await transport.aclose()
 

@@ -14,6 +14,8 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol
 
+import httpx
+
 from ..metrics.context import current_source
 from .errors import SourceError
 
@@ -78,6 +80,28 @@ async def fan_out[S: _HasKey, R](
             warnings.append((src.key, "source_unavailable", "timed out"))
         except SourceError as exc:
             warnings.append((src.key, exc.code, str(exc)))
+        except httpx.HTTPStatusError as exc:
+            # A 5xx that exhausted the SourceContext retry budget reaches here as a
+            # raw HTTPStatusError, NOT a typed SourceError: the permanent-4xx gate
+            # (context._request_bytes) only converts 401/403/404, and tenacity
+            # reraises the underlying 5xx unchanged. Surface the upstream status so an
+            # outage/maintenance 5xx reads as "upstream 503", never the opaque
+            # "unexpected error" (#152: mangadot served a 503 "Under Maintenance"
+            # HTML page → JSON parse never reached → generic warning).
+            warnings.append(
+                (src.key, "source_unavailable", f"upstream {exc.response.status_code}")
+            )
+        except httpx.TransportError as exc:
+            # Connect/read/timeout-class transport failures that exhausted retries are
+            # an upstream-reachability problem, not a gateway bug — name the transport
+            # error class so the warning is diagnosable rather than "unexpected" (#152).
+            warnings.append(
+                (
+                    src.key,
+                    "source_unavailable",
+                    f"transport error: {type(exc).__name__}",
+                )
+            )
         except Exception:  # noqa: BLE001 — isolation: one source must never break others
             warnings.append((src.key, "source_unavailable", "unexpected error"))
         finally:

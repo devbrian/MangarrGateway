@@ -273,14 +273,40 @@ class EnumerationCache:
         _emit_cache(op="enumerate", outcome="refetch", source_key=key[0])
 
     @staticmethod
-    def enum_key(source_key: str, series_id: str, languages: list[str]) -> CacheKey:
+    def enum_key(
+        source_key: str,
+        series_id: str,
+        languages: list[str],
+        *,
+        extra: Any = None,
+    ) -> CacheKey:
         """Layer-2 key (CACHE-03). Excludes ``type``/``chapter`` so a manga search
-        and its chapter follow-ups share one entry (T-09-01)."""
-        return (source_key, series_id, tuple(sorted(languages)))
+        and its chapter follow-ups share one entry (T-09-01).
+
+        ``extra`` is an optional, source-supplied discriminator appended ONLY when
+        non-``None`` so the historic 3-tuple shape is preserved for sources that do
+        not vary their enumeration by anything beyond ``(series_id, languages)``.
+        Sources whose cached enumeration depends on pagination inputs pass the
+        window (e.g. MangaDex's ``(stop_floor, offset)``) here so a HIT can never
+        serve a stale window (CR-01). Language-AGNOSTIC sources (Comix, MangaBall,
+        Mangadot) pass ``languages=[]`` so different-language requests for one title
+        share the cached walk (IN-02)."""
+        base = (source_key, series_id, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
 
     @staticmethod
     def resolve_key(
-        source_key: str, normalized_query: str, languages: list[str]
+        source_key: str,
+        normalized_query: str,
+        languages: list[str],
+        *,
+        extra: Any = None,
     ) -> CacheKey:
-        """Layer-1 key (D-01) — title/query → resolved series-id list."""
-        return (source_key, normalized_query, tuple(sorted(languages)))
+        """Layer-1 key (D-01) — title/query → resolved series-id list.
+
+        ``extra`` carries a source-supplied discriminator (appended ONLY when
+        non-``None`` to preserve the historic 3-tuple shape) for sources whose
+        resolved candidate set depends on more than ``(query, languages)`` — e.g.
+        the interactive vs default candidate count on MangaDex/Comix (WR-01)."""
+        base = (source_key, normalized_query, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)

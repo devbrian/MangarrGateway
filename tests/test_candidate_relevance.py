@@ -232,14 +232,16 @@ class _FakeCtxForSearch:
     # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
     # integration tests exercise byte-for-byte the pre-cache behavior.
     def cached_resolve_key(
-        self, normalized_query: str, languages: list[str]
+        self, normalized_query: str, languages: list[str], *, extra: object = None
     ) -> tuple[Any, ...]:
-        return ("mangadot", normalized_query, tuple(sorted(languages)))
+        base = ("mangadot", normalized_query, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
 
     def cached_enumerate_key(
-        self, series_id: str, languages: list[str]
+        self, series_id: str, languages: list[str], *, extra: object = None
     ) -> tuple[Any, ...]:
-        return ("mangadot", series_id, tuple(sorted(languages)))
+        base = ("mangadot", series_id, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
 
     async def cached_resolve(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await fetch_fn()
@@ -402,14 +404,16 @@ class _FakeMangaDexCtx:
     # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
     # integration tests exercise byte-for-byte the pre-cache behavior.
     def cached_resolve_key(
-        self, normalized_query: str, languages: list[str]
+        self, normalized_query: str, languages: list[str], *, extra: object = None
     ) -> tuple[Any, ...]:
-        return ("mangadex", normalized_query, tuple(sorted(languages)))
+        base = ("mangadex", normalized_query, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
 
     def cached_enumerate_key(
-        self, series_id: str, languages: list[str]
+        self, series_id: str, languages: list[str], *, extra: object = None
     ) -> tuple[Any, ...]:
-        return ("mangadex", series_id, tuple(sorted(languages)))
+        base = ("mangadex", series_id, tuple(sorted(languages)))
+        return base if extra is None else (*base, extra)
 
     async def cached_resolve(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await fetch_fn()

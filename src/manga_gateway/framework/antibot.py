@@ -36,8 +36,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -48,9 +50,19 @@ from ..metrics.collector import get_collector
 from .solver_lifecycle import BrowserLifecycle
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Awaitable, Callable, Iterable
 
 _log = logging.getLogger("manga_gateway")
+
+# Bounded poll budget for the paginated Next-walk (#146): after a JS-click of
+# the Next control, re-run the extract up to ``_PAGINATE_POLL_TICKS`` times
+# spaced ``_PAGINATE_POLL_INTERVAL`` seconds apart, watching for the rendered
+# id-set to change. Exhausting the budget with no change is stop-condition B
+# (no new rows) — a bounded, non-blocking guard against an infinite spin if a
+# site renders an always-present Next that never actually advances. The poll
+# uses ``asyncio.sleep`` (never a blocking sleep) so the event loop stays free.
+_PAGINATE_POLL_TICKS = 20
+_PAGINATE_POLL_INTERVAL = 0.1
 
 # Default URL the solver navigates to for cf_clearance acquisition. Overridden
 # by the application wiring (app.py lifespan) from the concrete source's
@@ -179,6 +191,60 @@ def _looks_like_js_predicate(text: str) -> bool:
     return "=>" in text or "return " in text
 
 
+# Matches a ``limit=<digits>`` query param, capturing the ``?``/``&`` + key so
+# only the numeric value is rewritten (group 1 is kept verbatim). Used by the
+# generic ``route_limit_rewrite`` handler — the SUBSTRING that selects which
+# requests to touch and the TARGET value both arrive from the caller (a source
+# constant), so this framework helper carries no site-specific literal.
+_LIMIT_PARAM_RE = re.compile(r"([?&]limit=)\d+")
+
+
+def _build_limit_rewrite_route_handler(
+    url_substring: str, target_limit: int
+) -> Callable[[Any], Awaitable[None]]:
+    """Build a Patchright ``page.route`` handler that rewrites a ``limit`` param.
+
+    Requests whose URL CONTAINS ``url_substring`` have their ``limit=\\d+`` query
+    value rewritten to ``target_limit`` and are continued with the new URL;
+    every other request is continued untouched. The rewrite is scoped (only the
+    caller-named substring's requests, only the ``limit`` value) and reflects no
+    client input — ``url_substring``/``target_limit`` are source constants
+    (T-eqm-01). ``page.route`` is the mechanism (NOT ``add_init_script``, which
+    Patchright suppresses).
+    """
+
+    async def _handler(route: Any) -> None:
+        req_url = route.request.url
+        if url_substring in req_url:
+            new_url = _LIMIT_PARAM_RE.sub(rf"\g<1>{target_limit}", req_url)
+            await route.continue_(url=new_url)
+        else:
+            await route.continue_()
+
+    return _handler
+
+
+async def _evaluate_guarded(
+    page: Any,
+    script: str,
+    timeout: float,  # noqa: ASYNC109 — per-evaluate budget (wait_for), not a cancel wrapper
+) -> Any:
+    """Run ``page.evaluate(script)`` under a timeout, translating failures.
+
+    Mirrors the extract-call discipline in ``_fetch_via_browser_once``: wraps
+    the evaluate in ``asyncio.wait_for`` and converts a TimeoutError or any
+    other exception into a single :class:`BrowserFetchError` so the caller sees
+    one type. Used by the paginated walk for the extract read, the next-button
+    probe, and the JS-click.
+    """
+    try:
+        return await asyncio.wait_for(page.evaluate(script), timeout=timeout)
+    except TimeoutError as exc:
+        raise BrowserFetchError(f"page.evaluate timed out after {timeout}s") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise BrowserFetchError(f"page.evaluate failed: {exc}") from exc
+
+
 def _attach_browser_event_loggers(page: Any, *, nav_url: str) -> None:
     """Wire ``page.on("pageerror" | "console" | "requestfailed")`` loggers.
 
@@ -265,7 +331,24 @@ class Clearance:
 
 @runtime_checkable
 class AntiBotSolver(Protocol):
-    """Resolves a per-source anti-bot challenge into a reusable clearance."""
+    """Resolves a per-source anti-bot challenge into a reusable clearance.
+
+    Browser-primitive seam (off-Protocol, D-41). The concrete
+    :class:`CloudflareSolver` ALSO exposes two browser-driven content-read
+    primitives that are deliberately NOT members of this ``runtime_checkable``
+    Protocol — adding them would flip ``isinstance(NoopSolver(), AntiBotSolver)``
+    to ``False`` and break the conftest ``_FakeSolver`` (which satisfies the
+    Protocol with only ``get_clearance``) plus the D-41 invariant asserted by
+    ``test_source_health.py``. Sources detect them via ``hasattr`` instead:
+
+    * ``async def fetch_via_browser(url, *, extract, wait_for=None,
+      timeout=30.0) -> Any`` — one-shot goto→wait→evaluate DOM read.
+    * ``async def fetch_via_browser_paginated(url, *, extract, wait_for=None,
+      next_selector, route_limit_rewrite=None, max_pages=200, timeout=30.0)
+      -> list`` — the same one-shot read PLUS an optional ``page.route()``
+      limit-rewrite and an in-page Next-walk that accumulates deduped rows
+      across pagination, all inside ONE page lifecycle (#146).
+    """
 
     async def get_clearance(self, source_key: str) -> Clearance | None:
         """Return clearance for ``source_key``, or ``None`` if none needed."""
@@ -580,26 +663,7 @@ class CloudflareSolver:
             # control flow / exception propagation / timing.
             browser_start = time.perf_counter()
             try:
-                try:
-                    # ``wait_until="commit"`` returns as soon as the response
-                    # is committed (issue #20). The caller's ``wait_for``
-                    # selector / predicate is the meaningful readiness signal —
-                    # blocking goto on ``domcontentloaded`` first adds 1–2s of
-                    # pure overhead since the scaffold wait already covers DOM
-                    # readiness.
-                    await page.goto(url, wait_until="commit", timeout=timeout_ms)
-                except Exception as exc:  # noqa: BLE001
-                    raise BrowserFetchError(f"goto {url!r} failed: {exc}") from exc
-                if wait_for is not None:
-                    try:
-                        if _looks_like_js_predicate(wait_for):
-                            await page.wait_for_function(wait_for, timeout=timeout_ms)
-                        else:
-                            await page.wait_for_selector(wait_for, timeout=timeout_ms)
-                    except Exception as exc:  # noqa: BLE001
-                        raise BrowserFetchError(
-                            f"wait_for {wait_for!r} failed: {exc}"
-                        ) from exc
+                await self._goto_and_wait(page, url, wait_for, timeout_ms)
                 try:
                     result = await asyncio.wait_for(
                         page.evaluate("async () => { " + extract + " }"),
@@ -634,6 +698,323 @@ class CloudflareSolver:
             finally:
                 with contextlib.suppress(Exception):
                     await page.close()
+
+    async def _goto_and_wait(
+        self, page: Any, url: str, wait_for: str | None, timeout_ms: int
+    ) -> None:
+        """Shared goto + optional ``wait_for`` sequence (one place, two callers).
+
+        Navigates with ``wait_until="commit"`` (returns as soon as the response
+        is committed — issue #20; the caller's ``wait_for`` is the meaningful
+        readiness signal, so blocking goto on ``domcontentloaded`` first just
+        adds 1–2s of overhead), then routes ``wait_for`` via
+        :func:`_looks_like_js_predicate` to ``wait_for_function`` (JS predicate)
+        vs ``wait_for_selector`` (CSS selector). Each step is wrapped so the
+        underlying Playwright exception surfaces as a single
+        :class:`BrowserFetchError`. Called by BOTH
+        :meth:`_fetch_via_browser_once` and :meth:`_paginate_via_browser_once`
+        so the goto/wait logic lives in exactly one place — the one-shot read's
+        behavior is byte-for-byte unchanged.
+        """
+        try:
+            await page.goto(url, wait_until="commit", timeout=timeout_ms)
+        except Exception as exc:  # noqa: BLE001
+            raise BrowserFetchError(f"goto {url!r} failed: {exc}") from exc
+        if wait_for is not None:
+            try:
+                if _looks_like_js_predicate(wait_for):
+                    await page.wait_for_function(wait_for, timeout=timeout_ms)
+                else:
+                    await page.wait_for_selector(wait_for, timeout=timeout_ms)
+            except Exception as exc:  # noqa: BLE001
+                raise BrowserFetchError(f"wait_for {wait_for!r} failed: {exc}") from exc
+
+    # ``timeout`` is the per-call Playwright operation budget (goto/wait_for and
+    # each evaluate receive ``timeout``), NOT a cancellation wrapper — same
+    # justification as ``fetch_via_browser``.
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — see comment above
+    ) -> list[Any]:
+        """Navigate ``url`` and walk its in-page Next control, accumulating the
+        full deduped row list across pagination (generic, source-agnostic; #146).
+
+        Like :meth:`fetch_via_browser` this drives the warm browser context and
+        reads JSON-serializable rows out of the rendered DOM via ``extract`` —
+        but instead of a single read it (a) optionally installs a Patchright
+        ``page.route()`` limit-rewrite handler BEFORE goto, and (b) after the
+        first paint, repeatedly runs ``extract``, merges any rows with an unseen
+        ``id``, then JS-clicks ``next_selector`` and polls until the rendered
+        id-set changes — until Next is absent/disabled, a click adds no new
+        rows, or ``max_pages`` is hit. The ENTIRE walk runs inside ONE
+        ``_browser_lock`` acquisition / ONE page (one goto, one wait) — there is
+        no extra navigation and no second Cloudflare-clearance cost.
+
+        Every site-specific value (the ``next_selector``, the
+        ``route_limit_rewrite`` substring + target, the ``extract`` body, the
+        ``wait_for``) is a CALLER argument — this framework method names no
+        source. Detected by sources via ``hasattr`` (off-Protocol, D-41).
+
+        Dead-driver recovery mirrors :meth:`fetch_via_browser`: a
+        :func:`_looks_like_dead_driver` ``BrowserFetchError`` triggers ONE
+        ``recycle_now`` + retry against a fresh context (same retry-once cap).
+
+        Args:
+            url: The full series/list URL to navigate to.
+            extract: A JS function body returning a JSON-serializable list of
+                rows; the framework wraps it as ``async () => { ...extract... }``
+                so the body can ``await`` and ``return``. Rows are deduped by
+                their ``id`` key.
+            wait_for: Optional pre-walk readiness wait (CSS selector or JS
+                predicate, routed exactly like :meth:`fetch_via_browser`).
+            next_selector: CSS selector for the in-page Next control. The walk
+                stops when it is absent or disabled (``disabled`` property or
+                ``aria-disabled``).
+            route_limit_rewrite: Optional ``(url_substring, target_limit)`` — a
+                ``page.route()`` handler rewrites the ``limit=\\d+`` query value
+                to ``target_limit`` on requests whose URL contains
+                ``url_substring`` (so the first paint already requests a larger
+                page); ``None`` installs no route.
+            max_pages: Infinite-loop guard — walking this many pages stops the
+                loop and logs a warning. NOT a feature cap.
+            timeout: Seconds budget applied to goto/wait_for and each evaluate.
+
+        Returns:
+            The merged, deduped list of rows across every walked page, in
+            first-seen order.
+
+        Raises:
+            BrowserFetchError: navigation/wait/evaluate failed or the context
+                could not be acquired (after the single dead-driver retry).
+        """
+        try:
+            return await self._paginate_via_browser_once(
+                url,
+                extract=extract,
+                wait_for=wait_for,
+                next_selector=next_selector,
+                route_limit_rewrite=route_limit_rewrite,
+                max_pages=max_pages,
+                timeout=timeout,
+                attempt=1,
+            )
+        except BrowserFetchError as exc:
+            if not _looks_like_dead_driver(exc):
+                raise
+            _log.warning(
+                "fetch_via_browser_paginated: dead-driver signal detected — "
+                "recycling browser context and retrying once (url=%s)",
+                url,
+            )
+            await self._lifecycle.recycle_now()
+            return await self._paginate_via_browser_once(
+                url,
+                extract=extract,
+                wait_for=wait_for,
+                next_selector=next_selector,
+                route_limit_rewrite=route_limit_rewrite,
+                max_pages=max_pages,
+                timeout=timeout,
+                attempt=2,
+            )
+
+    async def _paginate_via_browser_once(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None,
+        max_pages: int,
+        timeout: float,  # noqa: ASYNC109 — same justification as fetch_via_browser
+        attempt: int,
+    ) -> list[Any]:
+        """One attempt of the paginated walk (route + goto + wait + Next-walk).
+
+        Acquires a ``_browser_lock`` Semaphore slot, opens ONE page, installs
+        the optional route handler BEFORE goto, navigates, and walks the Next
+        control. Closes the page on all paths. Emits exactly one ``browser``
+        ring event (op=``fetch_via_browser_paginated``). Split out so the public
+        method can wrap a single dead-driver retry around it.
+        """
+        async with self._browser_lock:
+            try:
+                ctx = await self._lifecycle.get_context()
+            except Exception as exc:  # noqa: BLE001
+                raise BrowserFetchError(
+                    f"browser context unavailable for paginated fetch: {exc}"
+                ) from exc
+            try:
+                page = await ctx.new_page()
+            except Exception as exc:  # noqa: BLE001
+                raise BrowserFetchError(
+                    f"could not open page for fetch_via_browser_paginated: {exc}"
+                ) from exc
+            if self._log_browser_events:
+                _attach_browser_event_loggers(page, nav_url=url)
+            timeout_ms = int(timeout * 1000)
+            browser_start = time.perf_counter()
+            try:
+                # Install the route limit-rewrite BEFORE goto so the first
+                # paint's own requests are rewritten (route() must be in place
+                # before the navigation issues any request).
+                if route_limit_rewrite is not None:
+                    url_substring, target_limit = route_limit_rewrite
+                    handler = _build_limit_rewrite_route_handler(
+                        url_substring, target_limit
+                    )
+                    try:
+                        await page.route("**/*", handler)
+                    except Exception as exc:  # noqa: BLE001
+                        raise BrowserFetchError(
+                            f"page.route install failed: {exc}"
+                        ) from exc
+                await self._goto_and_wait(page, url, wait_for, timeout_ms)
+                result = await self._walk_next(
+                    page,
+                    extract=extract,
+                    next_selector=next_selector,
+                    max_pages=max_pages,
+                    timeout=timeout,
+                    url=url,
+                )
+            except BrowserFetchError as exc:
+                _emit_browser(
+                    op="fetch_via_browser_paginated",
+                    url=url,
+                    outcome="error",
+                    duration_ms=(time.perf_counter() - browser_start) * 1000.0,
+                    attempt=attempt,
+                    error=repr(exc),
+                )
+                raise
+            else:
+                _emit_browser(
+                    op="fetch_via_browser_paginated",
+                    url=url,
+                    outcome="ok",
+                    duration_ms=(time.perf_counter() - browser_start) * 1000.0,
+                    attempt=attempt,
+                    error=None,
+                )
+                return result
+            finally:
+                with contextlib.suppress(Exception):
+                    await page.close()
+
+    async def _walk_next(
+        self,
+        page: Any,
+        *,
+        extract: str,
+        next_selector: str,
+        max_pages: int,
+        timeout: float,  # noqa: ASYNC109 — per-evaluate budget, not a cancel wrapper
+        url: str,
+    ) -> list[Any]:
+        """Walk the in-page Next control on an already-navigated ``page``.
+
+        Runs entirely within the single page lifecycle the caller set up — no
+        extra goto, no second ``_browser_lock`` acquisition. Each iteration:
+        run ``extract`` and merge unseen-``id`` rows; probe ``next_selector``
+        (stop A if absent/disabled); snapshot the id-set, JS-click Next, then
+        poll the bounded budget until the id-set changes (stop B if it never
+        does); guard at ``max_pages`` (stop C — log a warning). Returns the
+        merged, deduped accumulator in first-seen order.
+
+        The Next selector is injected into the probe/click scripts as a
+        JSON-encoded string literal (``json.dumps``) so a selector containing
+        quotes is safe — no raw concatenation, no injection surface (T-eqm-03).
+        """
+        selector_literal = json.dumps(next_selector)
+        extract_script = "async () => { " + extract + " }"
+        # Probe: present + disabled state of the Next control (``disabled``
+        # property OR ``aria-disabled`` attribute).
+        probe_script = (
+            "() => { const el = document.querySelector("
+            + selector_literal
+            + "); if (!el) return { present: false, disabled: false };"
+            " const disabled = !!el.disabled"
+            " || el.getAttribute('aria-disabled') === 'true';"
+            " return { present: true, disabled: disabled }; }"
+        )
+        # JS-click bypasses an invisible overlay that could swallow a real click.
+        click_script = (
+            "() => { const b = document.querySelector("
+            + selector_literal
+            + "); if (b) b.click(); }"
+        )
+
+        accumulator: list[Any] = []
+        seen: set[Any] = set()
+
+        def _ids(rows: Any) -> set[Any]:
+            if not isinstance(rows, list):
+                return set()
+            return {r.get("id") for r in rows if isinstance(r, dict)}
+
+        def _merge(rows: Any) -> None:
+            if not isinstance(rows, list):
+                return
+            for row in rows:
+                rid = row.get("id") if isinstance(row, dict) else None
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                accumulator.append(row)
+
+        page_count = 1
+        while True:
+            rows = await _evaluate_guarded(page, extract_script, timeout)
+            _merge(rows)
+
+            # Stop C (infinite-loop guard) — checked AFTER the merge so the page
+            # we reached is always accumulated before we stop.
+            if page_count >= max_pages:
+                _log.warning(
+                    "fetch_via_browser_paginated: hit max_pages=%d on %s "
+                    "(infinite-loop guard — stopping the Next-walk)",
+                    max_pages,
+                    url,
+                )
+                break
+
+            # Stop A — Next absent or disabled.
+            state = await _evaluate_guarded(page, probe_script, timeout)
+            if (
+                not isinstance(state, dict)
+                or not state.get("present")
+                or state.get("disabled")
+            ):
+                break
+
+            before = _ids(rows)
+            await _evaluate_guarded(page, click_script, timeout)
+
+            # Bounded, non-blocking poll for the rendered id-set to change.
+            changed = False
+            for _ in range(_PAGINATE_POLL_TICKS):
+                await asyncio.sleep(_PAGINATE_POLL_INTERVAL)
+                if _ids(await _evaluate_guarded(page, extract_script, timeout)) != (
+                    before
+                ):
+                    changed = True
+                    break
+            if not changed:
+                # Stop B — the click produced no new rows within the budget.
+                break
+
+            page_count += 1
+
+        return accumulator
 
     async def aclose(self) -> None:
         """Tear the bounded lifecycle down + stop playwright (Pitfall 4)."""

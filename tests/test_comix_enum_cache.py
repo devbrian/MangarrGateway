@@ -43,12 +43,17 @@ _SERIES_URL = f"{_COMIX}/title/{_SERIES_ID}-{_SLUG}"
 
 
 class _CountingComixSolver:
-    """Fake AntiBotSolver: a canned ``Clearance`` + a ``fetch_via_browser`` that
-    COUNTS its invocations and returns a staged per-URL result (no real browser).
+    """Fake AntiBotSolver: a canned ``Clearance`` + browser-fetch primitives that
+    COUNT their invocations and return a staged per-URL result (no real browser).
 
     ``fetch_calls`` is the cross-search witness the headline assertion reads: a
-    Layer-2 cache HIT must never reach this method, so the delta across the second
-    search is exactly 0.
+    Layer-2 cache HIT must never reach the browser, so the delta across the second
+    search is exactly 0. The search path walks the FULL paginated chapter list
+    (#146) via ``fetch_via_browser_paginated`` — that is the method the source
+    actually calls now (``_fetch_series_chapters_raw``), so it increments
+    ``fetch_calls``. ``fetch_via_browser`` (the one-shot chapter-pages read) is
+    present so ``_solver_from_ctx`` (which requires BOTH primitives) accepts the
+    fake; it is unused on the search path.
     """
 
     def __init__(self) -> None:
@@ -73,6 +78,23 @@ class _CountingComixSolver:
         self.fetch_calls += 1
         if url not in self.browser_results:
             raise AssertionError(f"unmocked fetch_via_browser({url!r})")
+        return self.browser_results[url]
+
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        _ = (extract, wait_for, next_selector, route_limit_rewrite, max_pages, timeout)
+        self.fetch_calls += 1
+        if url not in self.browser_results:
+            raise AssertionError(f"unmocked fetch_via_browser_paginated({url!r})")
         return self.browser_results[url]
 
 

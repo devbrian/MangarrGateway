@@ -377,25 +377,34 @@ class SourceContext:
             return
         self._enum_cache.cache_replace(key, enum)
 
-    def cached_enumerate_key(self, series_id: str, languages: list[str]) -> CacheKey:
+    def cached_enumerate_key(
+        self, series_id: str, languages: list[str], *, extra: Any = None
+    ) -> CacheKey:
         """Build the canonical Layer-2 cache key for THIS source (T-09-01).
 
         Delegates to :meth:`EnumerationCache.enum_key` so the source cannot
         accidentally key on ``type``/``chapter`` — only
-        ``(source_key, series_id, sorted(languages))``.
+        ``(source_key, series_id, sorted(languages)[, extra])``. ``extra`` carries
+        a source-supplied discriminator (e.g. MangaDex's ``(stop_floor, offset)``
+        window, CR-01); language-agnostic sources pass ``languages=[]`` (IN-02).
         """
         from .enum_cache import EnumerationCache  # noqa: PLC0415
 
-        return EnumerationCache.enum_key(self._source_key, series_id, languages)
+        return EnumerationCache.enum_key(
+            self._source_key, series_id, languages, extra=extra
+        )
 
     def cached_resolve_key(
-        self, normalized_query: str, languages: list[str]
+        self, normalized_query: str, languages: list[str], *, extra: Any = None
     ) -> CacheKey:
-        """Build the canonical Layer-1 cache key for THIS source (D-01/T-09-01)."""
+        """Build the canonical Layer-1 cache key for THIS source (D-01/T-09-01).
+
+        ``extra`` carries a source-supplied discriminator (e.g. the interactive
+        candidate count on MangaDex/Comix, WR-01) appended to the key tuple."""
         from .enum_cache import EnumerationCache  # noqa: PLC0415
 
         return EnumerationCache.resolve_key(
-            self._source_key, normalized_query, languages
+            self._source_key, normalized_query, languages, extra=extra
         )
 
     # ─────────────────────────── HTTP ───────────────────────────
