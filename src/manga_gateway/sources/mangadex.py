@@ -104,7 +104,13 @@ class MangaDexSource(Source):
             # branch above caches NEITHER layer (D-02 — already one resolved
             # candidate). The key normalizes the query the SAME way the relevance
             # scorer does so punctuation/case variants collapse onto one entry.
-            resolve_key = ctx.cached_resolve_key(_normalize(req.query or ""), languages)
+            # WR-01: the resolved candidate set widens with ``req.interactive``
+            # (``count`` is 15 vs 5), so ``count`` rides the key — an interactive
+            # search after a non-interactive one (or vice-versa) is a MISS, not a
+            # HIT served the wrong-width candidate list.
+            resolve_key = ctx.cached_resolve_key(
+                _normalize(req.query or ""), languages, extra=count
+            )
             candidates: list[_MangaCandidate] = await ctx.cached_resolve(
                 resolve_key, _resolve_fn
             )

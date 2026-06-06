@@ -911,8 +911,13 @@ class ComixSource(Source):
                 cap=count,
             )
 
+        # WR-01: the resolved candidate set widens with ``req.interactive``
+        # (``count`` is 15 vs 5), so ``count`` rides the resolve key — an interactive
+        # search after a non-interactive one (or vice-versa) is a MISS, not a HIT
+        # served the wrong-width candidate list.
         series = await ctx.cached_resolve(
-            ctx.cached_resolve_key(_normalize(req.query or ""), languages), _resolve_fn
+            ctx.cached_resolve_key(_normalize(req.query or ""), languages, extra=count),
+            _resolve_fn,
         )
         # 260605-e9a deliverable 5: report how many series candidates we deep-
         # enumerate (one browser fan-out each; correct on a HIT too).
