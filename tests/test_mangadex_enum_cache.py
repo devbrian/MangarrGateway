@@ -346,3 +346,46 @@ async def test_kill_switch_reissues_upstream_calls() -> None:
         assert chapter_route.call_count - chapter_after > 0
     finally:
         await transport.aclose()
+
+
+# ──────── Test E: malformed attributes=None row does not crash the search ─────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_attributes_none_row_does_not_crash_search() -> None:
+    """CodeRabbit (PR #156): a ``{"attributes": None}`` chapter row is admitted by
+    ``_fetch_chapter_feed`` — ``_build_enumeration``/``_to_release`` must skip it
+    rather than raise ``AttributeError`` on ``None.get(...)`` and break the whole
+    search path. The valid rows still come back."""
+    manga_id = str(uuid.uuid4())
+    payload = _chapter_feed_payload(manga_id, ["10", "11"])
+    # Inject a malformed row with attributes=None alongside the two valid rows.
+    payload["data"].append(
+        {
+            "id": str(uuid.uuid4()),
+            "type": "chapter",
+            "attributes": None,
+            "relationships": [
+                {"id": manga_id, "type": "manga", "attributes": {"title": {"en": "x"}}},
+            ],
+        }
+    )
+    payload["total"] = len(payload["data"])
+    respx.get(f"{MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{MANGADEX}/chapter").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    src = MangaDexSource()
+    ctx, transport = _build_ctx(EnumerationCache())
+    try:
+        # Must not raise; the malformed row is skipped, the two valid rows survive.
+        result = await src.search(
+            SearchRequest(type="manga", query="Solo Leveling"), ctx
+        )
+        numbers = {str(r.chapter_number) for r in result}
+        assert {"10", "11"} <= numbers
+    finally:
+        await transport.aclose()

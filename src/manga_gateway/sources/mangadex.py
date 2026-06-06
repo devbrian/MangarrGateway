@@ -422,8 +422,8 @@ class MangaDexSource(Source):
         chapter_numbers = tuple(
             d
             for c in chapters
-            if (d := self._parse_decimal(c.get("attributes", {}).get("chapter")))
-            is not None
+            if isinstance((attrs := c.get("attributes")), dict)
+            and (d := self._parse_decimal(attrs.get("chapter"))) is not None
         )
         return Enumeration(
             items=chapters,
@@ -437,7 +437,10 @@ class MangaDexSource(Source):
     def _to_release(
         self, manga_id: str, chapter: dict[str, Any], ctx: SourceContext
     ) -> Release | None:
-        attrs = chapter.get("attributes", {})
+        # ``or {}`` guards the malformed ``{"attributes": None}`` row admitted by
+        # ``_fetch_chapter_feed`` (CodeRabbit) — ``.get(..., {})`` would not, since the
+        # key is present with a ``None`` value, so the default never applies.
+        attrs = chapter.get("attributes") or {}
         # Skip off-site chapters this phase (Open Q 2) — Phase 3 resolution would
         # fail; note carried forward for Phase 3.
         if attrs.get("externalUrl"):
