@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from .config import Settings
     from .framework.antibot import AntiBotSolver
+    from .framework.enum_cache import EnumerationCache
     from .framework.health import SourceHealth
     from .framework.ratelimit import RateLimiter
     from .framework.registry import SourceRegistry
@@ -94,6 +95,17 @@ def get_caps_cache(request: Request) -> TTLCache[str, object]:
 def get_handle_store(request: Request) -> HandleStore:
     store: HandleStore = request.app.state.handle_store
     return store
+
+
+def get_enum_cache(request: Request) -> EnumerationCache:
+    """The lifespan-owned process-wide enumeration cache (CACHE-01).
+
+    Mirrors ``get_handle_store``: a one-liner reading the singleton the lifespan
+    stashed on ``app.state.enum_cache``. Only the POST /search route threads this
+    into its ``SourceContext`` (recent/download keep the None default — CACHE-05).
+    """
+    cache: EnumerationCache = request.app.state.enum_cache
+    return cache
 
 
 def get_job_manager(request: Request) -> JobManager:

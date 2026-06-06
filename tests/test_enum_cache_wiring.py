@@ -25,6 +25,9 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from manga_gateway.app import create_app
+from manga_gateway.config import Settings
+from manga_gateway.framework import context as context_module
 from manga_gateway.framework.context import SourceContext
 from manga_gateway.framework.enum_cache import Enumeration, EnumerationCache
 from manga_gateway.framework.ratelimit import RateLimiter
@@ -178,3 +181,92 @@ def test_key_helpers_build_canonical_tuples() -> None:
         "naruto",
         ("en", "ja"),
     )
+
+
+# ──────────────────── Task 2: lifespan singleton + route wiring ────────────────────
+
+REPRESENTATIVE_KEY = "mangadex"
+
+
+def _settings(**over: object) -> Settings:
+    return Settings(api_key=TEST_API_KEY, **over)  # type: ignore[arg-type]
+
+
+def _stub_source_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op the representative source's network hooks (ctx is recorded at __init__)."""
+    from manga_gateway.sources.mangadex import MangaDexSource
+
+    async def _empty_search(self: object, req: object, ctx: object) -> list[Any]:
+        return []
+
+    async def _empty_recent(self: object, **kwargs: Any) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(MangaDexSource, "search", _empty_search)
+    monkeypatch.setattr(MangaDexSource, "recent", _empty_recent)
+
+
+class _CtxKwargRecorder:
+    """Record the kwargs each SourceContext construction site passes for the source."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.calls: list[dict[str, Any]] = []
+        real_init = SourceContext.__init__
+
+        def _recording_init(ctx: SourceContext, **kwargs: Any) -> None:
+            if kwargs.get("source_key") == REPRESENTATIVE_KEY:
+                self.calls.append(dict(kwargs))
+            real_init(ctx, **kwargs)
+
+        monkeypatch.setattr(SourceContext, "__init__", _recording_init)
+        monkeypatch.setattr(context_module.SourceContext, "__init__", _recording_init)
+
+
+@pytest.mark.asyncio
+async def test_app_builds_one_enum_cache_singleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lifespan builds exactly one EnumerationCache on app.state.enum_cache."""
+    _stub_source_hooks(monkeypatch)
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        cache = app.state.enum_cache
+        assert isinstance(cache, EnumerationCache)
+
+
+@pytest.mark.asyncio
+async def test_search_threads_cache_recent_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /search threads the singleton enum_cache; /recent keeps None (CACHE-05)."""
+    recorder = _CtxKwargRecorder(monkeypatch)
+    _stub_source_hooks(monkeypatch)
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        shared = app.state.enum_cache
+        transport = httpx.ASGITransport(app=app)
+        headers = {"X-Api-Key": TEST_API_KEY}
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver/api/v1"
+        ) as client:
+            recorder.calls.clear()
+            await client.post(
+                "/search",
+                headers=headers,
+                json={"type": "manga", "query": "x", "sources": [REPRESENTATIVE_KEY]},
+            )
+            search_calls = list(recorder.calls)
+            recorder.calls.clear()
+            await client.get(
+                "/recent",
+                headers=headers,
+                params={"sources": REPRESENTATIVE_KEY, "limit": "5"},
+            )
+            recent_calls = list(recorder.calls)
+
+    assert search_calls, "search route built no SourceContext for the source"
+    assert recent_calls, "recent route built no SourceContext for the source"
+    # search threads the ONE lifespan-built singleton (R1)
+    assert search_calls[0].get("enum_cache") is shared
+    # recent never receives the cache → the constructor default keeps it None
+    assert recent_calls[0].get("enum_cache") is None
