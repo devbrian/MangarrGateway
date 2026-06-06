@@ -209,6 +209,88 @@ async def test_paginate_all_walk_spans_multiple_feed_pages() -> None:
         await transport.aclose()
 
 
+# ─────── CR-01 regression: a different offset is NOT served the stale window ────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_different_offset_not_served_first_calls_stale_window() -> None:
+    """CR-01: a second search with a DIFFERENT offset re-fetches its own page.
+
+    The pre-fix Layer-2 key omitted the walk window, so request 2 (offset=50) hit
+    request 1's (offset=0) cached window and silently returned page 1's content.
+    With (stop_floor, offset) in the key, offset=50 is a MISS and fetches its own
+    page — never the stale offset-0 window.
+    """
+    manga_id = str(uuid.uuid4())
+    manga_route = respx.get(f"{MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    seen_offsets: list[str | None] = []
+
+    def _chapter_responder(request: httpx.Request) -> httpx.Response:
+        offset = request.url.params.get("offset")
+        seen_offsets.append(offset)
+        rows = ["1", "2", "3"] if offset == "0" else ["51", "52"]
+        return httpx.Response(200, json=_chapter_feed_payload(manga_id, rows))
+
+    chapter_route = respx.get(f"{MANGADEX}/chapter").mock(
+        side_effect=_chapter_responder
+    )
+    src = MangaDexSource()
+    ctx, transport = _build_ctx(EnumerationCache())
+    try:
+        page1 = await src.search(
+            SearchRequest(type="manga", query="Solo Leveling", offset=0), ctx
+        )
+        assert sorted(str(r.chapter_number) for r in page1) == ["1", "2", "3"]
+        manga_after = manga_route.call_count
+        chapter_after = chapter_route.call_count
+
+        page2 = await src.search(
+            SearchRequest(type="manga", query="Solo Leveling", offset=50), ctx
+        )
+        # Layer 1 still HITs (same query) — no second /manga call — but the Layer-2
+        # window key differs, so the offset=50 page is fetched fresh (one /chapter
+        # call) and returns its OWN rows, not the stale [1, 2, 3] window.
+        assert manga_route.call_count - manga_after == 0
+        assert chapter_route.call_count - chapter_after == 1
+        assert seen_offsets[-1] == "50"
+        assert sorted(str(r.chapter_number) for r in page2) == ["51", "52"]
+    finally:
+        await transport.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_chapter_specific_search_keys_distinctly_from_manga_search() -> None:
+    """CR-01: a chapter-specific (bounded, stop_floor) walk does not collide with the
+    paginate-all (type=manga) window — distinct ``stop_floor`` → distinct cache key."""
+    manga_id = str(uuid.uuid4())
+    respx.get(f"{MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    chapter_route = respx.get(f"{MANGADEX}/chapter").mock(
+        return_value=httpx.Response(
+            200, json=_chapter_feed_payload(manga_id, ["4", "5", "6"])
+        )
+    )
+    src = MangaDexSource()
+    ctx, transport = _build_ctx(EnumerationCache())
+    try:
+        await src.search(SearchRequest(type="manga", query="Solo Leveling"), ctx)
+        chapter_after = chapter_route.call_count
+        # chapter=5 → stop_floor=5 → different key than the type=manga walk
+        # (stop_floor=None), so this is a MISS that does its own bounded walk.
+        result = await src.search(
+            SearchRequest(type="chapter", query="Solo Leveling", chapter=5), ctx
+        )
+        assert chapter_route.call_count - chapter_after == 1
+        assert sorted(str(r.chapter_number) for r in result) == ["5"]
+    finally:
+        await transport.aclose()
+
+
 # ──────────────────────── Test C: recent() is never cached ─────────────────────────
 
 
