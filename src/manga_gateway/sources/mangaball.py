@@ -73,6 +73,7 @@ import lxml.html
 
 from ..framework.base import Source
 from ..framework.errors import SourceError
+from ..framework.relevance import prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -528,9 +529,17 @@ class MangaBallSource(Source):
         )
         titles, _pagination = _items_and_pagination(body)
 
-        candidates = [t for t in titles if isinstance(t, dict)][
-            :_DEFAULT_TITLE_CANDIDATES
-        ]
+        dict_titles = [t for t in titles if isinstance(t, dict)]
+        # Prune obviously-irrelevant candidates BEFORE the per-candidate
+        # chapter-listing fan-out (#126): an exact-match query enumerates only
+        # the one correct title; ambiguous queries still fan out to the cap (the
+        # prune falls back to the historic ``[:_DEFAULT_TITLE_CANDIDATES]``).
+        candidates = prune_candidates(
+            dict_titles,
+            req.query or "",
+            key=lambda t: _strip_html(t.get("name")),
+            cap=_DEFAULT_TITLE_CANDIDATES,
+        )
         # 260605-e9a deliverable 5: how many title candidates we deep-enumerate.
         ctx.candidates_enumerated = len(candidates)
         wanted_langs = set(req.languages) if req.languages else None
