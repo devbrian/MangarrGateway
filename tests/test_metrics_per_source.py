@@ -28,6 +28,7 @@ from starlette.responses import JSONResponse
 from manga_gateway.api.routes.recent import get_recent
 from manga_gateway.api.routes.search import search
 from manga_gateway.framework.context import SourceContext
+from manga_gateway.framework.cooldown import SourceFailureCooldown
 from manga_gateway.framework.enum_cache import EnumerationCache
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.framework.ratelimit import RateLimiter
@@ -153,6 +154,7 @@ def _deps() -> dict[str, object]:
         "health_map": {},
         "session_prep": None,
         "enum_cache": EnumerationCache(),
+        "failure_cooldown": SourceFailureCooldown(ttl_seconds=300),
     }
 
 
@@ -188,6 +190,7 @@ async def test_search_emits_per_source_and_final_counts(
             health_map=cast("dict", deps["health_map"]),  # type: ignore[arg-type]
             session_prep=cast("object", deps["session_prep"]),  # type: ignore[arg-type]
             enum_cache=cast("EnumerationCache", deps["enum_cache"]),
+            failure_cooldown=cast("SourceFailureCooldown", deps["failure_cooldown"]),
         )
         # Umbrella request event (middleware emits this after the handler returns;
         # do it here with the stashed contextvar still live).
@@ -247,6 +250,7 @@ async def test_search_bad_request_still_stashes_request_blob(
             health_map=cast("dict", deps["health_map"]),  # type: ignore[arg-type]
             session_prep=cast("object", deps["session_prep"]),  # type: ignore[arg-type]
             enum_cache=cast("EnumerationCache", deps["enum_cache"]),
+            failure_cooldown=cast("SourceFailureCooldown", deps["failure_cooldown"]),
         )
         c.emit_request(outcome="client_error", duration_ms=1.0, status=400)
     finally:
@@ -294,6 +298,7 @@ async def test_recent_emits_per_source_and_final_counts(
             solver=cast("object", deps["solver"]),  # type: ignore[arg-type]
             health_map=cast("dict", deps["health_map"]),  # type: ignore[arg-type]
             session_prep=cast("object", deps["session_prep"]),  # type: ignore[arg-type]
+            failure_cooldown=cast("SourceFailureCooldown", deps["failure_cooldown"]),
             sources=["alpha", "beta"],
             languages=None,
             limit=None,

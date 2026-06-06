@@ -185,15 +185,15 @@ class SingleFlightCache[V]:
                 future.exception()
             raise
         else:
-            # WR-03: never cache a valid-but-empty payload (an empty candidate list
-            # or an Enumeration with no items). A transient upstream 200-with-no-
-            # results would otherwise be cached as a successful resolution for the
-            # full TTL, returning empty for the whole window even after upstream
-            # recovers. Hard failures already aren't cached (the except branch);
-            # this declines the empty-but-valid body too. Concurrent followers still
-            # receive the value via the future — only the long-lived entry is skipped.
-            if not _is_empty_payload(value):
-                self._cache[key] = value
+            # 260606-lyb Change 3 (deliberate WR-03 reversal, commit aef08ce):
+            # successful results — INCLUDING empties (an empty candidate list or an
+            # Enumeration with no items) — ARE cached for the full TTL. A repeat
+            # NO-MATCH search now short-circuits with zero upstream calls. Hard
+            # failures are STILL never cached (the ``except`` branch above is
+            # untouched), and a DOWN source never reaches this success branch (it
+            # raises → handled by the per-source failure cooldown), so we only ever
+            # cache GENUINE successful empties — not a transient upstream outage.
+            self._cache[key] = value
             if not future.done():
                 future.set_result(value)
             return value
@@ -208,22 +208,6 @@ class SingleFlightCache[V]:
         """Return whether ``key`` has a live (non-expired) entry — the HIT check
         used to classify a cache event before ``get_or_fetch`` runs."""
         return self._cache.get(key, _MISSING) is not _MISSING
-
-
-def _is_empty_payload(value: Any) -> bool:
-    """True for a valid-but-empty resolve/enumerate payload that must NOT be cached.
-
-    WR-03: an empty candidate list (Layer 1) or an :class:`Enumeration` with no
-    items (Layer 2) is a successful-but-empty body — declining to cache it avoids
-    pinning a transient empty result for the full TTL. A non-sized value (defensive)
-    is never treated as empty.
-    """
-    if isinstance(value, Enumeration):
-        return not value.items
-    try:
-        return len(value) == 0
-    except TypeError:
-        return False
 
 
 def _emit_cache(*, op: str, outcome: str, source_key: str | None) -> None:

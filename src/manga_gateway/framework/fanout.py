@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import httpx
 
 from ..metrics.context import current_source
 from .errors import SourceError
+
+if TYPE_CHECKING:
+    from .cooldown import SourceFailureCooldown
 
 # Default per-source fan-out timeout (D-14 discretion). Sized to comfortably
 # cover the slowest legitimate per-source operation:
@@ -52,12 +55,19 @@ async def fan_out[S: _HasKey, R](
     *,
     per_source_timeout: float = _DEFAULT_TIMEOUT,
     collect_warnings: Callable[[S], list[tuple[str, str]]] | None = None,
+    cooldown: SourceFailureCooldown | None = None,
 ) -> tuple[list[R], list[WarningTuple]]:
     """Fan out ``run_one`` across ``sources`` with per-source isolation.
 
     Returns ``(releases, warnings)`` where ``warnings`` are ``(sourceKey, code,
     message)`` tuples. ``collect_warnings`` (optional) lets a successful source also
     surface soft warnings (D-14 partial success).
+
+    ``cooldown`` (optional, 260606-lyb Change 2) is the per-source failure negative
+    cache. Defaulted ``None`` so existing callers/tests stay green. When supplied: a
+    source already ``in_cooldown`` is SKIPPED (no upstream call, instant
+    ``source_unavailable`` warning), and a source whose run hits a HARD-failure branch
+    records a cooldown so the next identical search short-circuits.
     """
     releases: list[R] = []
     warnings: list[WarningTuple] = []
@@ -70,6 +80,15 @@ async def fan_out[S: _HasKey, R](
         # additive — does not change any control flow / exception propagation below.
         token = current_source.set(src.key)
         try:
+            # 260606-lyb Change 2: a source in cooldown is SKIPPED — no upstream
+            # call, no retry, no backoff. This return happens INSIDE the try (like
+            # the success return below), so it never reaches the trailing
+            # record_failure: a cooldown-skip is not itself a fresh failure.
+            if cooldown is not None and cooldown.in_cooldown(src.key):
+                warnings.append(
+                    (src.key, "source_unavailable", "upstream unavailable (cooldown)")
+                )
+                return src.key, []
             async with asyncio.timeout(per_source_timeout):
                 result = await run_one(src)
             if collect_warnings is not None:
@@ -106,6 +125,13 @@ async def fan_out[S: _HasKey, R](
             warnings.append((src.key, "source_unavailable", "unexpected error"))
         finally:
             current_source.reset(token)
+        # 260606-lyb Change 2 invariant: reaching this line means one of the five
+        # except branches above ran — BOTH non-error returns (the success return AND
+        # the cooldown-skip return) happen INSIDE the try, so they never fall through
+        # here. Therefore record_failure trips on HARD FAILURE ONLY: a 200-empty /
+        # zero-results success never sets a cooldown.
+        if cooldown is not None:
+            cooldown.record_failure(src.key)
         return src.key, []
 
     tasks: list[asyncio.Task[tuple[str, list[R]]]] = []
