@@ -261,6 +261,15 @@ class Settings(BaseSettings):
     # `_enum_cache_ttl_within_handle_ttl` model validator below fails fast above
     # 3600 (mirrors _reject_camoufox_parallel).
     enum_cache_ttl_seconds: int = Field(default=1800, ge=1)
+    # 260606-lyb Change 2: per-source failure cooldown (negative cache for
+    # FAILURES, distinct from the enum cache above which caches successes). An
+    # env-overridable ops knob (D-11, NOT the api_key exclusion):
+    # GATEWAY_SOURCE_FAILURE_COOLDOWN_SECONDS, default 300s (5 min). When a source's
+    # fan-out branch hits a hard failure (timeout / SourceError / 5xx / transport /
+    # unexpected) the framework suppresses that source SOURCE-WIDE for this window so
+    # a repeat search returns instantly with zero upstream calls. ge=0 (NOT ge=1)
+    # precisely because 0 is the documented DISABLE value (every in_cooldown → False).
+    source_failure_cooldown_seconds: int = Field(default=300, ge=0)
 
     @field_validator("metrics_cors_origins")
     @classmethod

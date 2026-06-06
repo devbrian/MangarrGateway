@@ -27,6 +27,7 @@ from .api import api_router
 from .config import Settings
 from .errors import register_error_handlers
 from .framework.antibot import CloudflareSolver
+from .framework.cooldown import SourceFailureCooldown
 from .framework.enum_cache import EnumerationCache
 from .framework.health import SourceHealth
 from .framework.proxy import build_proxy
@@ -303,6 +304,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ttl=settings.enum_cache_ttl_seconds,
         enabled=settings.enum_cache_enabled,
         ttl_overrides=enum_cache_ttl_overrides,
+    )
+    # 260606-lyb Change 2: ONE process-wide per-source failure cooldown for the whole
+    # lifespan (R1), mirroring the enum_cache construction. The search/recent routes
+    # thread it into fan_out so a hard-down source is skipped (zero upstream calls)
+    # for source_failure_cooldown_seconds; 0 disables it entirely.
+    app.state.failure_cooldown = SourceFailureCooldown(
+        ttl_seconds=settings.source_failure_cooldown_seconds
     )
     # Download surface: aiosqlite job store + lifespan-owned JobManager (PLAT-03).
     store = await open_store(settings.db_path)

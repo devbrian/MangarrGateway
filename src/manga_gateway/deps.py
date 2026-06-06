@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from .config import Settings
     from .framework.antibot import AntiBotSolver
+    from .framework.cooldown import SourceFailureCooldown
     from .framework.enum_cache import EnumerationCache
     from .framework.health import SourceHealth
     from .framework.ratelimit import RateLimiter
@@ -106,6 +107,18 @@ def get_enum_cache(request: Request) -> EnumerationCache:
     """
     cache: EnumerationCache = request.app.state.enum_cache
     return cache
+
+
+def get_failure_cooldown(request: Request) -> SourceFailureCooldown:
+    """The lifespan-owned process-wide per-source failure cooldown (260606-lyb).
+
+    Mirrors ``get_enum_cache``: a one-liner reading the singleton the lifespan
+    stashed on ``app.state.failure_cooldown``. The POST /search and GET /recent
+    routes pass this into ``fan_out`` so a down source is skipped (zero upstream
+    calls) while in cooldown.
+    """
+    cooldown: SourceFailureCooldown = request.app.state.failure_cooldown
+    return cooldown
 
 
 def get_job_manager(request: Request) -> JobManager:
