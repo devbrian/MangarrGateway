@@ -172,6 +172,40 @@ async def test_fanout_timeout_maps_to_warning() -> None:
     assert len(warnings) == 1
 
 
+@pytest.mark.asyncio
+async def test_fanout_persistent_5xx_maps_to_typed_upstream_warning() -> None:
+    # #152: a persistent upstream 5xx (e.g. mangadot's 503 "Under Maintenance")
+    # exhausts the retry budget and reaches fan_out as a raw httpx.HTTPStatusError,
+    # NOT a typed SourceError. It must surface the status ("upstream 503"), never the
+    # opaque "unexpected error" the generic `except Exception` would have produced.
+    src = _FakeSource("down")
+
+    async def run_one(_: _FakeSource) -> list[Release]:
+        request = httpx.Request("GET", "https://mangadot.net/api/search")
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError("maintenance", request=request, response=response)
+
+    releases, warnings = await fan_out([src], run_one)
+    assert releases == []
+    assert warnings == [("down", "source_unavailable", "upstream 503")]
+
+
+@pytest.mark.asyncio
+async def test_fanout_transport_error_maps_to_typed_warning() -> None:
+    # #152: a transport failure that exhausted retries is an upstream-reachability
+    # problem; name the transport class instead of "unexpected error".
+    src = _FakeSource("unreachable")
+
+    async def run_one(_: _FakeSource) -> list[Release]:
+        raise httpx.ConnectError("connection refused")
+
+    releases, warnings = await fan_out([src], run_one)
+    assert releases == []
+    assert warnings == [
+        ("unreachable", "source_unavailable", "transport error: ConnectError")
+    ]
+
+
 # ───────────────────────── SourceContext retry (WR-01) ──────────────────────────
 
 
