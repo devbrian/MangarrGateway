@@ -11,8 +11,9 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from manga_gateway.config import load_settings
+from manga_gateway.config import Settings, load_settings
 
 
 def test_generates_and_persists_key_on_empty_dir(tmp_path: Path) -> None:
@@ -239,3 +240,56 @@ def test_unknown_toml_keys_are_ignored(tmp_path: Path) -> None:
 
     assert settings.port == 7777
     assert not hasattr(settings, "made_up_key")
+
+
+# ── Search-result / chapter-link caching knobs (Phase 9, D-07/D-08/D-09) ───────
+
+_DUMMY_KEY = "k-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def test_enum_cache_defaults() -> None:
+    """D-07/D-08: kill-switch defaults ON; maxsize 512; ttl 1800 (30 min)."""
+    settings = Settings(api_key=_DUMMY_KEY)
+    assert settings.enum_cache_enabled is True
+    assert settings.enum_cache_maxsize == 512
+    assert settings.enum_cache_ttl_seconds == 1800
+
+
+def test_enum_cache_ttl_ceiling_rejects_above_handle_ttl() -> None:
+    """D-09/CACHE-05: a TTL above the 60-min (3600s) handle TTL fails fast."""
+    # 3600 (the ceiling) is allowed...
+    at_ceiling = Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=3600)
+    assert at_ceiling.enum_cache_ttl_seconds == 3600
+    # ...but one second over the ceiling is rejected at construction.
+    with pytest.raises(ValidationError, match="3600"):
+        Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=3601)
+
+
+def test_enum_cache_maxsize_rejects_non_positive() -> None:
+    """T-09-05: ge=1 — a zero/negative maxsize is rejected at construction."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=_DUMMY_KEY, enum_cache_maxsize=0)
+
+
+def test_enum_cache_ttl_rejects_non_positive() -> None:
+    """T-09-05: ge=1 — a zero/negative ttl is rejected at construction."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=0)
+
+
+def test_env_overrides_enum_cache_knobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-08/D-11: GATEWAY_ENUM_CACHE_* env vars override the defaults."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'api_key = "{_DUMMY_KEY}"\n', encoding="utf-8")
+
+    monkeypatch.setenv("GATEWAY_ENUM_CACHE_ENABLED", "0")
+    monkeypatch.setenv("GATEWAY_ENUM_CACHE_TTL_SECONDS", "900")
+    monkeypatch.setenv("GATEWAY_ENUM_CACHE_MAXSIZE", "64")
+
+    settings = load_settings(cfg)
+
+    assert settings.enum_cache_enabled is False
+    assert settings.enum_cache_ttl_seconds == 900
+    assert settings.enum_cache_maxsize == 64

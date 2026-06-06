@@ -35,6 +35,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _log = logging.getLogger("manga_gateway")
 
 _KEY_BYTES = 32  # secrets.token_urlsafe(32) -> >= 43 url-safe chars
+# The 60-min downloadHandle TTL — the enum-cache TTL ceiling (D-09/CACHE-05).
+_HANDLE_TTL_CEILING_SECONDS = 3600
 
 
 class Settings(BaseSettings):
@@ -238,6 +240,27 @@ class Settings(BaseSettings):
     # Runtime State Inventory: SEPARATE DB file from gateway.db for the snapshot
     # store (08-02), so the metrics persistence never contends with the job store.
     metrics_db_path: str = "/state/metrics.db"
+    # ── Search-result / chapter-link caching (Phase 9) ─────────────────────────
+    # Env-overridable ops knobs (D-11), same treatment as host/port/output_root
+    # (NOT the api_key exclusion). They ride the existing load_settings
+    # TOML->kwargs merge automatically — env > TOML > default. These govern the
+    # source-agnostic EnumerationCache (framework/enum_cache.py, 09-01) that the
+    # lifespan owns (R1 single-process) and every source opts into at its
+    # enumeration boundary.
+    #
+    # D-08 kill-switch: default ON. Set GATEWAY_ENUM_CACHE_ENABLED=0 to disable
+    # caching entirely (short-circuit straight to the upstream fetch) — the
+    # operator escape hatch to fall back to pre-Phase-9 behavior while debugging
+    # stale/wrong results.
+    enum_cache_enabled: bool = True
+    # D-07 ops knobs. Field(ge=1): a zero/negative bound would break the cache's
+    # TTLCache construction (T-09-05). Blueprint defaults: maxsize 512, ttl 30min.
+    enum_cache_maxsize: int = Field(default=512, ge=1)
+    # D-09/CACHE-05: the TTL MUST stay ≤ the 60-min (3600s) handle TTL so a cached
+    # enumeration can never out-live the downloadHandle it would serve. The
+    # `_enum_cache_ttl_within_handle_ttl` model validator below fails fast above
+    # 3600 (mirrors _reject_camoufox_parallel).
+    enum_cache_ttl_seconds: int = Field(default=1800, ge=1)
 
     @field_validator("metrics_cors_origins")
     @classmethod
@@ -316,6 +339,28 @@ class Settings(BaseSettings):
                 "results. Fix via env: set GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1, "
                 "or keep parallelism with GATEWAY_CLOUDFLARE_ENGINE=patchright "
                 "(issue #59)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _enum_cache_ttl_within_handle_ttl(self) -> Settings:
+        """Fail fast when the enum-cache TTL exceeds the 60-min handle TTL (D-09).
+
+        A cached enumeration mints a fresh ``downloadHandle`` on every serve
+        (CACHE-03), but the handle store's own TTL is 3600s. If the enumeration
+        TTL were allowed above that ceiling the cache could keep serving a series
+        whose handles can no longer be resolved downstream (CACHE-05). Reject the
+        misconfiguration at construction — mirroring ``_reject_camoufox_parallel``
+        — so it surfaces loudly at startup instead of silently mis-behaving.
+        """
+        if self.enum_cache_ttl_seconds > _HANDLE_TTL_CEILING_SECONDS:
+            raise ValueError(
+                "enum_cache_ttl_seconds="
+                f"{self.enum_cache_ttl_seconds} exceeds the "
+                f"{_HANDLE_TTL_CEILING_SECONDS}s (60-min) downloadHandle TTL "
+                "ceiling (D-09/CACHE-05): a cached enumeration must not out-live "
+                "the handle it serves. Fix via env: set "
+                "GATEWAY_ENUM_CACHE_TTL_SECONDS to a value ≤ 3600."
             )
         return self
 
