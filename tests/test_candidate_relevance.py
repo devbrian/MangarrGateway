@@ -29,6 +29,11 @@ def _by_title(item: dict[str, str]) -> str | None:
     return item.get("title")
 
 
+def _by_titles(item: dict[str, Any]) -> list[str | None]:
+    """Extract main + alt titles as the ``keys=`` variant expects."""
+    return [item.get("title"), *(item.get("alt_titles") or [])]
+
+
 # --- Helper unit tests -------------------------------------------------------
 
 
@@ -117,6 +122,84 @@ def test_two_exact_matches_are_ambiguous() -> None:
     ]
     result = prune_candidates(candidates, "berserk", key=_by_title, cap=5)
     assert len(result) == 3
+
+
+# --- keys= (multi-title / alt-title-aware) unit tests ------------------------
+
+
+def test_keys_exact_on_alt_title_prunes_to_one() -> None:
+    # Candidate A matches the query ONLY via its alternate (native) title;
+    # no main title matches → still prune to exactly [A] (#139).
+    candidates = [
+        {"title": "The Forgotten Field", "alt_titles": ["잊혀진 들판"]},
+        {"title": "Forgotten Tales", "alt_titles": []},
+        {"title": "A Field Guide", "alt_titles": ["A Different Native Name"]},
+    ]
+    result = prune_candidates(
+        candidates, "잊혀진 들판", keys=_by_titles, cap=5
+    )
+    assert len(result) == 1
+    assert result[0]["title"] == "The Forgotten Field"
+
+
+def test_keys_main_title_still_wins() -> None:
+    # Main-title exact match is byte-identical behavior to the key= path.
+    candidates = [
+        {"title": "The Forgotten Field", "alt_titles": ["잊혀진 들판"]},
+        {"title": "Forgotten Tales", "alt_titles": []},
+        {"title": "A Field Guide", "alt_titles": []},
+    ]
+    result = prune_candidates(
+        candidates, "the forgotten field", keys=_by_titles, cap=5
+    )
+    assert len(result) == 1
+    assert result[0]["title"] == "The Forgotten Field"
+
+
+def test_keys_two_exact_across_main_and_alt_are_ambiguous() -> None:
+    # Candidate A matches "op" via its ALT title; candidate B matches via its
+    # MAIN title — two DIFFERENT candidates each exact → genuine ambiguity → fan
+    # out to candidates[:cap], NOT length 1.
+    candidates = [
+        {"title": "One Piece", "alt_titles": ["OP"]},  # exact via alt
+        {"title": "OP", "alt_titles": []},  # exact via main
+        {"title": "Other Title", "alt_titles": []},
+    ]
+    result = prune_candidates(candidates, "op", keys=_by_titles, cap=5)
+    assert len(result) == 3
+
+
+def test_keys_and_key_are_mutually_exclusive() -> None:
+    candidates = [{"title": "A"}, {"title": "B"}]
+    # Both → error.
+    with pytest.raises((TypeError, ValueError)):
+        prune_candidates(
+            candidates, "a", key=_by_title, keys=_by_titles, cap=5
+        )
+    # Neither → error.
+    with pytest.raises((TypeError, ValueError)):
+        prune_candidates(candidates, "a", cap=5)
+
+
+def test_keys_with_none_and_empty_entries_are_dropped() -> None:
+    # A candidate whose every title is None/empty scores 0 and never wins.
+    candidates = [
+        {"title": None, "alt_titles": [None, "", "   "]},
+        {"title": "Real Series", "alt_titles": []},
+        {"title": "Another", "alt_titles": []},
+    ]
+    # Query the all-empty candidate's normalized "" — the empty-query guard does
+    # NOT apply here (query is non-empty), but the empty-title candidate scores 0.
+    result = prune_candidates(
+        candidates, "totally different query", keys=_by_titles, cap=5
+    )
+    # No exact, no dominant gap → fan out (3 < cap).
+    assert len(result) == 3
+    # And a query exactly matching an empty string must not prune to the empty
+    # candidate (it scores 0, not exact).
+    result2 = prune_candidates(candidates, "real series", keys=_by_titles, cap=5)
+    assert len(result2) == 1
+    assert result2[0]["title"] == "Real Series"
 
 
 # --- mangadot source integration --------------------------------------------
