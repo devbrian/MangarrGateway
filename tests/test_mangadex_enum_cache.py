@@ -385,7 +385,17 @@ async def test_attributes_none_row_does_not_crash_search() -> None:
         result = await src.search(
             SearchRequest(type="manga", query="Solo Leveling"), ctx
         )
+        # Strict: the malformed row is DROPPED (not minted as a chapter_number=None
+        # release), so exactly the two valid rows come back (CodeRabbit).
         numbers = {str(r.chapter_number) for r in result}
-        assert {"10", "11"} <= numbers
+        assert numbers == {"10", "11"}
+
+        # Also exercise the BOUNDED (type=chapter) walk so the malformed row passes
+        # through _page_passed_floor too (distinct stop_floor key → cache MISS →
+        # fresh bounded walk). Must not raise (CodeRabbit Major).
+        bounded = await src.search(
+            SearchRequest(type="chapter", query="Solo Leveling", chapter=10), ctx
+        )
+        assert {str(r.chapter_number) for r in bounded} == {"10"}
     finally:
         await transport.aclose()

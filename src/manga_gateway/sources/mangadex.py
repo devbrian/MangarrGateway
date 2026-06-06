@@ -364,7 +364,12 @@ class MangaDexSource(Source):
         locked guard against a premature stop).
         """
         for chapter in page:
-            number = self._parse_decimal(chapter.get("attributes", {}).get("chapter"))
+            # ``_fetch_chapter_feed`` admits ``{"attributes": None}`` rows; guard the
+            # dereference so a malformed row can't AttributeError the bounded walk
+            # (CodeRabbit) — a non-dict attributes simply contributes no floor.
+            if not isinstance((attrs := chapter.get("attributes")), dict):
+                continue
+            number = self._parse_decimal(attrs.get("chapter"))
             if number is not None and math.floor(number) > stop_floor:
                 return True
         return False
@@ -437,10 +442,13 @@ class MangaDexSource(Source):
     def _to_release(
         self, manga_id: str, chapter: dict[str, Any], ctx: SourceContext
     ) -> Release | None:
-        # ``or {}`` guards the malformed ``{"attributes": None}`` row admitted by
-        # ``_fetch_chapter_feed`` (CodeRabbit) — ``.get(..., {})`` would not, since the
-        # key is present with a ``None`` value, so the default never applies.
-        attrs = chapter.get("attributes") or {}
+        # ``_fetch_chapter_feed`` admits malformed ``{"attributes": None}`` rows; such
+        # a row carries no chapter data, so DROP it rather than mint a degenerate
+        # handle with ``chapter_number=None`` (CodeRabbit). A ``.get(..., {})`` default
+        # would not catch this — the key is present with a ``None`` value.
+        attrs = chapter.get("attributes")
+        if not isinstance(attrs, dict):
+            return None
         # Skip off-site chapters this phase (Open Q 2) — Phase 3 resolution would
         # fail; note carried forward for Phase 3.
         if attrs.get("externalUrl"):
