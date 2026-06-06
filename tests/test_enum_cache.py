@@ -27,9 +27,7 @@ from manga_gateway.framework.enum_cache import (
 
 
 def test_exhausted_enumeration_covers_any_floor() -> None:
-    enum = Enumeration(
-        items=[], chapter_numbers=(), exhausted=True, requested_limit=10
-    )
+    enum = Enumeration(items=[], chapter_numbers=(), exhausted=True, requested_limit=10)
     assert enum.covers_floor(999.0) is True
 
 

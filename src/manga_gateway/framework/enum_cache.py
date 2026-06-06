@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Any
 
 from cachetools import TLRUCache
 
+from ..metrics.collector import get_collector
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
@@ -178,9 +180,97 @@ class SingleFlightCache[V]:
         """Overwrite the cached value (used by the completeness-driven refetch)."""
         self._cache[key] = value
 
+    def contains(self, key: CacheKey) -> bool:
+        """Return whether ``key`` has a live (non-expired) entry — the HIT check
+        used to classify a cache event before ``get_or_fetch`` runs."""
+        return self._cache.get(key) is not None
+
+
+def _emit_cache(*, op: str, outcome: str, source_key: str | None) -> None:
+    """No-op-safe, failure-isolated ``emit_cache`` (D-06).
+
+    Mirrors ``_emit_solve`` in ``solver_lifecycle.py``: a ``None`` collector is a
+    no-op and a collector-side error never breaks the cached call.
+    """
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        collector.emit_cache(op=op, outcome=outcome, source_key=source_key)
+    except Exception:  # noqa: BLE001 — a metric failure must never break a search
+        pass
+
 
 class EnumerationCache:
-    """Source-agnostic two-layer cache. One instance per process (R1)."""
+    """Source-agnostic two-layer cache. One instance per process (R1).
+
+    Composes two independent :class:`SingleFlightCache` layers from the SAME
+    ``ttl`` / ``maxsize`` / ``enabled`` / ``ttl_overrides`` config (D-03 — Layer 1
+    shares Layer 2's staleness window):
+
+    * ``_resolve`` (Layer 1, ``op="resolve"``) — title/query → resolved series-id.
+    * ``_enum`` (Layer 2, ``op="enumerate"``) — the chapter-feed enumeration.
+
+    Each ``cached_*`` call emits a redacted, failure-isolated ``kind="cache"`` event
+    (``hit`` when the layer already holds the key, else ``miss`` after the fetch);
+    ``cache_replace`` emits ``refetch``. Nothing is emitted (and nothing is cached)
+    when the kill-switch is off (D-08).
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl: int = _DEFAULT_TTL,
+        maxsize: int = _DEFAULT_MAXSIZE,
+        enabled: bool = True,
+        ttl_overrides: dict[str, int] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._enabled = enabled
+        self._enum: SingleFlightCache[Enumeration] = SingleFlightCache(
+            ttl=ttl,
+            maxsize=maxsize,
+            enabled=enabled,
+            ttl_overrides=ttl_overrides,
+            clock=clock,
+        )
+        self._resolve: SingleFlightCache[Any] = SingleFlightCache(
+            ttl=ttl,
+            maxsize=maxsize,
+            enabled=enabled,
+            ttl_overrides=ttl_overrides,
+            clock=clock,
+        )
+
+    async def cached_enumerate(
+        self, key: CacheKey, fetch_fn: Callable[[], Awaitable[Enumeration]]
+    ) -> Enumeration:
+        """Layer-2 chapter-feed enumeration (CACHE-03). Emits enumerate hit/miss."""
+        if not self._enabled:
+            return await self._enum.get_or_fetch(key, fetch_fn)
+        outcome = "hit" if self._enum.contains(key) else "miss"
+        result = await self._enum.get_or_fetch(key, fetch_fn)
+        _emit_cache(op="enumerate", outcome=outcome, source_key=key[0])
+        return result
+
+    async def cached_resolve(
+        self, key: CacheKey, fetch_fn: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        """Layer-1 title/query → series-id resolution (D-01). Emits resolve hit/miss."""
+        if not self._enabled:
+            return await self._resolve.get_or_fetch(key, fetch_fn)
+        outcome = "hit" if self._resolve.contains(key) else "miss"
+        result = await self._resolve.get_or_fetch(key, fetch_fn)
+        _emit_cache(op="resolve", outcome=outcome, source_key=key[0])
+        return result
+
+    def cache_replace(self, key: CacheKey, enum: Enumeration) -> None:
+        """Replace the Layer-2 window after a completeness-driven deeper refetch
+        (CACHE-04). Emits ``op="enumerate", outcome="refetch"``."""
+        if not self._enabled:
+            return
+        self._enum.replace(key, enum)
+        _emit_cache(op="enumerate", outcome="refetch", source_key=key[0])
 
     @staticmethod
     def enum_key(source_key: str, series_id: str, languages: list[str]) -> CacheKey:

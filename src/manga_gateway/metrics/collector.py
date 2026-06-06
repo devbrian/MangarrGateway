@@ -308,6 +308,52 @@ class Collector:
             candidates_enumerated=candidates_enumerated,
         )
 
+    def emit_cache(
+        self,
+        *,
+        op: str,
+        outcome: str,
+        source_key: str | None = None,
+    ) -> None:
+        """Emit an enumeration-cache event (Phase 09, kind=``cache``).
+
+        ``op`` is the cache layer (``resolve`` = Layer 1 title→id, ``enumerate`` =
+        Layer 2 chapter feed); ``outcome`` ∈ ``{hit, miss, refetch}``. Mirrors
+        ``emit_solve`` for source attribution: ``source_key`` normally rides
+        ``current_source``, but the cache call site may run outside a source_scope,
+        so the explicit arg is wrapped in ``source_scope`` as a fallback.
+
+        D-06 redaction: ``url=None`` so the raw query / series-id is NEVER recorded
+        — only the ``source_key`` + layer ``op`` cross into the metrics store.
+        """
+        if source_key is not None and current_source.get() is None:
+            from .context import source_scope
+
+            with source_scope(source_key):
+                self._ingest(
+                    kind="cache",
+                    op=op,
+                    method=None,
+                    url=None,
+                    status=None,
+                    outcome=outcome,
+                    duration_ms=0.0,
+                    attempt=1,
+                    error=None,
+                )
+            return
+        self._ingest(
+            kind="cache",
+            op=op,
+            method=None,
+            url=None,
+            status=None,
+            outcome=outcome,
+            duration_ms=0.0,
+            attempt=1,
+            error=None,
+        )
+
     def emit_browser(
         self,
         *,
