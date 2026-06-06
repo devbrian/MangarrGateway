@@ -15,10 +15,11 @@ no pre-merge). Chapter numbers are parsed via ``Decimal`` (Pitfall 1, SRCH-06).
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from ..framework.base import Source
 from ..framework.errors import SourceError
+from ..framework.relevance import prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
@@ -31,6 +32,17 @@ _DEFAULT_MANGA_CANDIDATES = 5
 _INTERACTIVE_MANGA_CANDIDATES = 15
 # MangaDex page-size ceiling for the chapter feed.
 _MAX_FEED_LIMIT = 100
+
+
+class _MangaCandidate(NamedTuple):
+    """One title-search candidate carried through the #126/#139 prune.
+
+    ``titles`` is ``[main_title, *alt_titles]`` (None/empty entries already
+    dropped) — the exact shape ``prune_candidates(keys=...)`` scores over.
+    """
+
+    manga_id: str
+    titles: list[str]
 
 
 class MangaDexSource(Source):
@@ -53,6 +65,8 @@ class MangaDexSource(Source):
         mangadex_id = self._extract_id(req)
 
         if mangadex_id is not None:
+            # ID-first path: a single, already-resolved candidate. No prune —
+            # one candidate in, one out (mirrors comix's _fetch_manga_by_id).
             manga = await self._fetch_manga_by_id(mangadex_id, ctx)
             manga_ids = [manga["id"]] if manga else []
         else:
@@ -61,7 +75,22 @@ class MangaDexSource(Source):
                 if req.interactive
                 else _DEFAULT_MANGA_CANDIDATES
             )
-            manga_ids = await self._search_manga_titles(req.query or "", count, ctx)
+            candidates = await self._search_manga_titles(req.query or "", count, ctx)
+            # Prune obviously-irrelevant candidates BEFORE the per-candidate
+            # chapter-feed fan-out (#126): an exact-match query enumerates only
+            # the one correct series; ambiguous queries still fan out to ``count``
+            # (the prune falls back to the historic ``candidates[:count]``). Each
+            # candidate is scored over its MAIN *or* any ALTERNATE/native title
+            # (#139) — a query matching only the native name still prunes to it.
+            candidates = prune_candidates(
+                candidates,
+                req.query or "",
+                keys=lambda c: c.titles,
+                cap=count,
+            )
+            # 260605-e9a deliverable 5: how many manga we deep-enumerate.
+            ctx.candidates_enumerated = len(candidates)
+            manga_ids = [c.manga_id for c in candidates]
 
         releases: list[Release] = []
         feed_limit = min(req.limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT)
@@ -165,14 +194,62 @@ class MangaDexSource(Source):
 
     async def _search_manga_titles(
         self, query: str, limit: int, ctx: SourceContext
-    ) -> list[str]:
+    ) -> list[_MangaCandidate]:
+        """Title-fallback search → candidates carrying ``[main, *alt_titles]``.
+
+        Each ``/manga`` search item's ``attributes`` already carries ``title``
+        and ``altTitles``; we extract them here (#139) so the #126 prune can score
+        every candidate over its native/alt names, not just the main title. Items
+        without a usable ``id`` are skipped (unchanged from the old ID-only path).
+        """
         data = await ctx.get_json(
             f"{self.base_url}/manga",
             title=query,
             limit=limit,
             **{"includes[]": ["cover_art"]},
         )
-        return [m["id"] for m in data.get("data", []) if isinstance(m, dict)]
+        candidates: list[_MangaCandidate] = []
+        for m in data.get("data", []):
+            if not isinstance(m, dict):
+                continue
+            manga_id = m.get("id")
+            if not manga_id:
+                continue
+            candidates.append(
+                _MangaCandidate(str(manga_id), self._search_item_titles(m))
+            )
+        return candidates
+
+    @classmethod
+    def _search_item_titles(cls, manga: dict[str, Any]) -> list[str]:
+        """``[main_title, *alt_titles]`` from a ``/manga`` search item (#139).
+
+        Be defensive: ``attributes`` may be missing, ``title`` is a localized
+        dict, ``altTitles`` is a list of single-key localized dicts — malformed
+        / empty entries are skipped (behavior-neutral, default ``[]``).
+        """
+        attrs = manga.get("attributes")
+        if not isinstance(attrs, dict):
+            return []
+        titles: list[str] = []
+        main = cls._pick_localized_title(attrs.get("title"))
+        if main:
+            titles.append(main)
+        for alt in attrs.get("altTitles") or []:
+            value = cls._pick_localized_title(alt)
+            if value:
+                titles.append(value)
+        return titles
+
+    @staticmethod
+    def _pick_localized_title(localized: Any) -> str | None:
+        """First non-empty value of a MangaDex localized-title dict, else None."""
+        if not isinstance(localized, dict):
+            return None
+        for value in localized.values():
+            if value:
+                return str(value)
+        return None
 
     async def _fetch_chapter_feed(
         self,

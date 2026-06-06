@@ -378,6 +378,20 @@ def _strip_html(raw: Any) -> str | None:
     return text or None
 
 
+def _split_alt(raw: Any) -> list[str]:
+    """Split the ``alternateName`` HTML field into plain-text alt titles (#139).
+
+    ``alternateName`` arrives as a ``/``-separated HTML string (e.g.
+    ``ワンピース<span>/</span>OP``). Strip the HTML, split on ``/``, strip each
+    piece, and drop empties. Returns ``[]`` for ``None``/empty input so the
+    candidate simply carries no alt titles (behavior unchanged).
+    """
+    stripped = _strip_html(raw)
+    if not stripped:
+        return []
+    return [piece.strip() for piece in stripped.split("/") if piece.strip()]
+
+
 def _is_allowed_image_url(url: str) -> bool:
     """True if ``url`` looks like a MangaBall CDN page image (SSRF allowlist).
 
@@ -537,7 +551,12 @@ class MangaBallSource(Source):
         candidates = prune_candidates(
             dict_titles,
             req.query or "",
-            key=lambda t: _strip_html(t.get("name")),
+            # Score over the main name OR any alternate name (#139): a query that
+            # matches only a title's native/alt name still prunes to it.
+            keys=lambda t: [
+                _strip_html(t.get("name")),
+                *_split_alt(t.get("alternateName")),
+            ],
             cap=_DEFAULT_TITLE_CANDIDATES,
         )
         # 260605-e9a deliverable 5: how many title candidates we deep-enumerate.

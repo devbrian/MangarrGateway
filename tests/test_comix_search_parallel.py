@@ -35,6 +35,7 @@ Driven by a deterministic fake solver — no real browser, no network.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -409,3 +410,132 @@ async def test_search_fan_out_is_capped_by_browser_semaphore(
         f"max_in_flight={gated_solver.max_in_flight} — expected to saturate the "
         f"cap of {cap} with five concurrent candidates"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (f) Alt-title prune runs through the REAL _search_series + prune call site
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# GAP 1 (#139 coverage review): the only other comix alt-title test
+# (``tests/test_candidate_relevance.py::test_comix_alt_title_korean_prunes_to_
+# forgotten_field``) drives ``prune_candidates`` over a test-LOCAL tuple builder
+# that REIMPLEMENTS ``_search_series``'s parse — so a regression in the real
+# 4-tuple threading or the production ``prune_candidates(keys=...)`` call site
+# would not be caught. THIS test drives the REAL ``ComixSource.search()`` over
+# the real ``tests/fixtures/comix/search_the_forgotten_field.json`` payload, so
+# both the production ``_search_series`` parse (``altTitles`` → ``t[3]``) AND the
+# production ``keys=lambda t: [t[2], *t[3]]`` prune call execute. The browser
+# fan-out count (``slow_solver.browser_fetch_calls``) is the prune result: an
+# alt/main-title query that prunes to the single ``mr3m0`` series triggers
+# exactly ONE per-candidate browser nav, not one per valid candidate.
+
+_COMIX_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "comix" / "search_the_forgotten_field.json"
+)
+
+
+def _forgotten_field_fixture() -> dict[str, Any]:
+    """The real comix ``/api/v1/manga`` search payload (28 items, 22 valid)."""
+    return json.loads(_COMIX_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _valid_series_urls() -> list[str]:
+    """The series-page URLs the REAL ``_search_series`` would emit per candidate.
+
+    Mirrors ``_search_series``'s skip rules (no hid / ``hasChapters is False``)
+    only to know which series-page URLs to STAGE on the fake solver — the
+    production parse + prune still run for real over the fixture; this just
+    pre-stages a browser result for every candidate that COULD be navigated so
+    the test's narrowing assertion is meaningful (an un-pruned fan-out would hit
+    every staged URL).
+    """
+    urls: list[str] = []
+    for item in _forgotten_field_fixture()["result"]["items"]:
+        if not isinstance(item, dict):
+            continue
+        hid = item.get("hid")
+        if not hid or item.get("hasChapters") is False:
+            continue
+        slug = ComixSource._slug_from_item(item)  # noqa: SLF001 — mirror the URL build
+        urls.append(f"{_COMIX}/title/{hid}-{slug}")
+    return urls
+
+
+def _stage_forgotten_field(solver: _SlowComixSolver) -> list[str]:
+    """Mock the upstream search with the real fixture + stage every candidate.
+
+    Returns the list of valid series URLs (so the test can assert the prune
+    narrowed the browser fan-out to a strict SUBSET — ideally the single
+    ``mr3m0`` URL)."""
+    respx.get(f"{_COMIX}/api/v1/manga").mock(
+        return_value=httpx.Response(200, json=_forgotten_field_fixture())
+    )
+    urls = _valid_series_urls()
+    for url in urls:
+        solver.stage(
+            url,
+            result=[{"id": "c1", "chapter": "1", "lang": "en", "groups": []}],
+        )
+    return urls
+
+
+_FORGOTTEN_FIELD_URL = f"{_COMIX}/title/mr3m0-the-forgotten-field"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_real_search_alt_title_korean_prunes_browser_fanout_to_one(
+    comix_client: httpx.AsyncClient, slow_solver: _SlowComixSolver
+) -> None:
+    """The Korean alt title ``잊혀진 들판`` prunes the REAL search to ``mr3m0`` only.
+
+    The fixture has 22 valid candidates (many share the "Forgotten"/"Field"
+    keyword); the correct series matches the Korean query ONLY via its
+    ``altTitles`` entry. If the production ``_search_series`` failed to thread
+    ``altTitles`` into the 4-tuple OR the production ``prune_candidates(keys=...)``
+    call regressed, the prune would not narrow and the browser would be navigated
+    for every candidate (or fail to find the alt match) — both caught here."""
+    valid_urls = _stage_forgotten_field(slow_solver)
+    assert len(valid_urls) > 1  # the fixture genuinely fans out without the prune
+
+    resp = await comix_client.post(
+        "/search",
+        json={"type": "chapter", "query": "잊혀진 들판", "sources": ["comix"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # The prune narrowed the per-candidate browser fan-out to the single correct
+    # series — exactly ONE browser nav, to mr3m0's series page.
+    assert slow_solver.browser_fetch_calls == [_FORGOTTEN_FIELD_URL], (
+        slow_solver.browser_fetch_calls
+    )
+    body = resp.json()
+    assert body.get("warnings") == []
+    assert len(body["releases"]) == 1
+    assert body["releases"][0]["mangaTitle"] == "The Forgotten Field"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_real_search_main_title_prunes_browser_fanout_to_one(
+    comix_client: httpx.AsyncClient, slow_solver: _SlowComixSolver
+) -> None:
+    """Parity (#126): the English MAIN title also prunes the REAL search to one.
+
+    Same production path as the Korean case, proving the alt-title threading did
+    not break the pre-existing main-title prune behavior."""
+    _stage_forgotten_field(slow_solver)
+
+    resp = await comix_client.post(
+        "/search",
+        json={"type": "chapter", "query": "The Forgotten Field", "sources": ["comix"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert slow_solver.browser_fetch_calls == [_FORGOTTEN_FIELD_URL], (
+        slow_solver.browser_fetch_calls
+    )
+    body = resp.json()
+    assert body.get("warnings") == []
+    assert len(body["releases"]) == 1
+    assert body["releases"][0]["mangaTitle"] == "The Forgotten Field"

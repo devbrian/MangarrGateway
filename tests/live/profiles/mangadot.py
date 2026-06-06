@@ -54,6 +54,18 @@ LIVE-TUNE items (refine from the first deploy-host smoke)
   ``MangadotSource.fetch_image`` (the fetch_image docstring flags this).
 * **fixture_drift_paths** — empty until the first live smoke pins the real
   search / chapters-list / images shapes (mirrors comix.py / mangaball.py).
+
+Alt-title live smoke (#139)
+---------------------------
+``alt_title_query`` / ``alt_title_expected_substring`` populated (#139): a
+2026-06-05 live recon confirmed mangadot's ``GET /api/search`` matches native/alt
+titles server-side and ``alt_titles`` carries them — querying the Korean native
+title of Solo Leveling (``나 혼자만 레벨업``) returns the "Solo Leveling" series
+(``alt_titles`` includes that exact string). High-traffic, stable, long-running →
+a deterministic alt-title smoke. The query matches ONLY via the alt title (the
+English main title "Solo Leveling" does not contain the Korean string), so the
+release[*] title containing "Solo Leveling" proves the alt-title-aware path
+resolves end-to-end through the gateway.
 """
 
 from __future__ import annotations
@@ -77,4 +89,7 @@ LIVE_SMOKE = LiveSmokeProfile(
     # the real search / chapters-list / images shapes (mirrors comix.py).
     fixture_drift_paths=[],
     perf_budget_s=None,
+    # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
+    alt_title_query="나 혼자만 레벨업",
+    alt_title_expected_substring="Solo Leveling",
 )

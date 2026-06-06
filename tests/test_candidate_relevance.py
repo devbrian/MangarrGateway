@@ -14,7 +14,9 @@ Two layers:
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,11 +24,17 @@ import pytest
 from manga_gateway.framework.relevance import prune_candidates
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.models.search import SearchRequest
+from manga_gateway.sources.mangadex import MangaDexSource
 from manga_gateway.sources.mangadot import MangadotSource
 
 
 def _by_title(item: dict[str, str]) -> str | None:
     return item.get("title")
+
+
+def _by_titles(item: dict[str, Any]) -> list[str | None]:
+    """Extract main + alt titles as the ``keys=`` variant expects."""
+    return [item.get("title"), *(item.get("alt_titles") or [])]
 
 
 # --- Helper unit tests -------------------------------------------------------
@@ -117,6 +125,78 @@ def test_two_exact_matches_are_ambiguous() -> None:
     ]
     result = prune_candidates(candidates, "berserk", key=_by_title, cap=5)
     assert len(result) == 3
+
+
+# --- keys= (multi-title / alt-title-aware) unit tests ------------------------
+
+
+def test_keys_exact_on_alt_title_prunes_to_one() -> None:
+    # Candidate A matches the query ONLY via its alternate (native) title;
+    # no main title matches → still prune to exactly [A] (#139).
+    candidates = [
+        {"title": "The Forgotten Field", "alt_titles": ["잊혀진 들판"]},
+        {"title": "Forgotten Tales", "alt_titles": []},
+        {"title": "A Field Guide", "alt_titles": ["A Different Native Name"]},
+    ]
+    result = prune_candidates(candidates, "잊혀진 들판", keys=_by_titles, cap=5)
+    assert len(result) == 1
+    assert result[0]["title"] == "The Forgotten Field"
+
+
+def test_keys_main_title_still_wins() -> None:
+    # Main-title exact match is byte-identical behavior to the key= path.
+    candidates = [
+        {"title": "The Forgotten Field", "alt_titles": ["잊혀진 들판"]},
+        {"title": "Forgotten Tales", "alt_titles": []},
+        {"title": "A Field Guide", "alt_titles": []},
+    ]
+    result = prune_candidates(candidates, "the forgotten field", keys=_by_titles, cap=5)
+    assert len(result) == 1
+    assert result[0]["title"] == "The Forgotten Field"
+
+
+def test_keys_two_exact_across_main_and_alt_are_ambiguous() -> None:
+    # Candidate A matches "op" via its ALT title; candidate B matches via its
+    # MAIN title — two DIFFERENT candidates each exact → genuine ambiguity → fan
+    # out to candidates[:cap], NOT length 1.
+    candidates = [
+        {"title": "One Piece", "alt_titles": ["OP"]},  # exact via alt
+        {"title": "OP", "alt_titles": []},  # exact via main
+        {"title": "Other Title", "alt_titles": []},
+    ]
+    result = prune_candidates(candidates, "op", keys=_by_titles, cap=5)
+    assert len(result) == 3
+
+
+def test_keys_and_key_are_mutually_exclusive() -> None:
+    candidates = [{"title": "A"}, {"title": "B"}]
+    # Both → error.
+    with pytest.raises((TypeError, ValueError)):
+        prune_candidates(candidates, "a", key=_by_title, keys=_by_titles, cap=5)
+    # Neither → error.
+    with pytest.raises((TypeError, ValueError)):
+        prune_candidates(candidates, "a", cap=5)
+
+
+def test_keys_with_none_and_empty_entries_are_dropped() -> None:
+    # A candidate whose every title is None/empty scores 0 and never wins.
+    candidates = [
+        {"title": None, "alt_titles": [None, "", "   "]},
+        {"title": "Real Series", "alt_titles": []},
+        {"title": "Another", "alt_titles": []},
+    ]
+    # Query the all-empty candidate's normalized "" — the empty-query guard does
+    # NOT apply here (query is non-empty), but the empty-title candidate scores 0.
+    result = prune_candidates(
+        candidates, "totally different query", keys=_by_titles, cap=5
+    )
+    # No exact, no dominant gap → fan out (3 < cap).
+    assert len(result) == 3
+    # And a query exactly matching an empty string must not prune to the empty
+    # candidate (it scores 0, not exact).
+    result2 = prune_candidates(candidates, "real series", keys=_by_titles, cap=5)
+    assert len(result2) == 1
+    assert result2[0]["title"] == "Real Series"
 
 
 # --- mangadot source integration --------------------------------------------
@@ -215,3 +295,195 @@ async def test_mangadot_ambiguous_query_fans_out_to_five() -> None:
 
     assert len(ctx.array_calls) == 5  # _DEFAULT_MANGA_CANDIDATES, unchanged
     assert ctx.candidates_enumerated == 5
+
+
+# --- comix alt-title acceptance (real fixture) -------------------------------
+
+_COMIX_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "comix" / "search_the_forgotten_field.json"
+)
+
+
+def _comix_series_tuples() -> list[tuple[str, str, str, list[str]]]:
+    """Build the ``_search_series`` 4-tuples from the real comix search fixture.
+
+    Mirrors ``ComixSource._search_series``'s parse: skip ``hasChapters is False``
+    items and emit ``(hid, slug, title, alt_titles)`` from the same payload that
+    already carries ``altTitles``.
+    """
+    data = json.loads(_COMIX_FIXTURE.read_text(encoding="utf-8"))
+    out: list[tuple[str, str, str, list[str]]] = []
+    for item in data["result"]["items"]:
+        if not isinstance(item, dict):
+            continue
+        hid = item.get("hid")
+        if not hid:
+            continue
+        if item.get("hasChapters") is False:
+            continue
+        title = str(item.get("title") or "")
+        slug = str(item.get("url") or "")
+        alt_titles = [s for s in (item.get("altTitles") or []) if isinstance(s, str)]
+        out.append((str(hid), slug, title, alt_titles))
+    return out
+
+
+def _comix_keys(t: tuple[str, str, str, list[str]]) -> list[str | None]:
+    return [t[2], *t[3]]
+
+
+def test_comix_alt_title_korean_prunes_to_forgotten_field() -> None:
+    # The Korean alt title of "The Forgotten Field" (hid mr3m0, altTitles
+    # ["잊혀진 들판"]) must prune the per-candidate browser fan-out to that ONE
+    # series — even though no MAIN title matches the Korean query (#139).
+    series = _comix_series_tuples()
+    assert len(series) > 1  # the fixture has many same-keyword series
+    result = prune_candidates(series, "잊혀진 들판", keys=_comix_keys, cap=len(series))
+    assert len(result) == 1
+    assert result[0][2] == "The Forgotten Field"
+    assert result[0][0] == "mr3m0"
+
+
+def test_comix_main_title_prunes_to_forgotten_field() -> None:
+    # Parity with #126: the English MAIN title also prunes to the one series.
+    series = _comix_series_tuples()
+    result = prune_candidates(
+        series, "the forgotten field", keys=_comix_keys, cap=len(series)
+    )
+    assert len(result) == 1
+    assert result[0][2] == "The Forgotten Field"
+    assert result[0][0] == "mr3m0"
+
+
+# --- mangadex source integration (#139, fourth source) ----------------------
+
+_MANGADEX_BASE = "https://api.mangadex.org"
+_MANGADEX_SEARCH = f"{_MANGADEX_BASE}/manga"
+_MANGADEX_FEED = f"{_MANGADEX_BASE}/chapter"
+
+
+class _FakeMangaDexCtx:
+    """``SourceContext`` stand-in for the MangaDex title-fallback fan-out.
+
+    Records one ``feed_calls`` entry per ``GET /chapter`` enumeration so the
+    prune count is ``len(ctx.feed_calls)`` — the MangaDex analog of mangadot's
+    ``array_calls`` / comix's per-candidate nav count.
+    """
+
+    def __init__(self, *, search_data: list[dict[str, Any]]) -> None:
+        self.handle_store = HandleStore()
+        self._search_data = search_data
+        self.feed_calls: list[str] = []
+        self.candidates_enumerated: int | None = None
+
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        if url == _MANGADEX_SEARCH:
+            return {"result": "ok", "data": self._search_data}
+        if url == _MANGADEX_FEED:
+            # Record one enumeration per fan-out candidate; return a single
+            # plausible chapter so _to_release has something to mint.
+            self.feed_calls.append(str(params.get("manga")))
+            return {"result": "ok", "data": [_mangadex_chapter()]}
+        raise AssertionError(f"unexpected get_json url: {url}")
+
+
+def _mangadex_item(
+    *, manga_id: str, title: str, alt_titles: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
+    """One ``GET /manga?title=`` search item with localized title + altTitles."""
+    return {
+        "id": manga_id,
+        "type": "manga",
+        "attributes": {
+            "title": {"en": title},
+            "altTitles": alt_titles or [],
+            "availableTranslatedLanguages": ["en"],
+        },
+        "relationships": [],
+    }
+
+
+def _mangadex_chapter() -> dict[str, Any]:
+    return {
+        "id": "chapter-uuid",
+        "type": "chapter",
+        "attributes": {
+            "volume": None,
+            "chapter": "1",
+            "title": None,
+            "translatedLanguage": "en",
+            "externalUrl": None,
+            "isUnavailable": False,
+            "publishAt": "2026-05-29T13:57:18+00:00",
+            "readableAt": "2026-05-29T13:57:18+00:00",
+            "pages": 2,
+        },
+        "relationships": [
+            {"id": "grp", "type": "scanlation_group", "attributes": {"name": "G"}},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_mangadex_alt_title_match_prunes_fanout_to_one() -> None:
+    # The correct manga matches the query ONLY via its native/alt title; the
+    # distractors share the keyword but neither main nor alt matches → prune the
+    # per-candidate chapter-feed fan-out to that ONE manga_id (#139).
+    search_data = [
+        _mangadex_item(
+            manga_id="correct",
+            title="The Forgotten Field",
+            alt_titles=[{"ko": "잊혀진 들판"}],
+        ),
+        _mangadex_item(manga_id="d1", title="Forgotten Tales"),
+        _mangadex_item(
+            manga_id="d2",
+            title="A Field Guide",
+            alt_titles=[{"ja": "別の名前"}],
+        ),
+    ]
+    ctx = _FakeMangaDexCtx(search_data=search_data)
+
+    await MangaDexSource().search(
+        SearchRequest(type="chapter", query="잊혀진 들판"), ctx
+    )
+
+    assert ctx.feed_calls == ["correct"]
+    assert ctx.candidates_enumerated == 1
+
+
+@pytest.mark.asyncio
+async def test_mangadex_main_title_match_prunes_fanout_to_one() -> None:
+    # Parity with #126: the exact MAIN title query also prunes to one fan-out.
+    search_data = [
+        _mangadex_item(
+            manga_id="correct",
+            title="Solo Leveling",
+            alt_titles=[{"ko": "나 혼자만 레벨업"}],
+        ),
+        _mangadex_item(manga_id="d1", title="Solo Camping"),
+        _mangadex_item(manga_id="d2", title="Leveling Up Alone"),
+    ]
+    ctx = _FakeMangaDexCtx(search_data=search_data)
+
+    await MangaDexSource().search(
+        SearchRequest(type="chapter", query="Solo Leveling"), ctx
+    )
+
+    assert ctx.feed_calls == ["correct"]
+    assert ctx.candidates_enumerated == 1
+
+
+@pytest.mark.asyncio
+async def test_mangadex_ambiguous_query_fans_out_to_full_set() -> None:
+    # Several candidates merely share a common word — no exact match, no
+    # dominant gap → fan out to every candidate (#126 conservative behavior).
+    search_data = [
+        _mangadex_item(manga_id=f"m{i}", title=f"Dragon Tale {i}") for i in range(4)
+    ]
+    ctx = _FakeMangaDexCtx(search_data=search_data)
+
+    await MangaDexSource().search(SearchRequest(type="chapter", query="dragon"), ctx)
+
+    assert len(ctx.feed_calls) == 4
+    assert ctx.candidates_enumerated == 4

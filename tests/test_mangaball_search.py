@@ -121,18 +121,26 @@ def _chapter(
     }
 
 
-def _title(*, title_id: str, name: str = "One Piece") -> dict[str, Any]:
+def _title(
+    *,
+    title_id: str,
+    name: str = "One Piece",
+    alternate_name: str = 'ワンピース<span class="text-muted">/</span>OP',
+) -> dict[str, Any]:
     """A TITLE-ONLY search-advanced hit — explicitly NO ``chapters`` key (GAP-1).
 
     The live ``search-advanced`` returns titles only; chapters/translations exist
     ONLY in ``chapter-listing-by-title-id``. HTML-string fields
     (``alternateName``/``status``/``last_chapter``) must be stripped, never raw.
+    ``alternate_name`` defaults to the real ``/``-separated HTML shape (native
+    title + romaji abbreviation) so the alt-title prune (#139) has something to
+    split; override it for distractor titles whose alt names must NOT match.
     """
     return {
         "_id": title_id,
         "name": name,
         # HTML-string fields (recon Gotchas) — must be stripped, never raw.
-        "alternateName": 'ワンピース<span class="text-muted">/</span>OP',
+        "alternateName": alternate_name,
         "status": '<span class="badge">Ongoing</span>',
         "last_chapter": '<div class="lc"><a href="/x">Ch. 1184.1</a></div>',
         "url": f"http://mangaball.net/title-detail/one-piece-{title_id}/",
@@ -432,3 +440,100 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     # Every returned release's handle resolves (no eviction of survivors).
     for rel in releases:
         assert ctx.handle_store.resolve(rel.download_handle) is not None
+
+
+# --- alt-title prune wiring (#139, GAP 2) ------------------------------------
+#
+# These drive the REAL ``MangaBallSource.search()`` so the production
+# ``_split_alt`` / ``_strip_html(alternateName)`` extractor AND the production
+# ``prune_candidates(keys=...)`` call site both execute. The existing
+# ``test_search_strips_html_string_fields`` only checks HTML-stripping of emitted
+# fields — NO test previously exercised the alt-title prune wiring (the
+# ``alternateName`` → ``_split_alt`` → ``keys=`` path). The number of
+# ``chapter-listing-by-title-id`` POSTs is the prune count: an exact-match query
+# (main OR alt) deep-enumerates only the one correct title; an ambiguous query
+# fans out to the full set.
+
+
+def _listing_calls(ctx: Any) -> list[tuple[str, dict[str, Any]]]:
+    return [c for c in ctx.calls if c[0] == _CHAPTER_LISTING]
+
+
+@pytest.mark.asyncio
+async def test_search_alt_title_match_prunes_fanout_to_one() -> None:
+    """A query matching ONLY a title's alt name prunes the listing fan-out to it.
+
+    The correct title (``OP``) matches the query via its ``alternateName``
+    (``ワンピース<span>/</span>OP`` → ``["ワンピース", "OP"]`` after
+    ``_split_alt``/``_strip_html``); the distractors share neither main nor alt.
+    If ``_split_alt`` or the production ``prune_candidates(keys=...)`` call broke,
+    the prune would not narrow and ALL candidates would be deep-enumerated."""
+    correct_id = "aaaaaaaaaaaaaaaaaaaaaaaa"
+    titles = [
+        _title(
+            title_id=correct_id,
+            name="One Piece",
+            # Native title + the romaji abbreviation "OP" via the real HTML shape.
+            alternate_name="ワンピース<span>/</span>OP",
+        ),
+        _title(
+            title_id="bbbbbbbbbbbbbbbbbbbbbbbb",
+            name="One Punch Man",
+            alternate_name="ワンパンマン<span>/</span>OPM",
+        ),
+        _title(
+            title_id="cccccccccccccccccccccccc",
+            name="Overlord",
+            alternate_name="オーバーロード<span>/</span>OVL",
+        ),
+    ]
+    listings = {t["_id"]: [_chapter()] for t in titles}
+    ctx = _ctx(titles=titles, listings=listings)
+
+    await MangaBallSource().search(SearchRequest(type="manga", query="OP"), ctx)
+
+    listing_calls = _listing_calls(ctx)
+    assert len(listing_calls) == 1
+    assert listing_calls[0][1]["title_id"] == correct_id
+
+
+@pytest.mark.asyncio
+async def test_search_main_title_match_prunes_fanout_to_one() -> None:
+    """Parity (#126): an exact MAIN-title query also prunes the fan-out to one."""
+    correct_id = "aaaaaaaaaaaaaaaaaaaaaaaa"
+    titles = [
+        _title(title_id=correct_id, name="One Piece"),
+        _title(title_id="bbbbbbbbbbbbbbbbbbbbbbbb", name="One Punch Man"),
+        _title(title_id="cccccccccccccccccccccccc", name="Overlord"),
+    ]
+    listings = {t["_id"]: [_chapter()] for t in titles}
+    ctx = _ctx(titles=titles, listings=listings)
+
+    await MangaBallSource().search(SearchRequest(type="manga", query="One Piece"), ctx)
+
+    listing_calls = _listing_calls(ctx)
+    assert len(listing_calls) == 1
+    assert listing_calls[0][1]["title_id"] == correct_id
+
+
+@pytest.mark.asyncio
+async def test_search_ambiguous_query_fans_out_to_full_set() -> None:
+    """An ambiguous query (shared keyword, no exact main/alt hit) fans out fully.
+
+    Several candidates merely share the word "Dragon"; none is an exact match on
+    main OR alt → the prune falls back to the full candidate set (#126
+    conservative behavior), so EVERY candidate is deep-enumerated."""
+    titles = [
+        _title(
+            title_id=f"{i:024x}",
+            name=f"Dragon Tale {i}",
+            alternate_name=f"ドラゴン{i}<span>/</span>DT{i}",
+        )
+        for i in range(4)
+    ]
+    listings = {t["_id"]: [_chapter()] for t in titles}
+    ctx = _ctx(titles=titles, listings=listings)
+
+    await MangaBallSource().search(SearchRequest(type="manga", query="dragon"), ctx)
+
+    assert len(_listing_calls(ctx)) == 4

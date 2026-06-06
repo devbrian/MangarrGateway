@@ -224,7 +224,10 @@ class MangadotSource(Source):
         candidates = prune_candidates(
             dict_candidates,
             req.query or "",
-            key=lambda m: m.get("title"),
+            # Score over the main title OR any alternate/native title (#139). The
+            # alt-title field is absent from the current mangadot search payload,
+            # so ``or []`` keeps behavior byte-identical until/if it appears.
+            keys=lambda m: [m.get("title"), *(m.get("alt_titles") or [])],
             cap=_DEFAULT_MANGA_CANDIDATES,
         )
         # 260605-e9a deliverable 5: how many manga candidates we deep-enumerate.

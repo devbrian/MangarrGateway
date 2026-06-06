@@ -59,4 +59,11 @@ LIVE_SMOKE = LiveSmokeProfile(
     ],
     # D-61: perf budget owned by test_comix_perf_live.py for v1.
     perf_budget_s=None,
+    # Alt-title live smoke (#139): the Korean native title of "The Forgotten
+    # Field" (hid mr3m0, altTitles ["잊혀진 들판"] in the search payload). A live
+    # search for the native name must resolve to the same series the English
+    # ``default_query="Forgotten Field"`` does — proving alt-title matching works
+    # end-to-end against the real source, not just the offline fixture.
+    alt_title_query="잊혀진 들판",
+    alt_title_expected_substring="Forgotten Field",
 )

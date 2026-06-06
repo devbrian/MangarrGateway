@@ -52,4 +52,21 @@ LIVE_SMOKE = LiveSmokeProfile(
     expected_release_pattern={"sourceKey": "mangadex"},
     fixture_drift_paths=[],
     perf_budget_s=None,
+    # Alt-title live smoke (#139): INTENTIONALLY DISABLED for MangaDex (left None
+    # like mangadot/mangaball). Unlike the title-only sources — which return a
+    # broad keyword candidate list that the client-side prune narrows — MangaDex's
+    # ``GET /manga?title=`` is a real server-side search engine that ALREADY does
+    # alt-title matching itself (a native-script query returns romanized/alt
+    # matches). A 2026-06-05 live probe of the Korean Solo Leveling native title
+    # (나 혼자만 레벨업) returned only spin-offs (Ragnarok/Arise/Book Version), not
+    # the canonical series, so the chapter-feed enumeration produced 0 English
+    # releases — i.e. the result set is governed by MangaDex's own relevance
+    # ranking + spin-off catalog, not by our prune, which makes a deterministic
+    # native-query live assertion infeasible. The mangadex alt-title PRUNE WIRING
+    # is correct and conservative (byte-identical fallback when no unambiguous
+    # match) and is covered by the offline integration test in
+    # tests/test_candidate_relevance.py (alt→1, main→1, ambiguous→fan-out). The
+    # main-title live smoke (default_query above) exercises the live search path.
+    alt_title_query=None,
+    alt_title_expected_substring=None,
 )

@@ -71,6 +71,19 @@ confirms / tunes:
   ``chapter-listing-by-title-id`` flat shape match the recon (A7 fixture anchors).
 * **fixture_drift_paths** — empty until the first live smoke pins the real
   chapter-detail / search shapes; add anchors then (mirrors comix.py).
+
+Alt-title live smoke (#139)
+---------------------------
+``alt_title_query`` / ``alt_title_expected_substring`` populated (#139): a
+2026-06-05 live recon (CSRF-bootstrap + ``POST /api/v1/title/search-advanced/``)
+confirmed mangaball matches native/alt names server-side and the ``alternateName``
+``/``-separated HTML blob carries them — querying the Korean native title of Solo
+Leveling (``나 혼자만 레벨업``) returns the "Solo Leveling" series (its
+``alternateName`` leads with that exact string). High-traffic, stable → a
+deterministic alt-title smoke. The query matches ONLY via the alt name (the
+English main name "Solo Leveling" does not contain the Korean string), so a
+release whose title contains "Solo Leveling" proves the ``_split_alt`` +
+alt-title-aware prune path resolves end-to-end through the gateway.
 """
 
 from __future__ import annotations
@@ -96,4 +109,7 @@ LIVE_SMOKE = LiveSmokeProfile(
     # pins the real chapter-detail / search shapes (mirrors comix.py).
     fixture_drift_paths=[],
     perf_budget_s=None,
+    # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
+    alt_title_query="나 혼자만 레벨업",
+    alt_title_expected_substring="Solo Leveling",
 )
