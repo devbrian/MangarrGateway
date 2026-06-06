@@ -41,13 +41,14 @@ def _ev(
     op: str = "get_json",
     ts: float = 1.0,
     kind: str = "http",
+    endpoint: str | None = "GET /search",
 ) -> MetricEvent:
     return MetricEvent(
         ts=ts,
         kind=kind,
         request_id=request_id,
         surface="search",
-        endpoint="GET /search",
+        endpoint=endpoint,
         source_key="comix",
         op=op,
         method="GET",
@@ -231,6 +232,109 @@ async def test_multi_ring_membership_writes_one_row_per_ring(tmp_path: Path) -> 
         assert any(e["request_id"] == 42 for e in slow)
         # A steady ok call is only in recent.
         assert failures == [f for f in failures if f["outcome"] != "ok"]
+    finally:
+        await snap.close()
+
+
+# ─────────── include_unrouted filter (260606-0mq — hide endpoint=null) ────────
+
+
+async def test_recent_calls_default_hides_unrouted(tmp_path: Path) -> None:
+    """recent_calls at the default (include_unrouted=False per the route) returns
+    ONLY routed events (endpoint set); include_unrouted=True restores ALL events
+    (routed + unrouted), matching today's full output."""
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        # Two routed + two unrouted (endpoint=None) events.
+        snap.enqueue(_ev(duration_ms=100.0, request_id=1, ts=1.0), {"recent"})
+        snap.enqueue(
+            _ev(duration_ms=100.0, request_id=2, ts=2.0, endpoint=None), {"recent"}
+        )
+        snap.enqueue(_ev(duration_ms=100.0, request_id=3, ts=3.0), {"recent"})
+        snap.enqueue(
+            _ev(duration_ms=100.0, request_id=4, ts=4.0, endpoint=None), {"recent"}
+        )
+        await snap.flush()
+
+        filtered = await snap.recent_calls(100, include_unrouted=False)
+        assert all(e["endpoint"] is not None for e in filtered)
+        assert {e["request_id"] for e in filtered} == {1, 3}
+
+        unfiltered = await snap.recent_calls(100, include_unrouted=True)
+        assert {e["request_id"] for e in unfiltered} == {1, 2, 3, 4}
+        # The public accessor default keeps the full pre-260606 output (True).
+        assert await snap.recent_calls(100) == unfiltered
+    finally:
+        await snap.close()
+
+
+async def test_limit_applies_to_filtered_set(tmp_path: Path) -> None:
+    """LIMIT bounds the FILTERED set: 3 routed + 20 unrouted with limit=3 →
+    exactly 3 routed events, zero unrouted. A Python post-filter would have
+    returned fewer real rows here — this proves the filter is IN SQL before LIMIT.
+    """
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        # 20 unrouted with the NEWEST timestamps (would dominate a post-filter top-3).
+        for i in range(20):
+            snap.enqueue(
+                _ev(duration_ms=100.0, request_id=100 + i, ts=100.0 + i, endpoint=None),
+                {"recent"},
+            )
+        # 3 routed with OLDER timestamps.
+        for i in range(3):
+            snap.enqueue(
+                _ev(duration_ms=100.0, request_id=i, ts=float(i)), {"recent"}
+            )
+        await snap.flush()
+
+        filtered = await snap.recent_calls(3, include_unrouted=False)
+        assert len(filtered) == 3
+        assert all(e["endpoint"] is not None for e in filtered)
+        assert {e["request_id"] for e in filtered} == {0, 1, 2}
+    finally:
+        await snap.close()
+
+
+async def test_latest_failures_and_slow_honor_include_unrouted(tmp_path: Path) -> None:
+    """latest_failures and latest_slow hide an unrouted error/slow event by default
+    and surface it under include_unrouted=True (all three feeds at the snapshot
+    layer)."""
+    db = str(tmp_path / "metrics.db")
+    snap = await open_metric_store(db)
+    try:
+        # Enqueue an unrouted (endpoint=None) event directly into BOTH the failures
+        # and slow rings (explicit membership — we are testing the read-path SQL
+        # filter, not the live slow classifier's per-baseline threshold).
+        unrouted = _ev(
+            duration_ms=9000.0,
+            outcome="error",
+            request_id=42,
+            ts=99.0,
+            endpoint=None,
+        )
+        snap.enqueue(unrouted, {"recent", "failures", "slow"})
+        # A routed failure/slow event in the same rings so the filtered output is
+        # non-empty (proves the filter hides ONLY the unrouted row).
+        routed = _ev(
+            duration_ms=9000.0, outcome="error", request_id=7, ts=50.0
+        )
+        snap.enqueue(routed, {"recent", "failures", "slow"})
+        await snap.flush()
+
+        # Default hides the unrouted event on both feeds (but keeps the routed one).
+        failures_default = await snap.latest_failures(1000, include_unrouted=False)
+        slow_default = await snap.latest_slow(1000, include_unrouted=False)
+        assert {e["request_id"] for e in failures_default} == {7}
+        assert {e["request_id"] for e in slow_default} == {7}
+
+        # include_unrouted=True restores it on both feeds.
+        failures_all = await snap.latest_failures(1000, include_unrouted=True)
+        slow_all = await snap.latest_slow(1000, include_unrouted=True)
+        assert any(e["request_id"] == 42 for e in failures_all)
+        assert any(e["request_id"] == 42 for e in slow_all)
     finally:
         await snap.close()
 

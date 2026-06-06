@@ -186,22 +186,65 @@ class MetricSnapshotStore:
         return len(rows)
 
     # ── ring read path (indexed) ──────────────────────────────────────────────
-    async def recent_calls(self, limit: int) -> list[dict[str, object]]:
-        """Newest-first events in the ``recent`` ring, bounded to ``limit``."""
-        return await self._latest_in_ring("recent", limit)
+    async def recent_calls(
+        self, limit: int, *, include_unrouted: bool = True
+    ) -> list[dict[str, object]]:
+        """Newest-first events in the ``recent`` ring, bounded to ``limit``.
 
-    async def latest_failures(self, limit: int) -> list[dict[str, object]]:
-        """Newest-first events in the ``failures`` ring, bounded to ``limit``."""
-        return await self._latest_in_ring("failures", limit)
+        When ``include_unrouted`` is False the SQL adds
+        ``AND json_extract(payload, '$.endpoint') IS NOT NULL`` so unrouted noise
+        (events whose ``endpoint`` is null — 404s to unknown paths, ``/openapi.json``,
+        ``/docs``, admin-metrics polling) is hidden BEFORE the LIMIT bounds the set
+        (260606-0mq). Defaults to True so existing callers keep the full output.
+        """
+        return await self._latest_in_ring(
+            "recent", limit, include_unrouted=include_unrouted
+        )
 
-    async def latest_slow(self, limit: int) -> list[dict[str, object]]:
-        """Newest-first events in the ``slow`` ring, bounded to ``limit``."""
-        return await self._latest_in_ring("slow", limit)
+    async def latest_failures(
+        self, limit: int, *, include_unrouted: bool = True
+    ) -> list[dict[str, object]]:
+        """Newest-first events in the ``failures`` ring, bounded to ``limit``.
 
-    async def _latest_in_ring(self, ring: str, limit: int) -> list[dict[str, object]]:
+        ``include_unrouted=False`` hides unrouted (endpoint=null) events via the
+        in-SQL ``json_extract`` filter (260606-0mq); defaults to True (full output).
+        """
+        return await self._latest_in_ring(
+            "failures", limit, include_unrouted=include_unrouted
+        )
+
+    async def latest_slow(
+        self, limit: int, *, include_unrouted: bool = True
+    ) -> list[dict[str, object]]:
+        """Newest-first events in the ``slow`` ring, bounded to ``limit``.
+
+        ``include_unrouted=False`` hides unrouted (endpoint=null) events via the
+        in-SQL ``json_extract`` filter (260606-0mq); defaults to True (full output).
+        """
+        return await self._latest_in_ring(
+            "slow", limit, include_unrouted=include_unrouted
+        )
+
+    async def _latest_in_ring(
+        self, ring: str, limit: int, *, include_unrouted: bool = True
+    ) -> list[dict[str, object]]:
+        """Newest-first ``payload`` rows for ``ring``, bounded to ``limit``.
+
+        The base query is ``WHERE ring = ?``. When ``include_unrouted`` is False we
+        append the FIXED literal clause
+        ``AND json_extract(payload, '$.endpoint') IS NOT NULL`` so the unrouted
+        (endpoint=null) subset is filtered IN SQL — the LIMIT therefore bounds the
+        FILTERED set, not the raw set (260606-0mq). The fragment is a constant string
+        (never interpolated from caller data); the only parameterized values stay
+        ``(ring, limit)`` (T-0mq-01: no SQL-injection surface).
+        """
+        where = "WHERE ring = ?"
+        if not include_unrouted:
+            where += " AND json_extract(payload, '$.endpoint') IS NOT NULL"
         async with self._conn.execute(
-            "SELECT payload FROM ring_events WHERE ring = ? "
-            "ORDER BY ts DESC, id DESC LIMIT ?",
+            "SELECT payload FROM ring_events "
+            + where
+            + " ORDER BY ts DESC, id DESC LIMIT ?",
             (ring, limit),
         ) as cur:
             rows = await cur.fetchall()
