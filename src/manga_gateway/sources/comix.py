@@ -150,6 +150,20 @@ _CID_SEP = "|"
 # ``_parse_composite_chapter_id`` accepts it unchanged (locked decision 8).
 _DEFERRED_SENTINEL = "DEFERRED"
 
+# Page-image encryption (spike-012-verified). The CDN byte-encrypts the first
+# ``x-enc-len`` (4096) bytes of every 4th page image, keyed by the per-response
+# ``x-enc-seed`` header; ``x-enc-seed == 0`` means plaintext (no-op). The cipher
+# is a fully static 32-bit LCG keystream XORed over the prefix — pure stdlib, no
+# browser, no re-encode. These constants are the spike-012-verified LCG params.
+_ENC_MASK = 0xFFFFFFFF
+_ENC_MULTIPLIER = 1000005
+_ENC_INCREMENT = 1234567891
+_ENC_LEN_DEFAULT = 4096
+# Defensive ceiling on the decoded prefix length (T-iy5-01): a hostile/garbage
+# ``x-enc-len`` must NOT be able to force a whole-image per-byte XOR loop on the
+# event loop. The verified scheme length is 4096; this gives 16x headroom.
+_ENC_LEN_MAX = 65536
+
 
 def _make_deferred_composite(hid: str, slug: str, chapter_number: str) -> str:
     """Build a recent-feed handle's composite ``chapter_id`` (issue #42).
@@ -1254,19 +1268,65 @@ class ComixSource(Source):
             raise SourceError("source_unavailable", "malformed chapter manifest")
         return urls
 
+    @staticmethod
+    def _decode_enc_prefix(data: bytes, seed: int, enc_len: int) -> bytes:
+        """Return ``data`` with its first ``enc_len`` bytes LCG-XOR-decoded.
+
+        Spike-012-verified static cipher: ``seed == 0`` is a no-op (returns ``data``
+        unchanged — the ~75% plaintext pages); otherwise a 32-bit LCG keystream is
+        XORed over the prefix, taking the TOP byte of each advanced state. Pure stdlib,
+        bit-exact against the spike's captured (ciphertext, seed, plaintext) vector.
+        """
+        if seed == 0:
+            return data
+        out = bytearray(data)
+        state = seed & _ENC_MASK
+        for i in range(min(enc_len, len(out))):
+            state = (state * _ENC_MULTIPLIER + _ENC_INCREMENT) & _ENC_MASK
+            out[i] ^= (state >> 24) & 0xFF
+        return bytes(out)
+
+    @staticmethod
+    def _enc_header_int(raw: str | None) -> int:
+        """Parse an ``x-enc-*`` header to an int, failing SAFE to ``0`` (T-iy5-02).
+
+        A missing, empty, or non-numeric header returns ``0`` and never raises — so a
+        corrupt/hostile ``x-enc-seed`` degrades to plaintext passthrough rather than a
+        crash.
+        """
+        if raw is None:
+            return 0
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return 0
+
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's raw bytes via the shared session (PKG-02).
 
-        Delegates to ``ctx.get_bytes_plain`` — cleared by the framework seam
-        (D-40) but the decrypt seam is opted out: the Comix CDN
-        (``https://{cdn}.store/{seg}/{token}/{NN}.webp``, ``{seg}`` rotating —
-        ``si``/``i3``) serves plaintext WebP.
-        The browser is NEVER used for image fetch (CLAUDE.md): the cleared
-        httpx client does the bulk fetch, bounded by the per-job semaphore.
-        The host + token come from the browser-DOM page-list (Option A pivot —
-        Plan 04-04).
+        Delegates to ``ctx.get_bytes_plain_with_headers`` — cleared by the framework
+        seam (D-40), the framework decrypt seam opted out — so the source sees the raw
+        CDN bytes PLUS the response headers. The Comix CDN now serves byte-encrypted
+        WebP on every 4th page (``x-enc-seed != 0``): we decode statically over the
+        first ``x-enc-len`` bytes per the spike-012-verified cipher. The ~75% plaintext
+        pages (``x-enc-seed == 0`` / missing / malformed header) pass through
+        byte-for-byte (the fast path). Still NO browser for image bytes, NO re-encode —
+        pages stay WebP.
+
+        ``x-enc-len`` is clamped to ``_ENC_LEN_MAX`` (T-iy5-01) so a hostile header
+        cannot force a whole-image XOR loop. The clamped (≤65536-byte) integer loop is
+        trivial CPU (sub-millisecond) and runs inline on the event loop — NO
+        ``asyncio.to_thread`` offload is needed (unlike the Pillow/zipfile packaging
+        path). ``httpx.Headers.get`` is case-insensitive, so the lowercase header names
+        match regardless of wire casing.
         """
-        return await ctx.get_bytes_plain(url)
+        data, headers = await ctx.get_bytes_plain_with_headers(url)
+        seed = self._enc_header_int(headers.get("x-enc-seed"))
+        if seed == 0:
+            return data  # plaintext page — untouched (fast path)
+        enc_len = self._enc_header_int(headers.get("x-enc-len")) or _ENC_LEN_DEFAULT
+        enc_len = min(enc_len, _ENC_LEN_MAX)
+        return self._decode_enc_prefix(data, seed, enc_len)
 
     # ─────────────────────────── composite chapter-id ────────────────────────────
 
