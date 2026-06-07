@@ -125,3 +125,4 @@ def test_enc_header_int_rejects_signed_and_nondecimal() -> None:
     assert f("4294967295") == 0xFFFFFFFF  # max 32-bit seed admitted (boundary)
     assert f("4294967296") == 0  # > 32 bits → malformed (would alias under the mask)
     assert f("99999999999999") == 0  # far over → malformed
+    assert f("9" * 5000) == 0  # over-long digit run → 0, must NOT raise ValueError

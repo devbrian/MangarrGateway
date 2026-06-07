@@ -1297,17 +1297,20 @@ class ComixSource(Source):
         because a negative ``x-enc-len`` would make ``range(min(enc_len, …))`` empty —
         skipping the XOR loop and leaving an encrypted page as undecodable ciphertext —
         and a negative ``x-enc-seed`` would still decode (corrupting a plaintext page).
-        ``str.isdecimal()`` accepts only digit runs (rejecting ``-1``, ``+1``, ``0x..``,
-        whitespace-only), and still admits the large unsigned 32-bit seeds Comix sends.
-        Values exceeding 32 bits (> ``_ENC_MASK``) are also rejected: since
-        ``_decode_enc_prefix`` masks the seed with ``_ENC_MASK``, an out-of-range header
-        would otherwise alias to a different in-range state and decode-corrupt a page
-        instead of failing safe.
+        ``str.isdecimal()`` rejects ``-1``/``+1``/``0x..``/whitespace-only while still
+        admitting the large unsigned 32-bit seeds Comix sends. The ``len > 10`` guard
+        rejects over-long digit runs BEFORE ``int()``: a valid 32-bit value is at most
+        ``"4294967295"`` (10 digits), and the bound stops ``int()`` raising on a hostile
+        >4300-digit string (CPython's int-conversion limit), which would escape the
+        fail-safe. The residual ``> _ENC_MASK`` check rejects the in-10-digit-but-over
+        case (``"4294967296"``): ``_decode_enc_prefix`` masks with ``_ENC_MASK``, so an
+        out-of-range header would alias to a different in-range state and decode-corrupt
+        a page instead of failing safe.
         """
         if raw is None:
             return 0
         value = raw.strip()
-        if not value.isdecimal():
+        if not value.isdecimal() or len(value) > 10:
             return 0
         parsed = int(value)
         if parsed > _ENC_MASK:
