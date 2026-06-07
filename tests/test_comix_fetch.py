@@ -27,6 +27,7 @@ from manga_gateway.framework.decrypt import _SCHEMES, register_scheme
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.framework.health import SourceHealth
 from manga_gateway.handles.store import HandleStore
+from manga_gateway.sources.comix import ComixSource
 
 # ───────────────────────────── transport / solver fakes ──────────────────────────
 
@@ -107,6 +108,16 @@ def _cf_challenge_response(req: httpx.Request) -> httpx.Response:
     return httpx.Response(
         403,
         headers={"server": "cloudflare", "cf-mitigated": "challenge"},
+        content=b"...challenge-platform...",
+        request=req,
+    )
+
+
+def _cf_challenge_503_response(req: httpx.Request) -> httpx.Response:
+    # Issue #172: Cloudflare also serves challenges as 503 interstitials.
+    return httpx.Response(
+        503,
+        headers={"server": "cloudflare"},
         content=b"...challenge-platform...",
         request=req,
     )
@@ -223,6 +234,8 @@ async def test_cloudflare_with_null_clearance_sends_no_override() -> None:
 def test_is_cf_challenge_detects_markers() -> None:
     req = httpx.Request("GET", "https://comix/api")
     assert is_cf_challenge(_cf_challenge_response(req)) is True
+    # Issue #172: a 503 CF interstitial is ALSO a challenge.
+    assert is_cf_challenge(_cf_challenge_503_response(req)) is True
     # A plain 403 (no CF markers) is NOT a challenge.
     assert is_cf_challenge(httpx.Response(403, request=req)) is False
     # A 200 is never a challenge.
@@ -245,6 +258,27 @@ async def test_cloudflare_challenge_403_triggers_single_resolve_and_retry() -> N
 
     assert out == {"ok": True}
     assert solver.forced == 1  # exactly ONE forced re-solve
+    assert len(transport.calls) == 2  # initial + single retry
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_challenge_503_triggers_single_resolve_and_retry() -> None:
+    # Issue #172: a 503 CF interstitial must take the SAME forced-re-solve path as
+    # a 403 challenge — not skip it and burn retries against a stale cookie/UA.
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [
+            _cf_challenge_503_response(req),  # first → 503 challenge → re-solve+retry
+            httpx.Response(200, json={"ok": True}, request=req),  # retry succeeds
+        ]
+    )
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare+encrypted", solver=solver)
+
+    out = await ctx.get_json("https://comix/api")
+
+    assert out == {"ok": True}
+    assert solver.forced == 1  # exactly ONE forced re-solve, same as the 403 path
     assert len(transport.calls) == 2  # initial + single retry
 
 
@@ -557,3 +591,86 @@ async def test_caps_route_reports_tripped_breaker_in_same_poll(
     # Same poll cadence: the cached skeleton must NOT mask the live enabled flip.
     second = (await client.get("/caps")).json()
     assert any(s["key"] == target and s["enabled"] is False for s in second["sources"])
+
+
+# ─────────── Issue #171: cold-start manifest race → one bounded re-nav ───────────
+
+
+_VALID_PAGE_URL = "https://test.wowpic9.store/si/TOKENXXXXXXXXXXXXXX/01.webp"
+_COMIX_COMPOSITE = ComixSource._make_composite_chapter_id(
+    "9001596", "mr3m0", "cipher-tales", "1"
+)
+
+
+class _ManifestSequenceSolver:
+    """Fake solver whose ``fetch_via_browser`` returns queued results in order.
+
+    Backs the Issue #171 cold-race test: stage e.g. ``[[], [url]]`` and assert
+    ``fetch_manifest`` re-navigates once and resolves the warm second capture.
+    ``fetch_via_browser_paginated`` exists only so ``_solver_from_ctx``'s hasattr
+    guard passes — the resolved (non-DEFERRED) composite never walks the series.
+    """
+
+    def __init__(self, results: list[object]) -> None:
+        self._results = list(results)
+        self.browser_calls = 0
+
+    async def get_clearance(
+        self, source_key: str, *, force_resolve: bool = False
+    ) -> Clearance:
+        return Clearance(cookies={"cf_clearance": "X"}, user_agent="UA")
+
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        self.browser_calls += 1
+        return self._results.pop(0)
+
+    async def fetch_via_browser_paginated(  # pragma: no cover — never called
+        self, url: str, **kwargs: object
+    ) -> object:
+        raise AssertionError("resolved composite must not walk the series list")
+
+
+@pytest.mark.asyncio
+async def test_cold_race_empty_manifest_retries_once_then_resolves() -> None:
+    # Issue #171: a cold browser yields an EMPTY capture; one re-nav warms it and
+    # the second capture resolves the real manifest.
+    solver = _ManifestSequenceSolver([[], [_VALID_PAGE_URL]])
+    ctx = _ctx(_RecordingTransport([]), antibot="cloudflare+encrypted", solver=solver)
+
+    urls = await ComixSource().fetch_manifest(_COMIX_COMPOSITE, ctx)
+
+    assert urls == [_VALID_PAGE_URL]
+    assert solver.browser_calls == 2  # initial empty + ONE warm re-nav
+
+
+@pytest.mark.asyncio
+async def test_persistently_empty_manifest_raises_after_bounded_retry() -> None:
+    # A genuinely broken page stays empty across the re-nav → raise, but only after
+    # exactly ONE retry (bounded — no hot-loop on a permanently empty chapter).
+    solver = _ManifestSequenceSolver([[], []])
+    ctx = _ctx(_RecordingTransport([]), antibot="cloudflare+encrypted", solver=solver)
+
+    with pytest.raises(SourceError, match="malformed chapter manifest"):
+        await ComixSource().fetch_manifest(_COMIX_COMPOSITE, ctx)
+    assert solver.browser_calls == 2  # initial + single bounded retry, then raise
+
+
+@pytest.mark.asyncio
+async def test_populated_but_invalid_manifest_does_not_consume_retry() -> None:
+    # A populated-but-malformed manifest (off-domain URL) is a REAL fault, not a
+    # cold race — it raises immediately without spending the cold-race re-nav.
+    solver = _ManifestSequenceSolver(
+        [["https://evil.example/si/TOKENXXXXXXXXXXXXXX/01.webp"]]
+    )
+    ctx = _ctx(_RecordingTransport([]), antibot="cloudflare+encrypted", solver=solver)
+
+    with pytest.raises(SourceError, match="malformed chapter manifest"):
+        await ComixSource().fetch_manifest(_COMIX_COMPOSITE, ctx)
+    assert solver.browser_calls == 1  # no retry — only the empty signature retries
