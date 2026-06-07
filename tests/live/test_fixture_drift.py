@@ -28,12 +28,36 @@ The previous mismatch was a red herring (the bug was inside the JS
 extractor itself, not the Python-side wait), but symmetric call sites
 keep "drift" focused on real upstream/extractor changes rather than
 harness-vs-prod divergence.
+
+Issue #166 (2026-06-07): the Comix image CDN periodically ROTATES the
+host (``{sub}.wowpic{N}.store``) and the leading ``/iN/`` shard segment
+of every page URL — observed ``/si`` → ``/i3`` (commit d6bd242) → ``/i4``
+(this issue), THREE times, each forcing a manual fixture refresh. That
+rotation is provably noise: production already treats the host + segment
+as untrusted (the SSRF allowlist ``_COMIX_CDN_HOST_RE`` / ``_COMIX_CDN_PATH_RE``
+in ``src/manga_gateway/sources/comix.py`` wildcards exactly those parts —
+"the segment carries no trust"), so real downloads were never affected by
+the rotation; only this strict drift comparator re-flagged it.
+
+To stop each shard rotation re-flagging, both the captured and the fixture
+URL sets are passed through ``_normalize_comix_cdn_url`` (below) before the
+set-equality compare. It collapses ONLY the rotating host + ``/iN/`` segment
+of a Comix-CDN-shaped URL to fixed placeholders, while keeping the signed
+token and the per-page filename/ordinal STRICT — those are the real signal.
+A genuine change (token, ordinal/filename, page count, path structure, or a
+URL that is not Comix-CDN-shaped at all) still flags. This REFINES — does not
+abandon — D-60's flag-only intent: drift on anything that actually matters
+still fails the test for a human to review. The normalization is scoped to
+the Comix CDN shape (anything else passes through verbatim) so it cannot
+silently swallow drift on other fixtures/sources. Comix is the only source
+with ``fixture_drift_paths`` today.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +71,46 @@ pytestmark = [
     pytest.mark.live,
     pytest.mark.parametrize("source_key", REGISTERED_KEYS),
 ]
+
+# Issue #166 — Comix-CDN page-URL normalizer for the drift comparator.
+#
+# Mirrors the production SSRF allowlist shape (``_COMIX_CDN_HOST_RE`` +
+# ``_COMIX_CDN_PATH_RE`` in src/manga_gateway/sources/comix.py): host
+# ``{sub}.wowpic{N}.store`` and the leading ``/iN/`` short shard segment are
+# the parts Comix rotates and that production treats as untrusted. The signed
+# token (``[A-Za-z0-9_-]{16,}``) and the per-page ``NN.ext`` filename are the
+# real signal and are CAPTURED, not wildcarded — they stay strict in the
+# compare. Only URLs matching this exact shape are rewritten; everything else
+# returns verbatim, so genuine drift on any other URL form still flags.
+_COMIX_CDN_URL_RE = re.compile(
+    r"^https://[a-z0-9-]+\.wowpic\d+\.store"  # rotating host (noise)
+    r"/[a-z0-9]{2,4}"  # rotating /iN/ shard segment (noise)
+    r"/(?P<token>[A-Za-z0-9_-]{16,})"  # signed token (STRICT signal)
+    r"/(?P<page>\d+\.(?:webp|jpg|jpeg|png))$",  # page ordinal/filename (STRICT)
+    re.IGNORECASE,
+)
+
+
+def _normalize_comix_cdn_url(url: Any) -> Any:
+    """Collapse the rotating Comix CDN host + ``/iN/`` segment to placeholders.
+
+    Issue #166: the Comix image CDN periodically rotates its host and leading
+    ``/iN/`` shard segment (``/si`` → ``/i3`` → ``/i4`` so far), each rotation
+    re-flagging this comparator even though production already treats those
+    parts as untrusted noise. This normalizes ONLY those rotating parts of a
+    Comix-CDN-shaped URL, keeping the signed token and per-page filename strict.
+
+    Non-Comix-CDN inputs (any URL that does not match ``_COMIX_CDN_URL_RE``, or
+    a non-string) are returned UNCHANGED, so the normalization cannot silently
+    swallow genuine drift on other fixtures/sources.
+    """
+    if not isinstance(url, str):
+        return url
+    m = _COMIX_CDN_URL_RE.match(url)
+    if m is None:
+        return url
+    return f"comix-cdn://{m.group('token')}/{m.group('page')}"
+
 
 # Imported lazily inside the test so MangaDex (which skips before touching
 # any Comix-specific symbol) does not require the Comix source module.
@@ -66,6 +130,11 @@ async def test_fixture_drift(
       per test (W-03 lock).
     * Compare SET equality on the captured URL list against each declared
       fixture (Pitfall 6 — transient ordinal jitter is NOT drift).
+    * Issue #166: both sides are passed through ``_normalize_comix_cdn_url``
+      first so a pure host/``/iN/``-shard CDN rotation is NOT flagged, while
+      token/ordinal/page-count/path-structure drift STILL flags. Length
+      parity is asserted on the RAW lists (pre-normalization) so duplicate-
+      count drift still surfaces.
     """
     if not profile.fixture_drift_paths:
         pytest.skip(f"{source_key}: no fixture drift paths declared")
@@ -109,7 +178,10 @@ async def test_fixture_drift(
             f"chapter page structure changed"
         )
 
-        captured_set: set[Any] = set(captured)
+        # Issue #166: normalize the rotating Comix CDN host + /iN/ segment
+        # before the set compare so a pure shard rotation isn't flagged as
+        # drift. len(captured) (raw) is still used for the length-parity check.
+        captured_set: set[Any] = {_normalize_comix_cdn_url(u) for u in captured}
 
         for fixture_path in profile.fixture_drift_paths:
             assert fixture_path.exists(), (
@@ -125,7 +197,10 @@ async def test_fixture_drift(
                 # signal for those (we know they exist and parse).
                 continue
 
-            expected_set: set[Any] = set(expected)
+            # Same normalization on the fixture side — apples-to-apples
+            # (Issue #166). A real token/ordinal/path-structure change still
+            # survives normalization and flags below.
+            expected_set: set[Any] = {_normalize_comix_cdn_url(u) for u in expected}
             missing = expected_set - captured_set
             extra = captured_set - expected_set
             # D-60 / Pitfall 6: set-equality alone misses duplicate-count
