@@ -28,9 +28,11 @@ if TYPE_CHECKING:
     from ..framework.context import SourceContext
     from ..models.search import SearchRequest
 
-# Bound a title search's candidate manga; interactive widens it (D-22).
+# Bound a title search's candidate manga. The count is mode-invariant: interactive
+# no longer widens the fan-out (#162). Exact-match queries already collapse to ~1
+# candidate after the #126 prune regardless of the ceiling, so 5 is the single
+# source of truth for both modes (it is still referenced by the prune/cap below).
 _DEFAULT_MANGA_CANDIDATES = 5
-_INTERACTIVE_MANGA_CANDIDATES = 15
 # MangaDex page-size ceiling for the chapter feed.
 _MAX_FEED_LIMIT = 100
 # Defensive page-count cap for a single feed walk: 50 pages x 100 rows = 5000
@@ -75,21 +77,18 @@ class MangaDexSource(Source):
             manga = await self._fetch_manga_by_id(mangadex_id, ctx)
             manga_ids = [manga["id"]] if manga else []
         else:
-            count = (
-                _INTERACTIVE_MANGA_CANDIDATES
-                if req.interactive
-                else _DEFAULT_MANGA_CANDIDATES
-            )
+            count = _DEFAULT_MANGA_CANDIDATES
 
             async def _resolve_fn() -> list[_MangaCandidate]:
                 found = await self._search_manga_titles(req.query or "", count, ctx)
                 # Prune obviously-irrelevant candidates BEFORE the per-candidate
                 # chapter-feed fan-out (#126): an exact-match query enumerates only
-                # the one correct series; ambiguous queries still fan out to
-                # ``count`` (the prune falls back to the historic
-                # ``candidates[:count]``). Each candidate is scored over its MAIN
-                # *or* any ALTERNATE/native title (#139) — a query matching only the
-                # native name still prunes to it.
+                # the one correct series; ambiguous queries fan out to ``count`` (the
+                # prune falls back to the historic ``candidates[:count]``). ``count``
+                # is mode-invariant at 5 (#162) — interactive no longer widens it.
+                # Each candidate is scored over its MAIN *or* any ALTERNATE/native
+                # title (#139) — a query matching only the native name still prunes
+                # to it.
                 return prune_candidates(
                     found,
                     req.query or "",
@@ -103,12 +102,15 @@ class MangaDexSource(Source):
             # branch above caches NEITHER layer (D-02 — already one resolved
             # candidate). The key normalizes the query the SAME way the relevance
             # scorer does so punctuation/case variants collapse onto one entry.
-            # WR-01: the resolved candidate set widens with ``req.interactive``
-            # (``count`` is 15 vs 5), so ``count`` rides the key — an interactive
-            # search after a non-interactive one (or vice-versa) is a MISS, not a
-            # HIT served the wrong-width candidate list.
+            # WR-01: the search mode no longer affects candidate width — ``count`` is
+            # mode-invariant at 5 (#162), so the resolved candidate set is identical
+            # whether or not ``req.interactive`` is set. The resolve key is therefore
+            # mode-agnostic ``(source_key, normalized_query, languages)`` with NO
+            # ``extra=count`` discriminator, so a mode flip (interactive↔non-
+            # interactive) for a warmed query is a HIT, not a deliberate MISS — there
+            # is no width difference to reconcile, so no wrong-width list can be served.
             resolve_key = ctx.cached_resolve_key(
-                _normalize(req.query or ""), languages, extra=count
+                _normalize(req.query or ""), languages
             )
             candidates: list[_MangaCandidate] = await ctx.cached_resolve(
                 resolve_key, _resolve_fn
