@@ -368,6 +368,49 @@ async def test_get_bytes_plain_bypasses_registered_scheme() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_bytes_plain_with_headers_surfaces_response_headers() -> None:
+    """``get_bytes_plain_with_headers`` returns ``(bytes, headers)`` so a source can
+    run a per-source post-fetch decode keyed by a RESPONSE header — and, like
+    ``get_bytes_plain``, NEVER runs the framework decrypt seam (the bytes stay raw
+    even when a scheme IS registered for the source)."""
+    scheme = "test-rot1-bytes-headers"
+
+    @register_scheme(scheme)
+    def _rot1(body: bytes, config: dict[str, object]) -> bytes:  # pragma: no cover
+        return bytes((b + 1) % 256 for b in body)
+
+    try:
+        plain = b"\x52\x49\x46\x46\x10\x00\x00\x00WEBPVP8 "  # WebP-shaped bytes
+        req = httpx.Request("GET", "https://cdn.example.store/si/TOKEN/04.webp")
+        transport = _RecordingTransport(
+            [
+                httpx.Response(
+                    200,
+                    content=plain,
+                    headers={"x-enc-seed": "907127381", "x-enc-len": "4096"},
+                    request=req,
+                )
+            ]
+        )
+        ctx = _ctx(
+            transport,
+            antibot="cloudflare+encrypted",
+            solver=_CountingSolver(),
+            decrypt_scheme=scheme,
+        )
+
+        out, headers = await ctx.get_bytes_plain_with_headers(
+            "https://cdn.example.store/si/TOKEN/04.webp"
+        )
+
+        assert out == plain  # seam stays decrypt-opted-out — bytes UNCHANGED
+        assert headers.get("x-enc-seed") == "907127381"
+        assert headers["x-enc-len"] == "4096"
+    finally:
+        _SCHEMES.pop(scheme, None)
+
+
+@pytest.mark.asyncio
 async def test_get_json_plain_bypasses_registered_scheme() -> None:
     """``get_json_plain`` must NOT run the decrypt seam — Comix's search and
     chapter-index endpoints are plaintext per live recon, and routing them
