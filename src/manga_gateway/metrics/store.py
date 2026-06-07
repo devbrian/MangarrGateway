@@ -12,11 +12,14 @@ holds ring deques — it holds:
    (cardinality explosion).
 2. **Ring classification** — :meth:`classify` updates the rollup (so the slow
    threshold reflects this series' own live baseline) and returns the SET of
-   rings this event belongs to: always ``"recent"``; ``"failures"`` when
-   ``outcome != "ok"``; ``"slow"`` when ``duration_ms > max(slow_factor*avg,
-   p95)`` (a PER-SOURCE-relative baseline, NEVER a global ms constant — comix
-   ~220ms vs mangadex ~35ms). The collector enqueues one on-disk row per
-   (event, ring) membership; reads filter on the persisted ``ring`` tag.
+   rings this event belongs to: always ``"recent"``; ``"failures"`` for a genuine
+   failure (:func:`is_failure` — ``error``/``timeout`` on any event, plus a 4xx
+   ``client_error`` only on the umbrella ``request`` event; NOT the cache
+   hit/miss/refetch state or the re-solved per-source CF-403, which a blanket
+   ``outcome != "ok"`` over-counted); ``"slow"`` when ``duration_ms >
+   max(slow_factor*avg, p95)`` (a PER-SOURCE-relative baseline, NEVER a global ms
+   constant — comix ~220ms vs mangadex ~35ms). The collector enqueues one on-disk
+   row per (event, ring) membership; reads filter on the persisted ``ring`` tag.
 
 The dashboard reads ready-made JSON: rollups from here, ring events from disk.
 """
@@ -69,11 +72,47 @@ def histogram_from_pairs(pairs: list[tuple[int, int]]) -> HdrHistogram:
 
 RollupKey = tuple[str | None, str | None, str | None, str | None]
 
-# The three ring names. ``recent`` admits every event; ``failures`` admits
-# ``outcome != "ok"``; ``slow`` admits a per-baseline outlier (see classify).
+# The three ring names. ``recent`` admits every event; ``failures`` admits a
+# genuine failure (see :func:`is_failure`); ``slow`` admits a per-baseline
+# outlier (see classify).
 RING_RECENT = "recent"
 RING_FAILURES = "failures"
 RING_SLOW = "slow"
+
+# Outcomes that are a genuine failure on ANY event. Everything NOT listed here is
+# treated as a non-failure: "ok", the enumeration-cache STATE labels
+# "hit"/"miss"/"refetch" (kind="cache"), and the reserved transient labels
+# "retry"/"cf_resolve". ``client_error`` is CONDITIONAL — see :func:`is_failure`.
+_FAILURE_OUTCOMES = frozenset({"error", "timeout"})
+
+
+def is_failure(ev: MetricEvent) -> bool:
+    """True iff ``ev`` counts toward ``error_count`` and the ``failures`` ring.
+
+    Replaces the historic blanket ``outcome != "ok"`` test, which over-counted
+    every non-ok STATE label as an error (debug ``search-error-rate-inflated``):
+    the enumeration cache's ``hit``/``miss``/``refetch`` (``kind="cache"``,
+    ``enum_cache.py``) and Comix's expected pre-solve Cloudflare 403 — emitted as
+    ``client_error`` at the per-source http seam (``framework/context.py``) BEFORE
+    ``_send_with_clearance`` re-solves + retries it to ``ok`` — both inherit
+    ``endpoint="POST /search"`` + a ``source_key`` and so inflated the per-source
+    ``POST /search`` ``error_rate`` (and contaminated the ``failures`` ring, which
+    shared the test).
+
+    A genuine failure is ``error`` (5xx / transport exception / unrecovered solve,
+    browser, package, or job failure) or ``timeout`` for ANY event. A 4xx
+    (``client_error``) counts ONLY on the umbrella ``request`` event — the
+    gateway's OWN inbound API, ``kind="request"``, ``source_key=None``, emitted by
+    the request middleware. That preserves WR-04: a flood of 401/404/422 on the
+    gateway's own API is the prime observability signal and must stay visible in
+    ``error_rate`` + the ``failures`` ring. A per-SOURCE seam 4xx (``kind="http"``
+    and friends) is NOT counted — it is the expected, re-solved CF-403 noise.
+    """
+    if ev.outcome in _FAILURE_OUTCOMES:
+        return True
+    # WR-04: keep counting the gateway's own inbound-API 4xx; drop the per-source
+    # seam 4xx (the re-solved Cloudflare challenge 403).
+    return ev.outcome == "client_error" and ev.kind == "request"
 
 
 @dataclass
@@ -89,7 +128,7 @@ class Rollup:
 
     def observe(self, ev: MetricEvent) -> None:
         self.count += 1
-        if ev.outcome != "ok":
+        if is_failure(ev):
             self.error_count += 1
         d = ev.duration_ms
         self.sum_ms += d
@@ -141,8 +180,10 @@ class InMemoryStore:
     def classify(self, ev: MetricEvent) -> set[str]:
         """Update the rollup and return this event's ring-membership set.
 
-        Always includes ``"recent"``; adds ``"failures"`` for a non-ok outcome;
-        adds ``"slow"`` for a per-baseline outlier (``duration_ms >
+        Always includes ``"recent"``; adds ``"failures"`` for a genuine failure
+        (:func:`is_failure` — NOT a blanket ``outcome != "ok"``, so cache
+        hit/miss/refetch and the re-solved per-source CF-403 ``client_error`` are
+        excluded); adds ``"slow"`` for a per-baseline outlier (``duration_ms >
         max(slow_factor*avg, p95)``), evaluated AFTER the rollup update so the
         threshold reflects this series' own live avg/p95 — never a global ms
         constant. The collector enqueues one on-disk row per returned ring.
@@ -151,7 +192,7 @@ class InMemoryStore:
         rollup = self._rollups.setdefault(key, Rollup())
         rollup.observe(ev)
         rings = {RING_RECENT}
-        if ev.outcome != "ok":
+        if is_failure(ev):
             rings.add(RING_FAILURES)
         threshold = max(self._slow_factor * rollup.avg_ms, rollup.p95_ms())
         if ev.duration_ms > threshold:

@@ -134,7 +134,7 @@ async def _seed_routed_and_unrouted(app: FastAPI, *, outcome: str = "ok") -> Non
     collector = get_collector()
     assert collector is not None
 
-    status = 200 if outcome == "ok" else 404
+    status = 200 if outcome == "ok" else 500 if outcome == "error" else 404
 
     # Routed: endpoint set.
     routed_token = current_request.set(
@@ -196,11 +196,15 @@ async def test_recent_hides_unrouted_by_default(metrics_app: FastAPI) -> None:
 
 @pytest.mark.asyncio
 async def test_failures_hides_unrouted_by_default(metrics_app: FastAPI) -> None:
-    """A 404/client_error unrouted event (endpoint=null) in the failures ring is
-    hidden from /failures by default and restored by ?include_unrouted=true."""
+    """A 500/error unrouted event (endpoint=null) in the failures ring is hidden
+    from /failures by default and restored by ?include_unrouted=true.
+
+    Uses a genuine ``error`` failure (a seam ``client_error`` is no longer a
+    failure post debug ``search-error-rate-inflated``); the unrouted-filtering
+    behaviour under test is unchanged."""
     transport = httpx.ASGITransport(app=metrics_app)
     async with metrics_app.router.lifespan_context(metrics_app):
-        await _seed_routed_and_unrouted(metrics_app, outcome="client_error")
+        await _seed_routed_and_unrouted(metrics_app, outcome="error")
         async with httpx.AsyncClient(
             transport=transport,
             base_url=_ADMIN,
@@ -211,7 +215,7 @@ async def test_failures_hides_unrouted_by_default(metrics_app: FastAPI) -> None:
                 await ac.get("/failures?limit=200&include_unrouted=true")
             ).json()
 
-    # The unrouted client_error event is hidden by default …
+    # The unrouted error event is hidden by default …
     assert all(e["endpoint"] is not None for e in default)
     assert all(e["request_id"] != 9002 for e in default)
     # … and restored by the opt-in.
