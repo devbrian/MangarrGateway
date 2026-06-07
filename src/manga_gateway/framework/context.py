@@ -607,18 +607,49 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
-    async def _request_bytes(
+    async def get_bytes_plain_with_headers(
+        self, url: str
+    ) -> tuple[bytes, httpx.Headers]:
+        """Source-agnostic header-surfacing twin of :meth:`get_bytes_plain`.
+
+        For sources that run a per-source POST-fetch decode keyed by a RESPONSE
+        header, the framework must surface the headers alongside the bytes — but the
+        decode itself lives entirely in the source, so the framework stays agnostic of
+        any header name. Returns ``(resp.content, resp.headers)``: the raw fetched bytes
+        plus the (case-insensitive) ``httpx.Headers``.
+
+        Everything else mirrors :meth:`get_bytes_plain` exactly — the same ``_retrying``
+        wrapper, the same ``_feed_failure``/``_feed_success`` health feed, NOT
+        rate-limited (``limited=False``), and the SAME ``"get_bytes_plain"`` op label so
+        metrics rollups for image fetch do not fork. The framework decrypt seam stays
+        opted out (D-39): ``self._decrypt`` is NEVER run on this path, identical to
+        :meth:`get_bytes_plain`.
+        """
+
+        async def _attempt() -> tuple[bytes, httpx.Headers]:
+            try:
+                resp = await self._request_response(
+                    url, params=None, limited=False, op="get_bytes_plain"
+                )
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return resp.content, resp.headers
+
+        return await self._retrying()(_attempt)
+
+    async def _request_response(
         self,
         url: str,
         *,
         params: dict[str, Any] | None,
         limited: bool,
-        decrypt: bool = True,
         method: str = "GET",
         data: dict[str, Any] | None = None,
         op: str = "request",
-    ) -> bytes:
-        """Single request → optionally-decrypted body, with clearance + 403 reconcile.
+    ) -> httpx.Response:
+        """Single request → validated ``httpx.Response``, with clearance + 403 reconcile.
 
         Branches BEFORE the permanent-4xx gate (Pitfall 2). Two INDEPENDENT reconcile
         branches (D-03), each forcing exactly ONE refresh + ONE retry:
@@ -633,8 +664,8 @@ class SourceContext:
         retry passes ``force_resolve=True`` which refreshes WHICHEVER seam applies (the
         union in ``_clearance_kwargs``). ``method``/``data`` thread a form-POST through
         the SAME machinery as GET; httpx form-encodes ``data=dict`` as
-        ``application/x-www-form-urlencoded``. Returns DECRYPTED bytes (D-39) when
-        ``decrypt`` is True (the default); ``*_plain`` opts out for plaintext endpoints.
+        ``application/x-www-form-urlencoded``. Returns the validated response (after the
+        STOP gate + ``raise_for_status``); callers decide whether to decrypt the body.
         """
         resp = await self._send(
             url,
@@ -683,6 +714,32 @@ class SourceContext:
                 status=resp.status_code,
             )
         resp.raise_for_status()  # 5xx → HTTPStatusError → retried by _is_retryable
+        return resp
+
+    async def _request_bytes(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None,
+        limited: bool,
+        decrypt: bool = True,
+        method: str = "GET",
+        data: dict[str, Any] | None = None,
+        op: str = "request",
+    ) -> bytes:
+        """Single request → optionally-decrypted body (delegates to
+        :meth:`_request_response`).
+
+        The validated-response machinery (clearance injection, the two independent
+        403-reconcile branches, the permanent-4xx STOP, ``raise_for_status``) now lives
+        in :meth:`_request_response`; this method adds ONLY the decrypt-or-not branch.
+        Returns DECRYPTED bytes (D-39) when ``decrypt`` is True (the default); ``*_plain``
+        opts out for plaintext endpoints. Byte-for-byte equivalent to the pre-refactor
+        path for every caller.
+        """
+        resp = await self._request_response(
+            url, params=params, limited=limited, method=method, data=data, op=op
+        )
         if not decrypt:
             return resp.content
         return await self._decrypt(resp.content)
