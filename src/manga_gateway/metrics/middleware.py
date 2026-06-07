@@ -141,8 +141,12 @@ class MetricsRequestMiddleware:
                 # WR-04: a 4xx (401 unauthorized, 404, 422 validation) is NOT a
                 # success — it must admit to the failures ring + error_rate so a
                 # flood of 401s/404s (the prime observability signal) is visible.
-                # The store treats any outcome != "ok" as a failure, so a distinct
-                # "client_error" label counts without conflating with 5xx "error".
+                # The store's is_failure() counts "client_error" ONLY on this
+                # umbrella request event (kind="request"), so the gateway's own
+                # inbound-API 4xx stays visible while the re-solved per-source CF
+                # 403 seam "client_error" does NOT inflate per-source error_rate
+                # (debug search-error-rate-inflated). The 5xx "error" label is a
+                # genuine failure on any event.
                 if status_code == 0 or status_code >= 500:
                     outcome = "error"
                 elif status_code >= 400:

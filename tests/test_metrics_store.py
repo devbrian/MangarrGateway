@@ -12,7 +12,10 @@ Covers:
   ingested events;
 * rollups are keyed on ``(surface, source_key, endpoint, op)`` ONLY — two events
   differing only by ``url`` share one rollup (the no-url-key cardinality cap);
-* ``classify`` always includes ``recent``; adds ``failures`` for a non-ok outcome;
+* ``classify`` always includes ``recent``; adds ``failures`` only for a GENUINE
+  failure (``is_failure`` — error/timeout, plus a 4xx ``client_error`` on the
+  umbrella request event only; NOT cache hit/miss/refetch or the re-solved
+  per-source CF-403, debug ``search-error-rate-inflated``);
   adds ``slow`` for a per-baseline outlier (``> max(slow_factor*avg, p95)``) and
   NOT for a steady call — NEVER a global ms constant;
 * a failed slow call belongs to ALL THREE rings; a steady ok call to ``recent``
@@ -37,14 +40,20 @@ def _ev(
     outcome: str = "ok",
     url: str = "https://h/x",
     request_id: int | None = 1,
-    source_key: str = "comix",
+    source_key: str | None = "comix",
     endpoint: str = "GET /search",
     op: str = "get_json",
     surface: str = "search",
+    kind: str = "http",
+    status: int | None = None,
 ) -> MetricEvent:
+    # status defaults are outcome-driven so callers only override when they care:
+    # ok → 200, client_error → 403 (the CF-challenge / 4xx shape), else 500.
+    if status is None:
+        status = 200 if outcome == "ok" else 403 if outcome == "client_error" else 500
     return MetricEvent(
         ts=1.0,
-        kind="http",
+        kind=kind,
         request_id=request_id,
         surface=surface,
         endpoint=endpoint,
@@ -52,7 +61,7 @@ def _ev(
         op=op,
         method="GET",
         url=url,
-        status=200 if outcome == "ok" else 500,
+        status=status,
         outcome=outcome,
         duration_ms=duration_ms,
         attempt=1,
@@ -110,6 +119,93 @@ def test_classify_failure_adds_failures_ring() -> None:
         RING_RECENT,
         RING_FAILURES,
     }
+
+
+# ── debug search-error-rate-inflated: non-failure outcomes must NOT count ──────
+# The store used a blanket ``outcome != "ok"`` test, so the enumeration cache's
+# hit/miss/refetch STATE labels and Comix's expected pre-solve CF-403
+# ``client_error`` (re-solved + retried to ok) inflated the per-source
+# ``POST /search`` error_rate + the failures ring. They must now be excluded.
+
+
+def test_classify_cache_state_is_not_a_failure() -> None:
+    # kind="cache" hit/miss/refetch are STATE labels, not failures — recent only.
+    for outcome in ("hit", "miss", "refetch"):
+        rings = _store().classify(
+            _ev(duration_ms=0.0, kind="cache", op="enumerate", outcome=outcome)
+        )
+        assert rings == {RING_RECENT}, outcome
+
+
+def test_classify_per_source_seam_client_error_is_not_a_failure() -> None:
+    # The expected pre-solve Cloudflare 403 rides the per-source http seam
+    # (kind="http", source_key set) as outcome="client_error" before it is
+    # re-solved + retried to ok — it must NOT admit to the failures ring.
+    rings = _store().classify(
+        _ev(duration_ms=100.0, kind="http", source_key="comix", outcome="client_error")
+    )
+    assert rings == {RING_RECENT}
+
+
+def test_classify_request_level_client_error_still_counts() -> None:
+    # WR-04: the gateway's OWN inbound-API 4xx (the umbrella request event,
+    # kind="request", source_key=None) MUST still admit to the failures ring so a
+    # flood of 401/404/422 stays visible.
+    rings = _store().classify(
+        _ev(
+            duration_ms=5.0,
+            kind="request",
+            source_key=None,
+            op=None,
+            outcome="client_error",
+        )
+    )
+    assert rings == {RING_RECENT, RING_FAILURES}
+
+
+def test_classify_request_level_client_error_with_source_key_is_not_a_failure() -> None:
+    # CodeRabbit hardening (#164): the request-level 4xx exemption is pinned to the
+    # umbrella request event's documented contract — kind="request" AND
+    # source_key is None. A request-kind client_error that anomalously carries a
+    # source_key must NOT be counted as a gateway-API failure (recent only).
+    rings = _store().classify(
+        _ev(
+            duration_ms=5.0,
+            kind="request",
+            source_key="comix",
+            op=None,
+            outcome="client_error",
+        )
+    )
+    assert rings == {RING_RECENT}
+
+
+def test_per_source_search_error_rate_excludes_cache_and_resolved_cf403() -> None:
+    """End-to-end regression: a HEALTHY per-source POST /search reports ~0%
+    error_rate even though its cache lookups (hit/miss/refetch) and a re-solved
+    pre-solve CF-403 client_error all roll up under (source, "POST /search")."""
+    s = _store()
+    common = {"endpoint": "POST /search", "source_key": "comix"}
+    # One real successful fetch.
+    s.ingest(_ev(duration_ms=120.0, op="get_json", outcome="ok", **common))
+    # Cache seam noise — none of these are failures.
+    cache_evs = (("resolve", "miss"), ("enumerate", "hit"), ("enumerate", "refetch"))
+    for op, outcome in cache_evs:
+        s.ingest(_ev(duration_ms=0.0, kind="cache", op=op, outcome=outcome, **common))
+    # Comix's expected pre-solve CF-403 at the http seam (re-solved → ok).
+    s.ingest(_ev(duration_ms=90.0, op="get_json", outcome="client_error", **common))
+
+    rows = {(r["source"], r["endpoint"]): r for r in s.per_source_per_endpoint()}
+    row = rows[("comix", "POST /search")]
+    assert row["errors"] == 0
+    assert row["error_rate"] == 0.0
+
+    # ...but a GENUINE per-source failure (5xx / transport) still counts.
+    s.ingest(_ev(duration_ms=80.0, op="get_json", outcome="error", **common))
+    row = {(r["source"], r["endpoint"]): r for r in s.per_source_per_endpoint()}[
+        ("comix", "POST /search")
+    ]
+    assert row["errors"] == 1
 
 
 def test_classify_slow_is_per_baseline() -> None:
