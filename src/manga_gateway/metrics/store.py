@@ -102,17 +102,23 @@ def is_failure(ev: MetricEvent) -> bool:
     A genuine failure is ``error`` (5xx / transport exception / unrecovered solve,
     browser, package, or job failure) or ``timeout`` for ANY event. A 4xx
     (``client_error``) counts ONLY on the umbrella ``request`` event — the
-    gateway's OWN inbound API, ``kind="request"``, ``source_key=None``, emitted by
-    the request middleware. That preserves WR-04: a flood of 401/404/422 on the
-    gateway's own API is the prime observability signal and must stay visible in
-    ``error_rate`` + the ``failures`` ring. A per-SOURCE seam 4xx (``kind="http"``
-    and friends) is NOT counted — it is the expected, re-solved CF-403 noise.
+    gateway's OWN inbound API, ``kind="request"`` AND ``source_key is None``,
+    emitted by the request middleware. That preserves WR-04: a flood of
+    401/404/422 on the gateway's own API is the prime observability signal and must
+    stay visible in ``error_rate`` + the ``failures`` ring. A per-SOURCE seam 4xx
+    (``kind="http"`` and friends, or any event carrying a ``source_key``) is NOT
+    counted — it is the expected, re-solved CF-403 noise.
     """
     if ev.outcome in _FAILURE_OUTCOMES:
         return True
     # WR-04: keep counting the gateway's own inbound-API 4xx; drop the per-source
-    # seam 4xx (the re-solved Cloudflare challenge 403).
-    return ev.outcome == "client_error" and ev.kind == "request"
+    # seam 4xx (the re-solved Cloudflare challenge 403). The ``source_key is None``
+    # clause pins this to the umbrella request event per its documented contract —
+    # a ``request``-kind event carrying a source_key would be anomalous and must
+    # not be mis-counted as a gateway-API failure.
+    return (
+        ev.outcome == "client_error" and ev.kind == "request" and ev.source_key is None
+    )
 
 
 @dataclass

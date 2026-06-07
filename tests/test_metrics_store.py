@@ -163,6 +163,23 @@ def test_classify_request_level_client_error_still_counts() -> None:
     assert rings == {RING_RECENT, RING_FAILURES}
 
 
+def test_classify_request_level_client_error_with_source_key_is_not_a_failure() -> None:
+    # CodeRabbit hardening (#164): the request-level 4xx exemption is pinned to the
+    # umbrella request event's documented contract — kind="request" AND
+    # source_key is None. A request-kind client_error that anomalously carries a
+    # source_key must NOT be counted as a gateway-API failure (recent only).
+    rings = _store().classify(
+        _ev(
+            duration_ms=5.0,
+            kind="request",
+            source_key="comix",
+            op=None,
+            outcome="client_error",
+        )
+    )
+    assert rings == {RING_RECENT}
+
+
 def test_per_source_search_error_rate_excludes_cache_and_resolved_cf403() -> None:
     """End-to-end regression: a HEALTHY per-source POST /search reports ~0%
     error_rate even though its cache lookups (hit/miss/refetch) and a re-solved
