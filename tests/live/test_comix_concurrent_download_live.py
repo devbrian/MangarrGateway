@@ -19,8 +19,12 @@ the nox gate, ``-m 'not live'``), awaits ``solver.warm()`` before timing, and
 is env-knob-driven so a nightly job reuses it unchanged.
 
 Knobs:
-* ``COMIX_CONCURRENT_QUERY`` — search query (default "Forgotten Field", same as
-  the perf live tests so it resolves a series with >= 2 chapters).
+* ``COMIX_CONCURRENT_QUERY`` — search query (default "Nevermore", same as the
+  perf live tests so it resolves a series with >= 2 chapters). Re-pointed off
+  "Forgotten Field" in debug comix-concurrent-download-520 (#166): that query's
+  top releases included Chapter 23, whose CDN origin (j24n.wowpic5.store/i4/) is
+  degraded and fails ~55% of page fetches at any concurrency. "Nevermore"'s
+  newest chapters are served by the first-party WebToon CDN and download cleanly.
 * ``COMIX_CONCURRENT_TIMEOUT_SECONDS`` — terminal-poll budget per job
   (default 90.0 — generous; both jobs share the warm solver + browser gate).
 * ``COMIX_LIVE_HEADLESS`` — "0" to run headed (datacenter/CI fingerprint path).
@@ -44,7 +48,14 @@ from ._helpers import _assert_cbz_on_disk, _poll_until_terminal
 
 pytestmark = pytest.mark.live  # excluded from the gate
 
-_DEFAULT_QUERY = "Forgotten Field"
+# debug comix-concurrent-download-520 (#166): re-pointed off "Forgotten Field" —
+# that query's top releases included the degraded Chapter 23 (CDN origin
+# j24n.wowpic5.store/i4/ fails ~55% of page fetches at ANY concurrency, including
+# width=1, i.e. a genuinely broken upstream origin, not gateway load). "Nevermore"
+# is a verified-healthy series whose newest chapters are served by the first-party
+# WebToon CDN. CDN health is PER-CHAPTER, so if Nevermore's top chapters later
+# rotate to a flaky origin this may need revisiting (override COMIX_CONCURRENT_QUERY).
+_DEFAULT_QUERY = "Nevermore"
 _TEST_API_KEY = "test-comix-concurrent-live-key-DO-NOT-LOG-IN-PROD"
 _DEFAULT_TIMEOUT_S = 90.0
 _CONCURRENT_JOBS = 2

@@ -43,8 +43,12 @@ Like the rest of ``tests/live/``, this test:
 
 Knobs:
 
-* ``COMIX_PERF_QUERY`` — search query (default: "Forgotten Field",
-  same as ``test_comix_perf_live.py``).
+* ``COMIX_PERF_QUERY`` — search query (default: "Nevermore"). Re-pointed
+  off "Forgotten Field" in debug comix-concurrent-download-520 (#166):
+  that query's top-3 releases included Chapter 23, whose CDN origin
+  (j24n.wowpic5.store/i4/) is degraded and fails ~55% of page fetches at
+  any concurrency. "Nevermore"'s newest chapters are served by the
+  first-party WebToon CDN and download cleanly.
 * ``COMIX_PERF_MULTI_CHAPTERS`` — chapter count to download serially
   (default 3 — first + two more; raise for stronger averaging).
 * ``COMIX_PERF_PER_CHAPTER_BUDGET_SECONDS`` — steady-state wall-clock
@@ -72,7 +76,14 @@ from manga_gateway.config import Settings
 
 pytestmark = pytest.mark.live  # excluded from the gate
 
-_DEFAULT_QUERY = "Forgotten Field"
+# debug comix-concurrent-download-520 (#166): re-pointed off "Forgotten Field" —
+# that query's top-3 releases included the degraded Chapter 23 (CDN origin
+# j24n.wowpic5.store/i4/ fails ~55% of page fetches at ANY concurrency, including
+# width=1, i.e. a genuinely broken upstream origin, not gateway load). "Nevermore"
+# is a verified-healthy series whose newest chapters are served by the first-party
+# WebToon CDN. CDN health is PER-CHAPTER, so if Nevermore's top chapters later
+# rotate to a flaky origin this may need revisiting (override COMIX_PERF_QUERY).
+_DEFAULT_QUERY = "Nevermore"
 _TEST_API_KEY = "test-perf-comix-multi-key-DO-NOT-LOG-IN-PROD"
 
 # Per-chapter budget — applied uniformly to every chapter in the run
