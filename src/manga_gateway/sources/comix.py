@@ -730,6 +730,7 @@ _CHAPTER_LIST_EXTRACT_JS = """
     // A miss is still a valid chapter row (group simply omitted).
     let group = null;
     let publishedAtRelative = null;
+    let likes = null;
     const row = a.closest(
       '.mchap-row, li, tr, [data-chapter], .chapter, .chapter-item'
     );
@@ -751,13 +752,33 @@ _CHAPTER_LIST_EXTRACT_JS = """
         const text = (t.textContent || '').trim();
         if (text) publishedAtRelative = text;
       }
+      // REL-03: ``<span class="mchap-row__likes"><svg/>27</span>`` carries the
+      // per-chapter thumbs-up count. textContent is the inline SVG icon noise
+      // followed by the integer (e.g. an abbreviated "1.2K" form). Strip the
+      // non-digit noise and parse the trailing count; a row without the span is
+      // still a valid chapter row (likes simply null).
+      const lk = row.querySelector('.mchap-row__likes, [data-likes]');
+      if (lk) {
+        const raw = (lk.textContent || '').replace(/[^0-9.kKmM]/g, '');
+        const km = raw.match(/^([0-9.]+)([kKmM]?)$/);
+        if (km) {
+          let n = parseFloat(km[1]);
+          if (!isNaN(n)) {
+            const suffix = km[2].toLowerCase();
+            if (suffix === 'k') n *= 1000;
+            else if (suffix === 'm') n *= 1000000;
+            likes = Math.round(n);
+          }
+        }
+      }
     }
     out.push({
       id: id,
       chapter: m[2],
       lang: 'en',
       groups: group ? [{ name: group }] : [],
-      publishedAtRelative: publishedAtRelative
+      publishedAtRelative: publishedAtRelative,
+      likes: likes
     });
   }
   return out;
@@ -1130,6 +1151,9 @@ class ComixSource(Source):
                     language=language,
                     scanlation_group=None,
                     page_count=None,
+                    # votes intentionally None on the recent path: the
+                    # /api/v1/manga series-list item carries no per-chapter
+                    # likes (likes live only on the chapter-list DOM row).
                     ids={"comixSeriesId": str(hid)},
                 )
             )
@@ -1541,6 +1565,9 @@ class ComixSource(Source):
         volume = self._parse_int(chapter.get("volume"))
         language = chapter.get("lang") or chapter.get("language") or "en"
         page_count = self._parse_int(chapter.get("pages") or chapter.get("pageCount"))
+        # REL-03: per-chapter DOM likes -> display-only votes (None when absent).
+        # NOT added to the minted ResolutionRecord (display-only, no resolve role).
+        votes = self._parse_int(chapter.get("likes"))
         # Issue #30: prefer any absolute timestamp the source surfaces
         # (``publishedAt`` / ``date``), then fall back to parsing the rendered
         # relative time from ``publishedAtRelative`` ("3d ago", "2mos ago").
@@ -1603,6 +1630,7 @@ class ComixSource(Source):
             language=language,
             scanlation_group=group,
             page_count=page_count,
+            votes=votes,
             # D-46: ``comixSeriesId`` carries the hid (canonical series slug).
             ids={"comixChapterId": chapter_id, "comixSeriesId": series_hid},
         )
