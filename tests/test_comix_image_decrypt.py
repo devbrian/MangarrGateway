@@ -67,27 +67,23 @@ async def test_fetch_image_decodes_when_seed_nonzero() -> None:
 async def test_fetch_image_passthrough_seed_zero_and_missing() -> None:
     payload = b"\x52\x49\x46\x46\x10\x00\x00\x00WEBPVP8 "  # plaintext WebP-shaped page
 
+    src = ComixSource()
+
     # seed == 0 → untouched
     ctx_zero: Any = _FakeCtx(payload, {"x-enc-seed": "0"})
-    assert (
-        await ComixSource().fetch_image("https://cdn.example.store/si/T/01.webp", ctx_zero)
-        == payload
-    )
+    out_zero = await src.fetch_image("https://cdn.example.store/si/T/01.webp", ctx_zero)
+    assert out_zero == payload
 
     # header absent → untouched
     ctx_missing: Any = _FakeCtx(payload, {})
-    assert (
-        await ComixSource().fetch_image(
-            "https://cdn.example.store/si/T/02.webp", ctx_missing
-        )
-        == payload
+    out_missing = await src.fetch_image(
+        "https://cdn.example.store/si/T/02.webp", ctx_missing
     )
+    assert out_missing == payload
 
     # non-numeric header → fails safe to passthrough
     ctx_garbage: Any = _FakeCtx(payload, {"x-enc-seed": "garbage"})
-    assert (
-        await ComixSource().fetch_image(
-            "https://cdn.example.store/si/T/03.webp", ctx_garbage
-        )
-        == payload
+    out_garbage = await src.fetch_image(
+        "https://cdn.example.store/si/T/03.webp", ctx_garbage
     )
+    assert out_garbage == payload

@@ -649,7 +649,7 @@ class SourceContext:
         data: dict[str, Any] | None = None,
         op: str = "request",
     ) -> httpx.Response:
-        """Single request → validated ``httpx.Response``, with clearance + 403 reconcile.
+        """Single request → validated ``httpx.Response`` (clearance + 403 reconcile).
 
         Branches BEFORE the permanent-4xx gate (Pitfall 2). Two INDEPENDENT reconcile
         branches (D-03), each forcing exactly ONE refresh + ONE retry:
@@ -733,9 +733,9 @@ class SourceContext:
         The validated-response machinery (clearance injection, the two independent
         403-reconcile branches, the permanent-4xx STOP, ``raise_for_status``) now lives
         in :meth:`_request_response`; this method adds ONLY the decrypt-or-not branch.
-        Returns DECRYPTED bytes (D-39) when ``decrypt`` is True (the default); ``*_plain``
-        opts out for plaintext endpoints. Byte-for-byte equivalent to the pre-refactor
-        path for every caller.
+        Returns DECRYPTED bytes (D-39) when ``decrypt`` is True (the default);
+        ``*_plain`` opts out for plaintext endpoints. Byte-for-byte equivalent to the
+        pre-refactor path for every caller.
         """
         resp = await self._request_response(
             url, params=params, limited=limited, method=method, data=data, op=op
