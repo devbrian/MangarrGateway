@@ -709,6 +709,14 @@ _CHAPTER_PAGES_EXTRACT_JS = """
 # ~3 imgs DOM-resident, so we no longer try to lazy-load every page).
 _CHAPTER_PAGES_WAIT_FOR = ".rpage-page[data-page]"
 
+# Issue #171: how many times fetch_manifest navigates the chapter page before
+# giving up on an EMPTY capture. A cold Patchright context (right after a restart
+# / Cloudflare re-warm) can race the page's lazy-loaded <img>s — the extractor's
+# two-scroll capture sees ``seen.size === 0`` and deliberately returns [] (a real
+# chapter manifest is never legitimately empty). One bounded re-navigation warms
+# the context so the imgs populate; 2 attempts total (1 retry).
+_MANIFEST_COLD_RACE_ATTEMPTS = 2
+
 # JS extractor that returns the rendered chapter list off the series page DOM.
 # Selects ``<a>`` elements whose href matches the recon-pinned chapter URL
 # pattern ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and emits a
@@ -1231,33 +1239,48 @@ class ComixSource(Source):
         chapter_url = (
             f"{self.base_url}/title/{hid}-{slug}/{numeric_id}-chapter-{number}"
         )
-        try:
-            urls = await solver.fetch_via_browser(
-                chapter_url,
-                extract=_CHAPTER_PAGES_EXTRACT_JS,
-                # Issue #20: pass wait_for=None and let the JS extractor's
-                # own Step-1 scaffold wait do the readiness check. A Python-
-                # side wait_for_selector AND a JS-side scaffold poll would
-                # double-wait the same condition; the JS poll runs inside
-                # page.evaluate which Playwright is happy to schedule
-                # immediately after goto commits.
-                wait_for=None,
-                # debug comix-manifest-60s-timeout (2026-06-03): the extractor
-                # no longer walks pages serially — it does a cheap two-scroll
-                # capture (~1s) then SYNTHESIZES the full 1..N manifest from a
-                # captured page-image template, so resolve is now O(1) in pages
-                # (a couple seconds regardless of chapter length). The old
-                # O(pages) scrollIntoView walk burned ~1.55s/page and blew this
-                # ceiling on long chapters in the single-page reader. The 60s
-                # ceiling stays as a generous safety margin for the scaffold
-                # wait + Cloudflare/first-paint tail; the per-source rate
-                # limiter bounds outer cadence.
-                timeout=60.0,
-            )
-        except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
-            raise SourceError(
-                "source_unavailable", f"browser manifest fetch failed: {exc}"
-            ) from exc
+        # Issue #171: a cold browser can race the page's lazy <img> load and yield
+        # an EMPTY capture. Retry only that signature once (a warm re-nav lets the
+        # imgs populate); a genuinely broken page returns [] again and falls through
+        # to the malformed-manifest raise, while a populated-but-invalid manifest is
+        # a real fault that does NOT consume the retry.
+        urls: Any = None
+        for attempt in range(_MANIFEST_COLD_RACE_ATTEMPTS):
+            try:
+                urls = await solver.fetch_via_browser(
+                    chapter_url,
+                    extract=_CHAPTER_PAGES_EXTRACT_JS,
+                    # Issue #20: pass wait_for=None and let the JS extractor's
+                    # own Step-1 scaffold wait do the readiness check. A Python-
+                    # side wait_for_selector AND a JS-side scaffold poll would
+                    # double-wait the same condition; the JS poll runs inside
+                    # page.evaluate which Playwright is happy to schedule
+                    # immediately after goto commits.
+                    wait_for=None,
+                    # debug comix-manifest-60s-timeout (2026-06-03): the extractor
+                    # no longer walks pages serially — it does a cheap two-scroll
+                    # capture (~1s) then SYNTHESIZES the full 1..N manifest from a
+                    # captured page-image template, so resolve is now O(1) in pages
+                    # (a couple seconds regardless of chapter length). The old
+                    # O(pages) scrollIntoView walk burned ~1.55s/page and blew this
+                    # ceiling on long chapters in the single-page reader. The 60s
+                    # ceiling stays as a generous safety margin for the scaffold
+                    # wait + Cloudflare/first-paint tail; the per-source rate
+                    # limiter bounds outer cadence.
+                    timeout=60.0,
+                )
+            except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
+                raise SourceError(
+                    "source_unavailable", f"browser manifest fetch failed: {exc}"
+                ) from exc
+            # Cold-race signature: an EMPTY list on a non-final attempt → re-nav once.
+            if (
+                isinstance(urls, list)
+                and not urls
+                and attempt < _MANIFEST_COLD_RACE_ATTEMPTS - 1
+            ):
+                continue
+            break
         if (
             not isinstance(urls, list)
             or not urls
