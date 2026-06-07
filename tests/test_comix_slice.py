@@ -544,6 +544,18 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert not any("-chapter-" not in c[0] for c in solver.browser_fetch_calls)
 
 
+# ─── (5b) chapter-list extractor reads the per-row likes span ─────────────────
+
+
+def test_chapter_list_extract_js_reads_likes_span() -> None:
+    """The chapter-list extractor JS references the ``mchap-row__likes`` row
+    span so per-row likes flow into ``Release.votes`` (REL-03)."""
+    from manga_gateway.sources.comix import _CHAPTER_LIST_EXTRACT_JS
+
+    assert "mchap-row__likes" in _CHAPTER_LIST_EXTRACT_JS
+    assert "likes" in _CHAPTER_LIST_EXTRACT_JS
+
+
 # ─── (6) scanlation group comes from the DOM extractor ────────────────────────
 
 
@@ -602,6 +614,55 @@ async def test_scanlation_group_comes_from_dom_row(
     # No degraded-path warning is emitted — the group came straight off the DOM.
     codes = [w["code"] for w in body.get("warnings", []) if w["sourceKey"] == "comix"]
     assert "scanlation_group_unavailable" not in codes
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_dom_row_likes_become_release_votes(
+    comix_client: httpx.AsyncClient, solver: _ComixSolver
+) -> None:
+    """A staged chapter row carrying ``likes`` surfaces as ``votes`` on the
+    /search release (REL-03)."""
+    respx.get(f"{_COMIX}/api/v1/manga").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "result": {
+                    "items": [
+                        {
+                            "id": 116210,
+                            "hid": _SERIES_ID,
+                            "title": "Cipher Tales",
+                            "url": f"/title/{_SERIES_ID}-cipher-tales",
+                        }
+                    ]
+                },
+            },
+        )
+    )
+    series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
+    solver.stage_browser_paginated(
+        series_url,
+        [
+            {
+                "id": _CHAPTER_ID,
+                "chapter": "1",
+                "lang": "en",
+                "groups": [{"name": "Thunderscans"}],
+                "likes": 27,
+            }
+        ],
+    )
+
+    resp = await comix_client.post(
+        "/search",
+        json={"type": "chapter", "query": "Cipher", "sources": ["comix"]},
+    )
+    assert resp.status_code == 200, resp.text
+    releases = resp.json()["releases"]
+    assert len(releases) == 1
+    assert releases[0]["votes"] == 27
 
 
 @respx.mock
