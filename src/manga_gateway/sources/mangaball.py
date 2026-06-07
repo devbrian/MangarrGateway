@@ -888,6 +888,10 @@ class MangaBallSource(Source):
 
         language = str(translation.get("language") or "en")
         page_count = self._parse_int(translation.get("pages"))  # reliable; size is not
+        # REL-03: display-only votes from translation views. Locked decision
+        # (live recon): translations[].likes is ~always 0; views carries the
+        # real signal. NOT added to the minted ResolutionRecord (display-only).
+        votes = self._parse_int(translation.get("views"))
         publish_date = self._normalize_publish_date(translation.get("date"))
         group = translation.get("group")
         group_name = _strip_html(group.get("name")) if isinstance(group, dict) else None
@@ -930,6 +934,7 @@ class MangaBallSource(Source):
             language=language,
             scanlation_group=group_name,
             page_count=page_count,
+            votes=votes,
             ids={
                 "mangaballTitleId": title_id,
                 "mangaballTranslationId": translation_id,

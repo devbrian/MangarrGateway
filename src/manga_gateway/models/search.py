@@ -57,6 +57,11 @@ class Release(ApiModel):
     language: str | None = None
     scanlation_group: str | None = Field(default=None, alias="scanlationGroup")
     page_count: int | None = Field(default=None, alias="pageCount")
+    # Display-only advisory field (REL-03/D-19): per-release popularity count
+    # populated when the source exposes a like/vote/view signal (e.g. Comix
+    # chapter likes, MangaBall views), null otherwise. Never part of the minted
+    # ResolutionRecord / download handle — it has no resolution/download role.
+    votes: int | None = Field(default=None, alias="votes")
     size_bytes: int = Field(default=0, alias="sizeBytes")
     ids: dict[str, Any] | None = None
 

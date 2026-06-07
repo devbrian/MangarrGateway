@@ -256,6 +256,41 @@ def test_to_release_carries_required_REL01_fields_with_relative_date() -> None:
     assert release.scanlation_group == "Thunderscans"
 
 
+# ─────────────────────── votes from chapter likes (REL-03) ──────────────────
+
+
+def test_to_release_populates_votes_from_likes() -> None:
+    """A chapter dict carrying a DOM ``likes`` count maps to ``Release.votes``."""
+    source = ComixSource()
+    release = source._to_release(
+        "mr3m0",
+        "the-forgotten-field",
+        {
+            "id": "9938735",
+            "chapter": "23",
+            "lang": "en",
+            "publishedAtRelative": "2d ago",
+            "likes": 27,
+        },
+        _ctx(),
+    )
+    assert release is not None
+    assert release.votes == 27
+
+
+def test_to_release_votes_none_when_no_likes() -> None:
+    """A chapter dict with no ``likes`` leaves ``Release.votes`` None."""
+    source = ComixSource()
+    release = source._to_release(
+        "mr3m0",
+        "the-forgotten-field",
+        {"id": "9938735", "chapter": "23", "lang": "en"},
+        _ctx(),
+    )
+    assert release is not None
+    assert release.votes is None
+
+
 # ───────── Issue #42 (was #31): supports_recent flipped to True ─────────────
 
 

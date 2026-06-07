@@ -282,6 +282,7 @@ components:
         language:        { type: string, nullable: true, description: "BCP-47 translated language -> ReleaseInfo.TranslatedLanguage. First-class data; fully populated when known. null only when genuinely unknown." }
         scanlationGroup: { type: string, nullable: true, description: "Structured scanlation/translation group. Populated when known; first-class data the future Mangarr reads directly. null only when genuinely unknown." }
         pageCount:       { type: integer, nullable: true, description: "Page count for the chapter. Populated when known; first-class structured data. null only when genuinely unknown." }
+        votes:           { type: integer, nullable: true, description: "Per-release thumbs-up / popularity count where the source exposes one (e.g. Comix chapter likes, MangaBall views). null when the source has no vote concept." }
         sizeBytes:       { type: integer, default: 0 }
         ids:             { type: object, additionalProperties: true, nullable: true, description: "Cross-reference source ids (e.g. mangadexChapterId/mangadexMangaId). First-class structured data; populated when known." }
 

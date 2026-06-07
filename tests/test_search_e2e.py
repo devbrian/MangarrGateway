@@ -48,6 +48,29 @@ def test_dto_release_serializes_by_camelcase_alias() -> None:
     assert dumped["pageCount"] == 42
 
 
+def test_dto_release_votes_serializes_by_alias() -> None:
+    # REL-03 / D-19: votes is a display-only advisory field, populated when the
+    # source exposes a like/vote/view count, null otherwise.
+    with_votes = Release(
+        guid="g",
+        title="X - Chapter 1 (en)",
+        source_key="comix",
+        download_handle="h",
+        publish_date="2026-05-29T13:57:18+00:00",
+        votes=27,
+    )
+    assert with_votes.model_dump(by_alias=True)["votes"] == 27
+
+    without_votes = Release(
+        guid="g",
+        title="X - Chapter 1 (en)",
+        source_key="mangadex",
+        download_handle="h",
+        publish_date="2026-05-29T13:57:18+00:00",
+    )
+    assert without_votes.model_dump(by_alias=True)["votes"] is None
+
+
 def test_dto_decimal_chapter_survives_three_places() -> None:
     # SRCH-06 / Pitfall 1: a decimal chapter must survive to >=3 places.
     rel = Release(
@@ -393,6 +416,8 @@ async def test_search_title_returns_releases(client: httpx.AsyncClient) -> None:
     # SRCH-06: decimal survives to >=3 places, and appears in the title (D-18).
     assert Decimal(str(first["chapterNumber"])) == Decimal("1.005")
     assert "1.005" in first["title"]
+    # REL-03: MangaDex has no chapter-vote concept -> votes is null.
+    assert first["votes"] is None
     # D-21: two group uploads of the same chapter → two distinct guids.
     guids = {r["guid"] for r in releases}
     assert len(guids) == len(releases)

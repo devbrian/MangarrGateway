@@ -561,3 +561,37 @@ async def test_search_ambiguous_query_fans_out_to_full_set() -> None:
     await MangaBallSource().search(SearchRequest(type="manga", query="dragon"), ctx)
 
     assert len(_listing_calls(ctx)) == 4
+
+
+# ─────────────────────── votes from translation views (REL-03) ──────────────
+
+
+def test_to_release_populates_votes_from_views() -> None:
+    """A translation carrying ``views`` maps to ``Release.votes`` (REL-03).
+
+    Locked decision (live recon): ``translations[].likes`` is ~always 0, while
+    ``translations[].views`` carries the real popularity signal (e.g. 2789).
+    """
+    ctx = _ctx(titles=[])
+    translation = _translation(tx_id="a" * 24)
+    translation["views"] = 2789
+    translation["likes"] = 0  # ignored — views is the signal
+    source = MangaBallSource()
+    release = source._to_release(
+        "b" * 24, "One Piece", Decimal("1184.1"), translation, ctx
+    )
+    assert release is not None
+    assert release.votes == 2789
+
+
+def test_to_release_votes_none_when_no_views() -> None:
+    """A translation with no ``views`` leaves ``Release.votes`` None (likes ignored)."""
+    ctx = _ctx(titles=[])
+    translation = _translation(tx_id="a" * 24)
+    translation["likes"] = 0  # present but ignored; no views key
+    source = MangaBallSource()
+    release = source._to_release(
+        "b" * 24, "One Piece", Decimal("1184.1"), translation, ctx
+    )
+    assert release is not None
+    assert release.votes is None
