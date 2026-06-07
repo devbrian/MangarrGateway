@@ -335,6 +335,46 @@ async def test_zero_result_repeat_search_served_from_cache() -> None:
         await transport.aclose()
 
 
+# ─── #162: a mode flip (interactive↔non-interactive) is a Layer-1 resolve HIT ──────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_mode_flip_is_resolve_hit_zero_new_manga_calls() -> None:
+    """#162: count is mode-invariant (5), so the resolve key is mode-agnostic.
+
+    A non-interactive ``type=manga`` search warms (query, languages); a SUBSEQUENT
+    ``interactive=True`` search of the SAME (query, languages) makes ZERO additional
+    ``/manga`` resolve calls — a Layer-1 resolve HIT across the mode flip (the deployed
+    request-29412 redundant-/manga scenario). Pre-#162 the ``extra=count`` discriminator
+    (15 interactive vs 5 default) forced a deliberate MISS here.
+    """
+    manga_id = str(uuid.uuid4())
+    manga_route = respx.get(f"{MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{MANGADEX}/chapter").mock(
+        return_value=httpx.Response(
+            200, json=_chapter_feed_payload(manga_id, ["10", "11", "12"])
+        )
+    )
+    src = MangaDexSource()
+    ctx, transport = _build_ctx(EnumerationCache())
+    try:
+        await src.search(
+            SearchRequest(type="manga", query="Solo Leveling", interactive=False), ctx
+        )
+        manga_after_first = manga_route.call_count
+
+        await src.search(
+            SearchRequest(type="chapter", query="Solo Leveling", interactive=True), ctx
+        )
+        # The mode flip is a resolve HIT: zero additional /manga calls.
+        assert manga_route.call_count - manga_after_first == 0
+    finally:
+        await transport.aclose()
+
+
 # ──────────────────────── Test C: recent() is never cached ─────────────────────────
 
 
