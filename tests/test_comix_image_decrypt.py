@@ -87,3 +87,38 @@ async def test_fetch_image_passthrough_seed_zero_and_missing() -> None:
         "https://cdn.example.store/si/T/03.webp", ctx_garbage
     )
     assert out_garbage == payload
+
+    # signed/negative seed → fails safe to passthrough (must NOT decode-corrupt a
+    # plaintext page; `int("-1") & 0xFFFFFFFF` would otherwise be a live nonzero seed)
+    ctx_neg_seed: Any = _FakeCtx(payload, {"x-enc-seed": "-1", "x-enc-len": "4096"})
+    out_neg_seed = await src.fetch_image(
+        "https://cdn.example.store/si/T/04.webp", ctx_neg_seed
+    )
+    assert out_neg_seed == payload
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_negative_enc_len_falls_back_to_default() -> None:
+    """A hostile negative ``x-enc-len`` must NOT leave the page as ciphertext.
+
+    ``range(min(-1, …))`` is empty, so a naive parse would skip the XOR loop and
+    return undecodable bytes (a `page N invalid`). The decode must fall back to the
+    default length and still recover the WebP.
+    """
+    ctx: Any = _FakeCtx(_VECTOR_CIPHER, {"x-enc-seed": "1415945509", "x-enc-len": "-1"})
+    out = await ComixSource().fetch_image("https://cdn.example.store/si/T/08.webp", ctx)
+    assert out[:4] == b"RIFF"
+    assert out[8:12] == b"WEBP"
+
+
+def test_enc_header_int_rejects_signed_and_nondecimal() -> None:
+    f = ComixSource._enc_header_int
+    assert f(None) == 0
+    assert f("") == 0
+    assert f("  ") == 0
+    assert f("-1") == 0  # signed → malformed
+    assert f("+1") == 0  # signed → malformed
+    assert f("0x10") == 0  # non-decimal → malformed
+    assert f("4096") == 4096
+    assert f(" 4096 ") == 4096  # surrounding whitespace tolerated
+    assert f("3333521747") == 3333521747  # large unsigned 32-bit seed admitted

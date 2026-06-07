@@ -1288,18 +1288,24 @@ class ComixSource(Source):
 
     @staticmethod
     def _enc_header_int(raw: str | None) -> int:
-        """Parse an ``x-enc-*`` header to an int, failing SAFE to ``0`` (T-iy5-02).
+        """Parse an ``x-enc-*`` header to a non-negative int, failing SAFE to ``0``
+        (T-iy5-02).
 
-        A missing, empty, or non-numeric header returns ``0`` and never raises — so a
-        corrupt/hostile ``x-enc-seed`` degrades to plaintext passthrough rather than a
-        crash.
+        A missing, empty, non-numeric, OR signed/negative header returns ``0`` and never
+        raises — so a corrupt/hostile ``x-enc-seed``/``x-enc-len`` degrades to plaintext
+        passthrough rather than producing broken output. Rejecting negatives matters
+        because a negative ``x-enc-len`` would make ``range(min(enc_len, …))`` empty —
+        skipping the XOR loop and leaving an encrypted page as undecodable ciphertext —
+        and a negative ``x-enc-seed`` would still decode (corrupting a plaintext page).
+        ``str.isdecimal()`` accepts only digit runs (rejecting ``-1``, ``+1``, ``0x..``,
+        whitespace-only), and still admits the large unsigned 32-bit seeds Comix sends.
         """
         if raw is None:
             return 0
-        try:
-            return int(raw.strip())
-        except ValueError:
+        value = raw.strip()
+        if not value.isdecimal():
             return 0
+        return int(value)
 
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's raw bytes via the shared session (PKG-02).
@@ -1324,7 +1330,9 @@ class ComixSource(Source):
         seed = self._enc_header_int(headers.get("x-enc-seed"))
         if seed == 0:
             return data  # plaintext page — untouched (fast path)
-        enc_len = self._enc_header_int(headers.get("x-enc-len")) or _ENC_LEN_DEFAULT
+        enc_len = self._enc_header_int(headers.get("x-enc-len"))
+        if enc_len <= 0:
+            enc_len = _ENC_LEN_DEFAULT
         enc_len = min(enc_len, _ENC_LEN_MAX)
         return self._decode_enc_prefix(data, seed, enc_len)
 
