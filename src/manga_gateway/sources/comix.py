@@ -1299,13 +1299,20 @@ class ComixSource(Source):
         and a negative ``x-enc-seed`` would still decode (corrupting a plaintext page).
         ``str.isdecimal()`` accepts only digit runs (rejecting ``-1``, ``+1``, ``0x..``,
         whitespace-only), and still admits the large unsigned 32-bit seeds Comix sends.
+        Values exceeding 32 bits (> ``_ENC_MASK``) are also rejected: since
+        ``_decode_enc_prefix`` masks the seed with ``_ENC_MASK``, an out-of-range header
+        would otherwise alias to a different in-range state and decode-corrupt a page
+        instead of failing safe.
         """
         if raw is None:
             return 0
         value = raw.strip()
         if not value.isdecimal():
             return 0
-        return int(value)
+        parsed = int(value)
+        if parsed > _ENC_MASK:
+            return 0
+        return parsed
 
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's raw bytes via the shared session (PKG-02).

@@ -122,3 +122,6 @@ def test_enc_header_int_rejects_signed_and_nondecimal() -> None:
     assert f("4096") == 4096
     assert f(" 4096 ") == 4096  # surrounding whitespace tolerated
     assert f("3333521747") == 3333521747  # large unsigned 32-bit seed admitted
+    assert f("4294967295") == 0xFFFFFFFF  # max 32-bit seed admitted (boundary)
+    assert f("4294967296") == 0  # > 32 bits → malformed (would alias under the mask)
+    assert f("99999999999999") == 0  # far over → malformed
