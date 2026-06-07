@@ -106,12 +106,10 @@ class MangaDexSource(Source):
             # mode-invariant at 5 (#162), so the resolved candidate set is identical
             # whether or not ``req.interactive`` is set. The resolve key is therefore
             # mode-agnostic ``(source_key, normalized_query, languages)`` with NO
-            # ``extra=count`` discriminator, so a mode flip (interactive↔non-
+            # candidate-count discriminator, so a mode flip (interactive↔non-
             # interactive) for a warmed query is a HIT, not a deliberate MISS — there
             # is no width difference to reconcile, so no wrong-width list can be served.
-            resolve_key = ctx.cached_resolve_key(
-                _normalize(req.query or ""), languages
-            )
+            resolve_key = ctx.cached_resolve_key(_normalize(req.query or ""), languages)
             candidates: list[_MangaCandidate] = await ctx.cached_resolve(
                 resolve_key, _resolve_fn
             )

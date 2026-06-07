@@ -123,9 +123,11 @@ if TYPE_CHECKING:
 _log = logging.getLogger("manga_gateway")
 
 
-# Bound a title search's candidate series; interactive widens it (mirrors MangaDex).
+# Bound a title search's candidate series. The count is mode-invariant: interactive
+# no longer widens the fan-out (#162, mirrors MangaDex). Exact-match queries already
+# collapse to ~1 candidate after the #126 prune regardless of the ceiling, so 5 is the
+# single source of truth for both modes (still referenced by the prune/cap below).
 _DEFAULT_SERIES_CANDIDATES = 5
-_INTERACTIVE_SERIES_CANDIDATES = 15
 # Comix chapter-feed page-size ceiling (live recon: server default limit=20).
 _MAX_FEED_LIMIT = 100
 # Comix search page size (live recon: full-results page uses limit=28).
@@ -884,11 +886,7 @@ class ComixSource(Source):
         # Comix is English-only (live recon); ``languages`` is honored downstream
         # and is the language half of both cache keys (T-09-01).
         languages = req.languages or []
-        count = (
-            _INTERACTIVE_SERIES_CANDIDATES
-            if req.interactive
-            else _DEFAULT_SERIES_CANDIDATES
-        )
+        count = _DEFAULT_SERIES_CANDIDATES
 
         # Layer 1 (D-01): cache the title → pruned-candidate resolution so a repeat
         # search on the same (query, languages) skips the PLAINTEXT ``/api/v1/manga``
@@ -900,8 +898,8 @@ class ComixSource(Source):
             # Prune obviously-irrelevant candidates BEFORE the per-candidate browser
             # chapter fan-out (#126) — each wasted candidate is a 7-18s nav (#101).
             # An exact-match query narrows to the one correct series; ambiguous
-            # queries still fan out to ``count`` (the prune only narrows, never
-            # widens, so the ``req.interactive`` 15-candidate path is preserved).
+            # queries fan out to ``count`` (the prune only narrows, never widens).
+            # ``count`` is mode-invariant at 5 (#162) — interactive no longer widens it.
             return prune_candidates(
                 found,
                 req.query or "",
@@ -911,12 +909,15 @@ class ComixSource(Source):
                 cap=count,
             )
 
-        # WR-01: the resolved candidate set widens with ``req.interactive``
-        # (``count`` is 15 vs 5), so ``count`` rides the resolve key — an interactive
-        # search after a non-interactive one (or vice-versa) is a MISS, not a HIT
-        # served the wrong-width candidate list.
+        # WR-01: the search mode no longer affects candidate width — ``count`` is
+        # mode-invariant at 5 (#162), so the resolved candidate set is identical
+        # whether or not ``req.interactive`` is set. The resolve key is therefore
+        # mode-agnostic ``(source_key, normalized_query, languages)`` with NO
+        # candidate-count discriminator, so a mode flip (interactive↔non-interactive)
+        # for a warmed query is a HIT, not a deliberate MISS — there is no width
+        # difference to reconcile, so no wrong-width list can be served.
         series = await ctx.cached_resolve(
-            ctx.cached_resolve_key(_normalize(req.query or ""), languages, extra=count),
+            ctx.cached_resolve_key(_normalize(req.query or ""), languages),
             _resolve_fn,
         )
         # 260605-e9a deliverable 5: report how many series candidates we deep-
