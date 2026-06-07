@@ -676,9 +676,14 @@ class SourceContext:
             data=data,
             op=op,
         )
-        cf_stale = (
-            self._is_cloudflare and resp.status_code == 403 and is_cf_challenge(resp)
-        )
+        # Issue #172: do NOT pre-gate on ``status_code == 403``. ``is_cf_challenge``
+        # recognizes Cloudflare 503 interstitials as challenges too, and it carries
+        # its own status awareness (early-returns False for any status ∉ {403, 503}
+        # and only inspects the body after the status+server checks, so it is cheap
+        # and safe on the 2xx happy path). A hard-coded 403 gate let a 503 CF
+        # challenge skip this forced-re-solve branch and burn tenacity retries
+        # against the same stale cookie/UA without recovering.
+        cf_stale = self._is_cloudflare and is_cf_challenge(resp)
         # WR-03: gate the CSRF branch on THIS source actually being a csrf-bootstrap
         # source — not merely on a shared provider being present. In app.py the one
         # shared CsrfBootstrap is threaded into EVERY source's context (incl.

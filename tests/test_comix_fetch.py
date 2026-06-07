@@ -112,6 +112,16 @@ def _cf_challenge_response(req: httpx.Request) -> httpx.Response:
     )
 
 
+def _cf_challenge_503_response(req: httpx.Request) -> httpx.Response:
+    # Issue #172: Cloudflare also serves challenges as 503 interstitials.
+    return httpx.Response(
+        503,
+        headers={"server": "cloudflare"},
+        content=b"...challenge-platform...",
+        request=req,
+    )
+
+
 # ───────────────────────── D-40: clearance injection (UA match) ──────────────────
 
 
@@ -223,6 +233,8 @@ async def test_cloudflare_with_null_clearance_sends_no_override() -> None:
 def test_is_cf_challenge_detects_markers() -> None:
     req = httpx.Request("GET", "https://comix/api")
     assert is_cf_challenge(_cf_challenge_response(req)) is True
+    # Issue #172: a 503 CF interstitial is ALSO a challenge.
+    assert is_cf_challenge(_cf_challenge_503_response(req)) is True
     # A plain 403 (no CF markers) is NOT a challenge.
     assert is_cf_challenge(httpx.Response(403, request=req)) is False
     # A 200 is never a challenge.
@@ -245,6 +257,27 @@ async def test_cloudflare_challenge_403_triggers_single_resolve_and_retry() -> N
 
     assert out == {"ok": True}
     assert solver.forced == 1  # exactly ONE forced re-solve
+    assert len(transport.calls) == 2  # initial + single retry
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_challenge_503_triggers_single_resolve_and_retry() -> None:
+    # Issue #172: a 503 CF interstitial must take the SAME forced-re-solve path as
+    # a 403 challenge — not skip it and burn retries against a stale cookie/UA.
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [
+            _cf_challenge_503_response(req),  # first → 503 challenge → re-solve+retry
+            httpx.Response(200, json={"ok": True}, request=req),  # retry succeeds
+        ]
+    )
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare+encrypted", solver=solver)
+
+    out = await ctx.get_json("https://comix/api")
+
+    assert out == {"ok": True}
+    assert solver.forced == 1  # exactly ONE forced re-solve, same as the 403 path
     assert len(transport.calls) == 2  # initial + single retry
 
 
