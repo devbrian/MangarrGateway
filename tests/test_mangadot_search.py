@@ -218,6 +218,8 @@ async def test_search_mints_specific_guid_and_direct_chapter_id() -> None:
     assert rel.publish_date == "2026-05-12T12:21:39+00:00"
     assert rel.language == "en"
     assert rel.scanlation_group == "Stick"
+    # REL-03: MangaDot exposes no vote field (recon-gated) -> votes is None.
+    assert rel.votes is None
     assert rel.chapter_number == Decimal("26.0")
     assert rel.ids == {"mangaId": "20277", "mangadotChapterId": "388872"}
 

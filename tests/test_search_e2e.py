@@ -416,6 +416,8 @@ async def test_search_title_returns_releases(client: httpx.AsyncClient) -> None:
     # SRCH-06: decimal survives to >=3 places, and appears in the title (D-18).
     assert Decimal(str(first["chapterNumber"])) == Decimal("1.005")
     assert "1.005" in first["title"]
+    # REL-03: MangaDex has no chapter-vote concept -> votes is null.
+    assert first["votes"] is None
     # D-21: two group uploads of the same chapter → two distinct guids.
     guids = {r["guid"] for r in releases}
     assert len(guids) == len(releases)
