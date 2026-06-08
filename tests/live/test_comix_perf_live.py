@@ -68,7 +68,7 @@ download ``failed`` at 13/24 pages and the test failed — an upstream/origin
 flake, not a gateway perf regression.
 
 Pinning a fixed chapter THROUGH search is infeasible: comix search only surfaces
-the few newest chapters (observed: 21–24), and that window slides forward as the
+the few newest chapters (observed: 21-24), and that window slides forward as the
 series releases, so an older known-good chapter is simply not reachable via the
 search path. But this test does not need search at all — search has its own
 smoke coverage (``test_search_returns_releases``/``test_search_alt_title_resolves``)
