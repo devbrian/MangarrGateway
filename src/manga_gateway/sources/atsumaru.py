@@ -169,11 +169,21 @@ class AtsumaruSource(Source):
     id_types: list[str] = []
     # Single-language (English) aggregator — no per-chapter language metadata exists.
     languages = ["en"]
-    # Conservative start (recon Open Q): the read/search endpoints answered cold with
-    # no throttling observed on a residential IP, but the real Cloudflare-fronted
-    # ceiling is unprobed. 120/min is a safe v1 floor; live-tune with the rate-limit
-    # probe harness (scripts/probe_rate_limits.py) before raising it.
-    rate_limit_per_minute = 120
+    # Probe-tuned (2026-06-08, scripts/probe_rate_limits.py): two sweeps across fresh
+    # residential proxies found NO hard limit on atsumaru — zero
+    # 429/403/Cloudflare-challenge/Retry-After and zero latency degradation on ANY
+    # endpoint. The rate-ceiling sweep sustained 960/min cleanly at concurrency 8
+    # (search + manifest + image alike) — a FLOOR (the true ceiling is higher). 480 is
+    # the conservative ~50%-of-floor suggestion, the same shape as the mangaball/
+    # mangadot precedent (#101). The limiter is SHARED across search + manifest API
+    # calls; image bytes are exempt (``get_bytes`` is ``limited=False``).
+    rate_limit_per_minute = 480
+    # D-30 per-source override: the 2026-06-08 parallelism sweep sustained concurrency
+    # 32 cleanly on every endpoint (zero throttling), so chapter downloads parallelize
+    # safely. 3 mirrors the mangaball/mangadot precedent (#101); the job manager clamps
+    # it to the global max_concurrent_chapters (8). (This governs concurrent download
+    # JOBS for this source, not search fan-out.)
+    max_concurrent_jobs = 3
     antibot = "none"
     decrypt_scheme = None
     session_prep = None

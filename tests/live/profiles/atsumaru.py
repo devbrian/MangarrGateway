@@ -37,11 +37,19 @@ deterministic leading Typesense hit (``id=sVC2A``, ``title="One Piece"``, recon
 deterministic leading hit so ``release[0]`` is well-defined, and a short newest
 chapter (≈13 pages) so the download leg finishes inside ``download_timeout_s``.
 
+Rate limit (probe-measured 2026-06-08)
+--------------------------------------
+``scripts/probe_rate_limits.py`` ran two sweeps (parallelism + rate-ceiling) across
+fresh residential proxies and found NO hard limit: zero 429/403/CF-challenge and zero
+latency degradation on search/manifest/image, clean at concurrency 32 and 960/min
+(a FLOOR — the true ceiling is higher). The source is set to the conservative
+suggestion ``rate_limit_per_minute = 480`` + ``max_concurrent_jobs = 3``.
+
 LIVE-TUNE items (refine from the first deploy-host smoke)
 ---------------------------------------------------------
-* **rate_limit_per_minute** — currently a conservative 120/min (the Cloudflare
-  ceiling is unprobed). Raise it with ``scripts/probe_rate_limits.py`` once the real
-  ceiling is measured.
+* **rate_limit_per_minute / max_concurrent_jobs** — 480 / 3 are conservative
+  ~50%-of-floor values; both held with headroom in the probe. Re-probe only if the
+  site starts throttling under real load.
 * **recent fan-out cost** — ``recent`` fetches a full ``allChapters`` feed per
   recently-updated title (no chapter-level recent feed exists). Confirm the bounded
   fan-out (``_RECENT_TITLE_CAP``) stays comfortably under the rate budget.
