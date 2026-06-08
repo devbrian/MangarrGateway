@@ -88,7 +88,15 @@ jobs:
       # so a fallback re-run with ``GATEWAY_CLOUDFLARE_ENGINE=camoufox`` +
       # ``GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1`` works without a workflow edit
       # if the headed-Chromium path regresses on the datacenter runner.
+      #
+      # ``continue-on-error: true`` (debug nightly-camoufox-fetch-504): this is a
+      # fallback-only convenience pre-fetch for an engine the nightly NEVER runs
+      # (engine=patchright, above). A transient GitHub-releases 504 on the
+      # third-party daijro/camoufox release asset MUST NOT sink a patchright
+      # nightly — decouple it from the critical path. The live step (also
+      # ``continue-on-error``) plus the triage step own the real signal/exit code.
       - run: uv run camoufox fetch
+        continue-on-error: true
       # Xvfb provides the virtual display the HEADED Chromium launch needs on this
       # display-less runner (the solver auto-starts it via pyvirtualdisplay); the
       # realistic fonts reduce the Linux font-fingerprint anomaly.
