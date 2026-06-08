@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 def register_builtin_sources(registry: SourceRegistry) -> None:
     """Register all built-in sources into ``registry`` (called in the lifespan)."""
+    from .atsumaru import AtsumaruSource
     from .comix import ComixSource
     from .mangaball import MangaBallSource
     from .mangadex import MangaDexSource
@@ -26,3 +27,4 @@ def register_builtin_sources(registry: SourceRegistry) -> None:
     registry.register("comix")(ComixSource)
     registry.register("mangaball")(MangaBallSource)
     registry.register("mangadot")(MangadotSource)
+    registry.register("atsumaru")(AtsumaruSource)
