@@ -27,6 +27,14 @@ ENDPOINT SHAPES (live-recon-pinned, 2026-06-08):
   newest-first, every row carrying a stable chapter ``id`` + a ``createdAt`` date —
   so this is the enumeration source for BOTH ``search`` and ``recent`` (DIRECT mint,
   no Comix-style ``:DEFERRED`` late-bind: the id is always present).
+* scanlation group names: a chapter row carries only an opaque ``scanlationMangaId``,
+  NOT the group NAME — the name map lives in ``GET /api/manga/page?id=`` →
+  ``mangaPage.scanlators`` (``[{id, name}]``; One Piece ``[{… "Alpha"}]``, Solo
+  Leveling ``[Alpha, Asura, Flame]``). Enumeration fetches it alongside ``allChapters``
+  (concurrently, BEST-EFFORT — an advisory group must never fail the enumeration) and
+  resolves each chapter's ``scanlationMangaId`` → ``scanlationGroup``. (``manga.page``
+  itself is title-only-windowed via ``hasMoreChapters`` — NOT a complete chapter
+  source — so it is used ONLY for the scanlators map, never for enumeration.)
 * recent: ``GET /api/infinite/recentlyUpdated?page=&types=`` →
   ``{items:[{id,title,type,…}]}`` — a TITLE-ONLY newest-updated feed (no embedded
   chapter), so ``recent`` fans out a bounded ``allChapters`` per title and mints the
@@ -265,11 +273,18 @@ class AtsumaruSource(Source):
             # a cache HIT acquires neither the fan-out slot nor a rate-limit token.
             async def _enum_fn() -> Enumeration:
                 async with sem:
-                    listing = await ctx.get_json(
-                        f"{self.base_url}/api/manga/allChapters", mangaId=manga_id
+                    # allChapters (load-bearing) + the scanlator name map fetched
+                    # concurrently; the group resolve is BEST-EFFORT (helper swallows
+                    # its own errors → {}), so it never fails the enumeration.
+                    listing, group_names = await asyncio.gather(
+                        ctx.get_json(
+                            f"{self.base_url}/api/manga/allChapters", mangaId=manga_id
+                        ),
+                        self._fetch_scanlator_names(manga_id, ctx),
                     )
                 chapters = listing.get("chapters")
                 rows = chapters if isinstance(chapters, list) else []
+                _attach_group_names(rows, group_names)
                 return Enumeration(
                     items=rows,
                     chapter_numbers=tuple(
@@ -380,8 +395,12 @@ class AtsumaruSource(Source):
 
         async def _newest_release(manga_id: str, manga_title: str) -> Release | None:
             async with sem:
-                listing = await ctx.get_json(
-                    f"{self.base_url}/api/manga/allChapters", mangaId=manga_id
+                # allChapters + scanlator names concurrently (group BEST-EFFORT).
+                listing, group_names = await asyncio.gather(
+                    ctx.get_json(
+                        f"{self.base_url}/api/manga/allChapters", mangaId=manga_id
+                    ),
+                    self._fetch_scanlator_names(manga_id, ctx),
                 )
             chapters = listing.get("chapters")
             rows = chapters if isinstance(chapters, list) else []
@@ -390,6 +409,9 @@ class AtsumaruSource(Source):
             )
             if newest is None:
                 return None
+            newest["_group"] = group_names.get(
+                str(newest.get("scanlationMangaId") or "")
+            )
             return self._to_release(manga_id, manga_title, newest, ctx)
 
         tasks: list[Coroutine[Any, Any, Release | None]] = []
@@ -487,13 +509,17 @@ class AtsumaruSource(Source):
         publish_date = (
             _ms_to_iso(chapter.get("createdAt")) or datetime.now(UTC).isoformat()
         )
+        # Resolved scanlation group name (baked onto the row at enumeration time by
+        # ``_attach_group_names`` from the manga.page scanlators map). ``None`` when
+        # the best-effort lookup found nothing — an advisory field (REL-03/D-19).
+        group = chapter.get("_group") or None
 
         ch_str = (
             format(chapter_number.normalize(), "f")
             if chapter_number is not None
             else "?"
         )
-        title = self._build_title(manga_title, ch_str)
+        title = self._build_title(manga_title, ch_str, group=group)
         guid = f"atsumaru:{manga_id}:ch-{ch_str}:{chapter_id}"
 
         handle = ctx.handle_store.mint(
@@ -506,7 +532,7 @@ class AtsumaruSource(Source):
                 manga_title=manga_title,
                 chapter_number=chapter_number,
                 volume=None,
-                scanlation_group=None,
+                scanlation_group=group,
                 page_count=page_count,
             )
         )
@@ -520,9 +546,36 @@ class AtsumaruSource(Source):
             manga_title=manga_title,
             chapter_number=chapter_number,
             language="en",
+            scanlation_group=group,
             page_count=page_count,
             ids={"atsumaruMangaId": manga_id, "atsumaruChapterId": chapter_id},
         )
+
+    async def _fetch_scanlator_names(
+        self, manga_id: str, ctx: SourceContext
+    ) -> dict[str, str]:
+        """Best-effort ``scanlationMangaId → group name`` map for a manga (REL-03).
+
+        The ``allChapters`` rows carry only an opaque ``scanlationMangaId``; the human
+        group NAME lives in ``GET /api/manga/page?id=`` → ``mangaPage.scanlators``
+        (``[{id, name}]``). Returns ``{id: name}``, or ``{}`` on ANY missing/malformed
+        shape OR a fetch error (``SourceError`` swallowed) — the scanlation group is an
+        advisory field (D-19), so a flaky/absent ``manga.page`` must degrade to "no
+        group", never fail the load-bearing ``allChapters`` enumeration.
+        """
+        try:
+            body = await ctx.get_json(f"{self.base_url}/api/manga/page", id=manga_id)
+        except SourceError:
+            return {}
+        page = body.get("mangaPage")
+        scanlators = page.get("scanlators") if isinstance(page, dict) else None
+        if not isinstance(scanlators, list):
+            return {}
+        return {
+            str(s["id"]): str(s["name"])
+            for s in scanlators
+            if isinstance(s, dict) and s.get("id") and s.get("name")
+        }
 
     @classmethod
     def _language_wanted(cls, languages: list[str] | None) -> bool:
@@ -534,9 +587,18 @@ class AtsumaruSource(Source):
         return not languages or "en" in languages
 
     @staticmethod
-    def _build_title(manga_title: str, chapter: str) -> str:
-        """Compose a MangaParser-parseable release title (REL-02), MangaDex shape."""
-        return f"{manga_title} - Chapter {chapter} (en)"
+    def _build_title(
+        manga_title: str, chapter: str, *, group: str | None = None
+    ) -> str:
+        """Compose a MangaParser-parseable release title (REL-02), MangaDex shape.
+
+        Appends a ``[group]`` segment when the scanlation group is known (mirrors
+        ``mangaball``/``mangadex``) so Mangarr can parse + match on the group.
+        """
+        parts = [manga_title, "-", f"Chapter {chapter}", "(en)"]
+        if group:
+            parts.append(f"[{group}]")
+        return " ".join(parts)
 
     @staticmethod
     def _parse_decimal(raw: Any) -> Decimal | None:
@@ -556,6 +618,19 @@ class AtsumaruSource(Source):
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+
+def _attach_group_names(rows: list[Any], names: dict[str, str]) -> None:
+    """Bake the resolved scanlation group name onto each chapter row (``_group``).
+
+    Maps each row's ``scanlationMangaId`` through the ``manga.page`` scanlators map
+    so :meth:`AtsumaruSource._to_release` can read ``chapter["_group"]`` without a
+    second lookup. Mutates ``rows`` in place; a row with no/unknown scanlator gets
+    ``_group=None``. The enriched rows are what the Layer-2 enum cache stores.
+    """
+    for row in rows:
+        if isinstance(row, dict):
+            row["_group"] = names.get(str(row.get("scanlationMangaId") or ""))
 
 
 def _other_names(doc: dict[str, Any]) -> list[str]:
