@@ -58,10 +58,33 @@ Like the rest of ``tests/live/``, this test:
 * is path-agnostic (``tmp_path``) and env-knob-driven so a future nightly job
   reuses it unchanged.
 
+**Chapter pinning — no live search (issue #181, 2026-06-08).**
+
+The test originally measured ``releases[0]`` from a live ``POST /search`` —
+whichever chapter comix returned first (newest). That made the measured chapter
+NON-DETERMINISTIC: a nightly run landed on "Chapter 24 [Vortex Scans]", whose
+image CDN origin was degraded (pages 14+ returned ``upstream 404``), so the
+download ``failed`` at 13/24 pages and the test failed — an upstream/origin
+flake, not a gateway perf regression.
+
+Pinning a fixed chapter THROUGH search is infeasible: comix search only surfaces
+the few newest chapters (observed: 21-24), and that window slides forward as the
+series releases, so an older known-good chapter is simply not reachable via the
+search path. But this test does not need search at all — search has its own
+smoke coverage (``test_search_returns_releases``/``test_search_alt_title_resolves``)
+and was already OUTSIDE this test's timed window (the budget is the
+``POST /downloads`` → ``completed`` wall-clock only). So the test now MINTS a
+download handle DIRECTLY for the same known-good chapter the drift fixture is
+recorded against (``mr3m0`` "The Forgotten Field" chapter 20, numeric chapter id
+9001596, 17 pages — see ``tests/fixtures/comix/chapter_9001596_pages.json``, the
+same chapter ``test_fixture_drift`` navigates) and submits THAT, exercising the
+identical resolve → manifest → image-fetch → archive download path with zero
+search-path or sliding-window flakiness. The composite resolves to the exact
+chapter URL the drift test uses, so the two live comix tests now pin one stable
+chapter together.
+
 Knobs:
 
-* ``COMIX_PERF_QUERY`` — search query (default: "Forgotten Field", same as
-  ``test_comix_e2e_live.py``).
 * ``COMIX_PERF_BUDGET_SECONDS`` — wall-clock budget override (default 15.5,
   the post-issue-#45 measured-derived regression guard; tighten as further
   optimizations land).
@@ -73,6 +96,7 @@ import asyncio
 import math
 import os
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -81,11 +105,28 @@ import pytest
 
 from manga_gateway.app import create_app
 from manga_gateway.config import Settings
+from manga_gateway.handles.store import ResolutionRecord
+from manga_gateway.sources.comix import ComixSource
 
 pytestmark = pytest.mark.live  # excluded from the gate
 
-_DEFAULT_QUERY = "Forgotten Field"
 _TEST_API_KEY = "test-perf-comix-key-DO-NOT-LOG-IN-PROD"
+
+# Issue #181: the pinned known-good chapter — the SAME chapter the drift fixture
+# is recorded against and ``test_fixture_drift`` navigates: ``mr3m0`` "The
+# Forgotten Field" chapter 20, numeric chapter id 9001596, 17 pages
+# (tests/fixtures/comix/chapter_9001596_pages.json). The composite resolves to
+# ``{base_url}/title/mr3m0-the-forgotten-field/9001596-chapter-20`` in
+# ``fetch_manifest`` — no live search, so the sliding newest-chapter window
+# (and its per-chapter CDN flakiness) can never sink this perf measurement.
+_PIN_NUMERIC_ID = "9001596"
+_PIN_HID = "mr3m0"
+_PIN_SLUG = "the-forgotten-field"
+_PIN_CHAPTER = "20"
+_PIN_TITLE = "The Forgotten Field - Chapter 20 (en) [Vortex Scans]"
+_PIN_MANGA = "The Forgotten Field"
+_PIN_GROUP = "Vortex Scans"
+_PIN_PAGE_COUNT = 17
 # Issue #45 (2026-05-31): tightened from 20.0 → 15.5. The 20.0 figure was
 # anchored on the issue #32 sequential walk's ~14-15 s wall-clock; the
 # issue #45 two-scroll head+tail extractor (inner Swiper container
@@ -100,8 +141,30 @@ _DEFAULT_BUDGET_SECONDS = 15.5
 _TERMINAL_TIMEOUT_S = 60.0
 
 
-def _query() -> str:
-    return os.environ.get("COMIX_PERF_QUERY", _DEFAULT_QUERY)
+def _pinned_record() -> ResolutionRecord:
+    """The ResolutionRecord for the pinned chapter (issue #181).
+
+    Builds the resolved composite ``chapter_id``
+    (``9001596|mr3m0|the-forgotten-field|20``) that ``ComixSource.fetch_manifest``
+    reconstructs into the live chapter URL the drift test navigates. Minting this
+    directly into the handle store lets the perf test exercise the full download
+    path with NO live search — the title/group/page_count fields are advisory
+    (job display only) and do not affect the resolve/fetch the budget measures.
+    """
+    composite = ComixSource._make_composite_chapter_id(
+        _PIN_NUMERIC_ID, _PIN_HID, _PIN_SLUG, _PIN_CHAPTER
+    )
+    return ResolutionRecord(
+        source_key="comix",
+        chapter_id=composite,
+        language="en",
+        title=_PIN_TITLE,
+        manga_title=_PIN_MANGA,
+        chapter_number=Decimal(_PIN_CHAPTER),
+        volume=None,
+        scanlation_group=_PIN_GROUP,
+        page_count=_PIN_PAGE_COUNT,
+    )
 
 
 def _budget_seconds() -> float:
@@ -158,12 +221,12 @@ async def _poll_until_terminal(
 async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
     """Warm-solver Comix download must complete under the regression budget.
 
-    Search → submit first release → measure ``POST /downloads`` → first
-    ``status: completed`` observation. Asserts the elapsed wall-clock is
-    under :func:`_budget_seconds` (default ``_DEFAULT_BUDGET_SECONDS`` =
-    15.5 s, the post-issue-#45 measured-derived regression guard for the
-    two-scroll inner-Swiper extractor; tighten further when the
-    persistent-reader-page follow-up lands).
+    Mint a handle for the PINNED known-good chapter (issue #181 — no live
+    search) → submit → measure ``POST /downloads`` → first ``status: completed``
+    observation. Asserts the elapsed wall-clock is under :func:`_budget_seconds`
+    (default ``_DEFAULT_BUDGET_SECONDS`` = 15.5 s, the post-issue-#45
+    measured-derived regression guard for the two-scroll inner-Swiper extractor;
+    tighten further when the persistent-reader-page follow-up lands).
     """
     output_root = tmp_path / "out"
     await asyncio.to_thread(output_root.mkdir)
@@ -188,26 +251,16 @@ async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
             headers={"X-Api-Key": _TEST_API_KEY},
             timeout=120.0,
         ) as client:
-            # Search is OUTSIDE the timed window — the perf budget is the
-            # download wall-clock only (#20 acceptance: "POST /downloads to
-            # status: completed").
-            search = await client.post(
-                "/api/v1/search",
-                json={
-                    "type": "chapter",
-                    "query": _query(),
-                    "sources": ["comix"],
-                },
-            )
-            assert search.status_code == 200, (
-                f"search failed: {search.status_code} {search.text[:400]}"
-            )
-            releases = search.json().get("releases") or []
-            assert releases, (
-                f"no releases returned for query={_query()!r}; if comix.to "
-                f"changed its catalog, override COMIX_PERF_QUERY"
-            )
-            handle = releases[0]["downloadHandle"]
+            # Issue #181: NO live search — mint a handle for the pinned
+            # known-good chapter directly into the same handle store the
+            # download route resolves against (app.state.handle_store). Search
+            # has its own smoke coverage and was already outside the timed
+            # window; minting here removes the sliding newest-chapter window
+            # (and its per-chapter CDN flakiness) that sank the nightly with an
+            # `upstream 404` partway through a degraded newest chapter. The
+            # resolve → manifest → image-fetch → archive path the budget
+            # measures is byte-for-byte the production download path.
+            handle = app.state.handle_store.mint(_pinned_record())
 
             # Start the clock immediately before the submit so the budget
             # captures the SAME path the issue's baseline measured: submit
