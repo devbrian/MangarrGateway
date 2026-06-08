@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +40,8 @@ import tenacity
 from ..metrics.collector import get_collector
 from .decrypt import decrypt
 from .errors import SourceError
+
+_log = logging.getLogger("manga_gateway")
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -712,6 +715,24 @@ class SourceContext:
                 data=data,
                 op=op,
             )
+            # debug comix-recent-403 follow-up: distinguish "the re-solve could not
+            # clear Cloudflare" from a plain post-refresh 403. When a CF challenge
+            # SURVIVES the forced re-solve, the solver failed to earn a fresh
+            # cf_clearance — almost always because headless Chromium is now
+            # fingerprint-blocked by the host's Cloudflare. Emit a distinct WARN so
+            # this is diagnosable from logs immediately, without waiting for the
+            # source cooldown / the generic "upstream 403" warning to surface.
+            if cf_stale and is_cf_challenge(resp):
+                _log.warning(
+                    "Cloudflare challenge SURVIVED a forced re-solve "
+                    "(source=%s op=%s status=%d) — the solver could not earn a "
+                    "fresh cf_clearance; headless Chromium may be blocked "
+                    "(check GATEWAY_CLOUDFLARE_HEADLESS=false). "
+                    "Source enters cooldown.",
+                    self._source_key,
+                    op,
+                    resp.status_code,
+                )
         if resp.status_code in _PERMANENT_STATUSES:
             raise SourceError(
                 "source_unavailable",

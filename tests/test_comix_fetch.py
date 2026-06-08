@@ -301,6 +301,59 @@ async def test_cloudflare_second_challenge_after_resolve_is_terminal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cloudflare_challenge_surviving_resolve_logs_distinct_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # debug comix-recent-403 follow-up: when a CF challenge SURVIVES the forced
+    # re-solve (the "headless can't solve" signature), the gateway emits a distinct
+    # WARN naming the source + GATEWAY_CLOUDFLARE_HEADLESS, so it is diagnosable from
+    # logs immediately rather than only via the later generic "upstream 403" warning.
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [
+            _cf_challenge_response(req),  # challenge → re-solve
+            _cf_challenge_response(req),  # still challenge after re-solve → survived
+        ]
+    )
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare", solver=solver)
+
+    with caplog.at_level("WARNING", logger="manga_gateway"), pytest.raises(SourceError):
+        await ctx.get_json("https://comix/api")
+
+    survived = [
+        r for r in caplog.records if "SURVIVED a forced re-solve" in r.getMessage()
+    ]
+    assert len(survived) == 1
+    msg = survived[0].getMessage()
+    assert "comix" in msg  # names the source
+    assert "GATEWAY_CLOUDFLARE_HEADLESS" in msg  # points at the lever
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_resolved_challenge_logs_no_survival_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Control: when the re-solve CLEARS the challenge (2nd response is 200), the
+    # distinct "survived" warning must NOT fire — it is specific to a failed re-solve.
+    req = httpx.Request("GET", "https://comix/api")
+    transport = _RecordingTransport(
+        [
+            _cf_challenge_response(req),  # challenge → re-solve
+            httpx.Response(200, json={"ok": True}, request=req),  # cleared
+        ]
+    )
+    solver = _CountingSolver()
+    ctx = _ctx(transport, antibot="cloudflare", solver=solver)
+
+    with caplog.at_level("WARNING", logger="manga_gateway"):
+        assert await ctx.get_json("https://comix/api") == {"ok": True}
+    assert not [
+        r for r in caplog.records if "SURVIVED a forced re-solve" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
 async def test_cloudflare_non_challenge_403_is_terminal_without_resolve() -> None:
     req = httpx.Request("GET", "https://comix/api")
     transport = _RecordingTransport([httpx.Response(403, request=req)])  # no CF markers

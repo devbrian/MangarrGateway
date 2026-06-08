@@ -1227,18 +1227,24 @@ class CloudflareSolver:
             launch_kwargs["proxy"] = self._proxy
         return await AsyncNewBrowser(self._playwright, **launch_kwargs)
 
-    async def _solve_keyed(self, context: Any, key: str) -> Clearance:
+    async def _solve_keyed(
+        self, context: Any, key: str, *, force: bool = False
+    ) -> Clearance:
         """Resolve ``key`` to its per-domain challenge URL and solve there (#88).
 
         The lifecycle's solve closure is this method (not ``_solve_real``) so the
         per-key challenge URL is bound at solve time. ``key`` is the
         ``source_key``; its URL comes from the ``challenge_urls`` map, falling
-        back to the constructor ``challenge_url`` default when absent.
+        back to the constructor ``challenge_url`` default when absent. ``force``
+        marks a D-35 re-solve (the on-disk cf_clearance was just rejected) so
+        ``_solve_real`` discards the stale cookie before re-navigating.
         """
         url = self._challenge_urls.get(key) or self._challenge_url
-        return await self._solve_real(context, url)
+        return await self._solve_real(context, url, force=force)
 
-    async def _solve_real(self, context: Any, challenge_url: str) -> Clearance:
+    async def _solve_real(
+        self, context: Any, challenge_url: str, *, force: bool = False
+    ) -> Clearance:
         """Solve the challenge on the live context; capture cf_clearance + UA.
 
         ``challenge_url`` is supplied by :meth:`_solve_keyed` from the per-domain
@@ -1252,6 +1258,28 @@ class CloudflareSolver:
         Playwright async API (already off the event loop). The image fetch is NEVER
         done through the browser (CLAUDE.md) — only the token capture is.
         """
+        challenge_host = (urlparse(challenge_url).hostname or "").lower()
+        if force:
+            # D-35 forced re-solve (debug comix-recent-403): this path runs ONLY
+            # because a request just got a CF challenge — i.e. the cf_clearance held
+            # for this host (loaded from the persistent ``cloudflare-userdata`` dir)
+            # was REJECTED by Cloudflare. If we leave it in the jar, the poll loop
+            # below short-circuits on the stale cookie the instant we navigate and
+            # hands back a "clearance" we never re-earned (the false-positive
+            # "captured clearance (1 cookies)" that masked this bug). Drop it FIRST,
+            # host-scoped, so the loop genuinely waits for a fresh cookie. Scoping by
+            # the cookie's own domain keeps any OTHER cloudflare domain's clearance on
+            # the shared warm context intact (#88).
+            stale = await context.cookies()
+            stale_domains = {
+                c.get("domain")
+                for c in stale
+                if c.get("name") == "cf_clearance"
+                and _belongs_to_host(c, challenge_host)
+            }
+            for dom in stale_domains:
+                with contextlib.suppress(Exception):
+                    await context.clear_cookies(name="cf_clearance", domain=dom)
         page = await context.new_page()
         try:
             await page.goto(challenge_url, wait_until="domcontentloaded")
@@ -1271,8 +1299,9 @@ class CloudflareSolver:
             # solving domain B return the instant domain A's cookie is present in
             # the jar — capturing an EMPTY host-scoped cookie set for B and handing
             # B a clearance it never actually solved. Gate the break on a
-            # cf_clearance that ``_belongs_to_host`` the host we navigated.
-            challenge_host = (urlparse(challenge_url).hostname or "").lower()
+            # cf_clearance that ``_belongs_to_host`` the host we navigated
+            # (``challenge_host`` computed above, also used by the forced-re-solve
+            # stale-cookie purge).
             jar: list[dict[str, Any]] = []
             while True:
                 jar = await context.cookies()
@@ -1293,11 +1322,16 @@ class CloudflareSolver:
             # (Pitfall 1 / D-40).
             ua = await page.evaluate("navigator.userAgent")
             # Capture ALL cookies bound to the challenge URL's host (or any parent
-            # domain thereof). Comix's /api/v1 endpoints require BOTH cf_clearance
-            # AND the Laravel ``session`` cookie set on comix.to during the solve
-            # (empirically verified 2026-05-30 — passing only cf_clearance returns
-            # 403). Scoping by domain naturally excludes cross-site ad-tracking
-            # cookies the solver may pick up incidentally.
+            # domain thereof). Scoping by domain captures whatever the gated host
+            # needs (cf_clearance plus any app/session cookie set during the solve)
+            # and naturally excludes cross-site ad-tracking cookies the solver may
+            # pick up incidentally. NOTE: a 2026-05-30 recon believed Comix required
+            # BOTH cf_clearance AND a Laravel ``session`` cookie, but re-verified
+            # 2026-06-07 (debug comix-recent-403) a HEADED solve's cf_clearance ALONE
+            # returns 200 from /api/v1/manga — comix.to no longer sets/needs the
+            # session cookie, and a 1-cookie capture is healthy. The real failure mode
+            # is a HEADLESS solve never earning cf_clearance at all (see config.py /
+            # Dockerfile: the image runs headed because comix.to blocks headless).
             cookies = {
                 c["name"]: c["value"]
                 for c in jar
