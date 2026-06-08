@@ -100,8 +100,14 @@ RUN useradd --create-home --uid 10001 app \
 #    (AUTH-02), unreachable through a published port; 0.0.0.0 binds the port.
 #  * The state-routed paths put config.toml (the key), the DB, and cf_clearance
 #    on the /state volume so they survive container recreation (verified_facts #3).
-#  * GATEWAY_CLOUDFLARE_HEADLESS=true is the residential default; flip to false on
-#    a datacenter host (xvfb is already present, no rebuild).
+#  * GATEWAY_CLOUDFLARE_HEADLESS=false is the image default (the solver runs HEADED
+#    Chromium under the baked-in xvfb display, pyvirtualdisplay auto-starts it).
+#    Headless was the historical residential default, but comix.to's Cloudflare now
+#    fingerprints/blocks the headless Chromium UA ("HeadlessChrome") even from a
+#    residential IP — a headless solve no longer earns cf_clearance, so /recent and
+#    /search 403 (debug comix-recent-403, 2026-06-07). HEADED clears it on every
+#    host the image runs on (residential + datacenter), so it is the safe default;
+#    xvfb is already present (no rebuild needed to change this knob via .env).
 # NOT set on purpose: GATEWAY_API_KEY (ignored by design, D-01) and
 # GATEWAY_CLOUDFLARE_ENGINE (the app default `patchright` is correct; LD-1 keeps
 # Camoufox out of the image entirely).
@@ -110,7 +116,7 @@ ENV GATEWAY_HOST=0.0.0.0 \
     GATEWAY_DB_PATH=/state/gateway.db \
     GATEWAY_CLOUDFLARE_USER_DATA_DIR=/state/cloudflare-userdata \
     GATEWAY_OUTPUT_ROOT=/data/manga \
-    GATEWAY_CLOUDFLARE_HEADLESS=true
+    GATEWAY_CLOUDFLARE_HEADLESS=false
 
 USER app
 

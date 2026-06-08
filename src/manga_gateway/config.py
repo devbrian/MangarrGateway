@@ -123,13 +123,17 @@ class Settings(BaseSettings):
     # on some hosts; a datacenter-IP host may need to route the Chromium egress
     # through a residential proxy (CLAUDE.md proxy-ready transport, issue #65).
     cloudflare_fetch_concurrency: int = Field(default=3, ge=1)
-    # Run the stealth browser headless. Default True: headless clears CF on a
-    # residential-reputation IP (dev / residential prod) with no display needed.
-    # Set to False on a DATACENTER host (cloud / CI): Cloudflare fingerprints
-    # headless Chrome at the binary level and blocks it on datacenter IPs, but
-    # HEADED Chromium clears it (cf-fingerprint-probe, #35). When headed on a
-    # display-less Linux host the solver auto-starts an Xvfb virtual display
-    # (pyvirtualdisplay) — the host only needs the ``xvfb`` package installed.
+    # Run the stealth browser headless. The app default is True (bare-app/dev with
+    # a real display), but the SHIPPED DOCKER IMAGE bakes
+    # ``GATEWAY_CLOUDFLARE_HEADLESS=false`` (headed under xvfb) — see the Dockerfile.
+    # Headless historically cleared CF on a residential-reputation IP, but as of
+    # 2026-06-07 comix.to's Cloudflare fingerprints/blocks the headless Chromium UA
+    # ("HeadlessChrome") even from a residential IP: a headless solve no longer earns
+    # cf_clearance, so the gateway falls back to a stale on-disk cookie and comix
+    # /recent + /search 403 (debug comix-recent-403). HEADED Chromium still clears it
+    # on every host (residential + datacenter, #35). When headed on a display-less
+    # Linux host the solver auto-starts an Xvfb virtual display (pyvirtualdisplay) —
+    # the host only needs the ``xvfb`` package installed (it is in the image).
     cloudflare_headless: bool = True
     # D-34: persistent-context dir holding cf_clearance; resolved via pathlib at
     # the use site (Plan 04), NOT under output_root (T-04-03 — never logged).
