@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -87,7 +88,11 @@ class BrowserLifecycle:
         self,
         *,
         launch: Callable[[], Awaitable[Any]],
-        solve: Callable[[Any, str], Awaitable[Clearance]],
+        # ``solve(context, key, *, force=False)`` — ``force`` is keyword-only with a
+        # default so non-forced solves call it exactly as before; on a forced D-35
+        # re-solve the closure discards the rejected cf_clearance (debug
+        # comix-recent-403). ``...`` because Callable cannot spell a keyword-only arg.
+        solve: Callable[..., Awaitable[Clearance]],
         solve_concurrency: int = 1,
         recycle_seconds: float | None = None,
     ) -> None:
@@ -195,8 +200,10 @@ class BrowserLifecycle:
 
         if force:
             # attempt=2: a forced solve IS the D-35 re-solve → captures re-solve
-            # frequency in the solve metric (RESEARCH DRIFT note).
-            clearance = await self._run_solve(key, attempt=2)
+            # frequency in the solve metric (RESEARCH DRIFT note). ``force`` is
+            # threaded into the solve closure so it can discard the now-rejected
+            # cf_clearance before re-navigating (debug comix-recent-403).
+            clearance = await self._run_solve(key, attempt=2, force=True)
             self._held[key] = clearance  # D-35 re-solve replaces the cached value
             return clearance
 
@@ -219,7 +226,9 @@ class BrowserLifecycle:
         finally:
             self._inflight.pop(key, None)
 
-    async def _run_solve(self, key: str, *, attempt: int = 1) -> Clearance:
+    async def _run_solve(
+        self, key: str, *, attempt: int = 1, force: bool = False
+    ) -> Clearance:
         """Acquire the solve-cap semaphore, ensure a context, and solve ``key``.
 
         Metrics seam (OBS-01, RESEARCH DRIFT): the solve choke point emits an
@@ -227,12 +236,22 @@ class BrowserLifecycle:
         ``antibot.py``). ``attempt=2`` marks a forced D-35 re-solve. The emit is
         strictly additive + failure-isolated — a ``None`` collector is a no-op and a
         collector-side error never breaks the solve.
+
+        ``force`` is forwarded to the solve closure ONLY when the closure declares a
+        ``force`` parameter (signature-sniffed, mirroring ``context.py``'s
+        ``_call_solver`` D-41 discipline), so the production ``_solve_keyed`` can
+        discard the rejected on-disk cf_clearance before re-navigating (debug
+        comix-recent-403) while the many 2-arg ``solve(ctx, key)`` test closures keep
+        being called exactly as before.
         """
         start = time.perf_counter()
         async with self._sem:
             ctx = await self._ensure_context()
             try:
-                clearance = await self._solve(ctx, key)
+                if force and "force" in inspect.signature(self._solve).parameters:
+                    clearance = await self._solve(ctx, key, force=True)
+                else:
+                    clearance = await self._solve(ctx, key)
             except Exception as exc:
                 _emit_solve(
                     key,

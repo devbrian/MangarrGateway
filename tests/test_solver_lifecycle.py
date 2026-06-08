@@ -312,6 +312,77 @@ def test_force_resolve_off_protocol() -> None:
     assert "force_resolve" not in sig.parameters  # D-41 — Protocol unchanged
 
 
+# ───────────── D-35 forced re-solve purges the rejected cf_clearance ─────────────
+# debug comix-recent-403: on a forced re-solve the on-disk cf_clearance was just
+# REJECTED by Cloudflare; if it lingers in the persistent context, _solve_real's poll
+# loop short-circuits on it and hands back a "clearance" never re-earned (the
+# false-positive "captured clearance (1 cookies)" that masked the bug). The forced
+# path must drop the stale host-scoped cookie BEFORE re-navigating.
+
+
+class _PurgeFakePage:
+    async def goto(self, url: str, **_: object) -> None:
+        return None
+
+    async def evaluate(self, _script: str) -> str:
+        return "Mozilla/5.0 HeadedChrome"
+
+    async def close(self) -> None:
+        return None
+
+
+class _PurgeFakeContext:
+    """A persistent context holding a STALE comix cf_clearance plus a DIFFERENT
+    cloudflare domain's cookie. ``clear_cookies`` flips comix to a FRESH token so the
+    poll loop's next read captures the re-earned cookie."""
+
+    def __init__(self) -> None:
+        self.cleared = False
+        self.clear_calls: list[tuple[str | None, str | None]] = []
+
+    async def cookies(self) -> list[dict[str, str]]:
+        comix = "FRESH" if self.cleared else "STALE"
+        return [
+            {"name": "cf_clearance", "value": comix, "domain": ".comix.to"},
+            {"name": "cf_clearance", "value": "OTHER", "domain": ".mangadot.net"},
+        ]
+
+    async def clear_cookies(
+        self, *, name: str | None = None, domain: str | None = None
+    ) -> None:
+        self.clear_calls.append((name, domain))
+        if name == "cf_clearance" and domain == ".comix.to":
+            self.cleared = True
+
+    async def new_page(self) -> _PurgeFakePage:
+        return _PurgeFakePage()
+
+
+async def test_forced_resolve_purges_stale_clearance_host_scoped() -> None:
+    solver = CloudflareSolver(cloudflare_keys=("comix",))
+    ctx = _PurgeFakeContext()
+
+    clearance = await solver._solve_real(ctx, "https://comix.to/", force=True)
+
+    # The rejected comix cf_clearance was dropped BEFORE the re-solve captured the
+    # fresh one — host-scoped, so the unrelated mangadot clearance is untouched.
+    assert ctx.clear_calls == [("cf_clearance", ".comix.to")]
+    assert clearance.cookies["cf_clearance"] == "FRESH"
+
+
+async def test_nonforced_solve_does_not_purge_clearance() -> None:
+    # A first-solve-after-restart (force=False) must NOT discard the persisted
+    # cf_clearance — that is the whole point of D-34 restart persistence. It captures
+    # whatever the context already holds.
+    solver = CloudflareSolver(cloudflare_keys=("comix",))
+    ctx = _PurgeFakeContext()
+
+    clearance = await solver._solve_real(ctx, "https://comix.to/", force=False)
+
+    assert ctx.clear_calls == []  # nothing purged
+    assert clearance.cookies["cf_clearance"] == "STALE"  # reused as-is
+
+
 # ───────────────────────── #88 per-domain clearance (multi-key) ─────────────────────
 
 
