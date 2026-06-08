@@ -37,8 +37,10 @@ ENDPOINT SHAPES (live-recon-pinned, 2026-06-08):
   source — so it is used ONLY for the scanlators map, never for enumeration.)
 * recent: ``GET /api/infinite/recentlyUpdated?page=&types=`` →
   ``{items:[{id,title,type,…}]}`` — a TITLE-ONLY newest-updated feed (no embedded
-  chapter), so ``recent`` fans out a bounded ``allChapters`` per title and mints the
-  newest chapter.
+  chapter), so ``recent`` fans out ONE ``GET /api/manga/page?id=`` per title
+  (``mangaPage.chapters`` newest-first window + ``mangaPage.scanlators`` in a single
+  response) and mints the newest chapter — NOT ``allChapters`` (recent needs only the
+  newest chapter, not the complete feed), keeping it at ``1 + N`` calls per poll.
 * manifest: ``GET /api/read/chapter?mangaId=&chapterId=`` →
   ``{readChapter:{id,title,scanlationMangaId,pages:[{image:"/static/pages/{scan}/
   {chapter}/{N}.webp",number,…}]}}``. The page-image paths are read VERBATIM from the
@@ -369,11 +371,14 @@ class AtsumaruSource(Source):
         """Newest-updated titles → DIRECT newest-chapter releases (RCNT-01/02).
 
         GETs ``/api/infinite/recentlyUpdated`` (TITLE-ONLY — no embedded chapter), then
-        fans out a bounded ``allChapters`` per title (newest-first) and mints the
-        newest chapter as a DIRECT release (the chapter id is always present, so no
-        ``:DEFERRED`` late-bind). The route applies the authoritative newest-first sort
-        + ``since`` cut; the source-side ``since`` is intentionally left to the route
-        (IN-01). Zero networking glue — every call is ``ctx.get_json`` (SRC-02).
+        fans out exactly ONE ``GET /api/manga/page?id=`` per title — that detail
+        endpoint returns the newest-first chapter WINDOW *and* the scanlators map in a
+        single response, so recent needs no separate ``allChapters`` (it only wants the
+        single newest chapter, not the complete feed) and no separate scanlators call.
+        This keeps recent at ``1 + N`` calls, not ``1 + 2N`` (#recent-call-volume). The
+        newest chapter mints a DIRECT release (id always present, no ``:DEFERRED``). The
+        route applies the authoritative newest-first sort + ``since`` cut; the
+        source-side ``since`` is left to the route (IN-01). Zero glue (SRC-02).
         """
         if not self._language_wanted(languages):
             return []
@@ -394,21 +399,28 @@ class AtsumaruSource(Source):
         sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
 
         async def _newest_release(manga_id: str, manga_title: str) -> Release | None:
+            # ONE call per title: ``manga.page`` returns the newest-first chapter
+            # WINDOW *and* the scanlators map together (#recent-call-volume) — recent
+            # only needs the single newest chapter, so the complete ``allChapters``
+            # feed (up to 1000+ rows) is NOT fetched here. (search still uses
+            # ``allChapters`` because it needs the COMPLETE list to match a chapter.)
             async with sem:
-                # allChapters + scanlator names concurrently (group BEST-EFFORT).
-                listing, group_names = await asyncio.gather(
-                    ctx.get_json(
-                        f"{self.base_url}/api/manga/allChapters", mangaId=manga_id
-                    ),
-                    self._fetch_scanlator_names(manga_id, ctx),
+                body = await ctx.get_json(
+                    f"{self.base_url}/api/manga/page", id=manga_id
                 )
-            chapters = listing.get("chapters")
+            page = body.get("mangaPage") if isinstance(body, dict) else None
+            if not isinstance(page, dict):
+                return None
+            chapters = page.get("chapters")
             rows = chapters if isinstance(chapters, list) else []
+            # The window is newest-first; chapters[0] is the newest (verified == the
+            # allChapters head). Take the first row carrying a usable id.
             newest = next(
                 (c for c in rows if isinstance(c, dict) and c.get("id")), None
             )
             if newest is None:
                 return None
+            group_names = _scanlator_names(page)
             newest["_group"] = group_names.get(
                 str(newest.get("scanlationMangaId") or "")
             )
@@ -572,15 +584,7 @@ class AtsumaruSource(Source):
         # contract holds without relying on the transport's internals (CodeRabbit #185).
         if not isinstance(body, dict):
             return {}
-        page = body.get("mangaPage")
-        scanlators = page.get("scanlators") if isinstance(page, dict) else None
-        if not isinstance(scanlators, list):
-            return {}
-        return {
-            str(s["id"]): str(s["name"])
-            for s in scanlators
-            if isinstance(s, dict) and s.get("id") and s.get("name")
-        }
+        return _scanlator_names(body.get("mangaPage"))
 
     @classmethod
     def _language_wanted(cls, languages: list[str] | None) -> bool:
@@ -623,6 +627,25 @@ class AtsumaruSource(Source):
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+
+def _scanlator_names(page: Any) -> dict[str, str]:
+    """Parse a ``mangaPage`` object's ``scanlators`` → ``{id: name}`` (REL-03).
+
+    Best-effort: returns ``{}`` for any non-dict ``page`` / missing-or-malformed
+    ``scanlators`` so the advisory group never breaks the caller. Shared by the
+    search path (``_fetch_scanlator_names`` GETs ``manga.page`` for the map) and the
+    recent path (which already holds the ``manga.page`` body and needs both the
+    newest chapter and the map from it).
+    """
+    scanlators = page.get("scanlators") if isinstance(page, dict) else None
+    if not isinstance(scanlators, list):
+        return {}
+    return {
+        str(s["id"]): str(s["name"])
+        for s in scanlators
+        if isinstance(s, dict) and s.get("id") and s.get("name")
+    }
 
 
 def _attach_group_names(rows: list[Any], names: dict[str, str]) -> None:

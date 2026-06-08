@@ -1,12 +1,15 @@
 """Unit tests for ``AtsumaruSource.recent`` — title feed → newest-chapter mint.
 
 The recent feed (``GET /api/infinite/recentlyUpdated``) is TITLE-ONLY (no embedded
-chapter), so ``recent`` fans out a bounded ``allChapters`` per title (newest-first)
-and mints the newest chapter as a DIRECT release — the chapter id is always present,
-so no ``:DEFERRED`` late-bind. The minted handle carries the COMPOSITE
+chapter), so ``recent`` fans out exactly ONE ``GET /api/manga/page?id=`` per title —
+that detail endpoint returns the newest-first chapter WINDOW *and* the scanlators map
+together, so recent needs no separate ``allChapters`` and no separate scanlators call
+(``1 + N`` calls, not ``1 + 2N``). It mints the newest chapter as a DIRECT release
+(id always present, no ``:DEFERRED``); the minted handle carries the COMPOSITE
 ``{mangaId}:{chapterId}`` chapter id (read/chapter needs both).
 
-No network: a fake ``SourceContext`` routes ``get_json`` by URL.
+No network: a fake ``SourceContext`` routes ``get_json`` by URL. ``allChapters`` is
+deliberately NOT routed — recent must never call it (it would AssertionError).
 """
 
 from __future__ import annotations
@@ -19,7 +22,6 @@ from manga_gateway.handles.store import HandleStore
 from manga_gateway.sources.atsumaru import AtsumaruSource, _ms_to_iso
 
 _RECENT = "https://atsu.moe/api/infinite/recentlyUpdated"
-_ALLCHAPTERS = "https://atsu.moe/api/manga/allChapters"
 _MANGAPAGE = "https://atsu.moe/api/manga/page"
 _DEFAULT_SCANLATORS = [{"id": "sg", "name": "Alpha"}]
 
@@ -42,11 +44,15 @@ class _FakeCtxForRecent:
         self.calls.append((url, params))
         if url == _RECENT:
             return {"items": self._items}
-        if url == _ALLCHAPTERS:
-            return {"chapters": self._listings.get(str(params.get("mangaId")), [])}
         if url == _MANGAPAGE:
-            sc = self._scanlators.get(str(params.get("id")), _DEFAULT_SCANLATORS)
-            return {"mangaPage": {"scanlators": sc}}
+            mid = str(params.get("id"))
+            # manga.page carries BOTH the newest-first chapter window AND scanlators.
+            return {
+                "mangaPage": {
+                    "chapters": self._listings.get(mid, []),
+                    "scanlators": self._scanlators.get(mid, _DEFAULT_SCANLATORS),
+                }
+            }
         raise AssertionError(f"unexpected get_json url: {url}")
 
 
@@ -76,7 +82,7 @@ async def test_recent_mints_newest_chapter_per_title() -> None:
             _item(manga_id="m2", title="Naruto"),
         ],
         listings={
-            # allChapters is newest-first: chapters[0] is the latest.
+            # manga.page chapters is newest-first: chapters[0] is the latest.
             "m1": [
                 _chapter(chapter_id="op2", number=1184),
                 _chapter(chapter_id="op1", number=1183),
@@ -107,8 +113,11 @@ async def test_recent_bounds_fanout_to_limit() -> None:
     listings = {f"m{i}": [_chapter(chapter_id=f"c{i}", number=i)] for i in range(10)}
     ctx = _FakeCtxForRecent(items=items, listings=listings)
     await AtsumaruSource().recent(languages=None, limit=3, since=None, ctx=ctx)
-    allchapters_calls = [c for c in ctx.calls if c[0] == _ALLCHAPTERS]
-    assert len(allchapters_calls) == 3  # bounded by limit
+    # ONE manga.page call per title (bounded by limit) — and NO allChapters at all.
+    page_calls = [c for c in ctx.calls if c[0] == _MANGAPAGE]
+    assert len(page_calls) == 3
+    # 1 recentlyUpdated + 3 manga.page = 4 total (the 1+N shape, not 1+2N).
+    assert len(ctx.calls) == 4
 
 
 @pytest.mark.asyncio
