@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from manga_gateway.framework.errors import SourceError
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.models.search import SearchRequest
 from manga_gateway.sources.atsumaru import AtsumaruSource
@@ -32,20 +33,25 @@ from manga_gateway.sources.atsumaru import AtsumaruSource
 _GUID_RE = re.compile(r"^atsumaru:[\w-]+:ch-[\d.]+:[\w-]+$")
 _SEARCH = "https://atsu.moe/collections/manga/documents/search"
 _ALLCHAPTERS = "https://atsu.moe/api/manga/allChapters"
+_MANGAPAGE = "https://atsu.moe/api/manga/page"
+# Default scanlators map — the _chapter() fixture's scanlationMangaId is "cmgz".
+_DEFAULT_SCANLATORS = [{"id": "cmgz", "name": "Alpha"}]
 
 
 class _FakeCtxForSearch:
-    """``SourceContext`` stand-in: routes ``get_json`` by URL (two-call flow)."""
+    """``SourceContext`` stand-in: routes ``get_json`` by URL (search/chapters/page)."""
 
     def __init__(
         self,
         *,
         hits: list[dict[str, Any]],
         listings: dict[str, list[dict[str, Any]]],
+        scanlators: dict[str, list[dict[str, str]]] | None = None,
     ) -> None:
         self.handle_store = HandleStore()
         self._hits = hits
         self._listings = listings
+        self._scanlators = scanlators or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.candidates_enumerated: int | None = None
 
@@ -72,6 +78,13 @@ class _FakeCtxForSearch:
         if url == _ALLCHAPTERS:
             manga_id = str(params.get("mangaId"))
             return {"chapters": self._listings.get(manga_id, [])}
+        if url == _MANGAPAGE:
+            manga_id = str(params.get("id"))
+            return {
+                "mangaPage": {
+                    "scanlators": self._scanlators.get(manga_id, _DEFAULT_SCANLATORS)
+                }
+            }
         raise AssertionError(f"unexpected get_json url: {url}")
 
 
@@ -79,8 +92,9 @@ def _ctx(
     *,
     hits: list[dict[str, Any]],
     listings: dict[str, list[dict[str, Any]]] | None = None,
+    scanlators: dict[str, list[dict[str, str]]] | None = None,
 ) -> Any:
-    return _FakeCtxForSearch(hits=hits, listings=listings or {})
+    return _FakeCtxForSearch(hits=hits, listings=listings or {}, scanlators=scanlators)
 
 
 def _hit(
@@ -116,14 +130,16 @@ async def test_search_typesense_then_one_listing_per_candidate() -> None:
     )
     await AtsumaruSource().search(SearchRequest(type="manga", query="one piece"), ctx)
 
-    assert len(ctx.calls) == 2
-    url0, params0 = ctx.calls[0]
-    assert url0 == _SEARCH
-    assert params0["q"] == "one piece"
-    assert params0["filter_by"] == "hidden:!=true"
-    url1, params1 = ctx.calls[1]
-    assert url1 == _ALLCHAPTERS
-    assert params1["mangaId"] == "sVC2A"
+    urls = [u for u, _ in ctx.calls]
+    # Typesense search, then per-candidate allChapters + manga.page (scanlators).
+    assert urls.count(_SEARCH) == 1
+    assert urls.count(_ALLCHAPTERS) == 1
+    assert urls.count(_MANGAPAGE) == 1
+    search_params = next(p for u, p in ctx.calls if u == _SEARCH)
+    assert search_params["q"] == "one piece"
+    assert search_params["filter_by"] == "hidden:!=true"
+    assert next(p for u, p in ctx.calls if u == _ALLCHAPTERS)["mangaId"] == "sVC2A"
+    assert next(p for u, p in ctx.calls if u == _MANGAPAGE)["id"] == "sVC2A"
 
 
 @pytest.mark.asyncio
@@ -161,6 +177,46 @@ async def test_search_mints_composite_handle_and_guid() -> None:
     assert rel.chapter_number == Decimal("1184")
     assert rel.publish_date == "2026-05-29T19:59:57.472000+00:00"
     assert rel.ids == {"atsumaruMangaId": "sVC2A", "atsumaruChapterId": "gGfRS"}
+    # Scanlation group resolved from manga.page scanlators (scanlationMangaId cmgz →
+    # "Alpha"): on the release, the minted record, AND the parseable title.
+    assert rel.scanlation_group == "Alpha"
+    assert record.scanlation_group == "Alpha"
+    assert "[Alpha]" in rel.title
+
+
+@pytest.mark.asyncio
+async def test_search_resolves_distinct_groups_per_scanlation() -> None:
+    """A manga with two scanlations → each chapter carries its own group name."""
+    chapters = [
+        {**_chapter(chapter_id="a", number=200, index=200), "scanlationMangaId": "g1"},
+        {**_chapter(chapter_id="b", number=199, index=199), "scanlationMangaId": "g2"},
+    ]
+    ctx = _ctx(
+        hits=[_hit(manga_id="m")],
+        listings={"m": chapters},
+        scanlators={
+            "m": [{"id": "g1", "name": "Alpha"}, {"id": "g2", "name": "Asura"}]
+        },
+    )
+    releases = await AtsumaruSource().search(
+        SearchRequest(type="manga", query="x"), ctx
+    )
+    assert {r.scanlation_group for r in releases} == {"Alpha", "Asura"}
+
+
+@pytest.mark.asyncio
+async def test_search_group_absent_degrades_to_none() -> None:
+    """An unknown scanlationMangaId (no scanlators match) → scanlation_group None."""
+    ctx = _ctx(
+        hits=[_hit(manga_id="m")],
+        listings={"m": [_chapter(chapter_id="c")]},  # scanlationMangaId "cmgz"
+        scanlators={"m": [{"id": "OTHER", "name": "Nope"}]},
+    )
+    releases = await AtsumaruSource().search(
+        SearchRequest(type="manga", query="x"), ctx
+    )
+    assert releases[0].scanlation_group is None
+    assert "[" not in releases[0].title  # no group bracket
 
 
 @pytest.mark.asyncio
@@ -231,6 +287,49 @@ async def test_search_empty_hits_returns_no_releases() -> None:
     )
     assert releases == []
     assert len(ctx.calls) == 1  # only the Typesense call — no candidate to enumerate
+
+
+class _PageCtx:
+    """Minimal ctx for _fetch_scanlator_names: get_json returns canned/raises."""
+
+    def __init__(self, behavior: Any) -> None:
+        self._behavior = behavior
+
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        if self._behavior == "raise":
+            raise SourceError("source_unavailable", "boom")
+        return self._behavior
+
+
+@pytest.mark.asyncio
+async def test_fetch_scanlator_names_happy_and_best_effort() -> None:
+    src = AtsumaruSource()
+    ok = await src._fetch_scanlator_names(
+        "m",
+        _PageCtx(  # type: ignore[arg-type]
+            {
+                "mangaPage": {
+                    "scanlators": [
+                        {"id": "a", "name": "Alpha"},
+                        {"id": "b", "name": "Asura"},
+                    ]
+                }
+            }
+        ),
+    )
+    assert ok == {"a": "Alpha", "b": "Asura"}
+    # A fetch error is swallowed → {} (group is advisory, never fails enumeration).
+    assert await src._fetch_scanlator_names("m", _PageCtx("raise")) == {}  # type: ignore[arg-type]
+    # Malformed shapes all degrade to {} — incl. a non-dict body (CodeRabbit #185).
+    for bad in (
+        {},
+        {"mangaPage": {}},
+        {"mangaPage": {"scanlators": None}},
+        {"mangaPage": {"scanlators": [{"id": "x"}]}},  # missing name
+        [{"id": "a", "name": "X"}],  # non-dict (list) body
+        "oops",  # non-dict (str) body
+    ):
+        assert await src._fetch_scanlator_names("m", _PageCtx(bad)) == {}  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

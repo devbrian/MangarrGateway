@@ -20,6 +20,8 @@ from manga_gateway.sources.atsumaru import AtsumaruSource, _ms_to_iso
 
 _RECENT = "https://atsu.moe/api/infinite/recentlyUpdated"
 _ALLCHAPTERS = "https://atsu.moe/api/manga/allChapters"
+_MANGAPAGE = "https://atsu.moe/api/manga/page"
+_DEFAULT_SCANLATORS = [{"id": "sg", "name": "Alpha"}]
 
 
 class _FakeCtxForRecent:
@@ -28,10 +30,12 @@ class _FakeCtxForRecent:
         *,
         items: list[dict[str, Any]],
         listings: dict[str, list[dict[str, Any]]],
+        scanlators: dict[str, list[dict[str, str]]] | None = None,
     ) -> None:
         self.handle_store = HandleStore()
         self._items = items
         self._listings = listings
+        self._scanlators = scanlators or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
@@ -40,6 +44,9 @@ class _FakeCtxForRecent:
             return {"items": self._items}
         if url == _ALLCHAPTERS:
             return {"chapters": self._listings.get(str(params.get("mangaId")), [])}
+        if url == _MANGAPAGE:
+            sc = self._scanlators.get(str(params.get("id")), _DEFAULT_SCANLATORS)
+            return {"mangaPage": {"scanlators": sc}}
         raise AssertionError(f"unexpected get_json url: {url}")
 
 
@@ -52,6 +59,7 @@ def _chapter(
 ) -> dict[str, Any]:
     return {
         "id": chapter_id,
+        "scanlationMangaId": "sg",
         "title": f"Chapter {number}",
         "number": number,
         "createdAt": created,
@@ -88,6 +96,9 @@ async def test_recent_mints_newest_chapter_per_title() -> None:
     assert record is not None
     assert record.chapter_id == "m1:op2"
     assert by_title["One Piece"].publish_date.endswith("+00:00")
+    # Scanlation group resolved from manga.page scanlators (sg → Alpha).
+    assert by_title["One Piece"].scanlation_group == "Alpha"
+    assert record.scanlation_group == "Alpha"
 
 
 @pytest.mark.asyncio
