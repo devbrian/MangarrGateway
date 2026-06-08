@@ -58,10 +58,28 @@ Like the rest of ``tests/live/``, this test:
 * is path-agnostic (``tmp_path``) and env-knob-driven so a future nightly job
   reuses it unchanged.
 
+**Chapter pinning (issue #181, 2026-06-08).**
+
+The test previously measured ``releases[0]`` — whichever chapter the live
+search returned first (newest). That made the measured chapter
+NON-DETERMINISTIC: a nightly run landed on "Chapter 24 [Vortex Scans]", whose
+image CDN origin was degraded (pages 14+ returned ``upstream 404``), so the
+download ``failed`` at 13/24 pages and the test failed — an upstream/origin
+flake, not a gateway perf regression. The test now PINS the same known-good
+chapter the drift fixture is recorded against (``mr3m0-the-forgotten-field``
+chapter 20, 17 pages — see ``tests/fixtures/comix/chapter_9001596_pages.json``):
+it selects the release whose ``chapterNumber`` equals ``COMIX_PERF_CHAPTER``
+(default 20) from the search results, rather than the volatile newest release.
+If that chapter ever goes missing from the catalog the test fails LOUDLY with a
+"bump ``COMIX_PERF_CHAPTER``" hint rather than silently measuring a random
+chapter.
+
 Knobs:
 
 * ``COMIX_PERF_QUERY`` — search query (default: "Forgotten Field", same as
   ``test_comix_e2e_live.py``).
+* ``COMIX_PERF_CHAPTER`` — chapter number to pin (default "20", the recorded
+  drift-fixture chapter). Override if the catalog rotates it out of the feed.
 * ``COMIX_PERF_BUDGET_SECONDS`` — wall-clock budget override (default 15.5,
   the post-issue-#45 measured-derived regression guard; tighten as further
   optimizations land).
@@ -100,8 +118,50 @@ _DEFAULT_BUDGET_SECONDS = 15.5
 _TERMINAL_TIMEOUT_S = 60.0
 
 
+_DEFAULT_CHAPTER = "20"
+
+
 def _query() -> str:
     return os.environ.get("COMIX_PERF_QUERY", _DEFAULT_QUERY)
+
+
+def _target_chapter() -> str:
+    raw = os.environ.get("COMIX_PERF_CHAPTER", _DEFAULT_CHAPTER).strip()
+    return raw or _DEFAULT_CHAPTER
+
+
+def _select_pinned_handle(releases: list[dict[str, Any]], target: str) -> str:
+    """Return the ``downloadHandle`` of the release pinned to chapter ``target``.
+
+    Issue #181: pin the measured chapter to a known-good one (default 20, the
+    drift-fixture chapter) instead of the volatile newest ``releases[0]``, whose
+    CDN origin health is non-deterministic. Matches on numeric ``chapterNumber``
+    equality (the wire field is a JSON number, e.g. ``20.0``) so ``"20"`` and
+    ``20.0`` compare equal. Fails LOUDLY — not silently on the wrong chapter —
+    when the pinned chapter is absent, so a catalog rotation is diagnosable.
+    """
+    try:
+        target_value = float(target)
+    except ValueError as exc:  # pragma: no cover - guarded by _target_chapter
+        raise AssertionError(f"COMIX_PERF_CHAPTER={target!r} is not a number") from exc
+
+    available: list[str] = []
+    for rel in releases:
+        num = rel.get("chapterNumber")
+        if num is None:
+            continue
+        available.append(str(num))
+        # Decimal/float chapter numbers (e.g. 20, 20.0, 20.5) — exact numeric
+        # equality is the contract; math.isclose guards float repr noise only.
+        if math.isclose(float(num), target_value, rel_tol=0.0, abs_tol=1e-9):
+            return str(rel["downloadHandle"])
+
+    raise AssertionError(
+        f"pinned chapter {target!r} not found in search results for "
+        f"query={_query()!r}; available chapterNumbers={sorted(set(available))}. "
+        f"If comix.to rotated it out of the feed, override COMIX_PERF_CHAPTER "
+        f"(or COMIX_PERF_QUERY)."
+    )
 
 
 def _budget_seconds() -> float:
@@ -207,7 +267,11 @@ async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
                 f"no releases returned for query={_query()!r}; if comix.to "
                 f"changed its catalog, override COMIX_PERF_QUERY"
             )
-            handle = releases[0]["downloadHandle"]
+            # Issue #181: pin a known-good chapter (default 20, the drift-fixture
+            # chapter) instead of the volatile newest releases[0], whose CDN
+            # origin health is non-deterministic and sank the nightly with an
+            # `upstream 404` partway through the download.
+            handle = _select_pinned_handle(releases, _target_chapter())
 
             # Start the clock immediately before the submit so the budget
             # captures the SAME path the issue's baseline measured: submit
