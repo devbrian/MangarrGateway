@@ -101,13 +101,15 @@ curl -H "X-Api-Key: <key>" http://127.0.0.1:9191/api/v1/version
 reachable, but the API key is still required on **every** endpoint (AUTH-01). Run
 it on a trusted network or behind a reverse proxy.
 
-### Datacenter hosts (headed Chromium)
+### Headed Chromium (the image default)
 
-On a datacenter IP, Cloudflare blocks headless Chromium — set
-`GATEWAY_CLOUDFLARE_HEADLESS=false`. Xvfb is already in the image, so the headed
-path works with **no image change** (the solver auto-starts the virtual display).
-Routing egress through a residential proxy (`GATEWAY_CLOUDFLARE_PROXY_*`,
-issue #65) is the alternative mitigation.
+The Docker image bakes `GATEWAY_CLOUDFLARE_HEADLESS=false` (headed Chromium under
+Xvfb) — headless Chromium is now fingerprinted/blocked by Comix's Cloudflare even
+from a residential IP (debug `comix-recent-403`), so headed is the safe default on
+every host. Xvfb is already in the image, so this works with **no image change**
+(the solver auto-starts the virtual display). Routing egress through a residential
+proxy (`GATEWAY_CLOUDFLARE_PROXY_*`, issue #65) is an alternative/additional
+mitigation on flagged hosts.
 
 ### GHCR image
 
@@ -170,32 +172,42 @@ GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=1 \
 
 ### Headless vs headed (residential vs datacenter)
 
-`engine=patchright` (Chromium) clears Comix's Cloudflare differently depending on
-the host's IP reputation:
+`engine=patchright` (Chromium) is driven by `GATEWAY_CLOUDFLARE_HEADLESS`, which
+has **two different defaults** depending on how you run it:
 
-- **Residential IP** (dev box, residential prod): **headless works** — no display
-  needed. This is the default (`cloudflare_headless=true`).
-- **Datacenter IP** (cloud VPS, CI runners): Cloudflare fingerprints *headless*
-  Chrome at the binary level and blocks it (the root of issue #35). **Headed**
-  Chromium clears it — set `GATEWAY_CLOUDFLARE_HEADLESS=false`. On a display-less
-  Linux host the solver auto-starts an **Xvfb** virtual display
-  (`pyvirtualdisplay`); the host just needs the `xvfb` package installed:
+- **Image / runtime default: `false` (headed).** The Docker image bakes
+  `GATEWAY_CLOUDFLARE_HEADLESS=false`. As of debug `comix-recent-403`, Comix's
+  Cloudflare fingerprints *headless* Chromium at the binary level and blocks it
+  even from a **residential** IP (a generalization of issue #35, which first hit
+  datacenter IPs) — a headless solve no longer earns `cf_clearance`, so Comix
+  `/recent` and `/search` 403. **Headed** Chromium clears it on every host, so it
+  is the safe default everywhere. On a display-less Linux host the solver
+  auto-starts an **Xvfb** virtual display (`pyvirtualdisplay`); the host just
+  needs the `xvfb` package installed.
+- **App / config default: `true` (headless).** The bare-app `Settings`
+  (`cloudflare_headless`) defaults to `true` for local dev on a machine with a
+  **real display**, where headless is unnecessary. The shipped image overrides
+  this to `false` (above).
+
+To override — e.g. force headless on a residential dev box with a real display:
 
   ```bash
-  apt-get install -y xvfb fonts-liberation
+  apt-get install -y xvfb fonts-liberation   # only needed for the headed/Xvfb path
   GATEWAY_CLOUDFLARE_ENGINE=patchright \
   GATEWAY_CLOUDFLARE_FETCH_CONCURRENCY=3 \
-  GATEWAY_CLOUDFLARE_HEADLESS=false \
+  GATEWAY_CLOUDFLARE_HEADLESS=true \
     uv run python -m manga_gateway
   ```
 
-  (An alternative datacenter mitigation is routing the egress through a
-  **residential proxy** — tracked in issue #65 — but headed+Xvfb needs no proxy.)
+  (Note: headless is no longer reliable against Comix — prefer the default
+  `GATEWAY_CLOUDFLARE_HEADLESS=false`. An alternative mitigation on flagged hosts
+  is routing egress through a **residential proxy** — tracked in issue #65 — but
+  headed+Xvfb needs no proxy.)
 
 `docker/exp4a.Dockerfile` is the documented minimal Linux Chromium deploy basis
 (`python:3.12-slim-bookworm` + `patchright==1.60.0` + `patchright install
-chromium --with-deps` + `xvfb`); on a datacenter host run it with
-`GATEWAY_CLOUDFLARE_HEADLESS=false`.
+chromium --with-deps` + `xvfb`); it runs headed via the baked
+`GATEWAY_CLOUDFLARE_HEADLESS=false` default.
 
 ## Observability & Metrics
 
