@@ -320,12 +320,14 @@ async def test_fetch_scanlator_names_happy_and_best_effort() -> None:
     assert ok == {"a": "Alpha", "b": "Asura"}
     # A fetch error is swallowed → {} (group is advisory, never fails enumeration).
     assert await src._fetch_scanlator_names("m", _PageCtx("raise")) == {}  # type: ignore[arg-type]
-    # Malformed shapes all degrade to {}.
+    # Malformed shapes all degrade to {} — incl. a non-dict body (CodeRabbit #185).
     for bad in (
         {},
         {"mangaPage": {}},
         {"mangaPage": {"scanlators": None}},
         {"mangaPage": {"scanlators": [{"id": "x"}]}},  # missing name
+        [{"id": "a", "name": "X"}],  # non-dict (list) body
+        "oops",  # non-dict (str) body
     ):
         assert await src._fetch_scanlator_names("m", _PageCtx(bad)) == {}  # type: ignore[arg-type]
 

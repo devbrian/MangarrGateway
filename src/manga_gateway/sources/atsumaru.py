@@ -567,6 +567,11 @@ class AtsumaruSource(Source):
             body = await ctx.get_json(f"{self.base_url}/api/manga/page", id=manga_id)
         except SourceError:
             return {}
+        # Defence-in-depth: ``get_json`` already raises SourceError on a non-object
+        # body (caught above), but guard explicitly so the never-fail-enumeration
+        # contract holds without relying on the transport's internals (CodeRabbit #185).
+        if not isinstance(body, dict):
+            return {}
         page = body.get("mangaPage")
         scanlators = page.get("scanlators") if isinstance(page, dict) else None
         if not isinstance(scanlators, list):
