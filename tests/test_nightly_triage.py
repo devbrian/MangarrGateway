@@ -122,6 +122,66 @@ def test_compute_exit_empty_returns_one() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #180 — missing junit.xml degrades to a clean red (no traceback)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_junit_missing_path_returns_empty_no_raise(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Issue #180: a missing junit.xml degrades to {} with NO FileNotFoundError.
+
+    When an upstream provisioning step fails before the live step writes
+    ``junit.xml``, triage must not crash with a traceback — it returns an empty
+    parse, which ``compute_exit({})`` maps to the deliberate exit 1 (clean red).
+    """
+    missing = tmp_path / "does_not_exist.xml"
+    assert not missing.exists()
+    per_source = nightly_triage.parse_junit(missing)
+    assert per_source == {}
+
+
+def test_parse_junit_missing_path_warns_on_stderr(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #180: a clear stderr message names the missing report."""
+    missing = tmp_path / "does_not_exist.xml"
+    nightly_triage.parse_junit(missing)
+    captured = capsys.readouterr()
+    assert "no junit.xml" in captured.err
+
+
+def test_main_missing_junit_exits_one_no_gh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Issue #180: a missing ``--junit`` returns 1 and invokes no gh subprocess.
+
+    An empty per_source means the main loop iterates zero buckets, so NEITHER
+    ``upsert_sticky_issue`` NOR ``close_if_open`` is ever reached.
+    """
+    missing = tmp_path / "does_not_exist.xml"
+    upserts: list[str] = []
+    closes: list[str] = []
+    monkeypatch.setattr(
+        nightly_triage,
+        "upsert_sticky_issue",
+        lambda src, body, run_url: upserts.append(src),
+    )
+    monkeypatch.setattr(
+        nightly_triage,
+        "close_if_open",
+        lambda src, run_url: closes.append(src),
+    )
+
+    rc = nightly_triage.main(
+        ["--junit", str(missing), "--run-url", "https://example/run/1"]
+    )
+    assert rc == 1
+    assert upserts == []
+    assert closes == []
+
+
+# ---------------------------------------------------------------------------
 # Task 2 — subprocess-mocked gh CLI tests
 # ---------------------------------------------------------------------------
 

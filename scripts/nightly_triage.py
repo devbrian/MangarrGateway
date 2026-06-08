@@ -66,7 +66,20 @@ def parse_junit(path: Path) -> dict[str, dict[str, Any]]:
 
     A testcase is a failure iff it has a ``<failure>`` OR ``<error>`` child
     element. ``<skipped>`` is NOT a failure.
+
+    If ``path`` does not exist (issue #180 — an upstream provisioning step,
+    e.g. ``apt-get install xvfb``, failed before the live step wrote
+    ``junit.xml``), return ``{}`` and warn on stderr rather than raising
+    ``FileNotFoundError``. ``compute_exit({})`` maps the empty parse to the
+    deliberate exit code 1 (clean red), so a missing report surfaces as a
+    deliberate signal — not a crashed traceback that masks the real failure.
     """
+    if not path.exists():
+        print(
+            f"triage: no junit.xml at {path} — live step did not produce a report",
+            file=sys.stderr,
+        )
+        return {}
     tree = ET.parse(path)
     per_source: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"pass": 0, "fail": 0, "tests": []}
