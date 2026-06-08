@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from manga_gateway.handles.store import HandleStore
-from manga_gateway.sources.atsumaru import AtsumaruSource
+from manga_gateway.sources.atsumaru import AtsumaruSource, _ms_to_iso
 
 _RECENT = "https://atsu.moe/api/infinite/recentlyUpdated"
 _ALLCHAPTERS = "https://atsu.moe/api/manga/allChapters"
@@ -121,3 +121,20 @@ async def test_recent_non_english_language_returns_empty() -> None:
     )
     assert releases == []
     assert ctx.calls == []  # short-circuits before any network call
+
+
+def test_ms_to_iso_valid_and_malformed() -> None:
+    # A normal epoch-millis value → aware-UTC RFC3339.
+    assert _ms_to_iso(1780084797472) == "2026-05-29T19:59:57.472000+00:00"
+    assert _ms_to_iso("1780084797472").endswith("+00:00")
+    # Missing / non-numeric → None (caller falls back).
+    assert _ms_to_iso(None) is None
+    assert _ms_to_iso("") is None
+    assert _ms_to_iso("not-a-number") is None
+
+
+@pytest.mark.parametrize("bad", [10**30, -(10**30), 10**400])
+def test_ms_to_iso_out_of_range_falls_back(bad: int) -> None:
+    # CodeRabbit #184: an absurd epoch must not raise OverflowError/OSError out of
+    # _ms_to_iso and crash search/recent — it falls back to None.
+    assert _ms_to_iso(bad) is None

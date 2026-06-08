@@ -127,7 +127,15 @@ def _ms_to_iso(raw: Any) -> str | None:
         millis = int(raw)
     except (TypeError, ValueError):
         return None
-    return datetime.fromtimestamp(millis / 1000, UTC).isoformat()
+    # An out-of-range / absurd epoch (huge or very negative millis) makes
+    # ``datetime.fromtimestamp`` raise OverflowError/OSError/ValueError; swallow it
+    # and fall back rather than letting a single malformed ``createdAt`` crash the
+    # whole search/recent parse (CodeRabbit #184; mirrors the source's
+    # never-crash-on-a-bad-field discipline).
+    try:
+        return datetime.fromtimestamp(millis / 1000, UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _is_allowed_image_url(url: str) -> bool:
