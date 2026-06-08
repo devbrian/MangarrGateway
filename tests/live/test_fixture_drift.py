@@ -59,7 +59,6 @@ import asyncio
 import json
 import re
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -91,7 +90,7 @@ _COMIX_CDN_URL_RE = re.compile(
 )
 
 
-def _normalize_comix_cdn_url(url: Any) -> Any:
+def _normalize_comix_cdn_url(url: object) -> object:
     """Collapse the rotating Comix CDN host + ``/iN/`` segment to placeholders.
 
     Issue #166: the Comix image CDN periodically rotates its host and leading
@@ -181,7 +180,7 @@ async def test_fixture_drift(
         # Issue #166: normalize the rotating Comix CDN host + /iN/ segment
         # before the set compare so a pure shard rotation isn't flagged as
         # drift. len(captured) (raw) is still used for the length-parity check.
-        captured_set: set[Any] = {_normalize_comix_cdn_url(u) for u in captured}
+        captured_set: set[object] = {_normalize_comix_cdn_url(u) for u in captured}
 
         for fixture_path in profile.fixture_drift_paths:
             assert fixture_path.exists(), (
@@ -200,7 +199,7 @@ async def test_fixture_drift(
             # Same normalization on the fixture side — apples-to-apples
             # (Issue #166). A real token/ordinal/path-structure change still
             # survives normalization and flags below.
-            expected_set: set[Any] = {_normalize_comix_cdn_url(u) for u in expected}
+            expected_set: set[object] = {_normalize_comix_cdn_url(u) for u in expected}
             missing = expected_set - captured_set
             extra = captured_set - expected_set
             # D-60 / Pitfall 6: set-equality alone misses duplicate-count
@@ -216,7 +215,8 @@ async def test_fixture_drift(
             )
             assert captured_set == expected_set, (
                 f"D-60 drift on {fixture_path.name} ({source_key}): "
-                f"missing={sorted(missing)!r} extra={sorted(extra)!r} "
+                f"missing={sorted(map(str, missing))!r} "
+                f"extra={sorted(map(str, extra))!r} "
                 f"(captured {len(captured)} URLs, fixture has "
                 f"{len(expected)})"
             )
