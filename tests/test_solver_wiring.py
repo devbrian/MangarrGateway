@@ -44,13 +44,14 @@ async def test_lifespan_swaps_in_cloudflare_solver() -> None:
 async def test_lifespan_wires_per_domain_challenge_urls() -> None:
     """#88: the lifespan builds the per-domain ``challenge_urls`` map and passes
     it onto the solver, with one entry PER registered cloudflare source. Comix
-    (``https://comix.to/``) is the only registered cloudflare source — it
-    auto-grants its own clearance slot from its ``cloudflare_challenge_url``
-    class-attr (#90), with no app.py edit. (Mangadot was reclassified
-    ``antibot="none"`` in debug nightly-cf-warm-127-128 — it dropped its CF
-    interstitial — so it no longer grants a clearance slot.) Guards the app
+    (``https://comix.to/``) and Kagane (``https://kagane.to/``) are the registered
+    cloudflare sources — each auto-grants its own clearance slot from its
+    ``cloudflare_challenge_url`` class-attr (#90), with no app.py edit. (Mangadot was
+    reclassified ``antibot="none"`` in debug nightly-cf-warm-127-128 — it dropped its
+    CF interstitial — so it no longer grants a clearance slot.) Guards the app
     mapping against silent drift back to the old single-``challenge_url``
-    single-pick.
+    single-pick, and proves the multi-CF map carries a SECOND cf source with no
+    app.py change (the kagane onboarding zero-glue claim).
     """
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
@@ -58,6 +59,7 @@ async def test_lifespan_wires_per_domain_challenge_urls() -> None:
         assert isinstance(solver, CloudflareSolver)
         assert solver._challenge_urls == {
             "comix": "https://comix.to/",
+            "kagane": "https://kagane.to/",
         }
 
 

@@ -46,6 +46,7 @@ tests/fixtures/comix/CAPTURE_NOTES.txt
 # Throwaway recon output (scripts/comix_recon.py) — network logs, JS dumps, DOM
 # snapshots used to pin RESEARCH Open Q1/Q3 and the D-44 cipher pair. Never committed.
 _recon_out/
+_recon_out_kagane/
 _e2e_out/
 
 # Nightly live-smoke JUnit artifact written by `uv run nox -s live` (Phase 5

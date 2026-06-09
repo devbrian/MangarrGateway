@@ -19,6 +19,7 @@ def register_builtin_sources(registry: SourceRegistry) -> None:
     """Register all built-in sources into ``registry`` (called in the lifespan)."""
     from .atsumaru import AtsumaruSource
     from .comix import ComixSource
+    from .kagane import KaganeSource
     from .mangaball import MangaBallSource
     from .mangadex import MangaDexSource
     from .mangadot import MangadotSource
@@ -30,3 +31,4 @@ def register_builtin_sources(registry: SourceRegistry) -> None:
     registry.register("mangadot")(MangadotSource)
     registry.register("atsumaru")(AtsumaruSource)
     registry.register("weebcentral")(WeebCentralSource)
+    registry.register("kagane")(KaganeSource)
