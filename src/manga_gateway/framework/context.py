@@ -532,6 +532,57 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
+    async def post_json_body(
+        self,
+        url: str,
+        *,
+        body: dict[str, Any],
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST a JSON request body → parsed JSON object, rate-limited + retried.
+
+        The JSON-body twin of :meth:`post_json` (which form-encodes
+        ``application/x-www-form-urlencoded``). Some modern JSON-REST backends require
+        ``Content-Type: application/json`` request bodies AND query params on the same
+        POST, and a per-call custom header — Kagane's Komga-derived ``/api/v2`` API is
+        the first: ``POST /api/v2/search/series?page=&size=&sort=`` with a JSON body,
+        and the download-path book-token POST needs an ``x-integrity-token`` header
+        (live recon 2026-06-09). ``body`` is sent via httpx ``json=`` (httpx sets the
+        ``application/json`` content type); ``params`` rides the query string;
+        ``headers`` are merged ON TOP of the framework's credential headers (D-02/D-40)
+        so a per-call header (e.g. ``x-integrity-token``) composes with the injected
+        ``cf_clearance`` cookie + UA without the source touching the transport.
+
+        Routed through the SAME ONE shared transport, call-site limiter, tenacity retry,
+        clearance injection + challenge-403 single re-solve (D-35), the permanent-4xx
+        STOP, the decrypt seam (D-39; identity for plaintext sources), and the
+        ``_feed_success``/``_feed_failure`` health calls (D-36) as ``get_json`` —
+        including the parse running INSIDE the failure-feeding ``try`` so a non-object
+        ``200`` body also trips ``_feed_failure``. Sources add ZERO networking glue
+        (SRC-02): clearance, rate-limit, retry, and health all stay in the framework.
+        """
+
+        async def _attempt() -> dict[str, Any]:
+            try:
+                raw = await self._request_bytes(
+                    url,
+                    params=params,
+                    limited=True,
+                    method="POST",
+                    json_body=body,
+                    extra_headers=headers,
+                    op="post_json_body",
+                )
+                result = self._parse_json_object(raw)
+            except SourceError:
+                self._feed_failure()
+                raise
+            self._feed_success()
+            return result
+
+        return await self._retrying()(_attempt)
+
     async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
         """Identical to :meth:`get_json` but BYPASSES the decrypt seam (D-39).
 
@@ -650,6 +701,8 @@ class SourceContext:
         limited: bool,
         method: str = "GET",
         data: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
         op: str = "request",
     ) -> httpx.Response:
         """Single request → validated ``httpx.Response`` (clearance + 403 reconcile).
@@ -677,6 +730,8 @@ class SourceContext:
             force_resolve=False,
             method=method,
             data=data,
+            json_body=json_body,
+            extra_headers=extra_headers,
             op=op,
         )
         # Issue #172: do NOT pre-gate on ``status_code == 403``. ``is_cf_challenge``
@@ -713,6 +768,8 @@ class SourceContext:
                 force_resolve=True,
                 method=method,
                 data=data,
+                json_body=json_body,
+                extra_headers=extra_headers,
                 op=op,
             )
             # debug comix-recent-403 follow-up: distinguish "the re-solve could not
@@ -751,6 +808,8 @@ class SourceContext:
         decrypt: bool = True,
         method: str = "GET",
         data: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
         op: str = "request",
     ) -> bytes:
         """Single request → optionally-decrypted body (delegates to
@@ -764,7 +823,14 @@ class SourceContext:
         pre-refactor path for every caller.
         """
         resp = await self._request_response(
-            url, params=params, limited=limited, method=method, data=data, op=op
+            url,
+            params=params,
+            limited=limited,
+            method=method,
+            data=data,
+            json_body=json_body,
+            extra_headers=extra_headers,
+            op=op,
         )
         if not decrypt:
             return resp.content
@@ -779,6 +845,8 @@ class SourceContext:
         force_resolve: bool,
         method: str = "GET",
         data: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
         op: str = "request",
     ) -> httpx.Response:
         """Inject credentials (D-02/D-40) and issue ONE request (gated iff ``limited``).
@@ -800,6 +868,19 @@ class SourceContext:
             kwargs["params"] = params
         if data is not None:
             kwargs["data"] = data
+        if json_body is not None:
+            # httpx serializes ``json=`` to a body + sets ``Content-Type:
+            # application/json`` (the JSON-body POST path, post_json_body).
+            kwargs["json"] = json_body
+        if extra_headers:
+            # Merge per-call headers ON TOP of the credential headers (D-02/D-40) so a
+            # source-supplied header (e.g. ``x-integrity-token``) composes with the
+            # injected ``cf_clearance`` cookie + UA. The clearance headers win on a
+            # name clash (they are the credential of record); ``extra_headers`` here
+            # carry only source-specific, non-credential keys.
+            merged = dict(extra_headers)
+            merged.update(kwargs.get("headers") or {})
+            kwargs["headers"] = merged
         # ``attempt`` rides ``force_resolve``: a forced re-solve is the D-35
         # attempt-2 retry; tenacity's own retries each re-enter ``_send`` and emit
         # their own http event, so per-attempt counts come for free.
