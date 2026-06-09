@@ -142,6 +142,21 @@ def test_screen_size_raises_when_unparseable() -> None:
         dev.screen_size()
 
 
+def test_is_booted_true_when_boot_completed_is_one() -> None:
+    runner = FakeRunner(stdout_for={"getprop": b"1\n"})
+    dev = AdbDevice(runner=runner)
+    assert dev.is_booted() is True
+    (call,) = runner.argv_containing("getprop")
+    assert call[-2:] == ["getprop", "sys.boot_completed"]
+
+
+def test_is_booted_false_before_boot_completes() -> None:
+    # getprop returns empty (or 0) until the system finishes booting.
+    runner = FakeRunner(stdout_for={"getprop": b"\n"})
+    dev = AdbDevice(runner=runner)
+    assert dev.is_booted() is False
+
+
 def test_nonzero_exit_raises_adberror() -> None:
     runner = FakeRunner()
     runner.returncode = 1

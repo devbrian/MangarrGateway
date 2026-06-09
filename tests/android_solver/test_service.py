@@ -230,6 +230,39 @@ def test_healthz_reflects_pipeline_health() -> None:
     assert _service(FakePipeline(healthy=False)).healthz()[0] == 503
 
 
+class _BootDevice:
+    """Minimal device for AndroidSolvePipeline.health (WR-04): connect + is_booted."""
+
+    def __init__(self, *, booted: bool, connect_error: Exception | None = None) -> None:
+        self._booted = booted
+        self._connect_error = connect_error
+        self.connected = False
+
+    def connect(self) -> None:
+        if self._connect_error is not None:
+            raise self._connect_error
+        self.connected = True
+
+    def is_booted(self) -> bool:
+        return self._booted
+
+
+def test_pipeline_health_requires_boot_completed() -> None:
+    # WR-04: health is true only when the device actually booted, not merely when
+    # adb connect returned (adb connect is exit-0-on-failure).
+    booted = AndroidSolvePipeline(_BootDevice(booted=True), timeout_s=5.0)  # type: ignore[arg-type]
+    assert booted.health() is True
+
+    not_booted = AndroidSolvePipeline(_BootDevice(booted=False), timeout_s=5.0)  # type: ignore[arg-type]
+    assert not_booted.health() is False
+
+
+def test_pipeline_health_false_when_connect_raises() -> None:
+    dev = _BootDevice(booted=True, connect_error=RuntimeError("unreachable"))
+    pipeline = AndroidSolvePipeline(dev, timeout_s=5.0)  # type: ignore[arg-type]
+    assert pipeline.health() is False
+
+
 # ── HTTP transport hardening (CR-01 / IN-03) ─────────────────────────────────
 #
 # These exercise the real stdlib _Handler over a loopback socket to prove the

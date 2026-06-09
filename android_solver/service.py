@@ -170,10 +170,16 @@ class AndroidSolvePipeline:
         self._http_get: HttpGetter = http_get or _default_http_get
 
     def health(self) -> bool:
-        """Cheap reachability probe: ``adb connect`` answers ⇒ redroid is up."""
+        """Readiness probe: redroid is reachable AND Android has finished booting.
+
+        WR-04: ``adb connect`` is exit-0-on-failure across several platform-tools
+        versions, so trusting its exit code alone reports healthy when no solve can
+        possibly succeed (defeating the compose ``service_healthy`` gate). Verify
+        the device actually booted (``sys.boot_completed == 1``) instead.
+        """
         try:
             self._device.connect()
-            return True
+            return self._device.is_booted()
         except Exception:  # noqa: BLE001 — a health probe must never raise
             return False
 

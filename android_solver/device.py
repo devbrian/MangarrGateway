@@ -127,6 +127,17 @@ class AdbDevice:
         """``adb connect <target>`` — attach to the redroid adbd endpoint."""
         self._exec("connect", self._target)
 
+    def is_booted(self, *, timeout: float = 5.0) -> bool:
+        """True once Android has finished booting (``getprop sys.boot_completed``).
+
+        ``adb connect`` is exit-0-on-failure across several platform-tools versions
+        and a TCP-reachable adbd does NOT imply Android is up enough to solve. This
+        reads the canonical boot flag instead — ``sys.boot_completed == 1`` is set
+        only after the system has finished booting and the WebView can run.
+        """
+        result = self._device("shell", "getprop", "sys.boot_completed", timeout=timeout)
+        return result.stdout.decode("utf-8", "replace").strip() == "1"
+
     def force_stop_and_clear(self, package: str = WEBVIEW_PACKAGE) -> None:
         """Kill the WebView and wipe its data for a FRESH cookie jar."""
         self._device("shell", "am", "force-stop", package)
