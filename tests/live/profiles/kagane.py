@@ -41,15 +41,24 @@ Default-query selection
 deterministic leading relevance hit, so ``release[0]`` is well-defined for the
 download leg.
 
-Rate limit
-----------
-``rate_limit_per_minute = 30`` CONSERVATIVE start; ``max_concurrent_jobs`` left default.
-BOTH are set from the Step-5.5 ``scripts/probe_rate_limits.py`` measurement (Task 4),
-not the guess (precedent: clean httpx sources landed on 480 + 3 — trust the measure).
+Rate limit (probe-measured 2026-06-09)
+--------------------------------------
+``scripts/probe_rate_limits.py --source kagane --no-proxy`` (local residential IP)
+found the BINDING limit is the **manifest token path** — ``POST /api/integrity`` /
+``POST /api/v2/books/{id}`` HARD-block above ~30/min with ``Retry-After: 30`` (30 ok
+then 30 blocked at 60/min, c=1). The ``search`` endpoint is slow (~3-4s/call) but never
+429s; ``image`` bytes are clean to 240/min (the probe budget cap) and ``get_bytes`` is
+limiter-exempt anyway. Unlike the no-limit clean-httpx sources (atsumaru 480+3), Kagane
+has a genuine tight token bucket, so the source is set to
+``rate_limit_per_minute = 24`` (~80% of the 30/min hard ceiling — the per-source limiter
+gates BOTH token POSTs) + ``max_concurrent_jobs = 2``. NOT the 480+3 precedent — trust
+the measurement.
 
 LIVE-TUNE items
 --------------
-* **rate_limit_per_minute / max_concurrent_jobs** — probe-tune (Step 5.5).
+* **rate_limit_per_minute / max_concurrent_jobs** — 24 / 2 (probe-measured; the
+  manifest token path is the bottleneck). Re-probe with a residential proxy + larger
+  ``--max-requests`` if the token limit changes or to map parallelism past c=1.
 * **download_timeout_s** — 480.0 (CF warm + token flow + plaintext JPEG fetch, mirrors
   comix's CF-warm budget). Re-size against the real end-to-end download wall-clock.
 * **Referer on the CDN image GET** — the ``?token=`` query is the gate; a bare GET is

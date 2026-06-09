@@ -172,8 +172,20 @@ class KaganeSource(Source):
     # Predominantly English-translated aggregator; per-series ``translated_language``
     # gates the language filter (see :meth:`_language_wanted`).
     languages = ["en"]
-    # CONSERVATIVE start — replaced by the Step-5.5 rate-limit probe (Task 4).
-    rate_limit_per_minute = 30
+    # PROBE-MEASURED (2026-06-09, scripts/probe_rate_limits.py --no-proxy, local IP):
+    # the BINDING limit is the manifest token path — ``POST /api/integrity`` /
+    # ``POST /api/v2/books/{id}`` HARD-block above ~30/min with ``Retry-After: 30``
+    # (30 ok then 30 blocked at 60/min). The per-source limiter gates EVERY ``limited``
+    # call (search/series GET + both token POSTs), so it must sit under that ceiling:
+    # 24 = ~80% of the 30/min hard block, real headroom (the old conservative 30 sat
+    # exactly AT the block). search is slow (~3-4s/call) but never 429s; image bytes
+    # are ``get_bytes`` ``limited=False``-exempt (clean to 240/min, the probe cap).
+    rate_limit_per_minute = 24
+    # D-30: the token path's tight 30/min bucket is the bottleneck (each job mints 2
+    # token calls). 2 keeps concurrent jobs comfortably under it (the limiter paces the
+    # 4 token calls of 2 jobs across the budget); image fetch is exempt. The job manager
+    # clamps this to the global max_concurrent_chapters (8).
+    max_concurrent_jobs = 2
     antibot = "cloudflare"
     cloudflare_challenge_url = "https://kagane.to/"
     decrypt_scheme = None
