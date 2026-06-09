@@ -97,15 +97,17 @@ LIVE_SMOKE = LiveSmokeProfile(
     # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
     alt_title_query="나 혼자만 레벨업",
     alt_title_expected_substring="Solo Leveling",
-    # CI gating (#202): mangadot re-enabled its Cloudflare challenge 2026-06-09
-    # (reverse of #127/#128). The reclassification to antibot="cloudflare" is
-    # correct — a headed real-fingerprint Chromium clears it (verified locally on
-    # macOS: search live test passed in ~7s via proxy) — but the CI headed-Xvfb
-    # Linux solver cannot clear mangadot's tougher challenge (it clears comix's in
-    # the same run). Gated until the Patchright Linux-fingerprint work lands (#202);
-    # mangadot stays live (antibot=cloudflare) for hosts that CAN clear it.
+    # CI gating (Phase 10): mangadot's strict Cloudflare Turnstile is unclearable
+    # by ANY desktop browser automation from Linux (the render-consistency
+    # catch-22 proven in debug mangadot-cf-linux-fingerprint). It is cleared on the
+    # DEPLOY via the redroid + android-solver sidecars (a real Android WebView is a
+    # trusted fingerprint class). CI (GitHub Actions) has NO `binder` kernel module,
+    # so redroid cannot boot there — the Android solver cannot run in CI and these
+    # live items stay gated. `expected_caps_antibot="cloudflare"` is unchanged (the
+    # Android engine is an internal solver detail, not a /caps classification).
     ci_skip_reason=(
-        "mangadot.net Cloudflare challenge unclearable by CI "
-        "headed-Xvfb solver — gated pending #202"
+        "mangadot.net Cloudflare cleared on the deploy via the redroid/"
+        "android-solver sidecar (Android WebView); CI has no binder kernel "
+        "module — gated, Phase 10"
     ),
 )
