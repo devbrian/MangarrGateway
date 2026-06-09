@@ -346,7 +346,10 @@ async def test_lifespan_threads_same_proxy_into_solver() -> None:
         )
     )
     async with app.router.lifespan_context(app):
-        assert app.state.solver._proxy == {
+        # Phase 10: app.state.solver is a SolverRouter; the proxy threads into its
+        # Patchright leg (the browser solver). The Android leg reaches its sidecar
+        # over the docker-internal network and takes no Playwright proxy dict.
+        assert app.state.solver._patchright._proxy == {
             "server": _FAKE_SERVER,
             "username": _FAKE_USER,
             "password": _FAKE_PASS,
@@ -359,4 +362,5 @@ async def test_lifespan_no_proxy_leaves_solver_proxy_none() -> None:
 
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
-        assert app.state.solver._proxy is None
+        # Phase 10: proxy lives on the router's Patchright leg (see above).
+        assert app.state.solver._patchright._proxy is None
