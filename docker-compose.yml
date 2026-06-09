@@ -82,12 +82,19 @@ services:
 
   # ── redroid — Android 11 in Docker (the real WebView that clears the strict
   # Turnstile). privileged + the host iGPU device are REQUIRED for real-GPU WebGL
-  # (T-10-16, accepted/scoped): scoped to ONLY /dev/dri, no host network, and the
-  # adb 5555 port is NOT published (docker-internal only, T-10-12). Needs the host
-  # binder_linux/ashmem_linux modules loaded (see the top-of-file HOST PREREQ).
+  # (T-10-16, accepted/scoped): scoped to ONLY /dev/dri, no host network. Needs the
+  # host binder_linux/ashmem_linux modules loaded (see the top-of-file HOST PREREQ).
+  #
+  # adb 5555 EXPOSURE (operator decision): T-10-12 originally kept adb docker-internal
+  # only. On a trusted LAN-only deploy with no untrusted network reachability, the
+  # operator publishes adb 5555 (host 15555) for direct device inspection / load
+  # testing (`adb connect <host>:15555`). REMOVE this mapping for any deployment whose
+  # host is reachable from an untrusted network — an exposed adb is full device control.
   redroid:
     image: redroid/redroid:11.0.0-latest
     privileged: true
+    ports:
+      - "15555:5555"  # adb — LAN-only operator access (see T-10-12 note above)
     # Host iGPU passthrough → Android gets REAL GPU WebGL (Intel UHD, OpenGL ES
     # 3.2) so CF's render-consistency hash passes. The boot arg below selects it.
     devices:
@@ -120,11 +127,18 @@ services:
 
   # ── android-solver — thin sidecar (adb + the solver code, no gateway source).
   # Built from android_solver/Dockerfile. Drives redroid over adb+CDP and serves
-  # the authenticated control API (POST /solve). NO host ports: are published —
-  # the control API + adb are reachable only on the docker-internal network
-  # (SEC-01 / T-10-12). Every secret arrives via env (NOT baked, T-10-18).
+  # the authenticated control API (POST /solve). Every secret arrives via env
+  # (NOT baked, T-10-18); /solve is X-Solver-Key-auth'd + host-allowlisted (SEC-01).
+  #
+  # 8080 EXPOSURE (operator decision): T-10-12 originally kept the control API
+  # docker-internal only. On a trusted LAN-only deploy the operator publishes it
+  # (host 18080) so the solve path can be exercised/load-tested directly
+  # (`POST http://<host>:18080/solve`, X-Solver-Key required). REMOVE this mapping for
+  # any deployment whose host is reachable from an untrusted network.
   android-solver:
     build: android_solver/
+    ports:
+      - "18080:8080"  # control API /solve — LAN-only operator access (see T-10-12 note)
     depends_on:
       redroid:
         condition: service_healthy
