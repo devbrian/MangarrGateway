@@ -456,6 +456,12 @@ class _SolverHTTPServer(ThreadingHTTPServer):
     """Threaded server holding the shared ``SolverService`` (solves are locked)."""
 
     daemon_threads = True
+    # Listen backlog. stdlib's default (5) drops connections under a burst: a
+    # 15-way simultaneous /solve burst reset 1 connection at the TCP-accept layer
+    # before it reached the app (Phase 10 stress test — the app itself served
+    # 41/41). Solves still SERIALIZE behind SolverService's lock; this only widens
+    # the accept queue so bursty callers queue instead of getting RST.
+    request_queue_size = 128
 
     def __init__(
         self,
