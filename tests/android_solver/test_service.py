@@ -8,8 +8,10 @@ solves + timeout (T-10-11), and that the token value never reaches the logs
 
 from __future__ import annotations
 
+import http.client
 import threading
 import time
+from collections.abc import Iterator
 
 import pytest
 from android_solver.config import ConfigError, SidecarConfig
@@ -18,6 +20,8 @@ from android_solver.service import (
     SolveError,
     SolveResult,
     SolverService,
+    _Handler,
+    _SolverHTTPServer,
 )
 
 from android_solver import service
@@ -201,6 +205,106 @@ def test_pipeline_failure_is_504() -> None:
 def test_healthz_reflects_pipeline_health() -> None:
     assert _service(FakePipeline(healthy=True)).healthz()[0] == 200
     assert _service(FakePipeline(healthy=False)).healthz()[0] == 503
+
+
+# ── HTTP transport hardening (CR-01 / IN-03) ─────────────────────────────────
+#
+# These exercise the real stdlib _Handler over a loopback socket to prove the
+# pre-auth request path: the handler authenticates and caps the declared body
+# size BEFORE reading a single byte, and a malformed Content-Length is a clean
+# 400 (not a 500). The body is NEVER read on a rejected request, so the device
+# pipeline is never invoked.
+
+
+@pytest.fixture
+def http_server(
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[FakePipeline, int]]:
+    pipeline = FakePipeline()
+    srv = _SolverHTTPServer(("127.0.0.1", 0), _Handler, service=_service(pipeline))
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield pipeline, srv.server_address[1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+
+def test_handler_has_socket_read_timeout() -> None:
+    # A finite read timeout is what bounds a slow-loris dribble (CR-01).
+    assert _Handler.timeout is not None
+    assert _Handler.timeout > 0
+
+
+def test_http_rejects_oversized_body_before_reading(
+    http_server: tuple[FakePipeline, int],
+) -> None:
+    pipeline, port = http_server
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    # Declare a multi-GB body but send NONE of it: the handler must reject on the
+    # declared Content-Length alone, never blocking on the (never-sent) body.
+    conn.putrequest("POST", "/solve", skip_host=True, skip_accept_encoding=True)
+    conn.putheader("X-Solver-Key", "s3cret-solver-key")
+    conn.putheader("Content-Length", str(10_000_000_000))
+    conn.endheaders()
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 413
+    assert pipeline.calls == []  # body never read → pipeline never invoked
+
+
+def test_http_rejects_unauthenticated_before_reading_body(
+    http_server: tuple[FakePipeline, int],
+) -> None:
+    pipeline, port = http_server
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    # No X-Solver-Key, and a large declared body we never send: auth must fail
+    # FIRST, before any attempt to read the body.
+    conn.putrequest("POST", "/solve", skip_host=True, skip_accept_encoding=True)
+    conn.putheader("Content-Length", str(10_000_000_000))
+    conn.endheaders()
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 401
+    assert pipeline.calls == []
+
+
+def test_http_non_numeric_content_length_is_400(
+    http_server: tuple[FakePipeline, int],
+) -> None:
+    pipeline, port = http_server
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.putrequest("POST", "/solve", skip_host=True, skip_accept_encoding=True)
+    conn.putheader("X-Solver-Key", "s3cret-solver-key")
+    conn.putheader("Content-Length", "not-a-number")
+    conn.endheaders()
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 400
+    assert pipeline.calls == []
+
+
+def test_http_happy_path_reads_body_and_solves(
+    http_server: tuple[FakePipeline, int],
+) -> None:
+    pipeline, port = http_server
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request(
+        "POST",
+        "/solve",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+        headers={"X-Solver-Key": "s3cret-solver-key"},
+    )
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 200
+    assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
 
 
 # ── config (T-10-08, no keyless start) ───────────────────────────────────────

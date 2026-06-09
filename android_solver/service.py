@@ -64,6 +64,14 @@ _POLL_INTERVAL_S = 1.5
 _WS_TIMEOUT_S = 15.0
 _HTTP_TIMEOUT_S = 10.0
 
+# Pre-auth request hardening for the LAN-exposed control API (CR-01). A /solve
+# body is tiny JSON (``{"challenge_url": "https://<host>/"}``), so any larger
+# Content-Length is rejected 413 BEFORE the body is read — an unauthenticated
+# caller can never force a multi-GB allocation. The handler also carries a socket
+# read timeout so a slow-loris dribble cannot pin a worker thread indefinitely.
+_MAX_BODY_BYTES = 64 * 1024
+_HANDLER_READ_TIMEOUT_S = 15.0
+
 # Cross-origin Cloudflare OOPIF readiness poll: the Turnstile iframe renders a
 # few seconds after the page loads, so wait for it before locating the checkbox.
 _CF_FRAME_URL_MARKER = "challenges.cloudflare.com"
@@ -389,6 +397,12 @@ class SolverService:
             return False
         return hmac.compare_digest(provided_key, self._config.api_key)
 
+    def authenticate(self, provided_key: str | None) -> bool:
+        """Constant-time ``X-Solver-Key`` check for the transport-layer pre-body
+        gate (CR-01): the HTTP handler authenticates BEFORE reading the body so an
+        unauthenticated caller can never force a large/slow read."""
+        return self._authenticate(provided_key)
+
     def healthz(self) -> tuple[int, dict[str, Any]]:
         ok = self._pipeline.health()
         status = HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE
@@ -476,6 +490,9 @@ class _SolverHTTPServer(ThreadingHTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     server: _SolverHTTPServer  # narrowed for attribute access
+    # Socket read timeout (CR-01): kills slow/stalled connections so a slow-loris
+    # body dribble cannot pin a daemon worker thread indefinitely.
+    timeout = _HANDLER_READ_TIMEOUT_S
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -496,9 +513,33 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path != "/solve":
             self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
             return
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length) if length > 0 else b""
+        # CR-01: authenticate BEFORE reading the body. An unauthenticated caller
+        # must never be able to force a large/slow read on the LAN-exposed port.
         api_key = self.headers.get("X-Solver-Key")
+        if not self.server.service.authenticate(api_key):
+            self.close_connection = True  # don't drain a possibly-large body
+            self._send_json(
+                int(HTTPStatus.UNAUTHORIZED),
+                {"error": "invalid or missing X-Solver-Key"},
+            )
+            return
+        # IN-03: a non-numeric Content-Length is a clean 400, not a 500 crash.
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.close_connection = True
+            self._send_json(
+                int(HTTPStatus.BAD_REQUEST), {"error": "invalid Content-Length"}
+            )
+            return
+        # CR-01: cap the declared body size BEFORE reading a single byte.
+        if length > _MAX_BODY_BYTES:
+            self.close_connection = True
+            self._send_json(
+                int(HTTPStatus.REQUEST_ENTITY_TOO_LARGE), {"error": "body too large"}
+            )
+            return
+        body = self.rfile.read(length) if length > 0 else b""
         status, payload = self.server.service.solve(api_key=api_key, body=body)
         self._send_json(status, payload)
 
