@@ -40,6 +40,15 @@ output_root = "/data/manga"
 # cloudflare_proxy_username = "<proxy username>"
 # cloudflare_proxy_password = "<from env GATEWAY_CLOUDFLARE_PROXY_PASSWORD; do not hand-edit>"
 
+# ── Disabled sources (reversible ops knob; #198/#202) ─────────────────────────
+# Comma-separated source keys to SKIP registering at startup. A disabled source
+# is dropped from the registry entirely → absent from /caps, never searched, and
+# never added to the CF solver warm set (so a source that cannot clear Cloudflare
+# in this environment can't create a startup warm storm). Unset ⇒ all built-in
+# sources registered (default). Reversible: clear it to re-enable.
+# Typically set via the environment: GATEWAY_DISABLED_SOURCES="kagane,mangadot".
+# disabled_sources = "kagane,mangadot"
+
 # ── Search-result / chapter-link caching (Phase 9) ────────────────────────────
 # The source-agnostic enumeration cache (env > TOML > default).
 # enum_cache_enabled: kill-switch (D-08), default true. Set false to disable

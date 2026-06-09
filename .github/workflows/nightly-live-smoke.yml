@@ -72,6 +72,15 @@ jobs:
       GATEWAY_CLOUDFLARE_PROXY_SERVER: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_SERVER }}
       GATEWAY_CLOUDFLARE_PROXY_USERNAME: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_USERNAME }}
       GATEWAY_CLOUDFLARE_PROXY_PASSWORD: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_PASSWORD }}
+      # #198/#202: kagane.to + mangadot.net serve a Cloudflare managed challenge
+      # the headed-Xvfb-Linux solver cannot clear (comix clears in the same run;
+      # only a headed-macOS fingerprint clears these). Disabling them drops both
+      # from the registry → out of /caps, search, and the solver warm set, so they
+      # stop nightly-false-redding AND stop the ~6-min doomed-warm storm that
+      # starves comix at startup. REVERSIBLE: clear this when the Patchright
+      # Linux-fingerprint work (#202) lands. Supersedes their ci_skip_reason gates
+      # (now redundant but kept as a fallback for runs without this env).
+      GATEWAY_DISABLED_SOURCES: kagane,mangadot
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.

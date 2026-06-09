@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -75,7 +76,17 @@ def _registered_keys() -> list[str]:
     callers MUST NOT depend on the order — the source set is unordered).
     """
     reg = SourceRegistry()
-    register_builtin_sources(reg)
+    # #198/#202: honor GATEWAY_DISABLED_SOURCES so live-smoke collection matches
+    # what the app actually serves — a disabled source is not registered, hence
+    # not parametrized (no profile load, no ci_skip_reason needed for it). Mirrors
+    # Settings.disabled_source_keys() without constructing Settings (which would
+    # require an api_key just to read one env var).
+    disabled = frozenset(
+        key.strip().lower()
+        for key in os.environ.get("GATEWAY_DISABLED_SOURCES", "").split(",")
+        if key.strip()
+    )
+    register_builtin_sources(reg, disabled=disabled)
     return reg.keys()
 
 
