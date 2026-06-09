@@ -340,7 +340,12 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
     # still resolve from env vars exactly as production does.
     settings = Settings(api_key="session-solver-fixture-not-an-api-key")
     registry = SourceRegistry()
-    register_builtin_sources(registry)
+    # #198/#202: honor GATEWAY_DISABLED_SOURCES here too (mirrors app.py exactly)
+    # so the session-shared solver's cloudflare_keys EXCLUDE disabled sources —
+    # otherwise a disabled-but-unclearable source (kagane/mangadot) would still be
+    # warmed at session setup, re-introducing the warm storm and diverging from
+    # both REGISTERED_KEYS and the app's registry.
+    register_builtin_sources(registry, disabled=settings.disabled_source_keys())
     cf_sources = {
         key: cls
         for key, cls in registry.items()
