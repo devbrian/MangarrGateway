@@ -30,6 +30,15 @@
 # The gateway reaches android-solver over the docker-internal network ONLY; the
 # Android machinery stays out of the gateway process (R1 — gateway image UNCHANGED).
 #
+# OPT-IN via the `android` COMPOSE PROFILE: redroid + android-solver (and the host
+# ports they publish below) only start when the `android` profile is active. A bare
+# `docker compose up` runs the gateway ALONE — works with NO .env, exposes NO extra
+# ports (secure default), and the gateway boots mangadot/kagane disabled (D-33). To
+# run the full Android stack set `COMPOSE_PROFILES=android` in .env (the deploy
+# default — see .env.example) or pass `--profile android`. The sidecar REQUIRES
+# GATEWAY_ANDROID_SOLVER_API_KEY (it fails fast on an empty key), so the profile and
+# the key go together.
+#
 # HOST PREREQUISITE (redroid will NOT boot without it): the host kernel must load
 # the `binder_linux` (+ `ashmem_linux`) modules. Kernel 5.15-generic ships them as
 # loadable modules (binderfs) — no rebuild. Load + persist on the host once:
@@ -65,8 +74,14 @@ services:
     environment:
       GATEWAY_ANDROID_SOLVER_URL: "http://android-solver:8080"
       GATEWAY_ANDROID_SOLVER_API_KEY: "${GATEWAY_ANDROID_SOLVER_API_KEY:-}"
+    # `required: false` so a bare `docker compose up` (the `android` profile NOT
+    # active) starts the gateway ALONE — it neither waits on nor errors about the
+    # profiled android-solver. When the `android` profile IS active
+    # (COMPOSE_PROFILES=android in .env), the sidecar starts first (service_started).
     depends_on:
-      - android-solver
+      android-solver:
+        condition: service_started
+        required: false
     volumes:
       # App data (config.toml + the auto-generated API key, gateway.db,
       # cf_clearance, the metrics snapshot DB `metrics.db`, and the JSON-lines
@@ -86,21 +101,23 @@ services:
   # host binder_linux/ashmem_linux modules loaded (see the top-of-file HOST PREREQ).
   #
   # adb 5555 EXPOSURE (operator decision): T-10-12 originally kept adb docker-internal
-  # only. On a trusted LAN-only deploy with no untrusted network reachability, the
-  # operator publishes adb 5555 (host 15555) for direct device inspection / load
-  # testing (`adb connect <host>:15555`). REMOVE this mapping for any deployment whose
-  # host is reachable from an untrusted network — an exposed adb is full device control.
+  # only. Published ONLY when the `android` profile is active (so a bare `up` exposes
+  # nothing). On a trusted LAN-only deploy the operator publishes adb 5555 (host 15555)
+  # for direct device inspection / load testing (`adb connect <host>:15555`). REMOVE
+  # this mapping for any deployment whose host is reachable from an untrusted network —
+  # an exposed adb is full device control.
   redroid:
     image: redroid/redroid:11.0.0-latest
+    profiles: ["android"]  # opt-in: only starts when COMPOSE_PROFILES=android (or --profile android)
     privileged: true
     ports:
-      - "15555:5555"  # adb — LAN-only operator access (see T-10-12 note above)
+      - "15555:5555"  # adb — LAN-only; only published when the android profile is active
     # Host iGPU passthrough → Android gets REAL GPU WebGL (Intel UHD, OpenGL ES
     # 3.2) so CF's render-consistency hash passes. The boot arg below selects it.
     devices:
       - "/dev/dri:/dev/dri"
     # redroid takes Android boot args as its COMMAND. host GPU mode pairs with the
-    # /dev/dri device above. (Do NOT publish 5555 — adb stays docker-internal.)
+    # /dev/dri device above.
     command:
       - androidboot.redroid_gpu_mode=host
     volumes:
@@ -131,14 +148,16 @@ services:
   # (NOT baked, T-10-18); /solve is X-Solver-Key-auth'd + host-allowlisted (SEC-01).
   #
   # 8080 EXPOSURE (operator decision): T-10-12 originally kept the control API
-  # docker-internal only. On a trusted LAN-only deploy the operator publishes it
-  # (host 18080) so the solve path can be exercised/load-tested directly
-  # (`POST http://<host>:18080/solve`, X-Solver-Key required). REMOVE this mapping for
-  # any deployment whose host is reachable from an untrusted network.
+  # docker-internal only. Published ONLY when the `android` profile is active. On a
+  # trusted LAN-only deploy the operator publishes it (host 18080) so the solve path
+  # can be exercised/load-tested directly (`POST http://<host>:18080/solve`,
+  # X-Solver-Key required). REMOVE this mapping for any deployment whose host is
+  # reachable from an untrusted network.
   android-solver:
     build: android_solver/
+    profiles: ["android"]  # opt-in: only starts when COMPOSE_PROFILES=android (or --profile android)
     ports:
-      - "18080:8080"  # control API /solve — LAN-only operator access (see T-10-12 note)
+      - "18080:8080"  # control API /solve — LAN-only; only published when the android profile is active
     depends_on:
       redroid:
         condition: service_healthy
@@ -152,7 +171,6 @@ services:
       SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to"
       # Per-solve wall-clock cap (an Android WebView solve is slower than desktop).
       SOLVER_SOLVE_TIMEOUT_S: "120"
-    # NO `ports:` mapping — docker-internal only (SEC-01 / T-10-12).
     restart: unless-stopped
 
 volumes:
