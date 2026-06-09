@@ -100,13 +100,17 @@ services:
       # Persistent Android /data (the cleared cookie jar / WebView state). Defaults
       # to a named volume; set MANGARR_REDROID_DIR to bind a host dir.
       - ${MANGARR_REDROID_DIR:-redroid-data}:/data
-    # Gate readiness on Android finishing boot (sys.boot_completed=1) via the
-    # in-image adb. android-solver depends_on this being healthy before it connects.
+    # Gate readiness on Android finishing boot (sys.boot_completed=1). The
+    # healthcheck runs INSIDE the redroid container, where `getprop` is available
+    # directly — the redroid image ships `adbd` (listening on 5555 for the
+    # android-solver sidecar) but NOT the `adb` CLIENT, so an adb-based probe here
+    # always fails even on a fully-booted device. Read the prop locally instead.
+    # android-solver depends_on this being healthy before it connects over adb.
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "adb connect localhost:5555 >/dev/null 2>&1; [ \"$$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\\r')\" = \"1\" ]",
+          "[ \"$$(getprop sys.boot_completed 2>/dev/null | tr -d '\\r')\" = \"1\" ]",
         ]
       interval: 15s
       timeout: 10s
