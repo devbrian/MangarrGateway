@@ -229,14 +229,18 @@ it, keeping all Android machinery **out of the gateway process** (R1):
   bundled `org.chromium.webview_shell`. `privileged: true` and the host iGPU
   (`/dev/dri`) are **required** so Android renders WebGL on real hardware and the
   render-consistency check passes; the GPU is selected with the boot arg
-  `androidboot.redroid_gpu_mode=host`. The adb `5555` port is **not** published —
-  redroid is reachable only on the docker-internal network.
+  `androidboot.redroid_gpu_mode=host`. By default adb `5555` is docker-internal
+  only; this deploy **publishes** it as host `15555` by operator decision for
+  LAN-only device inspection (see the `REMOVE for untrusted networks` note in
+  `docker-compose.yml`).
 - **`android-solver`** — a thin sidecar that drives redroid over adb + CDP: load
   the challenge URL in the WebView, dynamically locate and hardware-`input tap` the
   Turnstile checkbox, poll for `cf_clearance`, and return `{cf_clearance,
-  user_agent}` from an authenticated, SSRF-allowlisted `POST /solve`. It publishes
-  **no** host port either. The gateway's `AndroidSolver` POSTs it and injects the
-  returned cookie + UA on the existing shared httpx leg.
+  user_agent}` from an authenticated, SSRF-allowlisted `POST /solve`. The control
+  API (`:8080`) is docker-internal by default; this deploy **publishes** it as host
+  `18080` (LAN-only, operator decision — same `docker-compose.yml` caveat;
+  `/solve` still requires `X-Solver-Key`). The gateway's `AndroidSolver` POSTs it
+  and injects the returned cookie + UA on the existing shared httpx leg.
 
 ### Host prerequisite (redroid will NOT boot without it)
 
