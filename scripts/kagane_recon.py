@@ -69,10 +69,15 @@ async def main() -> int:
     net_f = NETWORK_LOG.open("w", encoding="utf-8")
     seen_js: set[str] = set()
 
-    def log(rec: dict) -> None:
+    def _write_line(rec: dict) -> None:
+        net_f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        net_f.flush()
+
+    async def log(rec: dict) -> None:
+        # Offload the blocking write/flush so a high response volume can't stall
+        # the event loop (and skew recon capture).
         if not net_f.closed:
-            net_f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-            net_f.flush()
+            await asyncio.to_thread(_write_line, rec)
 
     print(f"[recon] launching headed Chromium at {START_URL}")
     async with async_playwright() as pw:
@@ -113,11 +118,21 @@ async def main() -> int:
                         rec["body_size"] = len(body)
                     except Exception as e:
                         rec["body_error"] = str(e)
-                log(rec)
+                await log(rec)
             except Exception as e:
-                log({"t": utcnow(), "kind": "response_error", "err": str(e)})
+                await log({"t": utcnow(), "kind": "response_error", "err": str(e)})
 
-        context.on("response", lambda r: asyncio.create_task(on_response(r)))
+        # Track spawned handlers so we can drain them before closing net_f /
+        # the context — otherwise late-completing tasks drop their final log
+        # lines (log() is gated on `not net_f.closed`).
+        response_tasks: set[asyncio.Task] = set()
+
+        def _spawn_on_response(r) -> None:
+            task = asyncio.create_task(on_response(r))
+            response_tasks.add(task)
+            task.add_done_callback(response_tasks.discard)
+
+        context.on("response", _spawn_on_response)
 
         page = context.pages[0] if context.pages else await context.new_page()
         try:
@@ -190,6 +205,11 @@ async def main() -> int:
             "home_html_head": (await page.content())[:8000],
         }
         SNAPSHOT.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2, default=str))
+
+        # Drain in-flight response handlers so their final log lines land before
+        # we close net_f / the context.
+        if response_tasks:
+            await asyncio.wait(set(response_tasks), timeout=10)
         await context.close()
 
     net_f.close()

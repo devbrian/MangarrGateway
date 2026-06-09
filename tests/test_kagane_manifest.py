@@ -84,6 +84,9 @@ async def test_fetch_manifest_three_calls_ordered_urls() -> None:
         f"{_CACHE}/api/v2/books/page/bookX/p1.jxl?token=drmtok&is_datasaver=false",
         f"{_CACHE}/api/v2/books/page/bookX/p2.jxl?token=drmtok&is_datasaver=false",
     ]
+    # Exactly two outbound calls — page URLs are constructed, not fetched —
+    # so a future unintended extra HTTP call in the happy path fails this test.
+    assert len(ctx.calls) == 2
     # integrity first, then the book-token POST.
     assert ctx.calls[0][0] == _INTEGRITY
     book_url, book_call = ctx.calls[1]
