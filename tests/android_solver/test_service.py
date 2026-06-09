@@ -515,7 +515,7 @@ def _build_pipeline(
     monkeypatch.setattr(service, "cdp_call", lambda *a, **k: {})
     monkeypatch.setattr(service, "locate_checkbox", locate)
     monkeypatch.setattr(service, "extract_clearance", extract)
-    monkeypatch.setattr(service, "webview_user_agent", lambda url: "UA-wv")
+    monkeypatch.setattr(service, "webview_user_agent", lambda url, **kwargs: "UA-wv")
     # Pre-loop readiness/scale steps are covered by their own units; collapse them
     # to constants here so the loop under test runs deterministically.
     monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws: None)
@@ -671,6 +671,66 @@ def test_solve_survives_transient_clearance_poll_failure(
 
     assert result.cf_clearance == "MANGADOT_TOKEN"
     assert extract.calls > 3  # it kept polling past the transient failures
+
+
+def test_solve_keeps_token_when_ua_fetch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # IN-01: the post-mint UA fetch is guarded — a /json/version hiccup must NOT
+    # discard the already-minted (~60s-expensive) token; UA falls back to "".
+    device = FakeDevice()
+    locate = SeqLocate([(50, 100)])
+    extract = SeqExtract(token_after=1)  # token mints immediately
+    clock = FakeClock()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=locate,
+        extract=extract,
+        clock=clock,
+        timeout_s=60.0,
+    )
+
+    def boom(url, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("/json/version hiccup")
+
+    monkeypatch.setattr(service, "webview_user_agent", boom)
+
+    result = pipeline.solve("https://mangadot.net/", "mangadot.net")
+
+    assert result.cf_clearance == "MANGADOT_TOKEN"  # token preserved
+    assert result.user_agent == ""  # UA fell back to empty rather than aborting
+
+
+def test_solve_threads_injected_getter_into_ua_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # IN-01: the UA fetch must use the pipeline's INJECTED http_get (so test/proxy
+    # injection apply), not the module-default urllib getter.
+    device = FakeDevice()
+    locate = SeqLocate([(50, 100)])
+    extract = SeqExtract(token_after=1)
+    clock = FakeClock()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=locate,
+        extract=extract,
+        clock=clock,
+        timeout_s=60.0,
+    )
+    captured: dict[str, object] = {}
+
+    def recorder(url, *, http_get=None):  # type: ignore[no-untyped-def]
+        captured["http_get"] = http_get
+        return "UA-rec"
+
+    monkeypatch.setattr(service, "webview_user_agent", recorder)
+
+    result = pipeline.solve("https://mangadot.net/", "mangadot.net")
+
+    assert result.user_agent == "UA-rec"
+    assert captured["http_get"] is pipeline._http_get
 
 
 def test_config_from_env_parses_allowlist_and_timeout() -> None:

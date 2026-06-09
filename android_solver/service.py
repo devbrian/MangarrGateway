@@ -213,7 +213,22 @@ class AndroidSolvePipeline:
         if not token:
             raise SolveError(f"clearance not minted for {host} before deadline")
 
-        user_agent = webview_user_agent(f"http://localhost:{port}/json/version") or ""
+        # IN-01: use the INJECTED getter (so tests/proxy injection apply), and
+        # guard the fetch — a trivial /json/version hiccup must not discard an
+        # already-minted, ~60s-expensive token (fall back to an empty UA).
+        try:
+            user_agent = (
+                webview_user_agent(
+                    f"http://localhost:{port}/json/version", http_get=self._http_get
+                )
+                or ""
+            )
+        except Exception:  # noqa: BLE001 — a UA hiccup must not discard a minted token
+            _log.warning(
+                "webview UA fetch failed after token mint; using empty UA",
+                exc_info=True,
+            )
+            user_agent = ""
         return SolveResult(cf_clearance=token, user_agent=user_agent, host=host)
 
     def _tap_until_cleared(
@@ -474,7 +489,9 @@ class SolverService:
                 _log.warning("solve timed out for host %s", host)
                 return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve timed out"}
             except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
-                _log.warning("solve failed for host %s", host)
+                # IN-02: keep the traceback so field solve failures are
+                # diagnosable (still never logs the token — the value isn't here).
+                _log.warning("solve failed for host %s", host, exc_info=True)
                 return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve failed"}
 
         # Redacted success event ONLY (T-10-10) — never the minted token value.
