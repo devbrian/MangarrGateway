@@ -309,6 +309,24 @@ class SeqExtract:
         return self._token if self.calls >= self._token_after else None
 
 
+class SeqVerify:
+    """``_in_verification`` stub: returns each result in turn; last value repeats.
+
+    Models Turnstile's post-tap "Verification successful, waiting for <host> to
+    respond" banner — ``True`` while it is up. The loop must NOT tap while it is
+    ``True`` (a tap there resets the widget and aborts the solve).
+    """
+
+    def __init__(self, results: list[bool]) -> None:
+        self._results = results
+        self.calls = 0
+
+    def __call__(self, ws):  # type: ignore[no-untyped-def]
+        index = min(self.calls, len(self._results) - 1)
+        self.calls += 1
+        return self._results[index]
+
+
 def _build_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -397,11 +415,12 @@ def test_solve_raises_when_deadline_passes_without_clearance(
 def test_solve_stops_tapping_once_widget_gone_then_returns_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Round 1: widget present → one tap. Round 2+: widget gone (locate → None) →
-    # NO further taps, but the clearance shows up during polling and is returned.
+    # Round 1: widget present → one tap. Once the re-tap interval elapses the
+    # widget is gone (locate → None) → NO further taps; the clearance shows up
+    # during polling and is returned.
     device = FakeDevice()
     locate = SeqLocate([(50, 100), None])  # present once, then gone
-    extract = SeqExtract(token_after=6)  # token appears in the 2nd round's poll
+    extract = SeqExtract(token_after=8)  # token after the re-tap window, widget gone
     clock = FakeClock()
     pipeline = _build_pipeline(
         monkeypatch,
@@ -415,7 +434,39 @@ def test_solve_stops_tapping_once_widget_gone_then_returns_token(
     result = pipeline.solve("https://mangadot.net/", "mangadot.net")
 
     assert result.cf_clearance == "MANGADOT_TOKEN"
-    # Tapped exactly once — never re-tapped a cleared page (no fresh challenge).
+    # Tapped exactly once — re-locate returned None (widget gone) so the elapsed
+    # re-tap interval produced no second tap on a cleared page.
+    assert device.taps == [(50, 100)]
+
+
+def test_solve_does_not_retap_during_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression for the tap-timing bug: the widget stays LOCATABLE the whole
+    # time and the re-tap interval elapses, but Turnstile is in its post-tap
+    # "Verification successful, waiting for <host> to respond" window. A second
+    # tap there resets the widget and aborts the solve, so the loop must tap
+    # exactly ONCE and then poll the clearance out without re-tapping.
+    device = FakeDevice()
+    locate = SeqLocate([(50, 100)])  # widget always located (never disappears)
+    extract = SeqExtract(token_after=9)  # token mints late, well past the interval
+    clock = FakeClock()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=locate,
+        extract=extract,
+        clock=clock,
+        timeout_s=60.0,
+    )
+    # Interactive on the first probe (first tap fires), then verification is up.
+    monkeypatch.setattr(pipeline, "_in_verification", SeqVerify([False, True]))
+
+    result = pipeline.solve("https://mangadot.net/", "mangadot.net")
+
+    assert result.cf_clearance == "MANGADOT_TOKEN"
+    # Exactly one tap: the verification guard suppressed every later tap even
+    # though the widget was still located and the re-tap interval had elapsed.
     assert device.taps == [(50, 100)]
 
 

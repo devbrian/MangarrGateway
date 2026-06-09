@@ -72,11 +72,33 @@ _FRAME_POLL_INTERVAL_S = 1.5
 
 # Re-tap cadence: on a COLD WebView the challenges.cloudflare.com OOPIF frame URL
 # appears BEFORE the checkbox inside it is interactive, so a single tap lands on
-# a not-yet-ready widget and misses. We re-locate + re-tap every _RETAP_INTERVAL_S
-# (polling for clearance in between) until the token is minted or the deadline
-# fires. Re-locating returns coords ONLY while the cf widget is still present, so
-# once the challenge passes we stop tapping and just poll out the clearance.
+# a not-yet-ready widget and misses. We re-locate + re-tap at most every
+# _RETAP_INTERVAL_S (polling for clearance in between) until the token is minted
+# or the deadline fires. Two guards keep a re-tap from DESTROYING a tap that DID
+# register: (a) we never tap within _RETAP_INTERVAL_S of the previous tap, which
+# gives a registered tap time to surface Turnstile's success text; and (b) once
+# that success/verification window is detected (_in_verification) we stop tapping
+# entirely and just poll out the clearance — a tap fired during the
+# "Verification successful, waiting for <host> to respond" phase RESETS the
+# widget and aborts the solve (the bug this loop exists to avoid).
 _RETAP_INTERVAL_S = 5.0
+
+# Main-challenge-page probe: Turnstile's post-tap success/verification banner
+# ("Verification successful, waiting for <host> to respond") renders in a
+# `#challenge-success-text` div in the TOP frame (NOT the OOPIF). While it is
+# visible the checkbox must NOT be re-tapped. Runtime.evaluate runs in the main
+# frame's default context (no Runtime.enable needed — same as _compute_scales).
+_VERIFY_PROBE_CMD_ID = 300
+_VERIFY_PROBE_JS = (
+    "(function(){try{"
+    "var sels=['#challenge-success-text','.challenge-success-text',"
+    "'#challenge-success'];"
+    "for(var i=0;i<sels.length;i++){var el=document.querySelector(sels[i]);"
+    "if(el&&(el.offsetParent||el.getClientRects().length))return true;}"
+    "var t=document.body?(document.body.innerText||''):'';"
+    "return /verification successful|waiting for .* to respond/i.test(t);"
+    "}catch(e){return false;}})()"
+)
 
 
 class SolveError(RuntimeError):
@@ -189,40 +211,73 @@ class AndroidSolvePipeline:
         y_scale: float,
         deadline: float,
     ) -> str | None:
-        """Re-locate + re-tap the Turnstile checkbox until clearance is minted.
+        """Tap the Turnstile checkbox once it is interactive, then let it verify.
 
         On a COLD WebView the ``challenges.cloudflare.com`` OOPIF frame URL appears
-        BEFORE the checkbox inside it is interactive, so a single tap can land on a
-        not-yet-ready widget and miss. Each round re-runs ``locate_checkbox`` (which
-        returns coords ONLY while the cf widget is still present) and re-taps, then
-        polls for the clearance for up to ``_retap_interval_s`` before re-locating.
+        BEFORE the checkbox inside it is interactive, so the first tap can land on a
+        not-yet-ready widget and miss. We therefore re-locate + re-tap — but a naive
+        5s re-tap loop fires a SECOND tap during Turnstile's post-tap
+        "Verification successful, waiting for <host> to respond" window, which
+        RESETS the widget and aborts the solve (the observed failure: two taps
+        ~7s apart, then the widget vanishes with no clearance).
 
-        Two key properties hold:
-          * The re-tap naturally lands the moment the checkbox becomes interactive
-            (cold-start race fixed), bounded by the solve ``deadline``.
-          * Once the challenge passes (widget/iframe gone ⇒ no cf OOPIF frame), the
-            re-locate returns ``None`` so we STOP tapping and just poll out the
-            clearance — never re-triggering a fresh challenge by tapping a cleared
-            page.
+        Each poll cycle therefore:
+          1. checks for the clearance first (a registered tap may have minted it);
+          2. if the success/verification banner is showing (``_in_verification``),
+             does NOTHING but wait — never tapping during verification;
+          3. otherwise (re-)taps the located checkbox, but never within
+             ``_retap_interval_s`` of the previous tap so a registered tap has time
+             to surface its success banner before another tap is even considered.
+
+        Together these mean: the tap naturally lands the moment the checkbox is
+        interactive (cold-start race handled, bounded by ``deadline``), and once a
+        tap registers it is NEVER disrupted by a follow-up tap.
         """
         token: str | None = None
+        last_tap: float | None = None
         while time.monotonic() < deadline:
-            coords = locate_checkbox(
-                ws,
-                screencap=self._device.screencap(),
-                x_scale=x_scale,
-                y_scale=y_scale,
-            )
-            if coords is not None:
-                self._device.input_tap(*coords)
-            # Short poll window between taps, never overrunning the deadline.
-            poll_until = min(deadline, time.monotonic() + self._retap_interval_s)
-            while time.monotonic() < poll_until:
-                token = extract_clearance(ws_url, host)
-                if token:
-                    return token
+            token = extract_clearance(ws_url, host)
+            if token:
+                return token
+
+            if self._in_verification(ws):
+                # Post-tap verification underway — tapping now resets the widget.
                 time.sleep(self._poll_interval_s)
+                continue
+
+            now = time.monotonic()
+            if last_tap is None or (now - last_tap) >= self._retap_interval_s:
+                coords = locate_checkbox(
+                    ws,
+                    screencap=self._device.screencap(),
+                    x_scale=x_scale,
+                    y_scale=y_scale,
+                )
+                if coords is not None:
+                    self._device.input_tap(*coords)
+                    last_tap = time.monotonic()
+            time.sleep(self._poll_interval_s)
         return token
+
+    def _in_verification(self, ws: WebSocketLike) -> bool:
+        """True while Turnstile's post-tap success/verification banner is showing.
+
+        Reads the TOP frame for the ``#challenge-success-text`` banner Cloudflare
+        renders during "Verification successful, waiting for <host> to respond".
+        While that is up the checkbox must NOT be re-tapped. Any CDP/eval failure
+        is treated as "not verifying" so the loop falls back to its tap behaviour
+        (fail-open: better to risk a tap than to stall forever on a probe error).
+        """
+        try:
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {"expression": _VERIFY_PROBE_JS, "returnByValue": True},
+                command_id=_VERIFY_PROBE_CMD_ID,
+            )
+        except Exception:  # noqa: BLE001 — a readiness probe must never abort the solve
+            return False
+        return bool(result.get("result", {}).get("value"))
 
     def _wait_for_cf_frame(self, ws: WebSocketLike) -> None:
         """Poll Page.getFrameTree until the challenges.cloudflare.com OOPIF appears.
