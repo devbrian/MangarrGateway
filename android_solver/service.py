@@ -44,20 +44,31 @@ from urllib.parse import urlsplit
 from android_solver.cdp import (
     HttpGetter,
     WebSocketFactory,
+    WebSocketLike,
+    cdp_call,
     extract_clearance,
     webview_user_agent,
 )
 from android_solver.config import SidecarConfig
-from android_solver.device import AdbDevice
+from android_solver.device import AdbDevice, AdbError
 from android_solver.turnstile import locate_checkbox
 
 _log = logging.getLogger("android_solver.service")
 
 # Default page-render settle + clearance-poll cadence for the real pipeline.
-_LAUNCH_SETTLE_S = 6.0
+# The OOPIF widget appears a few seconds AFTER load, so a short fixed settle is
+# only a floor — the real readiness gate is polling Page.getFrameTree for the
+# challenges.cloudflare.com child frame (_FRAME_POLL_* below).
+_LAUNCH_SETTLE_S = 2.0
 _POLL_INTERVAL_S = 1.5
 _WS_TIMEOUT_S = 15.0
 _HTTP_TIMEOUT_S = 10.0
+
+# Cross-origin Cloudflare OOPIF readiness poll: the Turnstile iframe renders a
+# few seconds after the page loads, so wait for it before locating the checkbox.
+_CF_FRAME_URL_MARKER = "challenges.cloudflare.com"
+_FRAME_POLL_TIMEOUT_S = 20.0
+_FRAME_POLL_INTERVAL_S = 1.5
 
 
 class SolveError(RuntimeError):
@@ -102,13 +113,15 @@ class AndroidSolvePipeline:
         http_get: HttpGetter | None = None,
         launch_settle_s: float = _LAUNCH_SETTLE_S,
         poll_interval_s: float = _POLL_INTERVAL_S,
-        device_pixel_ratio: float = 1.0,
+        frame_poll_timeout_s: float = _FRAME_POLL_TIMEOUT_S,
+        frame_poll_interval_s: float = _FRAME_POLL_INTERVAL_S,
     ) -> None:
         self._device = device
         self._timeout_s = timeout_s
         self._launch_settle_s = launch_settle_s
         self._poll_interval_s = poll_interval_s
-        self._device_pixel_ratio = device_pixel_ratio
+        self._frame_poll_timeout_s = frame_poll_timeout_s
+        self._frame_poll_interval_s = frame_poll_interval_s
         # Lazy default factories live in cdp (same package) — reuse them so the
         # devtools websocket/http plumbing has a single implementation (R1).
         from android_solver.cdp import _default_http_get, _default_ws_factory
@@ -128,7 +141,7 @@ class AndroidSolvePipeline:
         self._device.connect()
         self._device.force_stop_and_clear()
         self._device.launch_url(challenge_url)
-        time.sleep(self._launch_settle_s)  # let the challenge page render
+        time.sleep(self._launch_settle_s)  # floor before the devtools socket is up
 
         pid = self._device.pidof()
         port = self._device.forward_devtools(pid)
@@ -136,10 +149,17 @@ class AndroidSolvePipeline:
 
         ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
         try:
+            cdp_call(ws, "Page.enable", command_id=10)
+            cdp_call(ws, "DOM.enable", command_id=11)
+            # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
+            # after load) — the real readiness gate, not the fixed settle above.
+            self._wait_for_cf_frame(ws)
+            x_scale, y_scale = self._compute_scales(ws)
             coords = locate_checkbox(
                 ws,
                 screencap=self._device.screencap(),
-                device_pixel_ratio=self._device_pixel_ratio,
+                x_scale=x_scale,
+                y_scale=y_scale,
             )
         finally:
             ws.close()
@@ -150,10 +170,97 @@ class AndroidSolvePipeline:
 
         token = self._poll_clearance(ws_url, host)
         if not token:
+            # Cheap one-shot resilience: re-locate + re-tap once before giving up
+            # (the first tap can land a frame early, before the iframe settles).
+            token = self._relocate_tap_and_poll(ws_url, host)
+        if not token:
             raise SolveError(f"clearance not minted for {host} before deadline")
 
         user_agent = webview_user_agent(f"http://localhost:{port}/json/version") or ""
         return SolveResult(cf_clearance=token, user_agent=user_agent, host=host)
+
+    def _wait_for_cf_frame(self, ws: WebSocketLike) -> None:
+        """Poll Page.getFrameTree until the challenges.cloudflare.com OOPIF appears.
+
+        The Turnstile widget renders in a cross-origin child frame a few seconds
+        after the page loads. Returns once present; returns anyway on timeout so
+        locate_checkbox can still try the secondary/screenshot paths.
+        """
+        deadline = time.monotonic() + self._frame_poll_timeout_s
+        command_id = 20
+        while time.monotonic() < deadline:
+            tree = cdp_call(ws, "Page.getFrameTree", command_id=command_id)
+            command_id += 1
+            if self._frame_tree_has_cf(tree.get("frameTree")):
+                return
+            time.sleep(self._frame_poll_interval_s)
+        _log.warning("cloudflare OOPIF did not appear before frame-poll deadline")
+
+    @staticmethod
+    def _frame_tree_has_cf(frame_tree: Any) -> bool:
+        if not isinstance(frame_tree, dict):
+            return False
+        frame = frame_tree.get("frame", {})
+        url = frame.get("url", "") if isinstance(frame, dict) else ""
+        if isinstance(url, str) and _CF_FRAME_URL_MARKER in url:
+            return True
+        return any(
+            AndroidSolvePipeline._frame_tree_has_cf(child)
+            for child in frame_tree.get("childFrames", []) or []
+        )
+
+    def _compute_scales(self, ws: WebSocketLike) -> tuple[float, float]:
+        """CSS→physical per-axis scales: screen px / live viewport px.
+
+        x_scale = screen_width / window.innerWidth, y_scale likewise for height.
+        The vertical factor differs (webview_shell's URL bar shrinks innerHeight),
+        so the two are computed independently. Falls back to (1.0, 1.0) on any
+        missing/zero value (never logs a token).
+        """
+        try:
+            screen_w, screen_h = self._device.screen_size()
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {
+                    "expression": "[window.innerWidth, window.innerHeight]",
+                    "returnByValue": True,
+                },
+                command_id=30,
+            )
+            value = result.get("result", {}).get("value")
+            view_w = float(value[0])
+            view_h = float(value[1])
+        except (AdbError, KeyError, IndexError, TypeError, ValueError) as exc:
+            _log.warning(
+                "could not compute viewport scales (%s); using 1.0",
+                type(exc).__name__,
+            )
+            return (1.0, 1.0)
+        if view_w <= 0 or view_h <= 0:
+            _log.warning(
+                "non-positive viewport (%r, %r); using scale 1.0", view_w, view_h
+            )
+            return (1.0, 1.0)
+        return (screen_w / view_w, screen_h / view_h)
+
+    def _relocate_tap_and_poll(self, ws_url: str, host: str) -> str | None:
+        """Re-open the page ws, re-locate the checkbox, tap once, poll again."""
+        ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
+        try:
+            x_scale, y_scale = self._compute_scales(ws)
+            coords = locate_checkbox(
+                ws,
+                screencap=self._device.screencap(),
+                x_scale=x_scale,
+                y_scale=y_scale,
+            )
+        finally:
+            ws.close()
+        if coords is None:
+            return None
+        self._device.input_tap(*coords)
+        return self._poll_clearance(ws_url, host)
 
     def _poll_clearance(self, ws_url: str, host: str) -> str | None:
         deadline = time.monotonic() + self._timeout_s
