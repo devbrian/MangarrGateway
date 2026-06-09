@@ -428,7 +428,17 @@ class SolverService:
                 "error": "challenge_url is required"
             }
 
-        host = (urlsplit(challenge_url).hostname or "").lower()
+        split = urlsplit(challenge_url)
+        host = (split.hostname or "").lower()
+        if split.scheme not in ("http", "https"):
+            # WR-01 SSRF guard: pin the scheme BEFORE the host check so a
+            # ``file://``/``content://``/``javascript:``/``intent://`` URL with an
+            # allowlisted host can never reach ``am start -d`` (the gateway only
+            # ever sends an ``https://<host>/`` challenge nav).
+            _log.warning("rejected non-http(s) challenge scheme %r", split.scheme)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge url scheme not allowed"
+            }
         if host not in self._config.allowed_hosts:
             # T-10-09 SSRF guard: reject BEFORE any device action — the gateway
             # only ever sends a source's own cloudflare_challenge_url.

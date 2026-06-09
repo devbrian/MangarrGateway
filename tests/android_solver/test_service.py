@@ -119,6 +119,29 @@ def test_solve_rejects_non_allowlisted_host() -> None:
     assert "allowlist" in payload["error"]
 
 
+@pytest.mark.parametrize(
+    "challenge_url",
+    [
+        b'{"challenge_url": "file://mangadot.net/etc/passwd"}',
+        b'{"challenge_url": "intent://mangadot.net/#Intent;end"}',
+        b'{"challenge_url": "javascript://mangadot.net/%0aalert(1)"}',
+        b'{"challenge_url": "content://mangadot.net/data"}',
+    ],
+)
+def test_solve_rejects_non_http_scheme_even_for_allowlisted_host(
+    challenge_url: bytes,
+) -> None:
+    # WR-01: an allowlisted HOST with a non-http(s) SCHEME must still be rejected
+    # before any device action — the scheme is pinned ahead of the host check.
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).solve(
+        api_key="s3cret-solver-key", body=challenge_url
+    )
+    assert status == 422
+    assert pipeline.calls == []  # never reaches am start -d
+    assert "scheme" in payload["error"]
+
+
 def test_solve_requires_challenge_url() -> None:
     pipeline = FakePipeline()
     status, _ = _service(pipeline).solve(api_key="s3cret-solver-key", body=b"{}")
