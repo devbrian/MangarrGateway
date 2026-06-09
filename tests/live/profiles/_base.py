@@ -51,3 +51,13 @@ class LiveSmokeProfile:
     # contain — proving the alt/native query resolved to the right series live.
     alt_title_query: str | None = None
     alt_title_expected_substring: str | None = None
+    # CI gating (#197/#198). When set to a non-empty string, EVERY parametrized
+    # live-smoke test for this source is SKIPPED (not failed) via
+    # ``tests/live/conftest.py::pytest_collection_modifyitems``. The string is the
+    # skip reason — always include the tracking issue # so the gate is auditable.
+    # ``None`` (the default) runs the source normally. Rationale: a ``<skipped>``
+    # JUnit testcase is NOT counted as a failure by ``scripts/nightly_triage.py``,
+    # so a fully-gated source's sticky nightly issue auto-closes while the real
+    # fix is tracked. Use ONLY for a source that genuinely cannot pass in the
+    # nightly CI environment for a reason captured in the referenced issue.
+    ci_skip_reason: str | None = None

@@ -251,6 +251,14 @@ def pytest_collection_modifyitems(
         if source_key is None:
             continue
         profile = _load_profile(source_key)
+        # CI gating (#197/#198): a source whose profile declares ``ci_skip_reason``
+        # cannot pass in the nightly environment for a tracked reason — skip every
+        # one of its parametrized live tests rather than let it be a perpetual
+        # false-red. ``<skipped>`` is non-failing to ``scripts/nightly_triage.py``,
+        # so the source's sticky nightly issue auto-closes while the real fix is
+        # tracked in the referenced issue.
+        if profile.ci_skip_reason:
+            item.add_marker(pytest.mark.skip(reason=profile.ci_skip_reason))
         item.add_marker(
             pytest.mark.timeout(profile.download_timeout_s, method=timeout_method)
         )

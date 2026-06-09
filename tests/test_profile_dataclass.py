@@ -73,6 +73,8 @@ def test_profile_defaults() -> None:
     assert profile.expected_release_pattern == {}
     assert profile.fixture_drift_paths == []
     assert profile.perf_budget_s is None
+    # CI gating (#197/#198) is opt-in — un-gated by default.
+    assert profile.ci_skip_reason is None
 
 
 def test_default_factories_isolated() -> None:
