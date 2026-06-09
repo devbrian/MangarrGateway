@@ -97,4 +97,15 @@ LIVE_SMOKE = LiveSmokeProfile(
     # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
     alt_title_query="나 혼자만 레벨업",
     alt_title_expected_substring="Solo Leveling",
+    # CI gating (#202): mangadot re-enabled its Cloudflare challenge 2026-06-09
+    # (reverse of #127/#128). The reclassification to antibot="cloudflare" is
+    # correct — a headed real-fingerprint Chromium clears it (verified locally on
+    # macOS: search live test passed in ~7s via proxy) — but the CI headed-Xvfb
+    # Linux solver cannot clear mangadot's tougher challenge (it clears comix's in
+    # the same run). Gated until the Patchright Linux-fingerprint work lands (#202);
+    # mangadot stays live (antibot=cloudflare) for hosts that CAN clear it.
+    ci_skip_reason=(
+        "mangadot.net Cloudflare challenge unclearable by CI "
+        "headed-Xvfb solver — gated pending #202"
+    ),
 )
