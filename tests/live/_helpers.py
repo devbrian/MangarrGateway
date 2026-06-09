@@ -150,9 +150,12 @@ async def live_client_for(
 ) -> AsyncIterator[httpx.AsyncClient]:
     """Boot a real gateway app + lifespan + ``httpx.AsyncClient`` for a smoke test.
 
-    Conditionally awaits ``app.state.solver.warm()`` (60s cap) when the profile
-    declares ``needs_solver_warm=True`` — Comix needs the warm Cloudflare
-    clearance before issuing requests, MangaDex doesn't.
+    Conditionally warms ONLY the source under test
+    (``app.state.solver.get_clearance(profile.source_key)``, 60s cap) when the
+    profile declares ``needs_solver_warm=True`` — Comix needs cleared
+    ``cf_clearance`` before issuing requests, MangaDex doesn't. Scoped to the
+    single source (NOT the whole-solver ``warm()``) so one un-clearable
+    Cloudflare source can no longer time out another's smoke bucket (#196).
 
     ``tmp_path`` defaults to a Windows-portable system temp path; Plan 04
     smoke modules pass pytest's ``tmp_path`` fixture explicitly so the default
@@ -176,7 +179,21 @@ async def live_client_for(
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         if profile.needs_solver_warm:
-            await asyncio.wait_for(app.state.solver.warm(), timeout=60.0)
+            # #196 cross-source-contamination fix: warm ONLY the source under
+            # test, NOT the whole solver. ``solver.warm()`` eager-solves EVERY
+            # cloudflare-gated key sequentially (comix THEN kagane THEN ...),
+            # each under its own 60s ``_solve_real`` deadline — so a single key
+            # that can never clear in CI (kagane.to, #197/#198) burns the full
+            # 60s and blows this outer ceiling for EVERY warm-gated source,
+            # dragging comix (which clears fine) red along with it.
+            # ``get_clearance(source_key)`` is per-key single-flight + held-
+            # clearance aware: for a source the session-shared solver already
+            # warmed it returns the cached ``Clearance`` instantly; otherwise it
+            # solves just that one host. One failing CF source can no longer
+            # contaminate another's smoke bucket.
+            await asyncio.wait_for(
+                app.state.solver.get_clearance(profile.source_key), timeout=60.0
+            )
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://localhost",

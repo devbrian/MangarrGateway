@@ -241,10 +241,14 @@ async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        # Await warm() before timing anything — the perf budget covers the
+        # Await clearance before timing anything — the perf budget covers the
         # download path on a warm solver, not the initial Cloudflare solve.
+        # #196: scope to comix only — solver.warm() eager-solves every cloudflare
+        # key incl. kagane.to, which never clears in CI and burns its full 60s
+        # (#197/#198), blowing this ceiling. get_clearance("comix") solves just
+        # this host.
         solver = app.state.solver
-        await asyncio.wait_for(solver.warm(), timeout=60.0)
+        await asyncio.wait_for(solver.get_clearance("comix"), timeout=60.0)
         async with httpx.AsyncClient(
             transport=transport,
             base_url="http://localhost",

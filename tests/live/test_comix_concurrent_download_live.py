@@ -110,7 +110,12 @@ async def test_two_comix_downloads_run_concurrently(tmp_path: Path) -> None:
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
         solver = app.state.solver
-        await asyncio.wait_for(solver.warm(), timeout=60.0)
+        # #196: warm ONLY comix (the source under test), not the whole solver.
+        # solver.warm() eager-solves EVERY cloudflare key — incl. kagane.to,
+        # which never clears in CI and burns its full 60s (#197/#198) — blowing
+        # this outer ceiling and dragging comix red. get_clearance("comix")
+        # solves just this host.
+        await asyncio.wait_for(solver.get_clearance("comix"), timeout=60.0)
 
         async with httpx.AsyncClient(
             transport=transport,
