@@ -244,7 +244,17 @@ class AndroidSolvePipeline:
         token: str | None = None
         last_tap: float | None = None
         while time.monotonic() < deadline:
-            token = extract_clearance(ws_url, host)
+            # WR-03: a transient extract failure in ONE poll cycle (CDP hiccup, a
+            # refused 2nd concurrent socket, a ws timeout) must NOT abort an
+            # in-progress ~60s solve — treat it as "no token yet" and continue,
+            # mirroring the deliberately fail-open _in_verification probe below.
+            try:
+                token = extract_clearance(ws_url, host)
+            except Exception:  # noqa: BLE001 — a transient cookie poll must not abort the solve
+                _log.warning(
+                    "clearance poll failed transiently; continuing", exc_info=True
+                )
+                token = None
             if token:
                 return token
 

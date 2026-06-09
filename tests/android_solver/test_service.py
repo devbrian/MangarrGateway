@@ -597,6 +597,49 @@ def test_solve_does_not_retap_during_verification(
     assert device.taps == [(50, 100)]
 
 
+class RaiseThenToken:
+    """``extract_clearance`` stub: raises for the first ``raises`` cycles, then mints.
+
+    Models a transient CDP/cookie-poll blip (a refused 2nd concurrent socket, a ws
+    timeout). The solve loop must SWALLOW the blip and keep polling, not abort.
+    """
+
+    def __init__(self, raises: int, token: str = "MANGADOT_TOKEN") -> None:
+        self._raises = raises
+        self._token = token
+        self.calls = 0
+
+    def __call__(self, ws_url, host):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        if self.calls <= self._raises:
+            raise RuntimeError("transient CDP hiccup")
+        return self._token
+
+
+def test_solve_survives_transient_clearance_poll_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WR-03: a poll-cycle extract_clearance error must be caught + logged and the
+    # loop continues to the next cycle — it must NOT abort the whole solve.
+    device = FakeDevice()
+    locate = SeqLocate([(50, 100)])
+    extract = RaiseThenToken(raises=3)  # first 3 polls blow up, then the token mints
+    clock = FakeClock()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=locate,
+        extract=extract,  # type: ignore[arg-type]
+        clock=clock,
+        timeout_s=60.0,
+    )
+
+    result = pipeline.solve("https://mangadot.net/", "mangadot.net")
+
+    assert result.cf_clearance == "MANGADOT_TOKEN"
+    assert extract.calls > 3  # it kept polling past the transient failures
+
+
 def test_config_from_env_parses_allowlist_and_timeout() -> None:
     config = SidecarConfig.from_env(
         {
