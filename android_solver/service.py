@@ -1,0 +1,352 @@
+"""Authenticated, SSRF-safe, serialized control API for the android-solver sidecar.
+
+Wraps the Plan 10-01 pipeline pieces (``device`` driver + ``turnstile`` locator +
+``cdp`` extractor) in the minimal HTTP control surface the gateway's
+``AndroidSolver`` (Plan 10-03) calls:
+
+  * ``GET  /healthz`` → 200 when the redroid adb target answers.
+  * ``POST /solve``   → mint a Cloudflare clearance for an ALLOWLISTED host.
+
+Security posture (SEC-01):
+  * T-10-08 — every ``/solve`` requires the ``X-Solver-Key`` header to equal the
+    configured api key (constant-time compare); 401 otherwise.
+  * T-10-09 — the ``challenge_url`` host is validated against the allowlist BEFORE
+    any device action; a non-allowlisted host is rejected 422 (no arbitrary-URL
+    solve — the gateway only ever sends a source's own challenge URL).
+  * T-10-11 — solves are SERIALIZED (one WebView at a time) under a process lock
+    and bounded by an overall timeout (504 on expiry).
+  * T-10-10 — the clearance token VALUE is never written to the logs; only a
+    redacted ``solved <host>`` event is emitted.
+
+The control API is bound docker-internal-only (config default 0.0.0.0 inside the
+container, NO published host port — enforced by the 10-05 compose).
+
+R1: this module imports ONLY the sibling sidecar modules + the stdlib — never
+anything from ``src/manga_gateway``. The HTTP layer is stdlib ``http.server`` so
+the sidecar image needs no web-framework dependency.
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import time
+from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock
+from typing import Any, Protocol
+from urllib.parse import urlsplit
+
+from android_solver.cdp import (
+    HttpGetter,
+    WebSocketFactory,
+    extract_clearance,
+    webview_user_agent,
+)
+from android_solver.config import SidecarConfig
+from android_solver.device import AdbDevice
+from android_solver.turnstile import locate_checkbox
+
+_log = logging.getLogger("android_solver.service")
+
+# Default page-render settle + clearance-poll cadence for the real pipeline.
+_LAUNCH_SETTLE_S = 6.0
+_POLL_INTERVAL_S = 1.5
+_WS_TIMEOUT_S = 15.0
+_HTTP_TIMEOUT_S = 10.0
+
+
+class SolveError(RuntimeError):
+    """The solve pipeline could not mint a clearance (surfaces as 504)."""
+
+
+@dataclass(frozen=True)
+class SolveResult:
+    """A successful solve: the minted token + the WebView UA it was minted under."""
+
+    cf_clearance: str
+    user_agent: str
+    host: str
+
+
+class SolvePipeline(Protocol):
+    """The solve surface the control API drives (a FAKE is injected in tests)."""
+
+    def solve(self, challenge_url: str, host: str) -> SolveResult: ...
+
+    def health(self) -> bool: ...
+
+
+# ── the real pipeline: device → locate → tap → extract ───────────────────────
+
+
+class AndroidSolvePipeline:
+    """Compose the 10-01 pieces into one end-to-end clearance mint.
+
+    force_stop_and_clear → launch_url → locate_checkbox (dynamic CDP DOM) →
+    input_tap → poll extract_clearance until the token appears or the deadline
+    fires → capture the WebView UA. Only ever driven against a host the control
+    API already allowlisted (SSRF validation happens upstream in ``SolverService``).
+    """
+
+    def __init__(
+        self,
+        device: AdbDevice,
+        *,
+        timeout_s: float,
+        ws_factory: WebSocketFactory | None = None,
+        http_get: HttpGetter | None = None,
+        launch_settle_s: float = _LAUNCH_SETTLE_S,
+        poll_interval_s: float = _POLL_INTERVAL_S,
+        device_pixel_ratio: float = 1.0,
+    ) -> None:
+        self._device = device
+        self._timeout_s = timeout_s
+        self._launch_settle_s = launch_settle_s
+        self._poll_interval_s = poll_interval_s
+        self._device_pixel_ratio = device_pixel_ratio
+        # Lazy default factories live in cdp (same package) — reuse them so the
+        # devtools websocket/http plumbing has a single implementation (R1).
+        from android_solver.cdp import _default_http_get, _default_ws_factory
+
+        self._ws_factory: WebSocketFactory = ws_factory or _default_ws_factory
+        self._http_get: HttpGetter = http_get or _default_http_get
+
+    def health(self) -> bool:
+        """Cheap reachability probe: ``adb connect`` answers ⇒ redroid is up."""
+        try:
+            self._device.connect()
+            return True
+        except Exception:  # noqa: BLE001 — a health probe must never raise
+            return False
+
+    def solve(self, challenge_url: str, host: str) -> SolveResult:
+        self._device.connect()
+        self._device.force_stop_and_clear()
+        self._device.launch_url(challenge_url)
+        time.sleep(self._launch_settle_s)  # let the challenge page render
+
+        pid = self._device.pidof()
+        port = self._device.forward_devtools(pid)
+        ws_url = self._discover_page_ws(port)
+
+        ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
+        try:
+            coords = locate_checkbox(
+                ws,
+                screencap=self._device.screencap(),
+                device_pixel_ratio=self._device_pixel_ratio,
+            )
+        finally:
+            ws.close()
+        if coords is None:
+            raise SolveError(f"turnstile checkbox not located for {host}")
+
+        self._device.input_tap(*coords)
+
+        token = self._poll_clearance(ws_url, host)
+        if not token:
+            raise SolveError(f"clearance not minted for {host} before deadline")
+
+        user_agent = webview_user_agent(f"http://localhost:{port}/json/version") or ""
+        return SolveResult(cf_clearance=token, user_agent=user_agent, host=host)
+
+    def _poll_clearance(self, ws_url: str, host: str) -> str | None:
+        deadline = time.monotonic() + self._timeout_s
+        while time.monotonic() < deadline:
+            token = extract_clearance(ws_url, host)
+            if token:
+                return token
+            time.sleep(self._poll_interval_s)
+        return None
+
+    def _discover_page_ws(self, port: int) -> str:
+        payload = self._http_get(
+            f"http://localhost:{port}/json", timeout=_HTTP_TIMEOUT_S
+        )
+        targets = json.loads(payload)
+        for target in targets:
+            if target.get("type") == "page" and target.get("webSocketDebuggerUrl"):
+                return str(target["webSocketDebuggerUrl"])
+        for target in targets:  # fall back to any target exposing a ws url
+            if target.get("webSocketDebuggerUrl"):
+                return str(target["webSocketDebuggerUrl"])
+        raise SolveError("no CDP page target exposes a websocket debugger url")
+
+
+# ── the control service: auth + allowlist + serialized/timeout-bounded solve ──
+
+
+class SolverService:
+    """Stateless-per-request control logic, independent of the HTTP transport.
+
+    Tested directly (no socket needed): ``solve()`` and ``healthz()`` return a
+    ``(status_code, json_body)`` pair the HTTP handler just serializes.
+    """
+
+    def __init__(
+        self,
+        config: SidecarConfig,
+        pipeline: SolvePipeline,
+        *,
+        executor: Executor | None = None,
+    ) -> None:
+        self._config = config
+        self._pipeline = pipeline
+        # One WebView solve at a time (T-10-11): the lock serializes callers and
+        # the single-worker executor bounds each solve by wall-clock timeout.
+        self._lock = Lock()
+        self._executor = executor or ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="android-solve"
+        )
+
+    def _authenticate(self, provided_key: str | None) -> bool:
+        if not provided_key:
+            return False
+        return hmac.compare_digest(provided_key, self._config.api_key)
+
+    def healthz(self) -> tuple[int, dict[str, Any]]:
+        ok = self._pipeline.health()
+        status = HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE
+        return int(status), {"status": "ok" if ok else "unavailable"}
+
+    def solve(self, *, api_key: str | None, body: bytes) -> tuple[int, dict[str, Any]]:
+        if not self._authenticate(api_key):
+            # T-10-08: no device action without a valid key.
+            return int(HTTPStatus.UNAUTHORIZED), {
+                "error": "invalid or missing X-Solver-Key"
+            }
+
+        try:
+            payload = json.loads(body or b"{}")
+        except (ValueError, TypeError):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "malformed JSON body"}
+        if not isinstance(payload, dict):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "body must be a JSON object"}
+
+        challenge_url = payload.get("challenge_url")
+        if not isinstance(challenge_url, str) or not challenge_url:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge_url is required"
+            }
+
+        host = (urlsplit(challenge_url).hostname or "").lower()
+        if host not in self._config.allowed_hosts:
+            # T-10-09 SSRF guard: reject BEFORE any device action — the gateway
+            # only ever sends a source's own cloudflare_challenge_url.
+            _log.warning("rejected non-allowlisted challenge host %r", host)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge host not allowlisted"
+            }
+
+        return self._run_solve(challenge_url, host)
+
+    def _run_solve(self, challenge_url: str, host: str) -> tuple[int, dict[str, Any]]:
+        with self._lock:  # serialize: one WebView solve at a time (T-10-11)
+            future = self._executor.submit(self._pipeline.solve, challenge_url, host)
+            try:
+                result = future.result(timeout=self._config.solve_timeout_s)
+            except FuturesTimeout:
+                _log.warning("solve timed out for host %s", host)
+                return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve timed out"}
+            except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
+                _log.warning("solve failed for host %s", host)
+                return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve failed"}
+
+        # Redacted success event ONLY (T-10-10) — never the minted token value.
+        _log.info("solved %s", host)
+        return int(HTTPStatus.OK), {
+            "cf_clearance": result.cf_clearance,
+            "user_agent": result.user_agent,
+            "host": result.host,
+        }
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+# ── stdlib HTTP transport (thin shim over SolverService) ─────────────────────
+
+
+class _SolverHTTPServer(ThreadingHTTPServer):
+    """Threaded server holding the shared ``SolverService`` (solves are locked)."""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler: type[BaseHTTPRequestHandler],
+        *,
+        service: SolverService,
+    ) -> None:
+        super().__init__(server_address, handler)
+        self.service = service
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server: _SolverHTTPServer  # narrowed for attribute access
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+        if self.path == "/healthz":
+            status, payload = self.server.service.healthz()
+            self._send_json(status, payload)
+            return
+        self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+        if self.path != "/solve":
+            self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length > 0 else b""
+        api_key = self.headers.get("X-Solver-Key")
+        status, payload = self.server.service.solve(api_key=api_key, body=body)
+        self._send_json(status, payload)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        # Silence the default access log (keeps request lines — and any header
+        # echo — out of stdout); the service emits its own redacted events.
+        return
+
+
+def build_pipeline(config: SidecarConfig) -> SolvePipeline:
+    """Construct the real device-backed pipeline from the config."""
+    device = AdbDevice(config.adb_target)
+    return AndroidSolvePipeline(device, timeout_s=config.solve_timeout_s)
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
+    config = SidecarConfig.from_env()
+    service = SolverService(config, build_pipeline(config))
+    server = _SolverHTTPServer(
+        (config.bind_host, config.port), _Handler, service=service
+    )
+    _log.info(
+        "android-solver control API listening on %s:%s (docker-internal)",
+        config.bind_host,
+        config.port,
+    )
+    try:
+        server.serve_forever()
+    finally:
+        service.close()
+
+
+if __name__ == "__main__":
+    main()
