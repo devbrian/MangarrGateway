@@ -38,17 +38,20 @@ recon 2026-06-08). Selection mirrors mangadex.py's discipline: stable/long-runni
 deterministic leading hit so ``release[0]`` is well-defined, and a short newest
 chapter (≈13 pages) so the download leg finishes inside ``download_timeout_s``.
 
-Rate limit (probe-measured 2026-06-08)
+Rate limit (probe-measured 2026-06-09)
 --------------------------------------
-``scripts/probe_rate_limits.py`` ran two isolated-axis sweeps (parallelism +
-rate-ceiling) and found NO hard limit: zero 429/403/CF-challenge and zero latency
-degradation on the search/chapter-list/manifest/image byte paths, clean at
-concurrency 32 and 960/min (a FLOOR — the true ceiling is higher). The source is set
-to the conservative suggestion ``rate_limit_per_minute = 480`` + ``max_concurrent_jobs
-= 3``. NOTE: Weeb Central is an ALL-HTML source (every call is the unlimited
-``get_bytes`` byte path), so ``rate_limit_per_minute`` is advisory for /caps display —
-real load is bounded by ``max_concurrent_jobs`` + the framework per-job image
-semaphore.
+``scripts/probe_rate_limits.py`` measured a REAL server-side rate limit on the HTML
+endpoints — UNLIKE the mangaball/mangadot/atsumaru precedent (all "no hard limit" →
+480): the manifest endpoint 429s at ~120/min PER IP (even at concurrency 1, ~36 %
+blocked), and search 429s at concurrency >=8 / 120/min (clean parallelism = 4); the
+image CDN is unlimited (clean to concurrency 32, 120/min FLOOR). The source is set to
+``rate_limit_per_minute = 60`` (the conservative ~50 %-of-onset advisory) +
+``max_concurrent_jobs = 3``. CRITICAL: Weeb Central is an ALL-HTML source (every
+search/chapter-list/recent/manifest call uses the UNLIMITED ``get_bytes`` byte path),
+so ``rate_limit_per_minute`` is advisory for /caps display and does NOT actually gate
+the HTML calls — real load is bounded by ``max_concurrent_jobs`` + the per-job image
+semaphore. See the source module docstring's bulk-load caveat + recommended
+follow-up (route HTML GETs through a limited primitive).
 
 LIVE-TUNE items (refine from the first deploy-host smoke)
 ---------------------------------------------------------
@@ -63,8 +66,10 @@ LIVE-TUNE items (refine from the first deploy-host smoke)
 * **large-chapter manifest completeness** (RECON 7.4) —
   ``reading_style=long_strip`` returns ALL pages in one call (verified 13/13 for One
   Piece 1184); re-assert on a ~100-page manhwa strip.
-* **rate_limit_per_minute / max_concurrent_jobs** — 480 / 3 from the probe; re-probe
-  only if the site starts throttling under real load.
+* **rate_limit_per_minute / max_concurrent_jobs** — 60 / 3 from the 2026-06-09 probe
+  (60 is advisory only — the HTML byte path is unlimited; see the Rate limit section).
+  Re-probe the manifest clean ceiling on a faster proxy pool if a precise number is
+  needed (the low-rate manifest sweep was cut short by slow proxies).
 * **download_timeout_s** — 180.0 (no Cloudflare warm + plaintext same-origin-class
   CDN ``.png`` fetch, matching MangaDex's plain-CDN budget). Re-size against the real
   end-to-end download wall-clock.

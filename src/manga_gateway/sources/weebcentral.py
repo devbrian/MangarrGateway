@@ -58,6 +58,17 @@ RESIDENTIAL IP. A DATACENTER IP MAY trip a managed Cloudflare challenge
 (weebcentral.com fronts Cloudflare passively); the escalation is the existing
 one-attribute flip (``antibot = "cloudflare"`` + ``cloudflare_challenge_url``) — no
 glue change, since the framework already owns the clearance path.
+
+Bulk-load caveat (2026-06-09 rate-limit probe): UNLIKE the other none-antibot
+sources, weebcentral DOES server-side rate-limit its HTML endpoints (real HTTP-429):
+the manifest endpoint 429s at ~120 requests/min PER IP (even at concurrency 1), and
+search 429s at concurrency >=8. Because every HTML call here uses the UNLIMITED
+``ctx.get_bytes`` byte path (``limited=False``), the ``rate_limit_per_minute`` limiter
+does NOT gate them — so a bulk grab issuing >~100 manifests/min from one IP CAN 429.
+Normal interactive/automated use stays far below that (the image CDN, where downloads
+spend ~all their requests, is unlimited). RECOMMENDED FOLLOW-UP: route weebcentral's
+HTML GETs through a rate-limited primitive (or add a per-source byte-path limiter) so
+bulk operations honor the site's real per-IP ceiling — file as a GitHub issue.
 """
 
 from __future__ import annotations
@@ -335,21 +346,29 @@ class WeebCentralSource(Source):
     id_types: list[str] = []
     # English-scanlation focused → no per-chapter language metadata exists.
     languages = ["en"]
-    # Probe-tuned (2026-06-08, scripts/probe_rate_limits.py): two isolated-axis sweeps
-    # across fresh residential proxies found NO hard limit on weebcentral — zero
-    # 429/403/Cloudflare-challenge/Retry-After and zero latency degradation on the
-    # search/chapter-list/manifest/image byte paths. The rate-ceiling sweep sustained
-    # 960/min cleanly at concurrency 8 (a FLOOR — the true ceiling is higher); 480 is
-    # the conservative ~50%-of-floor suggestion, matching the mangaball/mangadot/
-    # atsumaru precedent. Because this is an ALL-HTML source (every call is the
-    # unlimited ``get_bytes`` byte path), ``rate_limit_per_minute`` is advisory for the
-    # /caps display — real per-source load is bounded by ``max_concurrent_jobs`` + the
-    # framework per-job image semaphore.
-    rate_limit_per_minute = 480
-    # D-30 per-source override: the 2026-06-08 parallelism sweep sustained concurrency
-    # 32 cleanly on every endpoint (zero throttling), so chapter downloads parallelize
-    # safely. 3 mirrors the mangaball/mangadot/atsumaru precedent; the job manager
-    # clamps it to the global max_concurrent_chapters.
+    # Probe-MEASURED (2026-06-09, scripts/probe_rate_limits.py — residential proxies).
+    # UNLIKE the mangaball/mangadot/atsumaru precedent (all "no hard limit" → 480),
+    # weebcentral DOES server-side rate-limit its HTML endpoints (real HTTP-429):
+    #   * manifest (/chapters/{id}/images): 429s at concurrency 1, 120/min (~36 % of
+    #     requests blocked) — the BINDING per-IP rate constraint.
+    #   * search (/search/data): clean at concurrency 1 across 30–120/min (zero 429;
+    #     the 90/120 misses were slow-proxy cell-deadlines, not throttling), but 429s
+    #     at concurrency >=8, 120/min (max clean parallelism = 4).
+    #   * image CDN: NO limit — clean to concurrency 32 and 120/min (a FLOOR).
+    # 60 is the conservative ~50 %-of-onset advisory (well under the manifest 429
+    # onset). CRITICAL CAVEAT: weebcentral is an ALL-HTML source — every search/
+    # chapter-list/recent/manifest call goes through the UNLIMITED ``ctx.get_bytes``
+    # byte path (``limited=False``), so this limiter does NOT actually gate them; the
+    # value is ADVISORY for the /caps display only. The site's real 429 limit is
+    # therefore unenforced on our side — see the module docstring's bulk-load caveat
+    # and the recommended follow-up (route HTML GETs through a limited primitive).
+    rate_limit_per_minute = 60
+    # D-30 per-source override: the 2026-06-09 parallelism sweep had the image CDN
+    # clean to concurrency 32 (downloads are image-dominated), but the manifest
+    # endpoint's per-IP rate sensitivity argues against aggressive job concurrency, so
+    # 3 (matching the precedent) is the conservative pick — each job issues only one
+    # manifest call, keeping the sustained manifest rate well under the 429 onset. The
+    # job manager clamps this to the global max_concurrent_chapters.
     max_concurrent_jobs = 3
     antibot = "none"
     decrypt_scheme = None
