@@ -58,6 +58,18 @@ class CommandRunner(Protocol):
     def __call__(self, argv: list[str], *, timeout: float) -> CommandResult: ...
 
 
+def _parse_resolution(line: str) -> tuple[int, int] | None:
+    """Parse a ``... size: WxH`` line into ``(width, height)`` ints, or None."""
+    _, _, value = line.partition(":")
+    width_str, sep, height_str = value.strip().partition("x")
+    if not sep:
+        return None
+    try:
+        return int(width_str), int(height_str)
+    except ValueError:
+        return None
+
+
 def _subprocess_runner(argv: list[str], *, timeout: float) -> CommandResult:
     """Default runner: shell out to the real ``adb`` CLI, bounded by ``timeout``."""
     proc = subprocess.run(  # noqa: S603 — argv is built from constants, never a shell string
@@ -161,3 +173,27 @@ class AdbDevice:
         """Grab the screen as PNG bytes (``adb exec-out screencap -p``)."""
         result = self._device("exec-out", "screencap", "-p")
         return result.stdout
+
+    def screen_size(self) -> tuple[int, int]:
+        """Return the PHYSICAL screen resolution ``(width, height)`` in pixels.
+
+        Parses ``adb shell wm size``. Output carries a ``Physical size: WxH``
+        line and, when a resolution override is active, an ``Override size: WxH``
+        line — the override is what the WebView actually renders into, so it WINS
+        when present. The physical pixels are the denominator-free target for
+        ``input_tap`` (CDP CSS px are scaled up to these — see turnstile.py).
+        """
+        result = self._device("shell", "wm", "size")
+        text = result.stdout.decode("utf-8", "replace")
+        physical: tuple[int, int] | None = None
+        override: tuple[int, int] | None = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Override size:"):
+                override = _parse_resolution(stripped)
+            elif stripped.startswith("Physical size:"):
+                physical = _parse_resolution(stripped)
+        size = override or physical
+        if size is None:
+            raise AdbError(f"could not parse screen size from wm size: {text!r}")
+        return size

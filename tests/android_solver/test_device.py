@@ -121,6 +121,27 @@ def test_screencap_returns_png_bytes() -> None:
     assert dev.screencap().startswith(b"\x89PNG")
 
 
+def test_screen_size_parses_physical_resolution() -> None:
+    runner = FakeRunner(stdout_for={"wm": b"Physical size: 720x1280\n"})
+    dev = AdbDevice(runner=runner)
+    assert dev.screen_size() == (720, 1280)
+
+
+def test_screen_size_override_wins_over_physical() -> None:
+    runner = FakeRunner(
+        stdout_for={"wm": b"Physical size: 720x1280\nOverride size: 1080x1920\n"}
+    )
+    dev = AdbDevice(runner=runner)
+    assert dev.screen_size() == (1080, 1920)
+
+
+def test_screen_size_raises_when_unparseable() -> None:
+    runner = FakeRunner(stdout_for={"wm": b"garbage output\n"})
+    dev = AdbDevice(runner=runner)
+    with pytest.raises(AdbError):
+        dev.screen_size()
+
+
 def test_nonzero_exit_raises_adberror() -> None:
     runner = FakeRunner()
     runner.returncode = 1
