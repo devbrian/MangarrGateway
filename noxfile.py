@@ -24,7 +24,10 @@ def gate(session: nox.Session) -> None:
     )
     session.run("ruff", "check", ".")
     session.run("ruff", "format", "--check", ".")
-    session.run("mypy", "src")
+    # `src` is the gateway; `android_solver` is the sidecar package (Phase 10).
+    # Both are type-checked under the strict [tool.mypy] config — the sidecar
+    # stays type-clean alongside the gateway (additive: never drops `src`).
+    session.run("mypy", "src", "android_solver")
     session.run("pytest", "-q")
 
 
