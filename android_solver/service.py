@@ -70,6 +70,14 @@ _CF_FRAME_URL_MARKER = "challenges.cloudflare.com"
 _FRAME_POLL_TIMEOUT_S = 20.0
 _FRAME_POLL_INTERVAL_S = 1.5
 
+# Re-tap cadence: on a COLD WebView the challenges.cloudflare.com OOPIF frame URL
+# appears BEFORE the checkbox inside it is interactive, so a single tap lands on
+# a not-yet-ready widget and misses. We re-locate + re-tap every _RETAP_INTERVAL_S
+# (polling for clearance in between) until the token is minted or the deadline
+# fires. Re-locating returns coords ONLY while the cf widget is still present, so
+# once the challenge passes we stop tapping and just poll out the clearance.
+_RETAP_INTERVAL_S = 5.0
+
 
 class SolveError(RuntimeError):
     """The solve pipeline could not mint a clearance (surfaces as 504)."""
@@ -113,6 +121,7 @@ class AndroidSolvePipeline:
         http_get: HttpGetter | None = None,
         launch_settle_s: float = _LAUNCH_SETTLE_S,
         poll_interval_s: float = _POLL_INTERVAL_S,
+        retap_interval_s: float = _RETAP_INTERVAL_S,
         frame_poll_timeout_s: float = _FRAME_POLL_TIMEOUT_S,
         frame_poll_interval_s: float = _FRAME_POLL_INTERVAL_S,
     ) -> None:
@@ -120,6 +129,7 @@ class AndroidSolvePipeline:
         self._timeout_s = timeout_s
         self._launch_settle_s = launch_settle_s
         self._poll_interval_s = poll_interval_s
+        self._retap_interval_s = retap_interval_s
         self._frame_poll_timeout_s = frame_poll_timeout_s
         self._frame_poll_interval_s = frame_poll_interval_s
         # Lazy default factories live in cdp (same package) — reuse them so the
@@ -147,6 +157,8 @@ class AndroidSolvePipeline:
         port = self._device.forward_devtools(pid)
         ws_url = self._discover_page_ws(port)
 
+        # Bound the whole locate→tap→poll loop by the solve deadline (T-10-11).
+        deadline = time.monotonic() + self._timeout_s
         ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
         try:
             cdp_call(ws, "Page.enable", command_id=10)
@@ -154,30 +166,63 @@ class AndroidSolvePipeline:
             # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
             # after load) — the real readiness gate, not the fixed settle above.
             self._wait_for_cf_frame(ws)
+            # Page ws, DOM/Page enable, frame readiness, and the viewport scales
+            # are computed ONCE; only locate+tap+poll repeats inside the loop.
             x_scale, y_scale = self._compute_scales(ws)
+            token = self._tap_until_cleared(
+                ws, ws_url, host, x_scale, y_scale, deadline
+            )
+        finally:
+            ws.close()
+        if not token:
+            raise SolveError(f"clearance not minted for {host} before deadline")
+
+        user_agent = webview_user_agent(f"http://localhost:{port}/json/version") or ""
+        return SolveResult(cf_clearance=token, user_agent=user_agent, host=host)
+
+    def _tap_until_cleared(
+        self,
+        ws: WebSocketLike,
+        ws_url: str,
+        host: str,
+        x_scale: float,
+        y_scale: float,
+        deadline: float,
+    ) -> str | None:
+        """Re-locate + re-tap the Turnstile checkbox until clearance is minted.
+
+        On a COLD WebView the ``challenges.cloudflare.com`` OOPIF frame URL appears
+        BEFORE the checkbox inside it is interactive, so a single tap can land on a
+        not-yet-ready widget and miss. Each round re-runs ``locate_checkbox`` (which
+        returns coords ONLY while the cf widget is still present) and re-taps, then
+        polls for the clearance for up to ``_retap_interval_s`` before re-locating.
+
+        Two key properties hold:
+          * The re-tap naturally lands the moment the checkbox becomes interactive
+            (cold-start race fixed), bounded by the solve ``deadline``.
+          * Once the challenge passes (widget/iframe gone ⇒ no cf OOPIF frame), the
+            re-locate returns ``None`` so we STOP tapping and just poll out the
+            clearance — never re-triggering a fresh challenge by tapping a cleared
+            page.
+        """
+        token: str | None = None
+        while time.monotonic() < deadline:
             coords = locate_checkbox(
                 ws,
                 screencap=self._device.screencap(),
                 x_scale=x_scale,
                 y_scale=y_scale,
             )
-        finally:
-            ws.close()
-        if coords is None:
-            raise SolveError(f"turnstile checkbox not located for {host}")
-
-        self._device.input_tap(*coords)
-
-        token = self._poll_clearance(ws_url, host)
-        if not token:
-            # Cheap one-shot resilience: re-locate + re-tap once before giving up
-            # (the first tap can land a frame early, before the iframe settles).
-            token = self._relocate_tap_and_poll(ws_url, host)
-        if not token:
-            raise SolveError(f"clearance not minted for {host} before deadline")
-
-        user_agent = webview_user_agent(f"http://localhost:{port}/json/version") or ""
-        return SolveResult(cf_clearance=token, user_agent=user_agent, host=host)
+            if coords is not None:
+                self._device.input_tap(*coords)
+            # Short poll window between taps, never overrunning the deadline.
+            poll_until = min(deadline, time.monotonic() + self._retap_interval_s)
+            while time.monotonic() < poll_until:
+                token = extract_clearance(ws_url, host)
+                if token:
+                    return token
+                time.sleep(self._poll_interval_s)
+        return token
 
     def _wait_for_cf_frame(self, ws: WebSocketLike) -> None:
         """Poll Page.getFrameTree until the challenges.cloudflare.com OOPIF appears.
@@ -243,33 +288,6 @@ class AndroidSolvePipeline:
             )
             return (1.0, 1.0)
         return (screen_w / view_w, screen_h / view_h)
-
-    def _relocate_tap_and_poll(self, ws_url: str, host: str) -> str | None:
-        """Re-open the page ws, re-locate the checkbox, tap once, poll again."""
-        ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
-        try:
-            x_scale, y_scale = self._compute_scales(ws)
-            coords = locate_checkbox(
-                ws,
-                screencap=self._device.screencap(),
-                x_scale=x_scale,
-                y_scale=y_scale,
-            )
-        finally:
-            ws.close()
-        if coords is None:
-            return None
-        self._device.input_tap(*coords)
-        return self._poll_clearance(ws_url, host)
-
-    def _poll_clearance(self, ws_url: str, host: str) -> str | None:
-        deadline = time.monotonic() + self._timeout_s
-        while time.monotonic() < deadline:
-            token = extract_clearance(ws_url, host)
-            if token:
-                return token
-            time.sleep(self._poll_interval_s)
-        return None
 
     def _discover_page_ws(self, port: int) -> str:
         payload = self._http_get(
