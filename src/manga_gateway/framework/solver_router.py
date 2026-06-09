@@ -17,6 +17,14 @@ backend owns the key — detected via ``inspect.signature`` exactly like context
 ``warm()`` warms BOTH backends and returns the UNION of their failed keys (so the
 lifespan force-disables exactly the failed sources across both engines); ``aclose()``
 closes BOTH (each guarded so one failure does not skip the other).
+
+Beyond the clearance Protocol the router ALSO passes through comix's two off-Protocol
+browser primitives (``fetch_via_browser`` / ``fetch_via_browser_paginated``, D-41) so
+that swapping the bare :class:`CloudflareSolver` for this router as ``app.state.solver``
+does not break comix's ``_solver_from_ctx`` ``hasattr`` gate. Both delegate to the
+patchright backend (the only engine with a real browser; comix is a patchright-engine
+source and the only caller — the android backend has no browser and never needs these),
+keeping criterion 4 "comix unaffected" true.
 """
 
 from __future__ import annotations
@@ -24,12 +32,44 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from .antibot import AntiBotSolver, Clearance
 
 _log = logging.getLogger("manga_gateway")
+
+
+class _BrowserFetchSolver(Protocol):
+    """The two off-Protocol browser primitives (D-41) the patchright backend exposes.
+
+    Declared locally — mirroring comix's own duck-typing — so the router can
+    ``cast`` ``self._patchright`` (typed as the browser-agnostic ``AntiBotSolver``
+    Protocol, which intentionally omits these) to a shape that declares them, and
+    delegate mypy-strict-clean with NO ``# type: ignore``.
+    """
+
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> Any: ...
+
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> list[Any]: ...
+
 
 # The android engine name (matches ``Source.solver_engine`` on mangadot/kagane).
 # Every other value (notably the ``"patchright"`` default) routes to the desktop
@@ -78,6 +118,49 @@ class SolverRouter:
         if force_resolve and "force_resolve" in inspect.signature(get).parameters:
             return await get(source_key, force_resolve=True)  # type: ignore[call-arg]
         return await get(source_key)
+
+    # ── off-Protocol browser primitives (D-41) — pass-through for comix ──────────
+    # Delegate to the PATCHRIGHT backend, never android: comix is the only caller
+    # and the only engine with a real browser is patchright (android is the
+    # WebView-sidecar clearance backend, no browser). These keep comix's
+    # ``_solver_from_ctx`` ``hasattr`` gate satisfied so the router is a faithful
+    # superset of the bare CloudflareSolver (criterion 4: comix unaffected).
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> Any:
+        """Delegate the one-shot browser-DOM read to the patchright backend (D-41)."""
+        backend = cast("_BrowserFetchSolver", self._patchright)
+        return await backend.fetch_via_browser(
+            url, extract=extract, wait_for=wait_for, timeout=timeout
+        )
+
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> list[Any]:
+        """Delegate the paginated browser-DOM walk to the patchright backend (D-41)."""
+        backend = cast("_BrowserFetchSolver", self._patchright)
+        return await backend.fetch_via_browser_paginated(
+            url,
+            extract=extract,
+            wait_for=wait_for,
+            next_selector=next_selector,
+            route_limit_rewrite=route_limit_rewrite,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
 
     async def warm(self) -> list[str]:
         """Warm BOTH backends; return the UNION of their failed keys (deduped).

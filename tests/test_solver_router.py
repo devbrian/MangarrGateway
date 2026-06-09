@@ -30,6 +30,8 @@ class _FakeBackend:
         self._tag = tag
         self._fails = fails or []
         self.calls: list[tuple[str, bool]] = []
+        self.browser_calls: list[tuple[str, dict[str, object]]] = []
+        self.paginated_calls: list[tuple[str, dict[str, object]]] = []
         self.warmed = 0
         self.closed = 0
 
@@ -42,6 +44,45 @@ class _FakeBackend:
         return Clearance(
             cookies={"cf_clearance": f"{self._tag}-{source_key}"}, user_agent=self._tag
         )
+
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the backend's op-budget kwarg
+    ) -> object:
+        self.browser_calls.append(
+            (url, {"extract": extract, "wait_for": wait_for, "timeout": timeout})
+        )
+        return f"{self._tag}-browser-{url}"
+
+    async def fetch_via_browser_paginated(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the backend's op-budget kwarg
+    ) -> list[object]:
+        self.paginated_calls.append(
+            (
+                url,
+                {
+                    "extract": extract,
+                    "wait_for": wait_for,
+                    "next_selector": next_selector,
+                    "route_limit_rewrite": route_limit_rewrite,
+                    "max_pages": max_pages,
+                    "timeout": timeout,
+                },
+            )
+        )
+        return [f"{self._tag}-paginated-{url}"]
 
     async def warm(self) -> list[str]:
         self.warmed += 1
@@ -162,3 +203,59 @@ async def test_aclose_closes_both_even_if_one_raises() -> None:
     router = SolverRouter(patchright=patchright, android=android, engine_by_source={})
     await router.aclose()  # must NOT raise
     assert android.closed == 1  # android still closed despite patchright raising
+
+
+# ─────────────── off-Protocol browser primitives (D-41, comix gate) ─────────────
+
+
+def test_router_exposes_comix_browser_primitives() -> None:
+    """Exactly comix ``_solver_from_ctx``'s gate: the router must expose BOTH
+    off-Protocol browser primitives so it is a faithful superset of CloudflareSolver."""
+    router, _, _ = _router()
+    assert hasattr(router, "fetch_via_browser")
+    assert hasattr(router, "fetch_via_browser_paginated")
+
+
+@pytest.mark.asyncio
+async def test_fetch_via_browser_delegates_to_patchright() -> None:
+    router, patchright, android = _router()
+    result = await router.fetch_via_browser(
+        "https://comix.to/x", extract="return 1", wait_for="#sel", timeout=12.0
+    )
+    assert result == "pw-browser-https://comix.to/x"
+    assert patchright.browser_calls == [
+        (
+            "https://comix.to/x",
+            {"extract": "return 1", "wait_for": "#sel", "timeout": 12.0},
+        )
+    ]
+    assert android.browser_calls == []  # android (no browser) is NEVER consulted
+
+
+@pytest.mark.asyncio
+async def test_fetch_via_browser_paginated_delegates_to_patchright() -> None:
+    router, patchright, android = _router()
+    result = await router.fetch_via_browser_paginated(
+        "https://comix.to/series",
+        extract="return rows",
+        wait_for="#ready",
+        next_selector=".next",
+        route_limit_rewrite=("api/v1/chapters", 500),
+        max_pages=50,
+        timeout=20.0,
+    )
+    assert result == ["pw-paginated-https://comix.to/series"]
+    assert patchright.paginated_calls == [
+        (
+            "https://comix.to/series",
+            {
+                "extract": "return rows",
+                "wait_for": "#ready",
+                "next_selector": ".next",
+                "route_limit_rewrite": ("api/v1/chapters", 500),
+                "max_pages": 50,
+                "timeout": 20.0,
+            },
+        )
+    ]
+    assert android.paginated_calls == []  # android (no browser) is NEVER consulted
