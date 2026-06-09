@@ -58,6 +58,10 @@ _MANGABALL_HOST = "mangaball.net"
 # needs stubbing to keep the contract suite off the network (the blanket get_clearance
 # short-circuit below still harmlessly covers it).
 _MANGADOT_HOST = "mangadot.net"
+# 260608-rkt: Weeb Central is now registered too, so every generated search/getRecent
+# case also fans out to weebcentral.com. Stub it to a fast permanent 403 for the same
+# reason as Comix/MangaBall — a per-source warnings[] entry, no retry, no real network.
+_WEEBCENTRAL_HOST = "weebcentral.com"
 
 # Contract of record lives at the repo root (D-07), copied from .handoff/.
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "manga-gateway.openapi.yaml"
@@ -150,6 +154,7 @@ def _stub_source_hosts(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         mock.route(host=_COMIX_HOST).mock(return_value=httpx.Response(403))
         mock.route(host=_MANGABALL_HOST).mock(return_value=httpx.Response(403))
         mock.route(host=_MANGADOT_HOST).mock(return_value=httpx.Response(403))
+        mock.route(host=_WEEBCENTRAL_HOST).mock(return_value=httpx.Response(403))
         yield
 
 
