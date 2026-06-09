@@ -53,10 +53,11 @@ _COMIX_HOST = "comix.to"
 # also fans out to mangaball.net. Stub it to a fast permanent 403 for the same
 # reason as Comix — a per-source warnings[] entry, no retry, no real network.
 _MANGABALL_HOST = "mangaball.net"
-# Mangadot is registered with antibot="none" (it dropped its Cloudflare interstitial —
-# debug nightly-cf-warm-127-128). It launches no browser, so only the upstream host
-# needs stubbing to keep the contract suite off the network (the blanket get_clearance
-# short-circuit below still harmlessly covers it).
+# Mangadot is registered with antibot="cloudflare" again (it RE-ENABLED its Cloudflare
+# interstitial 2026-06-09 — debug mangadot-live-smoke-403, #200, reversing #127/#128).
+# Like Comix it is now in ``_cloudflare_keys``, so the blanket get_clearance
+# short-circuit below returns the canned Clearance (no browser launch) and this stubbed
+# upstream host returns a fast 403 → a per-source warnings[] entry, no real network.
 _MANGADOT_HOST = "mangadot.net"
 # 260608-rkt: Weeb Central is now registered too, so every generated search/getRecent
 # case also fans out to weebcentral.com. Stub it to a fast permanent 403 for the same
@@ -121,7 +122,7 @@ def _stub_source_hosts(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     response shape — the only thing schemathesis validates here — is unchanged
     either way.
 
-    The Cloudflare-gated source (Comix) also has ``CloudflareSolver.
+    The Cloudflare-gated sources (Comix, Mangadot) also have ``CloudflareSolver.
     get_clearance`` short-circuited to a canned ``Clearance``. schemathesis drives
     the app via ``starlette TestClient``, which starts a fresh lifespan (and a fresh
     real ``CloudflareSolver``) for EVERY generated case. Without this patch each

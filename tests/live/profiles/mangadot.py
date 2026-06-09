@@ -10,15 +10,20 @@ file (D-49 keeps profiles structurally separate from the Source class).
 
 Anti-bot expectations
 ----------------------
-* ``expected_caps_antibot = "none"`` — matches ``MangadotSource.antibot``. Mangadot
-  dropped its Cloudflare interstitial (debug nightly-cf-warm-127-128, #127/#128): the
-  homepage and every ``/api`` endpoint now return plaintext JSON directly with NO
-  ``cf_clearance`` cookie ever issued. It is now a clean-JSON open source like
-  mangadex — no clearance to inject, no challenge 403 to reconcile.
-* ``needs_solver_warm = False`` — mangadot no longer needs a Patchright warm; there is
-  no clearance cookie to capture. Reclassifying ``antibot="none"`` also removes it from
-  the shared CF solver's warm set, so its old never-clearing 60s warm-poll stops
-  starving comix on the one ``solve_concurrency=1`` solver (#127 cascade).
+* ``expected_caps_antibot = "cloudflare"`` — matches ``MangadotSource.antibot``.
+  Mangadot RE-ENABLED its Cloudflare managed-challenge interstitial on 2026-06-09 (debug
+  mangadot-live-smoke-403, #200) — the REVERSE of #127/#128 which had recorded it
+  dropping the interstitial. Every ``/api`` endpoint now 403s the gateway's plain-httpx
+  UA with the Cloudflare "Just a moment..." JS challenge (verified live through a fresh
+  residential proxy IP → host-level gating, not proxy-IP reputation). It is a clean-JSON
+  ``cloudflare`` source like kagane — plain JSON once cleared (NOT ``+encrypted``).
+* ``needs_solver_warm = True`` — mangadot again needs a Patchright warm to capture the
+  ``cf_clearance`` cookie before the search/download legs. The #196 fix scoped the
+  per-test warm to ``get_clearance(source_key)``, so re-adding mangadot to the CF warm
+  set warms ONLY mangadot — it does not re-contaminate comix/kagane.
+* OPEN RISK (same as kagane #197/#198): whether the headless solver clears mangadot's
+  CURRENT challenge in CI is unverified — it cannot be confirmed from a local host and
+  must come from a fresh nightly ``workflow_dispatch``.
 
 Release shape (D-08): Mangadot releases carry ``mangaId`` as the leading id
 (``mangadot:{manga_id}:ch-{number}:{language}:{chapter_id}``); the smoke modules key
@@ -78,9 +83,9 @@ LIVE_SMOKE = LiveSmokeProfile(
     # The live loop verifies chapter-id -> images provenance resolves back to the
     # SAME manga with a matching page_count before relying on it for the download leg.
     default_query="Murim Psychopath",
-    expected_caps_antibot="none",
-    needs_solver_warm=False,
-    # Per-page same-origin image fetch only (no Cloudflare warm — mangadot is now open).
+    expected_caps_antibot="cloudflare",
+    needs_solver_warm=True,
+    # Cloudflare warm + per-page same-origin image fetch (mangadot re-gated CF, #200).
     download_timeout_s=480.0,
     max_releases_to_try=3,
     min_releases_returned=1,
