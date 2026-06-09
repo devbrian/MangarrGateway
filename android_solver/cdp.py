@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import urllib.request
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 _log = logging.getLogger("android_solver.cdp")
 
@@ -54,15 +54,18 @@ class HttpGetter(Protocol):
 
 def _default_ws_factory(url: str, *, timeout: float) -> WebSocketLike:
     """Open a real CDP page websocket via websocket-client (lazy import)."""
-    from websocket import create_connection  # type: ignore[import-untyped]
+    from websocket import create_connection
 
     # Chrome 111+ rejects a localhost Origin on the devtools socket → suppress it.
-    return create_connection(url, timeout=timeout, suppress_origin=True)
+    return cast(
+        WebSocketLike,
+        create_connection(url, timeout=timeout, suppress_origin=True),
+    )
 
 
 def _default_http_get(url: str, *, timeout: float) -> bytes:
     with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 — devtools http URL is sidecar-built
-        return resp.read()
+        return cast(bytes, resp.read())
 
 
 def _belongs_to_host(cookie: dict[str, Any], host: str) -> bool:
@@ -89,7 +92,7 @@ def _recv_result(ws: WebSocketLike, command_id: int) -> dict[str, Any]:
             raw = raw.decode("utf-8", "replace")
         message = json.loads(raw)
         if message.get("id") == command_id:
-            return message.get("result", {})
+            return cast(dict[str, Any], message.get("result", {}))
 
 
 def cdp_call(
@@ -159,4 +162,4 @@ def webview_user_agent(
     getter = http_get or _default_http_get
     payload = getter(devtools_http_url, timeout=timeout)
     data = json.loads(payload)
-    return data.get("User-Agent")
+    return cast("str | None", data.get("User-Agent"))
