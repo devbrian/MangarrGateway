@@ -125,6 +125,33 @@ async def test_force_resolve_reposts_and_replaces_held() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_force_resolve_failure_does_not_keep_stale_clearance() -> None:
+    """WR-05: a FAILED force-resolve must invalidate the held clearance so the
+    next non-force call re-solves instead of re-serving the known-bad token."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=[
+            _solve_response(),  # 1: initial solve → held
+            httpx.Response(504),  # 2: force-resolve self-heal FAILS
+            _solve_response(),  # 3: next non-force call must RE-SOLVE (not serve stale)
+        ]
+    )
+    solver = _solver()
+    try:
+        first = await solver.get_clearance("mangadot")
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.get_clearance("mangadot", force_resolve=True)
+        # If the stale clearance were still held, this would return it WITHOUT a
+        # network call (call_count would stay 2). It must instead re-solve.
+        third = await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert isinstance(first, Clearance)
+    assert isinstance(third, Clearance)
+    assert route.call_count == 3  # the failed force-resolve invalidated the hold
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_sidecar_non_200_raises() -> None:
     respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
     solver = _solver()

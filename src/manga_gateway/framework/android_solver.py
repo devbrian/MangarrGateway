@@ -87,7 +87,13 @@ class AndroidSolver:
         """
         if source_key not in self._challenge_urls:
             return None  # MangaDex et al. — no android clearance needed
-        if not force_resolve:
+        if force_resolve:
+            # WR-05: discard the held entry BEFORE the fresh solve so a FAILED
+            # force-resolve (the common 403 self-heal case) cannot leave the known
+            # -bad token held — the next non-force call must re-solve rather than
+            # silently re-serve the stale clearance that produced the 403.
+            self._held.pop(source_key, None)
+        else:
             held = self._held.get(source_key)
             if held is not None:
                 return held
