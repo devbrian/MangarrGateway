@@ -1,11 +1,17 @@
-"""Lifespan solver-wiring tests (Plan 04-04 Task 2, BOT-01/BOT-03, criterion #4).
+"""Lifespan solver-wiring tests (Plan 04-04 Task 2 + Phase 10, BOT-01/SRC-01/SRC-02).
 
 All deterministic — a MOCKED solver/browser, no real Chromium, no real sleeps:
 
-* the lifespan swaps ``NoopSolver`` for a ``CloudflareSolver`` as the ONE shared
-  solver (R1/BOT-01) and exposes a per-source ``SourceHealth`` map (D-38);
-* a forced Patchright launch failure leaves Comix ``force_disabled`` and NEVER
-  aborts startup — the app still serves and MangaDex resolves no-clearance
+* the lifespan swaps ``NoopSolver`` for a ``SolverRouter`` as the ONE shared
+  solver (R1/BOT-01): its Patchright leg is a ``CloudflareSolver`` owning the
+  patchright sources (comix), its Android leg an ``AndroidSolver`` covering the
+  android sources (mangadot/kagane). A per-source ``SourceHealth`` map (D-38)
+  still covers EVERY cloudflare source across both engines;
+* the Patchright leg's ``_challenge_urls`` is partitioned to patchright sources
+  ONLY — comix is present, mangadot/kagane are NOT (they route to the Android
+  leg) — so comix's browser warm/solve stays byte-for-byte unchanged;
+* a Patchright warm failure leaves Comix ``force_disabled`` and NEVER aborts
+  startup — the app still serves and MangaDex resolves no-clearance
   (D-33/Pitfall 3 / BOT-01);
 * the D-37 recovery watchdog re-probes a tripped breaker at +1h then +6h then
   stays down — asserted with a fake clock (no real waiting).
@@ -19,8 +25,10 @@ import pytest
 
 from manga_gateway.app import _recovery_watchdog, create_app
 from manga_gateway.config import Settings
+from manga_gateway.framework.android_solver import AndroidSolver
 from manga_gateway.framework.antibot import CloudflareSolver
 from manga_gateway.framework.health import SourceHealth
+from manga_gateway.framework.solver_router import SolverRouter
 
 TEST_API_KEY = "test-key-deterministic-0123456789"
 
@@ -32,35 +40,43 @@ def _settings(**over: object) -> Settings:
 # ───────────────────────────── lifespan swap (BOT-01) ─────────────────────────────
 
 
-async def test_lifespan_swaps_in_cloudflare_solver() -> None:
+async def test_lifespan_swaps_in_solver_router() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
-        assert isinstance(app.state.solver, CloudflareSolver)
+        solver = app.state.solver
+        # Phase 10: the ONE shared solver is now a SolverRouter composing the
+        # Patchright (comix) and Android (mangadot/kagane) backends.
+        assert isinstance(solver, SolverRouter)
+        assert isinstance(solver._patchright, CloudflareSolver)
+        assert isinstance(solver._android, AndroidSolver)
+        # The per-source breaker map still covers EVERY cloudflare source,
+        # regardless of which engine solves it (both engines).
         assert isinstance(app.state.source_health, dict)
-        assert "comix" in app.state.source_health
-        assert isinstance(app.state.source_health["comix"], SourceHealth)
+        for key in ("comix", "mangadot", "kagane"):
+            assert key in app.state.source_health
+            assert isinstance(app.state.source_health[key], SourceHealth)
 
 
-async def test_lifespan_wires_per_domain_challenge_urls() -> None:
-    """#88: the lifespan builds the per-domain ``challenge_urls`` map and passes
-    it onto the solver, with one entry PER registered cloudflare source. Comix
-    (``https://comix.to/``), Kagane (``https://kagane.to/``) and Mangadot
-    (``https://mangadot.net/``) are the registered cloudflare sources — each
-    auto-grants its own clearance slot from its ``cloudflare_challenge_url`` class-attr
-    (#90), with no app.py edit. (Mangadot RE-ENABLED its CF interstitial on 2026-06-09
-    in debug mangadot-live-smoke-403, #200 — the reverse of #127/#128 — so it grants a
-    clearance slot again.) Guards the app mapping against silent drift back to the old
-    single-``challenge_url`` single-pick, and proves the multi-CF map carries every
-    registered cf source with no app.py change (the zero-glue onboarding claim).
+async def test_engine_partition_splits_patchright_and_android_challenge_urls() -> None:
+    """Phase 10 (T-10-13): the lifespan partitions the per-domain challenge-URL map
+    by ``Source.solver_engine``. The Patchright leg owns ONLY the patchright sources
+    — comix (``https://comix.to/``) — so its browser warm/solve is byte-for-byte
+    unchanged and the unclearable-from-Linux mangadot/kagane NEVER enter the
+    Patchright warm set. The Android leg covers the android sources (mangadot
+    ``https://mangadot.net/`` + kagane ``https://kagane.to/``), routed to the
+    redroid-WebView sidecar. Guards against drift that would let either source leak
+    into the wrong engine's challenge map.
     """
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
         solver = app.state.solver
-        assert isinstance(solver, CloudflareSolver)
-        assert solver._challenge_urls == {
-            "comix": "https://comix.to/",
-            "kagane": "https://kagane.to/",
+        assert isinstance(solver, SolverRouter)
+        # Patchright leg: comix ONLY (NOT mangadot/kagane).
+        assert solver._patchright._challenge_urls == {"comix": "https://comix.to/"}
+        # Android leg: mangadot + kagane (NOT comix).
+        assert solver._android._challenge_urls == {
             "mangadot": "https://mangadot.net/",
+            "kagane": "https://kagane.to/",
         }
 
 
@@ -84,22 +100,25 @@ async def test_jobmanager_receives_solver_and_health() -> None:
 # ──────────────────── non-blocking launch (D-33/Pitfall 3) ────────────────────
 
 
-async def test_launch_failure_leaves_comix_disabled_and_app_lives(
+async def test_patchright_warm_failure_leaves_comix_disabled_and_app_lives(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Force the eager warm() to blow up — the lifespan must still complete and the
-    # app must still serve (MangaDex unaffected). Comix is force_disabled (D-33).
-    async def _boom(self: CloudflareSolver) -> None:
-        raise RuntimeError("patchright failed to launch")
+    # A Patchright warm failure surfaces as comix in the warm() failed-keys list
+    # (CloudflareSolver._warm_one returns False on a launch/solve failure → warm()
+    # reports the key). The router unions that with the android leg's failures and
+    # the lifespan force-disables exactly those — but startup must still complete and
+    # the app must still serve, MangaDex unaffected (D-33/Pitfall 3).
+    async def _comix_failed(self: CloudflareSolver) -> list[str]:
+        return ["comix"]
 
-    monkeypatch.setattr(CloudflareSolver, "warm", _boom)
+    monkeypatch.setattr(CloudflareSolver, "warm", _comix_failed)
 
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
-        # Startup completed despite the warm() failure.
+        # Startup completed despite the warm() failure; comix booted disabled.
         assert app.state.source_health["comix"].force_disabled is True
         assert app.state.source_health["comix"].is_enabled is False
-        # MangaDex path is untouched.
+        # MangaDex path is untouched (router dispatches a non-cf key to None).
         assert await app.state.solver.get_clearance("mangadex") is None
 
 
