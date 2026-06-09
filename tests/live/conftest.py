@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -75,7 +76,17 @@ def _registered_keys() -> list[str]:
     callers MUST NOT depend on the order — the source set is unordered).
     """
     reg = SourceRegistry()
-    register_builtin_sources(reg)
+    # #198/#202: honor GATEWAY_DISABLED_SOURCES so live-smoke collection matches
+    # what the app actually serves — a disabled source is not registered, hence
+    # not parametrized (no profile load, no ci_skip_reason needed for it). Mirrors
+    # Settings.disabled_source_keys() without constructing Settings (which would
+    # require an api_key just to read one env var).
+    disabled = frozenset(
+        key.strip().lower()
+        for key in os.environ.get("GATEWAY_DISABLED_SOURCES", "").split(",")
+        if key.strip()
+    )
+    register_builtin_sources(reg, disabled=disabled)
     return reg.keys()
 
 
@@ -329,7 +340,12 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
     # still resolve from env vars exactly as production does.
     settings = Settings(api_key="session-solver-fixture-not-an-api-key")
     registry = SourceRegistry()
-    register_builtin_sources(registry)
+    # #198/#202: honor GATEWAY_DISABLED_SOURCES here too (mirrors app.py exactly)
+    # so the session-shared solver's cloudflare_keys EXCLUDE disabled sources —
+    # otherwise a disabled-but-unclearable source (kagane/mangadot) would still be
+    # warmed at session setup, re-introducing the warm storm and diverging from
+    # both REGISTERED_KEYS and the app's registry.
+    register_builtin_sources(registry, disabled=settings.disabled_source_keys())
     cf_sources = {
         key: cls
         for key, cls in registry.items()

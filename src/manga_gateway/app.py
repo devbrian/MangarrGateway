@@ -150,7 +150,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # source key by name. Adding the 50+ planned sources is a register call and
     # zero edits to this shell (CLAUDE.md "framework knows no source by name").
     registry = SourceRegistry()
-    register_builtin_sources(registry)
+    # #198/#202: GATEWAY_DISABLED_SOURCES drops a source from the registry
+    # entirely — absent from /caps, never searched, and (since cf_sources below
+    # is derived from registry.items()) never warmed. Reversible via env.
+    register_builtin_sources(registry, disabled=settings.disabled_source_keys())
     app.state.registry = registry
     # Derive the set of cloudflare-gated source classes from the registry rather
     # than hardcoding it — anything whose ``antibot`` declares cloudflare needs

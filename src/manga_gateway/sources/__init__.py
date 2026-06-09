@@ -9,14 +9,25 @@ singleton).
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..framework.registry import SourceRegistry
 
 
-def register_builtin_sources(registry: SourceRegistry) -> None:
-    """Register all built-in sources into ``registry`` (called in the lifespan)."""
+def register_builtin_sources(
+    registry: SourceRegistry, disabled: Collection[str] | None = None
+) -> None:
+    """Register all built-in sources into ``registry`` (called in the lifespan).
+
+    ``disabled`` is an optional collection of source keys to SKIP (matched
+    case-insensitively). A disabled source is never registered, so it is absent
+    from ``/caps``, never searched, and never added to the CF solver warm set
+    (#198/#202 — keeps a source that cannot clear Cloudflare here from creating a
+    startup warm storm). Default ``None`` registers EVERY built-in source, so all
+    offline tests that expect the full set stay green.
+    """
     from .atsumaru import AtsumaruSource
     from .comix import ComixSource
     from .kagane import KaganeSource
@@ -25,10 +36,17 @@ def register_builtin_sources(registry: SourceRegistry) -> None:
     from .mangadot import MangadotSource
     from .weebcentral import WeebCentralSource
 
-    registry.register("mangadex")(MangaDexSource)
-    registry.register("comix")(ComixSource)
-    registry.register("mangaball")(MangaBallSource)
-    registry.register("mangadot")(MangadotSource)
-    registry.register("atsumaru")(AtsumaruSource)
-    registry.register("weebcentral")(WeebCentralSource)
-    registry.register("kagane")(KaganeSource)
+    disabled_keys = {key.lower() for key in (disabled or ())}
+    builtin: tuple[tuple[str, type], ...] = (
+        ("mangadex", MangaDexSource),
+        ("comix", ComixSource),
+        ("mangaball", MangaBallSource),
+        ("mangadot", MangadotSource),
+        ("atsumaru", AtsumaruSource),
+        ("weebcentral", WeebCentralSource),
+        ("kagane", KaganeSource),
+    )
+    for key, cls in builtin:
+        if key in disabled_keys:
+            continue
+        registry.register(key)(cls)

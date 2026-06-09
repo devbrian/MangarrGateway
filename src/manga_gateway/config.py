@@ -190,6 +190,17 @@ class Settings(BaseSettings):
     # TOML and never commit a real credential. get_secret_value() is unpacked
     # ONLY inside build_proxy.
     cloudflare_proxy_password: SecretStr | None = None
+    # ── Source enable/disable (reversible ops knob; #198/#202) ─────────────────
+    # Comma-separated source keys to SKIP registering at startup, e.g.
+    # GATEWAY_DISABLED_SOURCES="kagane,mangadot". A disabled source is dropped
+    # from the registry entirely → absent from /caps, never searched, and never
+    # added to the CF solver warm set (so a source that cannot clear Cloudflare
+    # in this environment can't create a startup warm storm). Default "" = every
+    # built-in source registered (behavior unchanged). REVERSIBLE: clear the env
+    # to re-enable. Kept a plain str (NOT a set) so the comma-separated env value
+    # needs no JSON encoding (unlike metrics_cors_origins); call
+    # ``disabled_source_keys()`` for the normalized frozenset.
+    disabled_sources: str = ""
     # alias decouples the key from the GATEWAY_ env prefix (D-01).
     api_key: str = Field(alias="api_key")
     # ── Observability & metrics (Phase 8) ─────────────────────────────────────
@@ -335,6 +346,19 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    def disabled_source_keys(self) -> frozenset[str]:
+        """Normalized set of source keys to skip registering (#198/#202).
+
+        Parses the comma-separated ``GATEWAY_DISABLED_SOURCES`` (``disabled_sources``)
+        value into a lowercased, whitespace-stripped frozenset; blank entries are
+        dropped. Empty/unset → empty set, i.e. every built-in source registers.
+        """
+        return frozenset(
+            key.strip().lower()
+            for key in self.disabled_sources.split(",")
+            if key.strip()
+        )
 
     @model_validator(mode="after")
     def _reject_camoufox_parallel(self) -> Settings:
