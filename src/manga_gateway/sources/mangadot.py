@@ -203,6 +203,14 @@ class MangadotSource(Source):
     # (#88 per-domain map; mirrors comix/kagane). mangadot serves plain JSON post-clear,
     # so ``decrypt_scheme``/``session_prep`` stay ``None`` (no encrypted-response path).
     cloudflare_challenge_url = "https://mangadot.net/"
+    # Phase 10 (SRC-01): route clearance to the Android-WebView solver sidecar, NOT
+    # the desktop Patchright solver. mangadot.net serves a STRICT Cloudflare Turnstile
+    # that desktop browser automation (Patchright/Camoufox/nodriver) cannot clear from
+    # Linux — a mechanistic catch-22 proven across 27 experiments (resolved debug
+    # ``mangadot-cf-linux-fingerprint``). A real Android WebView is a trusted
+    # fingerprint class that DOES clear it (proven end-to-end). This one-line attr is
+    # the only per-source code the engine switch needs.
+    solver_engine = "android"
     decrypt_scheme = None
     session_prep = None
     supports_search = True
