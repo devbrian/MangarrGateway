@@ -281,6 +281,14 @@ When the URL is unset, the `AndroidSolver` leg boots mangadot/kagane **disabled*
 (D-33) and the gateway still runs. Once the sidecars are up, **drop
 `mangadot,kagane` from `GATEWAY_DISABLED_SOURCES`** to re-enable them.
 
+Note the distinction: the gateway **application** runs fine without the sidecar
+configured (android sources just boot disabled). The full **compose stack**,
+however, requires `GATEWAY_ANDROID_SOLVER_API_KEY` to be set in `.env` — the
+`android-solver` sidecar fails fast (`ConfigError`) on an empty `SOLVER_API_KEY`,
+and the gateway service `depends_on` it — so `docker compose up` with no `.env`
+starts the gateway only after you provide that key (or after the sidecars are
+made opt-in).
+
 **CI stays gated.** GitHub Actions has no `binder` kernel module, so redroid cannot
 boot there — the mangadot/kagane live-smoke tests keep their `ci_skip_reason` and
 skip in CI. This is a **deploy-only** capability.

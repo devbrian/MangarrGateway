@@ -99,4 +99,3 @@ def test_webview_user_agent_parses_json_version() -> None:
     result = webview_user_agent("http://localhost:9222/json/version", http_get=fake_get)
 
     assert result == ua
-    assert result is not None and result.endswith(" wv")

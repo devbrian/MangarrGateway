@@ -182,7 +182,7 @@ def test_main_frame_skips_unmatched_selector() -> None:
 def test_locate_checkbox_falls_back_to_screenshot() -> None:
     calls: list[bytes] = []
 
-    def fake_locator(png: bytes):
+    def fake_locator(png: bytes) -> tuple[int, int]:
         calls.append(png)
         return (321, 654)
 
