@@ -100,18 +100,17 @@ services:
   # (T-10-16, accepted/scoped): scoped to ONLY /dev/dri, no host network. Needs the
   # host binder_linux/ashmem_linux modules loaded (see the top-of-file HOST PREREQ).
   #
-  # adb 5555 EXPOSURE (operator decision): T-10-12 originally kept adb docker-internal
-  # only. Published ONLY when the `android` profile is active (so a bare `up` exposes
-  # nothing). On a trusted LAN-only deploy the operator publishes adb 5555 (host 15555)
-  # for direct device inspection / load testing (`adb connect <host>:15555`). REMOVE
-  # this mapping for any deployment whose host is reachable from an untrusted network —
-  # an exposed adb is full device control.
+  # adb 5555 is DOCKER-INTERNAL ONLY (no host publish) — hardening for #215. adb is
+  # full device control, so it is NEVER reachable from the host/LAN. The android-solver
+  # sidecar reaches the device over the compose network (SOLVER_ADB_TARGET=redroid:5555);
+  # nothing outside the docker network needs adb (the gateway, the rate-limit probe, and
+  # CI all talk only to android-solver's /solve). For one-off manual device inspection,
+  # exec into this container or run adb from inside the docker network — do NOT re-add a
+  # host port publish on any host reachable from an untrusted network.
   redroid:
     image: redroid/redroid:11.0.0-latest
     profiles: ["android"]  # opt-in: only starts when COMPOSE_PROFILES=android (or --profile android)
     privileged: true
-    ports:
-      - "15555:5555"  # adb — LAN-only; only published when the android profile is active
     # Host iGPU passthrough → Android gets REAL GPU WebGL (Intel UHD, OpenGL ES
     # 3.2) so CF's render-consistency hash passes. The boot arg below selects it.
     devices:
