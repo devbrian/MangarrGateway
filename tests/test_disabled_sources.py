@@ -16,7 +16,16 @@ from manga_gateway.sources import register_builtin_sources
 
 # The full built-in set (kept in sync with register_builtin_sources).
 _ALL_SOURCES = frozenset(
-    {"mangadex", "comix", "mangaball", "mangadot", "atsumaru", "weebcentral", "kagane"}
+    {
+        "mangadex",
+        "comix",
+        "mangaball",
+        "mangadot",
+        "atsumaru",
+        "weebcentral",
+        "kagane",
+        "mangafire",
+    }
 )
 
 

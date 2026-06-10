@@ -18,13 +18,14 @@ backend owns the key — detected via ``inspect.signature`` exactly like context
 lifespan force-disables exactly the failed sources across both engines); ``aclose()``
 closes BOTH (each guarded so one failure does not skip the other).
 
-Beyond the clearance Protocol the router ALSO passes through comix's two off-Protocol
-browser primitives (``fetch_via_browser`` / ``fetch_via_browser_paginated``, D-41) so
-that swapping the bare :class:`CloudflareSolver` for this router as ``app.state.solver``
-does not break comix's ``_solver_from_ctx`` ``hasattr`` gate. Both delegate to the
-patchright backend (the only engine with a real browser; comix is a patchright-engine
-source and the only caller — the android backend has no browser and never needs these),
-keeping criterion 4 "comix unaffected" true.
+Beyond the clearance Protocol the router ALSO passes through the three off-Protocol
+browser primitives (``fetch_via_browser`` / ``fetch_via_browser_paginated`` /
+``fetch_via_browser_typed``, D-41) so that swapping the bare :class:`CloudflareSolver`
+for this router as ``app.state.solver`` does not break a source's ``_solver_from_ctx``
+``hasattr`` gate (comix uses the first two; MangaFire keyword search uses the typed
+one). All three delegate to the patchright backend (the only engine with a real
+browser; the android backend is a WebView-clearance sidecar with no browser and never
+needs these), keeping criterion 4 "comix unaffected" true.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ _log = logging.getLogger("manga_gateway")
 
 
 class _BrowserFetchSolver(Protocol):
-    """The two off-Protocol browser primitives (D-41) the patchright backend exposes.
+    """The three off-Protocol browser primitives (D-41) the patchright backend exposes.
 
     Declared locally — mirroring comix's own duck-typing — so the router can
     ``cast`` ``self._patchright`` (typed as the browser-agnostic ``AntiBotSolver``
@@ -69,6 +70,17 @@ class _BrowserFetchSolver(Protocol):
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
     ) -> list[Any]: ...
+
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> Any: ...
 
 
 # The android engine name (matches ``Source.solver_engine`` on mangadot/kagane).
@@ -159,6 +171,33 @@ class SolverRouter:
             next_selector=next_selector,
             route_limit_rewrite=route_limit_rewrite,
             max_pages=max_pages,
+            timeout=timeout,
+        )
+
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> Any:
+        """Delegate the real-keyboard browser-DOM read to the patchright backend (D-41).
+
+        MangaFire keyword search's ``_solver_from_ctx`` ``hasattr`` gate runs against
+        the production ``app.state.solver`` — which is THIS router — so the router must
+        expose the typed primitive too. Always delegates to ``self._patchright`` (the
+        android backend has no real browser).
+        """
+        backend = cast("_BrowserFetchSolver", self._patchright)
+        return await backend.fetch_via_browser_typed(
+            url,
+            type_selector=type_selector,
+            type_text=type_text,
+            extract=extract,
+            wait_for=wait_for,
             timeout=timeout,
         )
 
