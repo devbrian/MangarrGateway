@@ -736,9 +736,7 @@ class CloudflareSolver:
             try:
                 page = await ctx.new_page()
             except Exception as exc:  # noqa: BLE001
-                raise BrowserFetchError(
-                    f"could not open page for {op}: {exc}"
-                ) from exc
+                raise BrowserFetchError(f"could not open page for {op}: {exc}") from exc
             # #54 diagnostic instrumentation: attach pageerror/console/
             # requestfailed loggers BEFORE the body runs so we capture early
             # errors raised during navigation itself, not just post-load. Gated
