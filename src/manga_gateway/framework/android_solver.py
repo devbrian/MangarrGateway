@@ -63,6 +63,13 @@ class AndroidSolver:
         # margin so the gateway never abandons + re-fires a solve mid-flight (the app
         # wires this from settings.android_solver_timeout_s, default 180).
         timeout_s: float = 180.0,
+        # PROXY-01 / Req 7: the ``build_proxy`` Playwright dict
+        # (``{server, username?, password?}``) — the SAME value already feeding
+        # the CloudflareSolver. ``None`` ⇒ no proxy in the /solve body (D-08, the
+        # gate/CI/local-no-redroid path stays byte-for-byte unchanged). The dict
+        # arrives already built by ``build_proxy`` (the sole SecretStr unpacker,
+        # T-odg-01) — it is threaded through verbatim and NEVER logged (T-11-02).
+        proxy: dict[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
@@ -70,6 +77,7 @@ class AndroidSolver:
         self._api_key = api_key
         self._challenge_urls = dict(challenge_urls)
         self._timeout_s = timeout_s
+        self._proxy = proxy
         self._client = client
         self._owns_client = client is None
         # Last-good clearance per source key (the D-35 hold — mirrors the browser
@@ -165,9 +173,17 @@ class AndroidSolver:
         headers: dict[str, str] = {}
         if self._api_key is not None:
             headers["X-Solver-Key"] = self._api_key.get_secret_value()
+        # Req 7: thread the single static proxy into the /solve body so the
+        # sidecar's CF-solve egress matches the gateway's httpx-fetch egress for
+        # the same clearance. Gated like the CloudflareSolver: when unconfigured
+        # the body carries ONLY ``challenge_url`` (D-08). The proxy dict is passed
+        # through verbatim (already unpacked by build_proxy) and never logged.
+        body: dict[str, object] = {"challenge_url": challenge_url}
+        if self._proxy is not None:
+            body["proxy"] = self._proxy
         resp = await self._ensure_client().post(
             f"{self._base_url}/solve",
-            json={"challenge_url": challenge_url},
+            json=body,
             headers=headers,
             timeout=self._timeout_s,
         )
