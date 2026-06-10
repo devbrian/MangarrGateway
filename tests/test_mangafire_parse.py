@@ -93,4 +93,5 @@ def test_parse_cards_malformed_returns_empty() -> None:
     assert _parse_cards(b"") == []
     assert _parse_cards(b"<<<not html>>>") == []
     # A card with no /manga/ info link is skipped.
-    assert _parse_cards(b"<div class='original card-lg'><div class='inner'></div></div>") == []
+    no_link = b"<div class='original card-lg'><div class='inner'></div></div>"
+    assert _parse_cards(no_link) == []
