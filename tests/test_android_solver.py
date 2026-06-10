@@ -11,6 +11,7 @@ boot-disabled warm contract when the sidecar URL is unconfigured.
 from __future__ import annotations
 
 import inspect
+import json
 
 import httpx
 import pytest
@@ -29,6 +30,13 @@ _WEBVIEW_UA = (
     "Mozilla/5.0 (Linux; Android 11; redroid11_x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Mobile Safari/537.36"
 )
+# Plan 11-05 / Req 7: the build_proxy() playwright dict shape threaded into /solve.
+# Obviously-fake local-only values — never a real proxy credential.
+_PROXY = {
+    "server": "http://proxy.invalid:8080",
+    "username": "fakeuser",
+    "password": "NOTAREALSECRET-zzz9",
+}
 
 
 def _solver(**over: object) -> AndroidSolver:
@@ -81,6 +89,57 @@ async def test_get_clearance_returns_clearance() -> None:
     assert route.called
     sent = route.calls.last.request
     assert sent.headers["X-Solver-Key"] == "sidecar-secret"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_body_carries_proxy_when_configured() -> None:
+    """Req 7: a configured proxy rides the /solve body verbatim alongside
+    challenge_url, so the sidecar's CF-solve egress matches the gateway's
+    httpx-fetch egress for the same clearance."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(proxy=dict(_PROXY))
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert body["challenge_url"] == _CHALLENGE_URLS["mangadot"]
+    assert body["proxy"] == _PROXY
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_body_omits_proxy_when_unconfigured() -> None:
+    """D-08: proxy=None ⇒ the body has ONLY challenge_url (today's body
+    byte-for-byte), no ``proxy`` key."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(proxy=None)
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"challenge_url": _CHALLENGE_URLS["mangadot"]}
+    assert "proxy" not in body
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_does_not_log_proxy_or_token(caplog: pytest.LogCaptureFixture) -> None:
+    """T-11-02 / T-10-04: neither the proxy password nor the cf_clearance token
+    appears in any log record."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(proxy=dict(_PROXY))
+    with caplog.at_level("DEBUG", logger="manga_gateway"):
+        try:
+            await solver.get_clearance("mangadot")
+        finally:
+            await solver.aclose()
+    for record in caplog.records:
+        msg = record.getMessage()
+        assert _PROXY["password"] not in msg
+        assert "android-minted-token" not in msg
 
 
 @respx.mock
