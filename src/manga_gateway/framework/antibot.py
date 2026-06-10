@@ -43,7 +43,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, runtime_checkable
 from urllib.parse import urlparse
 
 from ..metrics.collector import get_collector
@@ -53,6 +53,11 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable
 
 _log = logging.getLogger("manga_gateway")
+
+# Return type of a ``_browser_call`` interaction ``body`` — generic so each
+# ``_once`` worker preserves its own result type (Any / list / the typed read)
+# through the shared scaffolding helper without a cast (D-02).
+_BodyResult = TypeVar("_BodyResult")
 
 # Bounded poll budget for the paginated Next-walk (#146): after a JS-click of
 # the Next control, re-run the extract up to ``_PAGINATE_POLL_TICKS`` times
@@ -681,69 +686,63 @@ class CloudflareSolver:
                 url, extract=extract, wait_for=wait_for, timeout=timeout, attempt=2
             )
 
-    async def _fetch_via_browser_once(
+    async def _browser_call(
         self,
         url: str,
         *,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — same justification as fetch_via_browser
-        attempt: int = 1,
-    ) -> Any:
-        """One attempt of the goto + wait_for + evaluate sequence (no retry).
+        op: str,
+        attempt: int,
+        body: Callable[[Any], Awaitable[_BodyResult]],
+    ) -> _BodyResult:
+        """Shared ``_once``-worker scaffolding for ALL browser primitives (D-02).
 
-        The body is identical to the original :meth:`fetch_via_browser` (pre-#54).
-        Split out so the public method can wrap a single retry around it after
-        detecting a dead-driver crash — the retry simply re-enters this method
-        against a freshly launched context. Acquires a ``_browser_lock``
-        Semaphore slot so retries re-bound correctly against any concurrent
-        ``fetch_via_browser`` call.
+        Owns the envelope that every ``fetch_via_browser*`` worker repeated
+        verbatim: acquire the ``_browser_lock`` Semaphore slot; get the warm
+        context (wrap failure → :class:`BrowserFetchError`); open ONE page
+        (wrap failure → :class:`BrowserFetchError`); attach the #54 diagnostic
+        loggers when enabled; ``perf_counter`` the interaction; run the caller's
+        divergent ``body(page)`` closure; emit EXACTLY ONE ``browser`` ring event
+        (``outcome="error"`` before re-raising a ``BrowserFetchError``, else
+        ``outcome="ok"`` and return the result); and ``page.close()`` on every
+        path. ``op`` is the metrics-event op string AND is woven into the wrap
+        messages so each primitive's errors stay self-identifying. ``body`` is
+        the ONLY thing that diverges across the one-shot / paginated / typed
+        workers — it receives the open page and returns the worker's result
+        (raising :class:`BrowserFetchError` on its own failures).
+
+        #125 / 260605-e9a: the single ``_emit_browser`` per call is
+        self-attributed to the source/request via contextvars and is STRICTLY
+        additive — it never changes control flow / exception propagation /
+        timing. The retry-once wrapper (#54) lives in the public method, not
+        here; ``attempt`` is passed through for the metrics emit.
         """
         async with self._browser_lock:
             try:
                 ctx = await self._lifecycle.get_context()
             except Exception as exc:  # noqa: BLE001
                 raise BrowserFetchError(
-                    f"browser context unavailable for fetch: {exc}"
+                    f"browser context unavailable for {op}: {exc}"
                 ) from exc
             try:
                 page = await ctx.new_page()
             except Exception as exc:  # noqa: BLE001
                 raise BrowserFetchError(
-                    f"could not open page for fetch_via_browser: {exc}"
+                    f"could not open page for {op}: {exc}"
                 ) from exc
             # #54 diagnostic instrumentation: attach pageerror/console/
-            # requestfailed loggers BEFORE goto so we capture early errors
-            # raised during navigation itself, not just post-load. Gated on
-            # the per-solver flag (default OFF). Handlers die with the page
+            # requestfailed loggers BEFORE the body runs so we capture early
+            # errors raised during navigation itself, not just post-load. Gated
+            # on the per-solver flag (default OFF). Handlers die with the page
             # at the ``finally: page.close()`` below — no separate cleanup
             # needed.
             if self._log_browser_events:
                 _attach_browser_event_loggers(page, nav_url=url)
-            timeout_ms = int(timeout * 1000)
-            # #125 / 260605-e9a: wrap the goto + wait_for + evaluate sequence in
-            # perf_counter and emit exactly ONE ``browser`` ring event per call
-            # (kind=browser), self-attributed to the source/request via contextvars.
-            # outcome "ok" on success, "error" on any BrowserFetchError (emitted in
-            # the except before re-raising). STRICTLY additive — never changes
-            # control flow / exception propagation / timing.
             browser_start = time.perf_counter()
             try:
-                await self._goto_and_wait(page, url, wait_for, timeout_ms)
-                try:
-                    result = await asyncio.wait_for(
-                        page.evaluate("async () => { " + extract + " }"),
-                        timeout=timeout,
-                    )
-                except TimeoutError as exc:
-                    raise BrowserFetchError(
-                        f"page.evaluate timed out after {timeout}s"
-                    ) from exc
-                except Exception as exc:  # noqa: BLE001
-                    raise BrowserFetchError(f"page.evaluate failed: {exc}") from exc
+                result = await body(page)
             except BrowserFetchError as exc:
                 _emit_browser(
-                    op="fetch_via_browser",
+                    op=op,
                     url=url,
                     outcome="error",
                     duration_ms=(time.perf_counter() - browser_start) * 1000.0,
@@ -753,7 +752,7 @@ class CloudflareSolver:
                 raise
             else:
                 _emit_browser(
-                    op="fetch_via_browser",
+                    op=op,
                     url=url,
                     outcome="ok",
                     duration_ms=(time.perf_counter() - browser_start) * 1000.0,
@@ -765,35 +764,76 @@ class CloudflareSolver:
                 with contextlib.suppress(Exception):
                     await page.close()
 
+    async def _fetch_via_browser_once(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — same justification as fetch_via_browser
+        attempt: int = 1,
+    ) -> Any:
+        """One attempt of the goto + wait_for + evaluate sequence (no retry).
+
+        The interaction body is identical to the original :meth:`fetch_via_browser`
+        (pre-#54); the lock/context/page/metrics/close envelope is owned by the
+        shared :meth:`_browser_call` helper (D-02). Split out so the public method
+        can wrap a single retry around it after detecting a dead-driver crash —
+        the retry simply re-enters this method against a freshly launched context.
+        """
+        timeout_ms = int(timeout * 1000)
+
+        async def _body(page: Any) -> Any:
+            await self._goto_and_wait(page, url, wait_for, timeout_ms)
+            return await _evaluate_guarded(
+                page, "async () => { " + extract + " }", timeout
+            )
+
+        return await self._browser_call(
+            url, op="fetch_via_browser", attempt=attempt, body=_body
+        )
+
     async def _goto_and_wait(
         self, page: Any, url: str, wait_for: str | None, timeout_ms: int
     ) -> None:
-        """Shared goto + optional ``wait_for`` sequence (one place, two callers).
+        """Shared goto + optional ``wait_for`` sequence (one place, three callers).
 
         Navigates with ``wait_until="commit"`` (returns as soon as the response
         is committed — issue #20; the caller's ``wait_for`` is the meaningful
         readiness signal, so blocking goto on ``domcontentloaded`` first just
-        adds 1–2s of overhead), then routes ``wait_for`` via
-        :func:`_looks_like_js_predicate` to ``wait_for_function`` (JS predicate)
-        vs ``wait_for_selector`` (CSS selector). Each step is wrapped so the
-        underlying Playwright exception surfaces as a single
-        :class:`BrowserFetchError`. Called by BOTH
-        :meth:`_fetch_via_browser_once` and :meth:`_paginate_via_browser_once`
-        so the goto/wait logic lives in exactly one place — the one-shot read's
-        behavior is byte-for-byte unchanged.
+        adds 1–2s of overhead), then routes ``wait_for`` via :meth:`_apply_wait`
+        to ``wait_for_function`` (JS predicate) vs ``wait_for_selector`` (CSS
+        selector). Each step is wrapped so the underlying Playwright exception
+        surfaces as a single :class:`BrowserFetchError`. Called by all three
+        ``_once`` workers so the goto/wait logic lives in exactly one place —
+        the one-shot read's behavior is byte-for-byte unchanged.
         """
         try:
             await page.goto(url, wait_until="commit", timeout=timeout_ms)
         except Exception as exc:  # noqa: BLE001
             raise BrowserFetchError(f"goto {url!r} failed: {exc}") from exc
-        if wait_for is not None:
-            try:
-                if _looks_like_js_predicate(wait_for):
-                    await page.wait_for_function(wait_for, timeout=timeout_ms)
-                else:
-                    await page.wait_for_selector(wait_for, timeout=timeout_ms)
-            except Exception as exc:  # noqa: BLE001
-                raise BrowserFetchError(f"wait_for {wait_for!r} failed: {exc}") from exc
+        await self._apply_wait(page, wait_for, timeout_ms)
+
+    async def _apply_wait(
+        self, page: Any, wait_for: str | None, timeout_ms: int
+    ) -> None:
+        """Route a ``wait_for`` to ``wait_for_function`` vs ``wait_for_selector``.
+
+        Split out of :meth:`_goto_and_wait` (D-02) so the typed worker can wait
+        AFTER typing — independently of the goto — not only at navigation time.
+        ``wait_for=None`` is a no-op. Classifies via :func:`_looks_like_js_predicate`
+        (JS predicate → ``wait_for_function``; CSS selector → ``wait_for_selector``)
+        and wraps any Playwright failure as a single :class:`BrowserFetchError`.
+        """
+        if wait_for is None:
+            return
+        try:
+            if _looks_like_js_predicate(wait_for):
+                await page.wait_for_function(wait_for, timeout=timeout_ms)
+            else:
+                await page.wait_for_selector(wait_for, timeout=timeout_ms)
+        except Exception as exc:  # noqa: BLE001
+            raise BrowserFetchError(f"wait_for {wait_for!r} failed: {exc}") from exc
 
     # ``timeout`` is the per-call Playwright operation budget (goto/wait_for and
     # each evaluate receive ``timeout``), NOT a cancellation wrapper — same
@@ -905,76 +945,43 @@ class CloudflareSolver:
     ) -> list[Any]:
         """One attempt of the paginated walk (route + goto + wait + Next-walk).
 
-        Acquires a ``_browser_lock`` Semaphore slot, opens ONE page, installs
-        the optional route handler BEFORE goto, navigates, and walks the Next
-        control. Closes the page on all paths. Emits exactly one ``browser``
-        ring event (op=``fetch_via_browser_paginated``). Split out so the public
-        method can wrap a single dead-driver retry around it.
+        The lock/context/page/metrics/close envelope is owned by the shared
+        :meth:`_browser_call` helper (D-02); the divergent body installs the
+        optional route handler BEFORE goto, navigates, and walks the Next
+        control. Emits exactly one ``browser`` ring event
+        (op=``fetch_via_browser_paginated``). Split out so the public method can
+        wrap a single dead-driver retry around it.
         """
-        async with self._browser_lock:
-            try:
-                ctx = await self._lifecycle.get_context()
-            except Exception as exc:  # noqa: BLE001
-                raise BrowserFetchError(
-                    f"browser context unavailable for paginated fetch: {exc}"
-                ) from exc
-            try:
-                page = await ctx.new_page()
-            except Exception as exc:  # noqa: BLE001
-                raise BrowserFetchError(
-                    f"could not open page for fetch_via_browser_paginated: {exc}"
-                ) from exc
-            if self._log_browser_events:
-                _attach_browser_event_loggers(page, nav_url=url)
-            timeout_ms = int(timeout * 1000)
-            browser_start = time.perf_counter()
-            try:
-                # Install the route limit-rewrite BEFORE goto so the first
-                # paint's own requests are rewritten (route() must be in place
-                # before the navigation issues any request).
-                if route_limit_rewrite is not None:
-                    url_substring, target_limit = route_limit_rewrite
-                    handler = _build_limit_rewrite_route_handler(
-                        url_substring, target_limit
-                    )
-                    try:
-                        await page.route("**/*", handler)
-                    except Exception as exc:  # noqa: BLE001
-                        raise BrowserFetchError(
-                            f"page.route install failed: {exc}"
-                        ) from exc
-                await self._goto_and_wait(page, url, wait_for, timeout_ms)
-                result = await self._walk_next(
-                    page,
-                    extract=extract,
-                    next_selector=next_selector,
-                    max_pages=max_pages,
-                    timeout=timeout,
-                    url=url,
+        timeout_ms = int(timeout * 1000)
+
+        async def _body(page: Any) -> list[Any]:
+            # Install the route limit-rewrite BEFORE goto so the first paint's
+            # own requests are rewritten (route() must be in place before the
+            # navigation issues any request).
+            if route_limit_rewrite is not None:
+                url_substring, target_limit = route_limit_rewrite
+                handler = _build_limit_rewrite_route_handler(
+                    url_substring, target_limit
                 )
-            except BrowserFetchError as exc:
-                _emit_browser(
-                    op="fetch_via_browser_paginated",
-                    url=url,
-                    outcome="error",
-                    duration_ms=(time.perf_counter() - browser_start) * 1000.0,
-                    attempt=attempt,
-                    error=repr(exc),
-                )
-                raise
-            else:
-                _emit_browser(
-                    op="fetch_via_browser_paginated",
-                    url=url,
-                    outcome="ok",
-                    duration_ms=(time.perf_counter() - browser_start) * 1000.0,
-                    attempt=attempt,
-                    error=None,
-                )
-                return result
-            finally:
-                with contextlib.suppress(Exception):
-                    await page.close()
+                try:
+                    await page.route("**/*", handler)
+                except Exception as exc:  # noqa: BLE001
+                    raise BrowserFetchError(
+                        f"page.route install failed: {exc}"
+                    ) from exc
+            await self._goto_and_wait(page, url, wait_for, timeout_ms)
+            return await self._walk_next(
+                page,
+                extract=extract,
+                next_selector=next_selector,
+                max_pages=max_pages,
+                timeout=timeout,
+                url=url,
+            )
+
+        return await self._browser_call(
+            url, op="fetch_via_browser_paginated", attempt=attempt, body=_body
+        )
 
     async def _walk_next(
         self,
