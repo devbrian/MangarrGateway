@@ -55,7 +55,7 @@ from android_solver.cdp import (
 from android_solver.config import SidecarConfig
 from android_solver.device import AdbDevice, AdbError
 from android_solver.egress import expected_egress
-from android_solver.proxy_hop import repoint
+from android_solver.proxy_hop import control_endpoint, repoint
 from android_solver.turnstile import locate_checkbox
 
 _log = logging.getLogger("android_solver.service")
@@ -246,6 +246,12 @@ class AndroidSolvePipeline:
         # from config (hop_host = "android-solver", NOT localhost — Pitfall 1).
         self._hop_host = hop_host
         self._hop_port = hop_port
+        # The hop's CONTROL channel is a SEPARATE loopback listener
+        # (127.0.0.1:<hop_port + 1>) — the sidecar (same container as the hop
+        # child) repoints over it. This is NOT the cross-container proxy port:
+        # sending a SET line to the proxy port silently closes (empty ack ⇒
+        # ProxyHopError, blocking every proxied solve). See proxy_hop.serve().
+        self._hop_control_host, self._hop_control_port = control_endpoint(hop_port)
         self._egress_read_timeout_s = egress_read_timeout_s
         # Lazy default factories live in cdp (same package) — reuse them so the
         # devtools websocket/http plumbing has a single implementation (R1).
@@ -326,7 +332,7 @@ class AndroidSolvePipeline:
         # picks the proxy up on launch (D-02). The credential-bearing upstream URI
         # is never logged (T-10-04 / T-11-02).
         upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
-        repoint(self._hop_host, self._hop_port, upstream)
+        repoint(self._hop_control_host, self._hop_control_port, upstream)
         self._device.set_global_http_proxy(self._hop_host, self._hop_port)
         try:
             _raise_if_cancelled(cancel)
@@ -481,7 +487,7 @@ class AndroidSolvePipeline:
         except Exception:  # noqa: BLE001 — teardown must not mask the solve outcome
             _log.warning("clear_global_http_proxy failed in teardown", exc_info=True)
         try:
-            repoint(self._hop_host, self._hop_port, None)
+            repoint(self._hop_control_host, self._hop_control_port, None)
         except Exception:  # noqa: BLE001 — teardown must not mask the solve outcome
             _log.warning("hop idle-repoint failed during teardown", exc_info=True)
 

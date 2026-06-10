@@ -54,6 +54,22 @@ class ProxyHopError(RuntimeError):
     """Raised when a control-channel repoint command does not ack ``OK``."""
 
 
+def control_endpoint(hop_port: int) -> tuple[str, int]:
+    """The loopback control endpoint a co-located parent uses to repoint the hop.
+
+    The hop runs TWO listeners (see :func:`serve`): a PROXY listener on
+    ``0.0.0.0:<hop_port>`` (cross-container — the redroid device routes its
+    WebView egress here) and a CONTROL listener on ``127.0.0.1:<hop_port + 1>``
+    (loopback — sidecar-internal only). The parent process (same container as the
+    hop child) MUST send ``SET``/``IDLE`` repoint commands to the CONTROL endpoint
+    returned here — NOT the proxy port, which speaks the proxy protocol and
+    silently closes a ``SET`` line (empty ack ⇒ :class:`ProxyHopError`). Keeping
+    this in one place keeps :func:`serve` and the parent's :func:`repoint` target
+    in lock-step.
+    """
+    return _DEFAULT_CONTROL_HOST, hop_port + 1
+
+
 class ServerFactory(Protocol):
     """Builds a pproxy upstream-server object from a ``#user:pass`` URI."""
 
@@ -138,7 +154,7 @@ async def serve(
     import pproxy
 
     if control_port is None:
-        control_port = hop_port + 1
+        _, control_port = control_endpoint(hop_port)
     factory = server_factory or _make_server
 
     rserver: list[object] = []

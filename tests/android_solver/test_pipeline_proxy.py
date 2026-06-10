@@ -26,6 +26,13 @@ from android_solver import service
 _PROXY = {"server": "http://up.example:8080", "username": "u", "password": "p"}
 _HOP_HOST = "android-solver"
 _HOP_PORT = 18081
+# The hop's CONTROL channel is a SEPARATE loopback listener (127.0.0.1:hop_port+1)
+# — NOT the cross-container proxy port. The sidecar repoints over THIS endpoint;
+# the device routes WebView egress through the PROXY port (_HOP_HOST:_HOP_PORT).
+# Sending a SET to the proxy port silently closes (empty ack ⇒ ProxyHopError),
+# which broke every live proxied solve until the repoint target was corrected.
+_HOP_CONTROL_HOST = "127.0.0.1"
+_HOP_CONTROL_PORT = _HOP_PORT + 1
 _EXPECTED_IP = "203.0.113.7"
 
 
@@ -188,13 +195,17 @@ def test_proxied_solve_verifies_egress_then_taps_and_returns_egress_ip(
     # Set BEFORE the tap; cleared AFTER (Req 2/5).
     assert device.events == ["set_proxy", "tap", "clear_proxy"]
     assert device.proxy_cleared == 1
-    # Hop repointed to the authed upstream (SET), then back to DIRECT (IDLE).
+    # Hop repointed to the authed upstream (SET), then back to DIRECT (IDLE) —
+    # over the LOOPBACK CONTROL endpoint, NOT the cross-container proxy port.
     assert repoint_calls[0] == (
-        _HOP_HOST,
-        _HOP_PORT,
+        _HOP_CONTROL_HOST,
+        _HOP_CONTROL_PORT,
         "http://up.example:8080#u:p",
     )
-    assert repoint_calls[-1] == (_HOP_HOST, _HOP_PORT, None)
+    assert repoint_calls[-1] == (_HOP_CONTROL_HOST, _HOP_CONTROL_PORT, None)
+    # The repoint (control) target MUST differ from the device proxy target —
+    # conflating them sends SET to the pproxy port (empty ack ⇒ ProxyHopError).
+    assert (repoint_calls[0][0], repoint_calls[0][1]) != device.proxy_set[0]
 
 
 # ── Req 3 / T-11-01: a bypassed proxy (observed != expected) raises, no token ──
@@ -221,7 +232,7 @@ def test_egress_mismatch_raises_without_token_and_still_clears(
     assert device.taps == []
     # finally STILL cleared the proxy + idled the hop (Req 5).
     assert device.proxy_cleared == 1
-    assert repoint_calls[-1] == (_HOP_HOST, _HOP_PORT, None)
+    assert repoint_calls[-1] == (_HOP_CONTROL_HOST, _HOP_CONTROL_PORT, None)
 
 
 # ── Req 3: a transient / non-IP echo is a FAILURE, never a pass ───────────────
@@ -342,4 +353,8 @@ def test_username_only_proxy_uri_omits_credentials_fragment(
         proxy={"server": "http://up.example:8080"},
     )
 
-    assert repoint_calls[0] == (_HOP_HOST, _HOP_PORT, "http://up.example:8080")
+    assert repoint_calls[0] == (
+        _HOP_CONTROL_HOST,
+        _HOP_CONTROL_PORT,
+        "http://up.example:8080",
+    )

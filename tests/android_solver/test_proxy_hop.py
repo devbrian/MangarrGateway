@@ -18,6 +18,7 @@ from android_solver.proxy_hop import (
     ProxyHopError,
     _handle_control,
     apply_command,
+    control_endpoint,
     repoint,
     serve,
 )
@@ -37,6 +38,23 @@ class _SentinelFactory:
     def __call__(self, uri: str) -> object:
         self.uris.append(uri)
         return self.sentinel
+
+
+def test_control_endpoint_is_loopback_and_distinct_from_proxy_port() -> None:
+    """The repoint target is 127.0.0.1:hop_port+1 — NEVER the cross-container port.
+
+    The live regression: the sidecar repointed over (hop_host, hop_port) — the
+    pproxy PROXY listener — which silently closes a SET line (empty ack ⇒
+    ProxyHopError), blocking every proxied solve. control_endpoint() is the single
+    source of truth that keeps serve()'s control listener and the parent's repoint
+    target in lock-step on the LOOPBACK control channel.
+    """
+    host, port = control_endpoint(18081)
+    assert host == "127.0.0.1"  # loopback, sidecar-internal only (T-11-05)
+    assert port == 18082  # hop_port + 1
+    # Must differ from the (cross-container) proxy endpoint the device routes to.
+    assert (host, port) != ("android-solver", 18081)
+    assert port != 18081
 
 
 def test_apply_set_mutates_rserver_in_place() -> None:
