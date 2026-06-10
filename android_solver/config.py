@@ -20,6 +20,7 @@ _ENV_API_KEY = "SOLVER_API_KEY"
 _ENV_ADB_TARGET = "SOLVER_ADB_TARGET"
 _ENV_ALLOWED_HOSTS = "SOLVER_ALLOWED_HOSTS"
 _ENV_TIMEOUT = "SOLVER_SOLVE_TIMEOUT_S"
+_ENV_CANCEL_GRACE = "SOLVER_CANCEL_GRACE_S"
 _ENV_BIND_HOST = "SOLVER_BIND_HOST"
 _ENV_PORT = "SOLVER_PORT"
 
@@ -29,6 +30,13 @@ _DEFAULT_ADB_TARGET = "redroid:5555"
 # host is rejected before any device action (SSRF guard, T-10-09).
 _DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("mangadot.net", "kagane.to")
 _DEFAULT_TIMEOUT_S = 120.0
+# Bounded cleanup window (issue #207 / WR-02): when a solve exceeds the timeout
+# its worker thread CANNOT be force-killed, so the service signals cooperative
+# cancellation and waits at most this long for the worker to abort at its next
+# adb/CDP checkpoint, reset the device, and exit — so the NEXT /solve starts on a
+# clean device instead of queuing behind a still-running orphan. Held under the
+# service lock, so it also caps how long the next caller can be delayed.
+_DEFAULT_CANCEL_GRACE_S = 20.0
 # Bind 0.0.0.0 INSIDE the container; the compose service publishes NO host port
 # (10-05), so the control API is reachable only on the docker-internal network
 # (the gateway is the only caller — T-10-12). Mirrors the gateway image's
@@ -49,6 +57,7 @@ class SidecarConfig:
     adb_target: str = _DEFAULT_ADB_TARGET
     allowed_hosts: frozenset[str] = field(default=frozenset(_DEFAULT_ALLOWED_HOSTS))
     solve_timeout_s: float = _DEFAULT_TIMEOUT_S
+    cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S
     bind_host: str = _DEFAULT_BIND_HOST
     port: int = _DEFAULT_PORT
 
@@ -76,6 +85,10 @@ class SidecarConfig:
             source.get(_ENV_TIMEOUT), _DEFAULT_TIMEOUT_S, _ENV_TIMEOUT
         )
 
+        cancel_grace_s = _parse_positive_float(
+            source.get(_ENV_CANCEL_GRACE), _DEFAULT_CANCEL_GRACE_S, _ENV_CANCEL_GRACE
+        )
+
         bind_host = (source.get(_ENV_BIND_HOST) or _DEFAULT_BIND_HOST).strip()
         port = _parse_port(source.get(_ENV_PORT))
 
@@ -84,6 +97,7 @@ class SidecarConfig:
             adb_target=adb_target,
             allowed_hosts=allowed_hosts,
             solve_timeout_s=solve_timeout_s,
+            cancel_grace_s=cancel_grace_s,
             bind_host=bind_host,
             port=port,
         )

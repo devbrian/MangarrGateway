@@ -37,7 +37,7 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -113,6 +113,29 @@ class SolveError(RuntimeError):
     """The solve pipeline could not mint a clearance (surfaces as 504)."""
 
 
+class SolveCancelled(RuntimeError):
+    """The solve was cooperatively cancelled after the timeout (issue #207).
+
+    Raised by the pipeline when it observes the cancel signal at one of its
+    adb/CDP checkpoints. The pipeline resets the device on its way out so the next
+    solve starts clean; the service treats it as a (clean) post-timeout exit.
+    """
+
+
+def _raise_if_cancelled(cancel: Event | None) -> None:
+    """Cooperative cancellation checkpoint (issue #207).
+
+    The single-worker ``ThreadPoolExecutor`` cannot be force-killed, so a
+    timed-out solve is abandoned by ``future.result(timeout=...)`` while its
+    thread keeps driving the device — starving the next solve behind the service
+    lock. The pipeline therefore calls this between every blocking adb/CDP step;
+    once the service ``set()``s the event the next checkpoint raises and unwinds
+    the solve promptly.
+    """
+    if cancel is not None and cancel.is_set():
+        raise SolveCancelled("solve cancelled after timeout")
+
+
 @dataclass(frozen=True)
 class SolveResult:
     """A successful solve: the minted token + the WebView UA it was minted under."""
@@ -125,7 +148,9 @@ class SolveResult:
 class SolvePipeline(Protocol):
     """The solve surface the control API drives (a FAKE is injected in tests)."""
 
-    def solve(self, challenge_url: str, host: str) -> SolveResult: ...
+    def solve(
+        self, challenge_url: str, host: str, cancel: Event | None = None
+    ) -> SolveResult: ...
 
     def health(self) -> bool: ...
 
@@ -183,15 +208,49 @@ class AndroidSolvePipeline:
         except Exception:  # noqa: BLE001 — a health probe must never raise
             return False
 
-    def solve(self, challenge_url: str, host: str) -> SolveResult:
+    def solve(
+        self, challenge_url: str, host: str, cancel: Event | None = None
+    ) -> SolveResult:
+        """Mint a clearance, cooperatively cancellable via ``cancel`` (issue #207).
+
+        On cancellation the in-flight pipeline unwinds at its next adb/CDP
+        checkpoint and the device is reset (``force_stop_and_clear``) on the way
+        out so the NEXT solve starts on a clean WebView, not a half-driven
+        challenge page.
+        """
+        try:
+            return self._solve(challenge_url, host, cancel)
+        except SolveCancelled:
+            # AC3 (#207): a cancelled solve must leave redroid clean for the next
+            # caller — reset the WebView so no wedged challenge state carries over.
+            self._reset_device_quietly()
+            raise
+
+    def _reset_device_quietly(self) -> None:
+        """Best-effort device reset on the cancellation path (never raises)."""
+        try:
+            self._device.force_stop_and_clear()
+        except Exception:  # noqa: BLE001 — cleanup must not mask the cancellation
+            _log.warning("device reset after cancellation failed", exc_info=True)
+
+    def _solve(
+        self, challenge_url: str, host: str, cancel: Event | None
+    ) -> SolveResult:
         self._device.connect()
+        _raise_if_cancelled(cancel)
         self._device.force_stop_and_clear()
+        _raise_if_cancelled(cancel)
         self._device.launch_url(challenge_url)
+        _raise_if_cancelled(cancel)
         time.sleep(self._launch_settle_s)  # floor before the devtools socket is up
+        _raise_if_cancelled(cancel)
 
         pid = self._device.pidof()
+        _raise_if_cancelled(cancel)
         port = self._device.forward_devtools(pid)
+        _raise_if_cancelled(cancel)
         ws_url = self._discover_page_ws(port)
+        _raise_if_cancelled(cancel)
 
         # Bound the whole locate→tap→poll loop by the solve deadline (T-10-11).
         deadline = time.monotonic() + self._timeout_s
@@ -201,12 +260,12 @@ class AndroidSolvePipeline:
             cdp_call(ws, "DOM.enable", command_id=11)
             # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
             # after load) — the real readiness gate, not the fixed settle above.
-            self._wait_for_cf_frame(ws)
+            self._wait_for_cf_frame(ws, cancel)
             # Page ws, DOM/Page enable, frame readiness, and the viewport scales
             # are computed ONCE; only locate+tap+poll repeats inside the loop.
             x_scale, y_scale = self._compute_scales(ws)
             token = self._tap_until_cleared(
-                ws, ws_url, host, x_scale, y_scale, deadline
+                ws, ws_url, host, x_scale, y_scale, deadline, cancel
             )
         finally:
             ws.close()
@@ -239,6 +298,7 @@ class AndroidSolvePipeline:
         x_scale: float,
         y_scale: float,
         deadline: float,
+        cancel: Event | None = None,
     ) -> str | None:
         """Tap the Turnstile checkbox once it is interactive, then let it verify.
 
@@ -265,6 +325,9 @@ class AndroidSolvePipeline:
         token: str | None = None
         last_tap: float | None = None
         while time.monotonic() < deadline:
+            # issue #207: abort the (longest) loop promptly on a post-timeout
+            # cancel so the device frees without waiting out the full deadline.
+            _raise_if_cancelled(cancel)
             # WR-03: a transient extract failure in ONE poll cycle (CDP hiccup, a
             # refused 2nd concurrent socket, a ws timeout) must NOT abort an
             # in-progress ~60s solve — treat it as "no token yet" and continue,
@@ -318,7 +381,9 @@ class AndroidSolvePipeline:
             return False
         return bool(result.get("result", {}).get("value"))
 
-    def _wait_for_cf_frame(self, ws: WebSocketLike) -> None:
+    def _wait_for_cf_frame(
+        self, ws: WebSocketLike, cancel: Event | None = None
+    ) -> None:
         """Poll Page.getFrameTree until the challenges.cloudflare.com OOPIF appears.
 
         The Turnstile widget renders in a cross-origin child frame a few seconds
@@ -328,6 +393,7 @@ class AndroidSolvePipeline:
         deadline = time.monotonic() + self._frame_poll_timeout_s
         command_id = 20
         while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel)  # issue #207: don't poll past a cancel
             tree = cdp_call(ws, "Page.getFrameTree", command_id=command_id)
             command_id += 1
             if self._frame_tree_has_cf(tree.get("frameTree")):
@@ -481,12 +547,20 @@ class SolverService:
         return self._run_solve(challenge_url, host)
 
     def _run_solve(self, challenge_url: str, host: str) -> tuple[int, dict[str, Any]]:
+        cancel = Event()
         with self._lock:  # serialize: one WebView solve at a time (T-10-11)
-            future = self._executor.submit(self._pipeline.solve, challenge_url, host)
+            future = self._executor.submit(
+                self._pipeline.solve, challenge_url, host, cancel
+            )
             try:
                 result = future.result(timeout=self._config.solve_timeout_s)
             except FuturesTimeout:
                 _log.warning("solve timed out for host %s", host)
+                # issue #207 / WR-02: the worker can't be force-killed. Signal
+                # cooperative cancellation and drain it within a BOUNDED grace
+                # window (still under the lock) so the orphan resets the device
+                # and exits before the next /solve — no cascading 504s.
+                self._cancel_and_drain(future, cancel, host)
                 return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve timed out"}
             except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
                 # IN-02: keep the traceback so field solve failures are
@@ -501,6 +575,31 @@ class SolverService:
             "user_agent": result.user_agent,
             "host": result.host,
         }
+
+    def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
+        """Signal cancellation and wait (bounded) for the orphan to unwind (#207).
+
+        Called under the service lock on a solve timeout. ``cancel.set()`` tells
+        the worker to abort at its next adb/CDP checkpoint, reset the device, and
+        exit; we then wait at most ``cancel_grace_s`` for it to do so. A worker
+        wedged in a single blocking syscall may outlive the grace — we log and
+        move on rather than hold the lock forever, but the common case frees the
+        device (and the next caller) within the window.
+        """
+        cancel.set()
+        try:
+            future.result(timeout=self._config.cancel_grace_s)
+        except FuturesTimeout:
+            _log.warning(
+                "solve for host %s did not abort within %.0fs grace; worker may "
+                "still be running",
+                host,
+                self._config.cancel_grace_s,
+            )
+        except SolveCancelled:
+            _log.info("solve for host %s cancelled cleanly after timeout", host)
+        except Exception:  # noqa: BLE001 — drain must not raise out of cleanup
+            _log.warning("solve for host %s errored after cancel", host, exc_info=True)
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

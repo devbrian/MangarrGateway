@@ -17,6 +17,7 @@ import pytest
 from android_solver.config import ConfigError, SidecarConfig
 from android_solver.service import (
     AndroidSolvePipeline,
+    SolveCancelled,
     SolveError,
     SolveResult,
     SolverService,
@@ -46,15 +47,28 @@ class FakePipeline:
         self._counter_lock = threading.Lock()
         self._active = 0
         self.max_concurrent = 0
+        self.cancelled = False
 
-    def solve(self, challenge_url: str, host: str) -> SolveResult:
+    def solve(
+        self, challenge_url: str, host: str, cancel: threading.Event | None = None
+    ) -> SolveResult:
         with self._counter_lock:
             self._active += 1
             self.max_concurrent = max(self.max_concurrent, self._active)
         try:
             self.calls.append((challenge_url, host))
             if self._delay:
-                time.sleep(self._delay)
+                # Cooperative: poll the cancel signal in small steps (mirrors the
+                # real pipeline's adb/CDP checkpoints) so a timed-out solve frees
+                # the worker promptly instead of running the full delay (#207).
+                waited = 0.0
+                step = 0.02
+                while waited < self._delay:
+                    if cancel is not None and cancel.is_set():
+                        self.cancelled = True
+                        raise SolveCancelled("cancelled after timeout")
+                    time.sleep(step)
+                    waited += step
             if self._error is not None:
                 raise self._error
             return self._result or SolveResult(
@@ -220,6 +234,51 @@ def test_pipeline_failure_is_504() -> None:
         body=b'{"challenge_url": "https://mangadot.net/"}',
     )
     assert status == 504
+
+
+# ── cooperative cancellation on timeout (issue #207) ─────────────────────────
+
+
+def test_timed_out_solve_is_cancelled_so_worker_frees_promptly() -> None:
+    # AC1 (#207): a solve that exceeds the timeout is cooperatively cancelled —
+    # the worker observes the signal and exits well within the grace window
+    # rather than running its full (10s) work and pinning the device.
+    pipeline = FakePipeline(delay=10.0)
+    service = _service(pipeline, solve_timeout_s=0.1, cancel_grace_s=5.0)
+    start = time.monotonic()
+    status, payload = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    elapsed = time.monotonic() - start
+    assert status == 504
+    assert payload == {"error": "solve timed out"}
+    assert pipeline.cancelled is True  # the worker saw the cancel signal
+    assert elapsed < 5.0  # freed within the grace, not the full 10s delay
+
+
+def test_next_solve_not_starved_by_timed_out_orphan() -> None:
+    # AC2 (#207): after a solve times out and is cancelled, the NEXT /solve must
+    # proceed promptly on the freed single worker — no cascading 504s behind a
+    # still-running orphan.
+    pipeline = FakePipeline(delay=10.0)
+    service = _service(pipeline, solve_timeout_s=0.1, cancel_grace_s=5.0)
+    first, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert first == 504  # timed out → cancelled → worker freed
+
+    pipeline._delay = 0.0  # the orphan is gone; the next solve is fast
+    start = time.monotonic()
+    second, payload = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    elapsed = time.monotonic() - start
+    assert second == 200
+    assert payload["cf_clearance"] == "MANGADOT_TOKEN"
+    assert elapsed < 5.0  # not queued behind the cancelled orphan
 
 
 # ── healthz ──────────────────────────────────────────────────────────────────
@@ -399,12 +458,13 @@ class FakeDevice:
 
     def __init__(self) -> None:
         self.taps: list[tuple[int, int]] = []
+        self.force_stops = 0
 
     def connect(self) -> None:
         return None
 
     def force_stop_and_clear(self) -> None:
-        return None
+        self.force_stops += 1
 
     def launch_url(self, url: str) -> None:
         return None
@@ -518,7 +578,7 @@ def _build_pipeline(
     monkeypatch.setattr(service, "webview_user_agent", lambda url, **kwargs: "UA-wv")
     # Pre-loop readiness/scale steps are covered by their own units; collapse them
     # to constants here so the loop under test runs deterministically.
-    monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws: None)
+    monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws, cancel=None: None)
     monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
     return pipeline
 
@@ -733,6 +793,44 @@ def test_solve_threads_injected_getter_into_ua_fetch(
     assert captured["http_get"] is pipeline._http_get
 
 
+def test_solve_resets_device_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AC3 (#207): a solve cancelled mid-flight must reset the device
+    # (force_stop_and_clear) on its way out so the next solve starts on a clean
+    # WebView, not a half-driven challenge page.
+    device = FakeDevice()
+    cancel = threading.Event()
+
+    # The cancel fires DURING launch_url (the service signalling mid-solve); the
+    # very next checkpoint then unwinds the solve.
+    original_launch = device.launch_url
+
+    def launch_then_cancel(url: str) -> None:
+        original_launch(url)
+        cancel.set()
+
+    monkeypatch.setattr(device, "launch_url", launch_then_cancel)
+
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=SeqLocate([(50, 100)]),
+        extract=SeqExtract(token_after=10_000),
+        clock=FakeClock(),
+        timeout_s=60.0,
+    )
+
+    with pytest.raises(SolveCancelled):
+        pipeline.solve("https://mangadot.net/", "mangadot.net", cancel)
+
+    # force_stop_and_clear ran TWICE: the normal pre-launch reset, then the
+    # cancellation-cleanup reset — the device is left clean for the next solve.
+    assert device.force_stops == 2
+    # The solve unwound before the locate→tap loop, so no tap landed.
+    assert device.taps == []
+
+
 def test_config_from_env_parses_allowlist_and_timeout() -> None:
     config = SidecarConfig.from_env(
         {
@@ -740,9 +838,17 @@ def test_config_from_env_parses_allowlist_and_timeout() -> None:
             "SOLVER_ADB_TARGET": "redroid:5556",
             "SOLVER_ALLOWED_HOSTS": "mangadot.net, kagane.to",
             "SOLVER_SOLVE_TIMEOUT_S": "30",
+            "SOLVER_CANCEL_GRACE_S": "7",
         }
     )
     assert config.api_key == "k"
     assert config.adb_target == "redroid:5556"
     assert config.allowed_hosts == frozenset({"mangadot.net", "kagane.to"})
     assert config.solve_timeout_s == 30.0
+    assert config.cancel_grace_s == 7.0
+
+
+def test_config_defaults_cancel_grace() -> None:
+    # issue #207: the post-timeout drain window has a sane default when unset.
+    config = SidecarConfig.from_env({"SOLVER_API_KEY": "k"})
+    assert config.cancel_grace_s == 20.0
