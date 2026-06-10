@@ -40,6 +40,7 @@ class FakePipeline:
         error: Exception | None = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.proxies: list[dict[str, object] | None] = []
         self._result = result
         self._delay = delay
         self._healthy = healthy
@@ -50,13 +51,19 @@ class FakePipeline:
         self.cancelled = False
 
     def solve(
-        self, challenge_url: str, host: str, cancel: threading.Event | None = None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: threading.Event | None = None,
+        *,
+        proxy: dict[str, object] | None = None,
     ) -> SolveResult:
         with self._counter_lock:
             self._active += 1
             self.max_concurrent = max(self.max_concurrent, self._active)
         try:
             self.calls.append((challenge_url, host))
+            self.proxies.append(proxy)
             if self._delay:
                 # Cooperative: poll the cancel signal in small steps (mirrors the
                 # real pipeline's adb/CDP checkpoints) so a timed-out solve frees
@@ -186,6 +193,109 @@ def test_solve_returns_clearance_for_allowlisted_host() -> None:
         "host": "mangadot.net",
     }
     assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
+
+
+# ── per-solve proxy validation (Req 1 / T-11-06) ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # proxy is not a dict
+        b'{"challenge_url": "https://mangadot.net/", "proxy": "http://p:1"}',
+        b'{"challenge_url": "https://mangadot.net/", "proxy": 5}',
+        # server missing / not a str
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {}}',
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {"server": 5}}',
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {"server": ""}}',
+        # server scheme not http/https
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "socks5://p:1"}}',
+        # server has no hostname
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {"server": "http://"}}',
+        # username/password present but not a str
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "username": 7}}',
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "password": 7}}',
+    ],
+)
+def test_solve_rejects_malformed_proxy_before_any_device_action(body: bytes) -> None:
+    # Req 1 / T-11-06: a malformed proxy is a PRE-action 422 — the device pipeline
+    # is never invoked (no hop repoint, no global http_proxy set).
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).solve(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # 422 is pre-action — no device action
+    assert "proxy" in payload["error"]
+
+
+def test_solve_forwards_wellformed_proxy_to_pipeline() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/",'
+            b' "proxy": {"server": "http://up.example:8080",'
+            b' "username": "u", "password": "p"}}'
+        ),
+    )
+    assert status == 200
+    assert pipeline.proxies == [
+        {"server": "http://up.example:8080", "username": "u", "password": "p"}
+    ]
+
+
+def test_solve_without_proxy_passes_none_to_pipeline() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert status == 200
+    assert pipeline.proxies == [None]
+
+
+# ── D-07: proxied solves use the longer proxy_solve_timeout_s ─────────────────
+
+
+def test_proxied_solve_uses_proxy_timeout_not_base() -> None:
+    # D-07 / Pitfall 6: with a proxy present the future is bounded by the LONGER
+    # proxy_solve_timeout_s. The pipeline delay sits BETWEEN the base (tiny) and
+    # the proxy (generous) timeout, so the proxied solve completes (200) where a
+    # base-timeout solve would 504.
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/",'
+            b' "proxy": {"server": "http://up.example:8080"}}'
+        ),
+    )
+    assert status == 200
+
+
+def test_no_proxy_solve_uses_base_timeout_and_times_out() -> None:
+    # The same delay under the base (tiny) timeout and NO proxy must 504 — proving
+    # the timeout selection keys off proxy-presence, not a constant.
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert status == 504
 
 
 # ── serialization + timeout (T-10-11) ────────────────────────────────────────

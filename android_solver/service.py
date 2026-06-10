@@ -149,7 +149,12 @@ class SolvePipeline(Protocol):
     """The solve surface the control API drives (a FAKE is injected in tests)."""
 
     def solve(
-        self, challenge_url: str, host: str, cancel: Event | None = None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None = None,
+        *,
+        proxy: dict[str, Any] | None = None,
     ) -> SolveResult: ...
 
     def health(self) -> bool: ...
@@ -209,7 +214,12 @@ class AndroidSolvePipeline:
             return False
 
     def solve(
-        self, challenge_url: str, host: str, cancel: Event | None = None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None = None,
+        *,
+        proxy: dict[str, Any] | None = None,
     ) -> SolveResult:
         """Mint a clearance, cooperatively cancellable via ``cancel`` (issue #207).
 
@@ -217,9 +227,13 @@ class AndroidSolvePipeline:
         checkpoint and the device is reset (``force_stop_and_clear``) on the way
         out so the NEXT solve starts on a clean WebView, not a half-driven
         challenge page.
+
+        When ``proxy`` is supplied the WebView egress is routed through the
+        per-solve authenticated hop and verified before the tap (Phase 11); when
+        ``None`` today's direct-egress flow runs byte-for-byte unchanged (D-08).
         """
         try:
-            return self._solve(challenge_url, host, cancel)
+            return self._solve(challenge_url, host, cancel, proxy=proxy)
         except SolveCancelled:
             # AC3 (#207): a cancelled solve must leave redroid clean for the next
             # caller — reset the WebView so no wedged challenge state carries over.
@@ -234,7 +248,11 @@ class AndroidSolvePipeline:
             _log.warning("device reset after cancellation failed", exc_info=True)
 
     def _solve(
-        self, challenge_url: str, host: str, cancel: Event | None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None,
+        proxy: dict[str, Any] | None = None,
     ) -> SolveResult:
         self._device.connect()
         _raise_if_cancelled(cancel)
@@ -544,16 +562,69 @@ class SolverService:
                 "error": "challenge host not allowlisted"
             }
 
-        return self._run_solve(challenge_url, host)
+        # Req 1 / T-11-06: validate the optional per-solve proxy SHAPE BEFORE any
+        # device action — a malformed proxy is a pre-action 422 (no hop repoint, no
+        # global http_proxy set). The ipify egress target is a sidecar constant, so
+        # the only caller-supplied URL here is the upstream proxy server (validated
+        # for scheme + hostname, never blindly fetched). The existing challenge_url
+        # host-allowlist above is untouched.
+        proxy_err = self._validate_proxy(payload.get("proxy"))
+        if proxy_err is not None:
+            return proxy_err
+        proxy = payload.get("proxy")
 
-    def _run_solve(self, challenge_url: str, host: str) -> tuple[int, dict[str, Any]]:
+        return self._run_solve(challenge_url, host, proxy)
+
+    @staticmethod
+    def _validate_proxy(
+        proxy: Any,
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Return a 422 tuple if ``proxy`` is malformed, else ``None`` (valid/absent).
+
+        A present proxy MUST be a dict with a str ``server`` whose ``urlsplit``
+        yields an http/https scheme AND a hostname; ``username``/``password`` are
+        optional and, if present, must be str. The credentials are never logged.
+        """
+        if proxy is None:
+            return None
+        if not isinstance(proxy, dict):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {"error": "malformed proxy"}
+        server = proxy.get("server")
+        if not isinstance(server, str) or not server:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy server"
+            }
+        split = urlsplit(server)
+        if split.scheme not in ("http", "https") or not split.hostname:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy server"
+            }
+        for cred in ("username", "password"):
+            value = proxy.get(cred)
+            if value is not None and not isinstance(value, str):
+                return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                    "error": f"malformed proxy {cred}"
+                }
+        return None
+
+    def _run_solve(
+        self, challenge_url: str, host: str, proxy: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any]]:
         cancel = Event()
+        # D-07 / Pitfall 6: a proxied solve adds a cross-container CONNECT hop +
+        # egress-verify, so it is bounded by the LONGER proxy_solve_timeout_s; a
+        # no-proxy solve keeps the base solve_timeout_s (D-08, unchanged).
+        timeout_s = (
+            self._config.proxy_solve_timeout_s
+            if proxy is not None
+            else self._config.solve_timeout_s
+        )
         with self._lock:  # serialize: one WebView solve at a time (T-10-11)
             future = self._executor.submit(
-                self._pipeline.solve, challenge_url, host, cancel
+                self._pipeline.solve, challenge_url, host, cancel, proxy=proxy
             )
             try:
-                result = future.result(timeout=self._config.solve_timeout_s)
+                result = future.result(timeout=timeout_s)
             except FuturesTimeout:
                 _log.warning("solve timed out for host %s", host)
                 # issue #207 / WR-02: the worker can't be force-killed. Signal
