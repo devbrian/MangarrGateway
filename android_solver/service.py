@@ -842,6 +842,19 @@ class SolverService:
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "malformed proxy server"
             }
+        # WR-04: force the lazy port parse HERE, while still pre-device. An
+        # out-of-range/non-numeric port (e.g. ``http://host:99999``) makes
+        # ``urlsplit(...).port`` raise ``ValueError: Port out of range 0-65535``;
+        # without this guard that ValueError surfaces later inside ``_proxy_parts``
+        # (in the worker thread), is swallowed by ``_run_solve``'s broad except, and
+        # becomes a misleading 504 AFTER the device-action stage. Catch it here so a
+        # bad port is the clean pre-action 422 the contract promises.
+        try:
+            _ = split.port
+        except ValueError:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy server"
+            }
         for cred in ("username", "password"):
             value = proxy.get(cred)
             if value is not None and not isinstance(value, str):

@@ -214,6 +214,11 @@ def test_solve_returns_clearance_for_allowlisted_host() -> None:
         b' "proxy": {"server": "socks5://p:1"}}',
         # server has no hostname
         b'{"challenge_url": "https://mangadot.net/", "proxy": {"server": "http://"}}',
+        # WR-04: server port out of range — must be a PRE-device 422, not a 504.
+        # Without port validation in _validate_proxy this body passes validation and
+        # later raises ValueError in _proxy_parts (worker thread) → misleading 504.
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://host:99999"}}',
         # username/password present but not a str
         b'{"challenge_url": "https://mangadot.net/",'
         b' "proxy": {"server": "http://p:1", "username": 7}}',
