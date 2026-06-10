@@ -97,6 +97,16 @@ ignore_missing_imports = true
 module = ["websocket"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# pproxy (2.7.9) is an android-solver SIDECAR-only dep (android_solver/
+# requirements.txt) that ships no type stubs / py.typed marker — it is NOT a
+# gateway dependency, so it is absent from the gate venv and mypy cannot resolve
+# it. The sidecar's auth-injecting CONNECT hop (android_solver/proxy_hop.py,
+# Plan 03) imports `pproxy`. Treat the import as untyped rather than pulling
+# pproxy into the gateway's own deps.
+module = ["pproxy", "pproxy.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
