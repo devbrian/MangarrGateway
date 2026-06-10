@@ -32,6 +32,8 @@ import hmac
 import ipaddress
 import json
 import logging
+import subprocess
+import sys
 import time
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -815,11 +817,15 @@ class SolverService:
                 return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve failed"}
 
         # Redacted success event ONLY (T-10-10) — never the minted token value.
-        _log.info("solved %s", host)
+        # The verified egress_ip IS loggable (Req 6 / T-10-04).
+        _log.info("solved %s (egress %s)", host, result.egress_ip or "direct")
         return int(HTTPStatus.OK), {
             "cf_clearance": result.cf_clearance,
             "user_agent": result.user_agent,
             "host": result.host,
+            # Req 6: present on EVERY response — the verified egress on a proxied
+            # solve, "" on the no-proxy path (additive-only; D-08 keys unchanged).
+            "egress_ip": result.egress_ip,
         }
 
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
@@ -938,9 +944,70 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def build_pipeline(config: SidecarConfig) -> SolvePipeline:
-    """Construct the real device-backed pipeline from the config."""
+    """Construct the real device-backed pipeline from the config.
+
+    Threads the hop ``host``/``port`` into the pipeline so the proxied solve can
+    route the device-wide ``global http_proxy`` through the cross-container hop
+    (``android-solver:<hop_port>`` — never localhost, Pitfall 1).
+    """
     device = AdbDevice(config.adb_target)
-    return AndroidSolvePipeline(device, timeout_s=config.solve_timeout_s)
+    return AndroidSolvePipeline(
+        device,
+        timeout_s=config.solve_timeout_s,
+        hop_host=config.hop_host,
+        hop_port=config.hop_port,
+    )
+
+
+def _spawn_proxy_hop(config: SidecarConfig) -> subprocess.Popen[bytes]:
+    """Start the persistent pproxy CONNECT hop as a sidecar child subprocess.
+
+    Runs ``python -m android_solver.proxy_hop --port <hop_port>`` (Runtime State).
+    The child is terminated on sidecar shutdown by :func:`_terminate_proxy_hop`
+    so it is never orphaned (T-11-04).
+    """
+    _log.info("starting proxy hop child on port %d", config.hop_port)
+    return subprocess.Popen(  # noqa: S603 — argv is built from config ints/constants
+        [
+            sys.executable,
+            "-m",
+            "android_solver.proxy_hop",
+            "--port",
+            str(config.hop_port),
+        ]
+    )
+
+
+def _terminate_proxy_hop(hop: subprocess.Popen[bytes] | None) -> None:
+    """Terminate the hop child on shutdown (bounded), killing it if it lingers."""
+    if hop is None:
+        return
+    hop.terminate()
+    try:
+        hop.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        _log.warning("proxy hop did not exit on terminate; killing")
+        hop.kill()
+
+
+def _boot_defensive_clear(config: SidecarConfig) -> None:
+    """Clear any residual device-wide ``global http_proxy`` at sidecar boot (Req 5).
+
+    A prior crashed proxied solve could have left ``global http_proxy`` set on the
+    redroid device. This best-effort boot-time clear restores direct egress so the
+    first no-proxy solve is not silently routed through a dead hop. It never blocks
+    startup — the device may not be booted yet (logged, swallowed).
+    """
+    device = AdbDevice(config.adb_target)
+    try:
+        device.connect()
+        device.clear_global_http_proxy()
+        _log.info("boot-time defensive global http_proxy clear ran")
+    except Exception:  # noqa: BLE001 — best-effort; device may not be ready yet
+        _log.warning(
+            "boot-time defensive proxy clear skipped (device not ready)",
+            exc_info=True,
+        )
 
 
 def main() -> None:
@@ -948,6 +1015,10 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
     config = SidecarConfig.from_env()
+    # Boot the persistent hop child + a defensive proxy clear BEFORE serving so the
+    # first solve has a live hop and a clean device (Runtime State / Req 5).
+    hop = _spawn_proxy_hop(config)
+    _boot_defensive_clear(config)
     service = SolverService(config, build_pipeline(config))
     server = _SolverHTTPServer(
         (config.bind_host, config.port), _Handler, service=service
@@ -960,7 +1031,9 @@ def main() -> None:
     try:
         server.serve_forever()
     finally:
+        # Never orphan the hop child (T-11-04); always shut the executor down.
         service.close()
+        _terminate_proxy_hop(hop)
 
 
 if __name__ == "__main__":

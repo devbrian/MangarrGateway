@@ -191,6 +191,7 @@ def test_solve_returns_clearance_for_allowlisted_host() -> None:
         "cf_clearance": "MANGADOT_TOKEN",
         "user_agent": "Mozilla/5.0 (Android 11) WebView wv",
         "host": "mangadot.net",
+        "egress_ip": "",  # additive-only on the no-proxy path (D-08)
     }
     assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
 
@@ -296,6 +297,45 @@ def test_no_proxy_solve_uses_base_timeout_and_times_out() -> None:
         body=b'{"challenge_url": "https://mangadot.net/"}',
     )
     assert status == 504
+
+
+# ── Req 6 + D-08: egress_ip ships in every payload, no-proxy unchanged ─────────
+
+
+def test_no_proxy_payload_is_today_shape_plus_empty_egress_ip() -> None:
+    # D-08 regression: a no-proxy /solve invokes the pipeline with proxy=None and
+    # returns the today-shape payload keys PLUS an additive empty egress_ip — i.e.
+    # the no-proxy behaviour is unchanged except for the additive field.
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert status == 200
+    assert pipeline.proxies == [None]  # pipeline driven with proxy=None
+    assert set(payload) == {"cf_clearance", "user_agent", "host", "egress_ip"}
+    assert payload["egress_ip"] == ""  # empty on the no-proxy path
+
+
+def test_proxied_payload_carries_verified_egress_ip() -> None:
+    # Req 6: the verified egress on a proxied solve reaches the 200 payload.
+    pipeline = FakePipeline(
+        result=SolveResult(
+            cf_clearance="MANGADOT_TOKEN",
+            user_agent="UA-wv",
+            host="mangadot.net",
+            egress_ip="203.0.113.7",
+        )
+    )
+    status, payload = _service(pipeline, proxy_solve_timeout_s=5.0).solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/",'
+            b' "proxy": {"server": "http://up.example:8080"}}'
+        ),
+    )
+    assert status == 200
+    assert payload["egress_ip"] == "203.0.113.7"
 
 
 # ── serialization + timeout (T-10-11) ────────────────────────────────────────
