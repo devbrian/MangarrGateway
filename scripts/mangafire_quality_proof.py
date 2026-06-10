@@ -227,7 +227,8 @@ async def _capture_title(
             clean, frag = urldefrag(url)
             offset = int(frag[4:]) if frag.startswith("scr_") else 0
             raw = await ctx.get_bytes(clean)
-            (capture_dir / f"page_{captured:03d}_off{offset}.bin").write_bytes(raw)
+            dst = capture_dir / f"page_{captured:03d}_off{offset}.bin"
+            await asyncio.to_thread(dst.write_bytes, raw)
             captured += 1
         return captured
     return 0
@@ -292,7 +293,8 @@ async def _live_scan_catalog(capture_dir: Path, max_titles: int) -> int:
             except Exception as exc:  # noqa: BLE001
                 print(f"[scan] feed error {feed}: {type(exc).__name__}")
                 continue
-            for card in _parse_cards(html):
+            cards = await asyncio.to_thread(_parse_cards, html)
+            for card in cards:
                 href = card.get("href", "")
                 token = href.rsplit("/manga/", 1)[-1].strip("/")
                 if token and token not in seen:
