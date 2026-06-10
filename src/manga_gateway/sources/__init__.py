@@ -34,6 +34,7 @@ def register_builtin_sources(
     from .mangaball import MangaBallSource
     from .mangadex import MangaDexSource
     from .mangadot import MangadotSource
+    from .mangafire import MangaFireSource
     from .weebcentral import WeebCentralSource
 
     disabled_keys = {key.lower() for key in (disabled or ())}
@@ -45,6 +46,7 @@ def register_builtin_sources(
         ("atsumaru", AtsumaruSource),
         ("weebcentral", WeebCentralSource),
         ("kagane", KaganeSource),
+        ("mangafire", MangaFireSource),
     )
     for key, cls in builtin:
         if key in disabled_keys:
