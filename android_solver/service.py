@@ -29,6 +29,7 @@ the sidecar image needs no web-framework dependency.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import logging
 import time
@@ -51,6 +52,8 @@ from android_solver.cdp import (
 )
 from android_solver.config import SidecarConfig
 from android_solver.device import AdbDevice, AdbError
+from android_solver.egress import expected_egress
+from android_solver.proxy_hop import repoint
 from android_solver.turnstile import locate_checkbox
 
 _log = logging.getLogger("android_solver.service")
@@ -108,6 +111,20 @@ _VERIFY_PROBE_JS = (
     "}catch(e){return false;}})()"
 )
 
+# Per-solve proxied-egress verification (Req 3 / D-03/D-04/D-05). After the device
+# proxy is set and CDP is up, the WebView is navigated to a NEUTRAL IP echo and its
+# observed egress is read in-browser, then compared to the sidecar self-probe's
+# expected egress (learned through the SAME authenticated upstream). A mismatch — a
+# silently-bypassed proxy — or any transient navigate/eval/parse failure raises
+# (NO token, T-11-01). The echo target is a sidecar CONSTANT, never caller-supplied
+# (no new SSRF surface, T-11-06).
+_EGRESS_ECHO_URL = "https://api.ipify.org"
+_EGRESS_NAV_CMD_ID = 40
+_EGRESS_READ_CMD_ID = 41
+_CHALLENGE_RENAV_CMD_ID = 42
+_EGRESS_READ_TIMEOUT_S = 15.0
+_EGRESS_READ_JS = "document.body.innerText"
+
 
 class SolveError(RuntimeError):
     """The solve pipeline could not mint a clearance (surfaces as 504)."""
@@ -136,13 +153,41 @@ def _raise_if_cancelled(cancel: Event | None) -> None:
         raise SolveCancelled("solve cancelled after timeout")
 
 
+def _proxy_parts(
+    proxy: dict[str, Any],
+) -> tuple[str, str, int, str | None, str | None]:
+    """Decompose a validated /solve proxy into the hop URI + self-probe inputs.
+
+    Returns ``(upstream_uri, up_host, up_port, user, pw)`` where ``upstream_uri`` is
+    the ``http://HOST:PORT#USER:PASS`` form pproxy needs to inject
+    ``Proxy-Authorization`` on the upstream CONNECT (the ``#user:pass`` fragment is
+    appended only when BOTH are present). ``up_host``/``up_port``/``user``/``pw``
+    feed the stdlib self-probe (``egress.expected_egress``) through the SAME
+    upstream. The credential-bearing URI is NEVER logged (T-11-02).
+    """
+    server = str(proxy["server"])
+    split = urlsplit(server)
+    up_host = split.hostname or ""
+    up_port = split.port or (443 if split.scheme == "https" else 80)
+    user = proxy.get("username")
+    pw = proxy.get("password")
+    upstream = f"{server}#{user}:{pw}" if user and pw else server
+    return upstream, up_host, up_port, user, pw
+
+
 @dataclass(frozen=True)
 class SolveResult:
-    """A successful solve: the minted token + the WebView UA it was minted under."""
+    """A successful solve: the minted token + the WebView UA it was minted under.
+
+    ``egress_ip`` carries the VERIFIED proxied egress on a proxied solve (Req 6);
+    it defaults to ``""`` so a no-proxy solve keeps a stable, byte-for-byte shape
+    (D-08). The egress IP is loggable; ``cf_clearance`` is NEVER logged (T-10-04).
+    """
 
     cf_clearance: str
     user_agent: str
     host: str
+    egress_ip: str = ""
 
 
 class SolvePipeline(Protocol):
@@ -184,6 +229,9 @@ class AndroidSolvePipeline:
         retap_interval_s: float = _RETAP_INTERVAL_S,
         frame_poll_timeout_s: float = _FRAME_POLL_TIMEOUT_S,
         frame_poll_interval_s: float = _FRAME_POLL_INTERVAL_S,
+        hop_host: str = "",
+        hop_port: int = 0,
+        egress_read_timeout_s: float = _EGRESS_READ_TIMEOUT_S,
     ) -> None:
         self._device = device
         self._timeout_s = timeout_s
@@ -192,6 +240,11 @@ class AndroidSolvePipeline:
         self._retap_interval_s = retap_interval_s
         self._frame_poll_timeout_s = frame_poll_timeout_s
         self._frame_poll_interval_s = frame_poll_interval_s
+        # The docker-reachable hop the device routes WebView egress through. Set
+        # from config (hop_host = "android-solver", NOT localhost — Pitfall 1).
+        self._hop_host = hop_host
+        self._hop_port = hop_port
+        self._egress_read_timeout_s = egress_read_timeout_s
         # Lazy default factories live in cdp (same package) — reuse them so the
         # devtools websocket/http plumbing has a single implementation (R1).
         from android_solver.cdp import _default_http_get, _default_ws_factory
@@ -258,6 +311,48 @@ class AndroidSolvePipeline:
         _raise_if_cancelled(cancel)
         self._device.force_stop_and_clear()
         _raise_if_cancelled(cancel)
+
+        if proxy is None:
+            # D-08: no-proxy solves run the direct-egress flow byte-for-byte
+            # unchanged — no hop repoint, no global http_proxy, no egress-verify.
+            return self._drive_solve(challenge_url, host, cancel, expected_egress_ip="")
+
+        # Proxied solve (Req 2/3/5): set the device-wide proxy under the serialized
+        # service Lock and ALWAYS clear it in finally — even on a mid-flight raise
+        # (Req 5, mirroring the #207 cancel-drain discipline). The hop is repointed
+        # to the per-solve authenticated upstream BEFORE the WebView restarts so it
+        # picks the proxy up on launch (D-02). The credential-bearing upstream URI
+        # is never logged (T-10-04 / T-11-02).
+        upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
+        repoint(self._hop_host, self._hop_port, upstream)
+        self._device.set_global_http_proxy(self._hop_host, self._hop_port)
+        try:
+            _raise_if_cancelled(cancel)
+            # Learn the egress this SAME upstream should present (stdlib self-probe,
+            # D-05); the WebView's observed egress is asserted against it pre-tap.
+            expected = expected_egress(up_host, up_port, user, pw)
+            return self._drive_solve(
+                challenge_url, host, cancel, expected_egress_ip=expected
+            )
+        finally:
+            self._clear_proxy_quietly()
+
+    def _drive_solve(
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None,
+        *,
+        expected_egress_ip: str,
+    ) -> SolveResult:
+        """Launch → CDP → (egress-verify when proxied) → tap → extract.
+
+        When ``expected_egress_ip`` is non-empty (proxied path) the WebView's
+        observed egress is read in-browser and asserted to equal it BEFORE the tap
+        (Req 3); a mismatch or transient echo failure raises with NO token. When it
+        is ``""`` (no-proxy path) the egress-verify is skipped and this flow is
+        byte-for-byte today's direct-egress solve (D-08).
+        """
         self._device.launch_url(challenge_url)
         _raise_if_cancelled(cancel)
         time.sleep(self._launch_settle_s)  # floor before the devtools socket is up
@@ -276,6 +371,24 @@ class AndroidSolvePipeline:
         try:
             cdp_call(ws, "Page.enable", command_id=10)
             cdp_call(ws, "DOM.enable", command_id=11)
+            if expected_egress_ip:
+                # Req 3 / T-11-01: prove the WebView egresses through the verified
+                # proxy IP BEFORE tapping — a silently-bypassed proxy must NOT mint
+                # a wrong-IP clearance. Mismatch/transient echo failure ⇒ no token.
+                observed = self._observe_webview_egress(ws, cancel)
+                if observed != expected_egress_ip:
+                    raise SolveError(
+                        "WebView egress did not match the expected proxied egress"
+                    )
+                _log.info("verified proxied WebView egress %s", observed)
+                # The echo read navigated away; return to the challenge under the
+                # now-verified egress before locating the Turnstile widget.
+                cdp_call(
+                    ws,
+                    "Page.navigate",
+                    {"url": challenge_url},
+                    command_id=_CHALLENGE_RENAV_CMD_ID,
+                )
             # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
             # after load) — the real readiness gate, not the fixed settle above.
             self._wait_for_cf_frame(ws, cancel)
@@ -306,7 +419,69 @@ class AndroidSolvePipeline:
                 exc_info=True,
             )
             user_agent = ""
-        return SolveResult(cf_clearance=token, user_agent=user_agent, host=host)
+        return SolveResult(
+            cf_clearance=token,
+            user_agent=user_agent,
+            host=host,
+            egress_ip=expected_egress_ip,
+        )
+
+    def _observe_webview_egress(self, ws: WebSocketLike, cancel: Event | None) -> str:
+        """Navigate the WebView to the IP echo and return its observed egress IP.
+
+        Uses the existing CDP channel (``Page.navigate`` → ``Runtime.evaluate``
+        ``document.body.innerText`` returnByValue), normalizing the body with
+        ``ipaddress.ip_address``. A failed navigate, a transient eval error, or a
+        non-IP body is NEVER a pass — it raises :class:`SolveError` (T-11-01). The
+        observed IP is loggable; no token is involved here.
+        """
+        try:
+            cdp_call(
+                ws,
+                "Page.navigate",
+                {"url": _EGRESS_ECHO_URL},
+                command_id=_EGRESS_NAV_CMD_ID,
+            )
+        except Exception as exc:  # noqa: BLE001 — any nav failure ⇒ not a pass
+            raise SolveError(f"egress echo navigation failed: {exc}") from exc
+
+        deadline = time.monotonic() + self._egress_read_timeout_s
+        last_err: Exception | None = None
+        while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel)
+            time.sleep(self._poll_interval_s)  # settle for the echo page to load
+            try:
+                result = cdp_call(
+                    ws,
+                    "Runtime.evaluate",
+                    {"expression": _EGRESS_READ_JS, "returnByValue": True},
+                    command_id=_EGRESS_READ_CMD_ID,
+                )
+                value = result.get("result", {}).get("value")
+                return str(ipaddress.ip_address(str(value).strip()))
+            except SolveCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 — retry until the load settles
+                last_err = exc
+                continue
+        raise SolveError(f"could not read a valid WebView egress IP: {last_err}")
+
+    def _clear_proxy_quietly(self) -> None:
+        """ALWAYS-run proxy teardown (Req 5): clear global http_proxy + hop IDLE.
+
+        Runs in the proxied solve's ``finally`` even when the solve raised
+        mid-flight, so the device is never left with a residual ``global
+        http_proxy`` and the hop returns to DIRECT. Neither step is allowed to mask
+        the original error — both are best-effort and only log on failure.
+        """
+        try:
+            self._device.clear_global_http_proxy()
+        except Exception:  # noqa: BLE001 — teardown must not mask the solve outcome
+            _log.warning("clear_global_http_proxy failed in teardown", exc_info=True)
+        try:
+            repoint(self._hop_host, self._hop_port, None)
+        except Exception:  # noqa: BLE001 — teardown must not mask the solve outcome
+            _log.warning("hop idle-repoint failed during teardown", exc_info=True)
 
     def _tap_until_cleared(
         self,

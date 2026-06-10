@@ -1,0 +1,345 @@
+"""AndroidSolvePipeline per-solve proxied-egress lifecycle (Req 2/3/5/6).
+
+Drives the REAL ``AndroidSolvePipeline._solve`` proxied path with fakes — no adb /
+redroid / WebView / network. Asserts:
+
+  * the device-wide proxy is set with ``(hop_host, hop_port)`` BEFORE the tap and
+    ALWAYS cleared in ``finally`` (Req 2/5), including the raise path;
+  * the WebView egress is verified BEFORE the tap — observed==expected proceeds,
+    observed!=expected raises with NO token, a transient/non-IP echo raises (Req 3);
+  * the proxy host is the config ``hop_host`` (``android-solver``), never localhost
+    (Pitfall 1 / T-11-05);
+  * the proxied success result carries the verified ``egress_ip`` (Req 6).
+"""
+
+from __future__ import annotations
+
+import pytest
+from android_solver.service import (
+    AndroidSolvePipeline,
+    SolveError,
+    SolveResult,
+)
+
+from android_solver import service
+
+_PROXY = {"server": "http://up.example:8080", "username": "u", "password": "p"}
+_HOP_HOST = "android-solver"
+_HOP_PORT = 18081
+_EXPECTED_IP = "203.0.113.7"
+
+
+class FakeClock:
+    """Deterministic monotonic clock; ``sleep`` advances ``now``."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakeDevice:
+    """Records proxy set/clear calls + taps over the AdbDevice surface used here."""
+
+    def __init__(self) -> None:
+        self.taps: list[tuple[int, int]] = []
+        self.force_stops = 0
+        self.proxy_set: list[tuple[str, int]] = []
+        self.proxy_cleared = 0
+        # Ordered event log so the test can assert set-before-tap-before-clear.
+        self.events: list[str] = []
+
+    def connect(self) -> None:
+        return None
+
+    def force_stop_and_clear(self) -> None:
+        self.force_stops += 1
+
+    def set_global_http_proxy(self, host: str, port: int) -> None:
+        self.proxy_set.append((host, port))
+        self.events.append("set_proxy")
+
+    def clear_global_http_proxy(self) -> None:
+        self.proxy_cleared += 1
+        self.events.append("clear_proxy")
+
+    def launch_url(self, url: str) -> None:
+        return None
+
+    def pidof(self) -> int:
+        return 4321
+
+    def forward_devtools(self, pid: int) -> int:
+        return 9222
+
+    def screencap(self) -> bytes:
+        return b"PNG"
+
+    def screen_size(self) -> tuple[int, int]:
+        return (720, 1280)
+
+    def input_tap(self, x: int, y: int) -> None:
+        self.taps.append((x, y))
+        self.events.append("tap")
+
+
+class FakeWs:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def send(self, payload: str) -> None:
+        return None
+
+    def recv(self) -> str:
+        return "{}"
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _build_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device: FakeDevice,
+    clock: FakeClock,
+    egress_body: object,
+    expected_ip: str = _EXPECTED_IP,
+    repoint_calls: list[tuple[str, int, str | None]] | None = None,
+) -> AndroidSolvePipeline:
+    page_targets = b'[{"type":"page","webSocketDebuggerUrl":"ws://localhost:9222/p"}]'
+    pipeline = AndroidSolvePipeline(
+        device,  # type: ignore[arg-type]
+        timeout_s=60.0,
+        ws_factory=lambda url, *, timeout: FakeWs(),  # type: ignore[arg-type,return-value]
+        http_get=lambda url, *, timeout: page_targets,
+        launch_settle_s=0.0,
+        poll_interval_s=1.0,
+        hop_host=_HOP_HOST,
+        hop_port=_HOP_PORT,
+        egress_read_timeout_s=5.0,
+    )
+    monkeypatch.setattr(service, "time", clock)
+
+    # Only the egress READ (command_id 41) returns the scripted ipify body; every
+    # other CDP command (Page.enable, the _in_verification probe id 300, the
+    # re-navigate, etc.) returns an empty dict so it does not look like a verifying
+    # banner or a stray IP.
+    def fake_cdp_call(ws, method, params=None, *, command_id):  # type: ignore[no-untyped-def]
+        if method == "Runtime.evaluate" and command_id == service._EGRESS_READ_CMD_ID:
+            return {"result": {"value": egress_body}}
+        return {}
+
+    monkeypatch.setattr(service, "cdp_call", fake_cdp_call)
+    monkeypatch.setattr(service, "locate_checkbox", lambda ws, **k: (50, 100))
+
+    # Return no token on the FIRST poll so a tap actually fires, then mint — this
+    # lets the tests assert the set-proxy → tap → clear-proxy ordering.
+    extract_state = {"calls": 0}
+
+    def fake_extract(ws_url, host):  # type: ignore[no-untyped-def]
+        extract_state["calls"] += 1
+        return "TOKEN" if extract_state["calls"] >= 2 else None
+
+    monkeypatch.setattr(service, "extract_clearance", fake_extract)
+    monkeypatch.setattr(service, "webview_user_agent", lambda url, **kwargs: "UA-wv")
+    monkeypatch.setattr(service, "expected_egress", lambda *a, **k: expected_ip)
+
+    calls = repoint_calls if repoint_calls is not None else []
+
+    def fake_repoint(host, port, upstream, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((host, port, upstream))
+
+    monkeypatch.setattr(service, "repoint", fake_repoint)
+
+    # Collapse the pre-tap readiness/scale steps (covered by their own units).
+    monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws, cancel=None: None)
+    monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
+    return pipeline
+
+
+# ── Req 2/3/6: matching egress proceeds to tap and returns egress_ip ──────────
+
+
+def test_proxied_solve_verifies_egress_then_taps_and_returns_egress_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,  # WebView observed == self-probe expected
+        repoint_calls=repoint_calls,
+    )
+
+    result: SolveResult = pipeline.solve(
+        "https://mangadot.net/", "mangadot.net", proxy=_PROXY
+    )
+
+    assert result.cf_clearance == "TOKEN"
+    assert result.egress_ip == _EXPECTED_IP  # Req 6: verified egress on the result
+    # Proxy set with the docker hop host:port (Pitfall 1 — never localhost).
+    assert device.proxy_set == [(_HOP_HOST, _HOP_PORT)]
+    # Set BEFORE the tap; cleared AFTER (Req 2/5).
+    assert device.events == ["set_proxy", "tap", "clear_proxy"]
+    assert device.proxy_cleared == 1
+    # Hop repointed to the authed upstream (SET), then back to DIRECT (IDLE).
+    assert repoint_calls[0] == (
+        _HOP_HOST,
+        _HOP_PORT,
+        "http://up.example:8080#u:p",
+    )
+    assert repoint_calls[-1] == (_HOP_HOST, _HOP_PORT, None)
+
+
+# ── Req 3 / T-11-01: a bypassed proxy (observed != expected) raises, no token ──
+
+
+def test_egress_mismatch_raises_without_token_and_still_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body="198.51.100.99",  # WebView egress != expected → bypass
+        repoint_calls=repoint_calls,
+        expected_ip=_EXPECTED_IP,
+    )
+
+    with pytest.raises(SolveError):
+        pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
+
+    # No tap ever fired (raised before the tap) — NO wrong-IP token minted.
+    assert device.taps == []
+    # finally STILL cleared the proxy + idled the hop (Req 5).
+    assert device.proxy_cleared == 1
+    assert repoint_calls[-1] == (_HOP_HOST, _HOP_PORT, None)
+
+
+# ── Req 3: a transient / non-IP echo is a FAILURE, never a pass ───────────────
+
+
+def test_transient_non_ip_echo_raises_not_a_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body="<html>error: not an ip</html>",  # non-IP body
+    )
+
+    with pytest.raises(SolveError):
+        pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
+
+    assert device.taps == []  # echo-read failure ⇒ no tap, no token
+    assert device.proxy_cleared == 1  # still cleared in finally
+
+
+# ── Req 5: a raise mid-flight still clears the proxy in finally ───────────────
+
+
+def test_proxy_cleared_even_when_solve_raises_midflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+    )
+
+    # Make the post-verify tap loop blow up so the solve raises after the proxy
+    # was set — the finally must STILL clear it.
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("tap loop exploded")
+
+    monkeypatch.setattr(pipeline, "_tap_until_cleared", boom)
+
+    with pytest.raises(RuntimeError):
+        pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
+
+    assert device.proxy_set == [(_HOP_HOST, _HOP_PORT)]
+    assert device.proxy_cleared == 1  # cleared despite the mid-flight raise
+
+
+# ── Pitfall 1: proxy host is the config hop_host, never localhost ─────────────
+
+
+def test_proxy_host_is_hop_host_never_localhost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+    )
+
+    pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
+
+    (host, port) = device.proxy_set[0]
+    assert host == _HOP_HOST
+    assert host not in ("localhost", "127.0.0.1")
+    assert port == _HOP_PORT
+
+
+# ── D-08: a no-proxy solve sets NO device proxy and repoints NO hop ───────────
+
+
+def test_no_proxy_solve_sets_no_device_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+        repoint_calls=repoint_calls,
+    )
+
+    result = pipeline.solve("https://mangadot.net/", "mangadot.net")
+
+    assert result.cf_clearance == "TOKEN"
+    assert result.egress_ip == ""  # additive-empty on the no-proxy path
+    assert device.proxy_set == []  # no global http_proxy set
+    assert device.proxy_cleared == 0  # nothing to clear
+    assert repoint_calls == []  # hop never repointed
+    assert device.taps == [(50, 100)]  # the solve still tapped + minted
+
+
+def test_username_only_proxy_uri_omits_credentials_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _proxy_parts only appends #user:pass when BOTH are present; a server-only
+    # proxy passes a bare upstream URI (no half-formed credential fragment).
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+        repoint_calls=repoint_calls,
+    )
+
+    pipeline.solve(
+        "https://mangadot.net/",
+        "mangadot.net",
+        proxy={"server": "http://up.example:8080"},
+    )
+
+    assert repoint_calls[0] == (_HOP_HOST, _HOP_PORT, "http://up.example:8080")
