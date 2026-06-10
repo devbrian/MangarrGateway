@@ -11,6 +11,8 @@ CRITICAL (SRCH-04): a source returning ``[]`` with NO warning is a distinct, val
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Protocol
 
@@ -21,6 +23,8 @@ from .errors import SourceError
 
 if TYPE_CHECKING:
     from .cooldown import SourceFailureCooldown
+
+_log = logging.getLogger("manga_gateway")
 
 # Default per-source fan-out timeout (D-14 discretion). Sized to comfortably
 # cover the slowest legitimate per-source operation:
@@ -80,6 +84,13 @@ async def fan_out[S: _HasKey, R](
         # additive — does not change any control flow / exception propagation below.
         token = current_source.set(src.key)
         try:
+            # Capture FIRST inside the try so ``started`` is always bound before any
+            # statement that could raise (e.g. cooldown.in_cooldown) — the except
+            # handlers below read ``started`` for their elapsed log, and an unbound
+            # ``started`` there would raise NameError out of _guarded and break the
+            # per-source isolation guarantee (SRCH-03). The cooldown-check time it
+            # now includes is negligible vs the actual source run (CodeRabbit, #223).
+            started = time.perf_counter()
             # 260606-lyb Change 2: a source in cooldown is SKIPPED — no upstream
             # call, no retry, no backoff. This return happens INSIDE the try (like
             # the success return below), so it never reaches the trailing
@@ -96,8 +107,22 @@ async def fan_out[S: _HasKey, R](
                     warnings.append((src.key, code, message))
             return src.key, result
         except TimeoutError:
+            _log.warning(
+                "fan-out: source %s timed out after %.1fs (>= %.0fs budget) — no "
+                "result; in-flight op cancelled before completing (cold browser/CF "
+                "path suspected)",
+                src.key,
+                time.perf_counter() - started,
+                per_source_timeout,
+            )
             warnings.append((src.key, "source_unavailable", "timed out"))
         except SourceError as exc:
+            _log.warning(
+                "fan-out: source %s failed after %.1fs: %s",
+                src.key,
+                time.perf_counter() - started,
+                str(exc),
+            )
             warnings.append((src.key, exc.code, str(exc)))
         except httpx.HTTPStatusError as exc:
             # A 5xx that exhausted the SourceContext retry budget reaches here as a
@@ -107,6 +132,12 @@ async def fan_out[S: _HasKey, R](
             # outage/maintenance 5xx reads as "upstream 503", never the opaque
             # "unexpected error" (#152: mangadot served a 503 "Under Maintenance"
             # HTML page → JSON parse never reached → generic warning).
+            _log.warning(
+                "fan-out: source %s failed after %.1fs: upstream %s",
+                src.key,
+                time.perf_counter() - started,
+                exc.response.status_code,
+            )
             warnings.append(
                 (src.key, "source_unavailable", f"upstream {exc.response.status_code}")
             )
@@ -114,6 +145,12 @@ async def fan_out[S: _HasKey, R](
             # Connect/read/timeout-class transport failures that exhausted retries are
             # an upstream-reachability problem, not a gateway bug — name the transport
             # error class so the warning is diagnosable rather than "unexpected" (#152).
+            _log.warning(
+                "fan-out: source %s failed after %.1fs: transport error: %s",
+                src.key,
+                time.perf_counter() - started,
+                type(exc).__name__,
+            )
             warnings.append(
                 (
                     src.key,
@@ -122,6 +159,12 @@ async def fan_out[S: _HasKey, R](
                 )
             )
         except Exception:  # noqa: BLE001 — isolation: one source must never break others
+            _log.warning(
+                "fan-out: source %s failed after %.1fs: unexpected error",
+                src.key,
+                time.perf_counter() - started,
+                exc_info=True,
+            )
             warnings.append((src.key, "source_unavailable", "unexpected error"))
         finally:
             current_source.reset(token)
