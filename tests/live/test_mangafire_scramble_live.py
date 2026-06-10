@@ -89,7 +89,7 @@ async def test_mangafire_descramble_quality_on_live_scrambled_pages() -> None:
             )
 
         clean, frag = urldefrag(scrambled_url)
-        offset = int(frag[4:])  # guaranteed scr_<int>0 by the selection above
+        offset = int(frag[4:])  # guaranteed scr_<N> with N>0 by the selection above
         raw = await ctx.get_bytes(clean)
         out = await asyncio.to_thread(_descramble_image, raw, offset)
         assert_descramble_preserves_quality(raw, out)
