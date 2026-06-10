@@ -52,28 +52,44 @@ async def test_mangafire_descramble_quality_on_live_scrambled_pages() -> None:
 
         chapters = await source._chapter_list(_BLUE_LOCK_SLUG_ID, "en", ctx)
         scrambled_url: str | None = None
-        scanned = 0
+        inspected = 0  # manifests actually resolved (vs errored — see `errors`)
+        errors = 0
         for chapter in chapters[:_SCAN_CHAPTERS]:
             href = chapter.get("href")
             if not href:
                 continue
-            scanned += 1
             try:
                 manifest = await source.fetch_manifest(href, ctx)
-            except Exception:  # noqa: BLE001 — a bad chapter must not stop the scan
+            except Exception as exc:  # noqa: BLE001 — resilient scan, but VISIBLE
+                # Logging (not silent continue) so a "dormant" skip can't mask a
+                # run where every manifest fetch was actually failing (S112).
+                errors += 1
+                print(f"[live mangafire] skip chapter {href!r}: fetch_manifest {exc!r}")
                 continue
-            hits = [url for url in manifest if "#scr_" in url]
-            if hits:
-                scrambled_url = hits[0]
+            inspected += 1
+            for url in manifest:
+                _, frag = urldefrag(url)
+                # Select on a parsed offset>0, not a bare "#scr_" substring — robust
+                # even if a future manifest ever emitted a scr_0 (non-scrambled) tag.
+                if not frag.startswith("scr_"):
+                    continue
+                try:
+                    if int(frag[4:]) > 0:
+                        scrambled_url = url
+                        break
+                except ValueError:
+                    continue
+            if scrambled_url is not None:
                 break
 
         if scrambled_url is None:
             pytest.skip(
-                f"MangaFire scrambling dormant — 0 offset>0 pages in {scanned} chapters"
+                f"MangaFire scrambling dormant — 0 offset>0 pages in {inspected} "
+                f"chapters inspected ({errors} manifest fetch error(s))"
             )
 
         clean, frag = urldefrag(scrambled_url)
-        offset = int(frag[4:]) if frag.startswith("scr_") else 0
+        offset = int(frag[4:])  # guaranteed scr_<int>0 by the selection above
         raw = await ctx.get_bytes(clean)
         out = await asyncio.to_thread(_descramble_image, raw, offset)
         assert_descramble_preserves_quality(raw, out)
