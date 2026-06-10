@@ -59,7 +59,10 @@ class AndroidSolver:
         base_url: str | None,
         api_key: SecretStr | None,
         challenge_urls: dict[str, str],
-        timeout_s: float = 120.0,
+        # Client timeout: must exceed the sidecar's per-solve cap (default 120s) +
+        # margin so the gateway never abandons + re-fires a solve mid-flight (the app
+        # wires this from settings.android_solver_timeout_s, default 180).
+        timeout_s: float = 180.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.

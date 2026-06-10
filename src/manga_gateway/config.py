@@ -205,10 +205,13 @@ class Settings(BaseSettings):
     # ``X-Solver-Key`` header (SEC-01); set it via GATEWAY_ANDROID_SOLVER_API_KEY.
     android_solver_url: str | None = None  # e.g. "http://android-solver:8080"
     android_solver_api_key: SecretStr | None = None
-    # gt=0: a non-positive timeout would break the httpx request budget. Default
-    # 120s — an Android WebView Turnstile solve (force-stop + load + dynamic tap +
-    # cf_clearance poll) is slower than a desktop solve.
-    android_solver_timeout_s: float = Field(default=120.0, gt=0)
+    # gt=0: a non-positive timeout would break the httpx request budget. This is the
+    # gateway->sidecar CLIENT timeout; it MUST exceed the sidecar's own per-solve cap
+    # (SOLVER_SOLVE_TIMEOUT_S, default 120s) + margin — otherwise the gateway abandons
+    # a solve the sidecar would complete and re-fires, thrashing the single redroid
+    # (Phase 10 live-verify). Default 180 = the 120s cap + 60s margin, so a clean
+    # out-of-the-box run does not trip the coupling. Raise it if you raise the cap.
+    android_solver_timeout_s: float = Field(default=180.0, gt=0)
     # ── Source enable/disable (reversible ops knob; #198/#202) ─────────────────
     # Comma-separated source keys to SKIP registering at startup, e.g.
     # GATEWAY_DISABLED_SOURCES="kagane,mangadot". A disabled source is dropped
