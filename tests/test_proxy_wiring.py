@@ -364,3 +364,36 @@ async def test_lifespan_no_proxy_leaves_solver_proxy_none() -> None:
     async with app.router.lifespan_context(app):
         # Phase 10: proxy lives on the router's Patchright leg (see above).
         assert app.state.solver._patchright._proxy is None
+
+
+async def test_lifespan_threads_same_proxy_into_android_solver() -> None:
+    """Req 7: the lifespan feeds the SAME build_proxy Playwright dict into the
+    router's Android leg, so the sidecar /solve egress matches the httpx-fetch
+    egress for the minted clearance."""
+    from manga_gateway.app import create_app
+
+    app = create_app(
+        _settings(
+            cloudflare_proxy_server=_FAKE_SERVER,
+            cloudflare_proxy_username=_FAKE_USER,
+            cloudflare_proxy_password=_FAKE_PASS,
+        )
+    )
+    async with app.router.lifespan_context(app):
+        # The Android leg carries the same dict the Patchright leg does — one
+        # build_proxy call feeds both (no second call, no new setting).
+        assert app.state.solver._android._proxy == {
+            "server": _FAKE_SERVER,
+            "username": _FAKE_USER,
+            "password": _FAKE_PASS,
+        }
+
+
+async def test_lifespan_no_proxy_leaves_android_solver_proxy_none() -> None:
+    """No proxy configured ⇒ the Android leg receives no proxy (``_proxy is
+    None``) so its /solve body stays byte-for-byte today (D-08)."""
+    from manga_gateway.app import create_app
+
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        assert app.state.solver._android._proxy is None
