@@ -128,6 +128,7 @@ def _row(
     date_added: str = "2026-05-12 12:21:39+00",
     page_count: int = 75,
     source: str = "user",
+    comment_count: int = 0,
 ) -> dict[str, Any]:
     """One bare chapter-array row (RESEARCH §chapter list)."""
     return {
@@ -141,6 +142,7 @@ def _row(
         "date_added": date_added,
         "page_count": page_count,
         "source": source,
+        "comment_count": comment_count,
     }
 
 
@@ -194,7 +196,14 @@ async def test_search_mints_specific_guid_and_direct_chapter_id() -> None:
     ctx = _ctx(
         manga_list=[_manga(manga_id="20277")],
         listings={
-            "20277": [_row(chapter_id="388872", chapter_number="26.0", language="en")]
+            "20277": [
+                _row(
+                    chapter_id="388872",
+                    chapter_number="26.0",
+                    language="en",
+                    comment_count=7,
+                )
+            ]
         },
     )
     releases = await MangadotSource().search(
@@ -218,10 +227,34 @@ async def test_search_mints_specific_guid_and_direct_chapter_id() -> None:
     assert rel.publish_date == "2026-05-12T12:21:39+00:00"
     assert rel.language == "en"
     assert rel.scanlation_group == "Stick"
-    # REL-03: MangaDot exposes no vote field (recon-gated) -> votes is None.
-    assert rel.votes is None
+    # REL-03: per-chapter comment_count (unit = comments) wired to display-only
+    # votes.
+    assert rel.votes == 7
     assert rel.chapter_number == Decimal("26.0")
     assert rel.ids == {"mangaId": "20277", "mangadotChapterId": "388872"}
+
+
+@pytest.mark.asyncio
+async def test_search_comment_count_zero_and_absent_votes() -> None:
+    # REL-03: default comment_count=0 → votes==0; a row omitting the key →
+    # votes is None (_parse_int is None-safe).
+    row_absent = _row(chapter_id="1", chapter_number="2.0")
+    del row_absent["comment_count"]
+    ctx = _ctx(
+        manga_list=[_manga(manga_id="20277")],
+        listings={
+            "20277": [
+                _row(chapter_id="388872", chapter_number="26.0"),  # default 0
+                row_absent,
+            ]
+        },
+    )
+    releases = await MangadotSource().search(
+        SearchRequest(type="manga", query="x"), ctx
+    )
+    by_id = {r.ids["mangadotChapterId"]: r for r in releases}
+    assert by_id["388872"].votes == 0
+    assert by_id["1"].votes is None
 
 
 @pytest.mark.asyncio
