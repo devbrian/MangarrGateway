@@ -471,6 +471,11 @@ class KaganeSource(Source):
         language = str(series.get("translated_language") or "en")
         chapter_number = self._parse_decimal(book.get("chapter_no"))
         page_count = self._parse_int(book.get("page_count"))
+        # REL-03: display-only votes from the Komga-fork per-chapter view
+        # counter (unit = views). None for recent-feed ``latest_chapters`` rows
+        # which lack the field (correct/desired — _parse_int is None-safe). NOT
+        # added to the minted ResolutionRecord (display-only).
+        votes = self._parse_int(book.get("views"))
         group = _first_group(book)
         publish_date = (
             _iso_or_none(book.get("became_visible_at"))
@@ -513,6 +518,7 @@ class KaganeSource(Source):
             language=language,
             scanlation_group=group,
             page_count=page_count,
+            votes=votes,
             ids={"kaganeSeriesId": series_id, "kaganeBookId": book_id},
         )
 

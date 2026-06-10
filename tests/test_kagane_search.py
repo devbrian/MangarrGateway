@@ -109,7 +109,12 @@ def _series(
 
 
 def _book(
-    *, book_id: str, chapter_no: Any = 200, sort_no: float = 200.0, pages: int = 12
+    *,
+    book_id: str,
+    chapter_no: Any = 200,
+    sort_no: float = 200.0,
+    pages: int = 12,
+    views: int = 856,
 ) -> dict[str, Any]:
     return {
         "book_id": book_id,
@@ -118,6 +123,7 @@ def _book(
         "volume_no": None,
         "sort_no": sort_no,
         "page_count": pages,
+        "views": views,
         "groups": [{"group_id": "g1", "title": "The Hours Between"}],
         "became_visible_at": "2026-03-07T14:27:20.534756Z",
         "created_at": "2026-03-07T14:27:20.534756Z",
@@ -173,12 +179,27 @@ async def test_search_mints_book_id_handle_and_guid() -> None:
     assert record.source_key == "kagane"
     assert record.page_count == 12
     assert rel.page_count == 12
+    # REL-03: views (Komga-fork per-chapter counter) wired to display-only votes.
+    assert rel.votes == 856
     assert rel.language == "en"
     assert rel.chapter_number == Decimal("200")
     assert rel.publish_date == "2026-03-07T14:27:20.534756+00:00"
     assert rel.ids == {"kaganeSeriesId": "s1", "kaganeBookId": "b1"}
     assert rel.scanlation_group == "The Hours Between"
     assert "[The Hours Between]" in rel.title
+
+
+@pytest.mark.asyncio
+async def test_search_release_without_views_has_null_votes() -> None:
+    # REL-03: recent-feed `latest_chapters` rows lack `views` → votes is None.
+    book = _book(book_id="b1")
+    del book["views"]
+    ctx = _ctx(content=[_series(series_id="s1")], details={"s1": [book]})
+    releases = await KaganeSource().search(
+        SearchRequest(type="manga", query="solo leveling"), ctx
+    )
+    assert len(releases) == 1
+    assert releases[0].votes is None
 
 
 @pytest.mark.asyncio
