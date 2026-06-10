@@ -40,13 +40,17 @@ issue #192 recon (``/manga/blue-lockk.kw9j9``, live-verified 2026-06-09) with a
 deterministic leading hit so ``release[0]`` is well-defined. The first live smoke
 confirms the catalog still returns it; swap if the catalog shifts.
 
-Rate limit (PLACEHOLDER — pending the D-14 probe in Plan 03)
-------------------------------------------------------------
-``rate_limit_per_minute = 60`` + ``max_concurrent_jobs = 3`` on the production source
-are CONSERVATIVE PLACEHOLDERS, NOT measured values — the HTML paths use the unlimited
-``get_bytes``/``get_json`` primitives, so the real bound is the per-source fan-out
-semaphore + ``max_concurrent_jobs``. Plan 03 runs the
-``rate-limit-probe-mangarrgateway`` playbook to set both from the measurement.
+Rate limit (PROBE-MEASURED 2026-06-10 — D-14, Plan 03)
+------------------------------------------------------
+``rate_limit_per_minute = 60`` + ``max_concurrent_jobs = 3`` are now MEASURED, not
+guessed (``scripts/probe_rate_limits.py``, residential proxies). The mangafire.to
+text/AJAX host enforces a real HTTP-429 ceiling — clean at 120/min, 429 onset at
+300/min — so 60 is the conservative ~50%-of-clean-ceiling value governing the limited
+``get_json`` chapter-list path. The image CDN had NO limit (clean to 960/min at
+concurrency 8); images ride the unlimited ``get_bytes`` path bounded by
+``max_concurrent_jobs = 3``. The browser-manifest path was unmeasurable by the httpx
+probe — the live nightly below re-confirms it end-to-end. See the source's
+reconciliation block for the full per-endpoint breakdown.
 
 LIVE-TUNE items (refine from the first deploy-host smoke)
 ---------------------------------------------------------
@@ -60,8 +64,9 @@ LIVE-TUNE items (refine from the first deploy-host smoke)
   it within the ≤60×500ms budget on the deploy host.
 * **image descramble** (D-12) — confirm ``offset>0`` pages descramble correctly and
   ``offset==0`` pages pass through unchanged on real CDN images.
-* **rate_limit_per_minute / max_concurrent_jobs** — replace the 60 / 3 placeholders
-  with the D-14 probe measurement (Plan 03).
+* **rate_limit_per_minute / max_concurrent_jobs** — set to 60 / 3 from the 2026-06-10
+  D-14 probe (real 429 ceiling on the text host; image CDN unlimited). Re-confirm the
+  browser-manifest path (probe-unmeasurable) against the real end-to-end download.
 * **download_timeout_s** — 480.0 (Cloudflare warm + browser-DOM manifest + per-page
   descramble, matching the comix CF-warm budget). Re-size against the real end-to-end
   download wall-clock.

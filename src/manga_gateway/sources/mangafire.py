@@ -338,11 +338,32 @@ class MangaFireSource(Source):
     id_types: list[str] = []
     # Recon-observed language set (the /filter language[] options). Refine in Plan 03.
     languages = ["en", "fr", "es", "es-la", "pt-br", "ja"]
-    # PLACEHOLDER — replaced by the D-14 probe in Plan 03; NOT a final value. The HTML
-    # paths use the unlimited get_bytes/get_json byte/json primitives, so the real
-    # bound is _CHAPTERS_FANOUT_CONCURRENCY / max_concurrent_jobs, not this limiter.
+    # Probe-measured (2026-06-10, scripts/probe_rate_limits.py, residential proxies,
+    # fresh-proxy-per-category, 46/50 healthy) — D-14, replacing the Plan 02
+    # placeholders. Two sweeps found a REAL per-endpoint difference (unlike atsumaru's
+    # uniform floor):
+    #   * text/AJAX host (mangafire.to — /filter + /ajax/manga/{slug}/chapter): a real
+    #     HTTP-429 CEILING. Fully clean at 120/min (0/120 throttled); 429 onset at
+    #     300/min (103/300 blocked), worsening at 600 (370) and 960 (718). Parallelism
+    #     stayed clean to concurrency 32 at 120/min. 60 is the harness's conservative
+    #     ~50%-safety-fraction of the 120/min clean ceiling — a MEASURED ceiling, not a
+    #     floor (contrast atsumaru's 480 FLOOR). It governs the LIMITED get_json
+    #     chapter-list path (the high-volume fan-out path) and leaves host headroom for
+    #     the few UNLIMITED get_bytes /filter calls that share the same 429 ceiling.
+    #   * image CDN (separate host): NO limit — clean to 960/min at concurrency 8 (a
+    #     FLOOR). The get_bytes image path is exempt from this limiter (limited=False);
+    #     its throughput is bounded by max_concurrent_jobs, not rate_limit_per_minute.
+    #   * browser manifest (fetch_via_browser): UNMEASURABLE by the httpx probe (a
+    #     browser-nav path — skipped, "manifest not captured"); the Plan 04 live nightly
+    #     confirms it end-to-end.
     rate_limit_per_minute = 60
-    # PLACEHOLDER — replaced by the D-14 probe in Plan 03; NOT a final value.
+    # D-30 per-source override — tuned for the UNLIMITED get_bytes image-fetch path that
+    # rides a download job (recent/search/filter HTML use the separate per-source
+    # _CHAPTERS_FANOUT_CONCURRENCY semaphore, not this knob). The image CDN sustained
+    # concurrency 32 + 960/min cleanly, so images are NOT the bottleneck; the binding
+    # constraint on concurrent JOBS is each job's one browser CF-nav manifest (comix-
+    # class, unmeasurable above). 3 mirrors the comix/mangadot/atsumaru precedent and is
+    # clamped by the job manager to the global max_concurrent_chapters (8).
     max_concurrent_jobs = 3
     # D-05: interior pages answer cold over httpx, but declare cloudflare anyway so the
     # framework keeps a warm browser + clearance for the manifest path and degrades
