@@ -14,12 +14,18 @@ deliberately NOT routed — recent must never call it (it would AssertionError).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
 from manga_gateway.handles.store import HandleStore
-from manga_gateway.sources.atsumaru import AtsumaruSource, _ms_to_iso
+from manga_gateway.sources.atsumaru import (
+    _CHAPTERS_FANOUT_CONCURRENCY,
+    _RECENT_TITLE_CAP,
+    AtsumaruSource,
+    _ms_to_iso,
+)
 
 _RECENT = "https://atsu.moe/api/infinite/recentlyUpdated"
 _MANGAPAGE = "https://atsu.moe/api/manga/page"
@@ -141,6 +147,58 @@ async def test_recent_non_english_language_returns_empty() -> None:
     )
     assert releases == []
     assert ctx.calls == []  # short-circuits before any network call
+
+
+def test_recent_fanout_concurrency_is_single_wave() -> None:
+    """recent() must fan out wide enough to clear the title cap in ONE wave.
+
+    Regression lock for debug ``atsumaru-unavailable-58171``: the recent fan-out
+    originally reused a search-tuned concurrency of 6, which forced ~4 sequential waves
+    across the 20-title cap. On atsu.moe's intermittent multi-second latency tail the
+    cumulative wall-clock exceeded fanout.py's 30s per-source ``asyncio.timeout`` and
+    the source was cancelled → ``source_unavailable``. The source-wide
+    ``_CHAPTERS_FANOUT_CONCURRENCY`` must be ≥ the title cap so the worst case is one
+    wave (~recentlyUpdated + the single slowest page).
+    """
+    assert _CHAPTERS_FANOUT_CONCURRENCY >= _RECENT_TITLE_CAP
+
+
+class _ConcurrencyTrackingCtx(_FakeCtxForRecent):
+    """Records peak in-flight ``manga.page`` calls to assert a single fan-out wave."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._inflight = 0
+        self.peak_inflight = 0
+
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        if url == _MANGAPAGE:
+            self._inflight += 1
+            self.peak_inflight = max(self.peak_inflight, self._inflight)
+            try:
+                # Yield so every concurrently-launched task can enter before any exits;
+                # peak then reflects the true wave width, not scheduling order.
+                await asyncio.sleep(0)
+                return await super().get_json(url, **params)
+            finally:
+                self._inflight -= 1
+        return await super().get_json(url, **params)
+
+
+@pytest.mark.asyncio
+async def test_recent_launches_full_cap_in_one_wave() -> None:
+    # 20 titles (the cap) with limit large enough not to clamp the fan-out.
+    n = _RECENT_TITLE_CAP
+    items = [_item(manga_id=f"m{i}") for i in range(n)]
+    listings = {f"m{i}": [_chapter(chapter_id=f"c{i}", number=i)] for i in range(n)}
+    ctx = _ConcurrencyTrackingCtx(items=items, listings=listings)
+    releases = await AtsumaruSource().recent(
+        languages=None, limit=1000, since=None, ctx=ctx
+    )
+    assert len(releases) == n
+    # All 20 manga.page calls must be in flight at once (single wave), proving the
+    # fan-out is no longer throttled to the search-tuned 6.
+    assert ctx.peak_inflight == n
 
 
 def test_ms_to_iso_valid_and_malformed() -> None:
