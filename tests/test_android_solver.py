@@ -126,7 +126,9 @@ async def test_solve_body_omits_proxy_when_unconfigured() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_solve_does_not_log_proxy_or_token(caplog: pytest.LogCaptureFixture) -> None:
+async def test_solve_does_not_log_proxy_or_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """T-11-02 / T-10-04: neither the proxy password nor the cf_clearance token
     appears in any log record."""
     respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
