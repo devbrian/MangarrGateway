@@ -209,6 +209,91 @@ To override — e.g. force headless on a residential dev box with a real display
 chromium --with-deps` + `xvfb`); it runs headed via the baked
 `GATEWAY_CLOUDFLARE_HEADLESS=false` default.
 
+## Android-WebView Cloudflare solver (mangadot + kagane)
+
+`mangadot.net` and `kagane.to` serve a **strict** Cloudflare Turnstile that the
+desktop Patchright/Camoufox path **provably cannot clear from Linux** — a
+mechanistic catch-22: an honest Linux fingerprint is distrusted, and spoofing a
+non-Linux one contradicts the real software/GPU render output that Cloudflare's
+render-consistency hash flags. This was proven across Patchright, Camoufox,
+nodriver, curl_cffi TLS-impersonation, software **and** real-iGPU WebGL, and
+headless **and** headed (Weston-GPU) — all fail (debug
+`mangadot-cf-linux-fingerprint`). Comix's lighter challenge is **unaffected** and
+stays on Patchright.
+
+A **real Android WebView** is a different, trusted fingerprint class (the same one
+the Tachiyomi `mangadotnet` extension rides). Two docker-compose sidecars provide
+it, keeping all Android machinery **out of the gateway process** (R1):
+
+- **`redroid`** — Android 11 in Docker (`redroid/redroid:11.0.0-latest`). Runs the
+  bundled `org.chromium.webview_shell`. `privileged: true` and the host iGPU
+  (`/dev/dri`) are **required** so Android renders WebGL on real hardware and the
+  render-consistency check passes; the GPU is selected with the boot arg
+  `androidboot.redroid_gpu_mode=host`. By default adb `5555` is docker-internal
+  only; this deploy **publishes** it as host `15555` by operator decision for
+  LAN-only device inspection (see the `REMOVE for untrusted networks` note in
+  `docker-compose.yml`).
+- **`android-solver`** — a thin sidecar that drives redroid over adb + CDP: load
+  the challenge URL in the WebView, dynamically locate and hardware-`input tap` the
+  Turnstile checkbox, poll for `cf_clearance`, and return `{cf_clearance,
+  user_agent}` from an authenticated, SSRF-allowlisted `POST /solve`. The control
+  API (`:8080`) is docker-internal by default; this deploy **publishes** it as host
+  `18080` (LAN-only, operator decision — same `docker-compose.yml` caveat;
+  `/solve` still requires `X-Solver-Key`). The gateway's `AndroidSolver` POSTs it
+  and injects the returned cookie + UA on the existing shared httpx leg.
+
+### Host prerequisite (redroid will NOT boot without it)
+
+The host kernel must load the **`binder_linux`** (and `ashmem_linux`) modules.
+Kernel 5.15-generic ships them as loadable modules (binderfs) — no rebuild. Load
+and persist them on the host **once**:
+
+```bash
+sudo modprobe binder_linux ashmem_linux
+printf 'binder_linux\nashmem_linux\n' | sudo tee /etc/modules-load.d/redroid.conf
+```
+
+The host must also expose the iGPU at `/dev/dri` (verified on the deploy's Alder
+Lake iGPU). Without binder, `docker compose up redroid` never reaches
+`sys.boot_completed=1` and the `android-solver` healthcheck dependency never goes
+healthy.
+
+### Shared egress IP (locked constraint)
+
+`cf_clearance` is **IP-bound**: redroid and the gateway's httpx image-fetch leg
+**must egress the same public IP**. The deploy NATs both through the home WAN
+residential IP, so they are consistent with no extra config. If a residential
+proxy is ever added for these sources (issue #65), **redroid must egress through
+the SAME proxy** or the minted clearance is rejected.
+
+### Landmine: do NOT `adb root`
+
+`adb root` against redroid **wedges its `adbd`** — the solver must run **unrooted**.
+If a device wedges, recover by restarting the `redroid` container. (The sidecar
+never escalates; this is only a manual-debugging hazard.)
+
+### Enabling on the deploy
+
+The gateway points at the sidecar via `GATEWAY_ANDROID_SOLVER_URL` +
+`GATEWAY_ANDROID_SOLVER_API_KEY` (the api key must match the sidecar's
+`SOLVER_API_KEY` — compose wires both from one `.env` value; see `.env.example`).
+When the URL is unset, the `AndroidSolver` leg boots mangadot/kagane **disabled**
+(D-33) and the gateway still runs. Once the sidecars are up, **drop
+`mangadot,kagane` from `GATEWAY_DISABLED_SOURCES`** to re-enable them.
+
+Note the distinction: the gateway **application** runs fine without the sidecar
+configured (android sources just boot disabled). The android sidecars are **opt-in**
+via the `android` compose profile — a bare `docker compose up` runs the gateway
+alone (works with no `.env`, exposes no extra ports). To bring up redroid +
+android-solver, set `COMPOSE_PROFILES=android` in `.env` (or pass `--profile
+android`); this goes **with** `GATEWAY_ANDROID_SOLVER_API_KEY`, since the sidecar
+fails fast (`ConfigError`) on an empty `SOLVER_API_KEY`. With both set, the deploy's
+usual `docker compose -f docker-compose.yml up --build -d` brings up the full stack.
+
+**CI stays gated.** GitHub Actions has no `binder` kernel module, so redroid cannot
+boot there — the mangadot/kagane live-smoke tests keep their `ci_skip_reason` and
+skip in CI. This is a **deploy-only** capability.
+
 ## Observability & Metrics
 
 The gateway records a small event for every meaningful outbound action (HTTP

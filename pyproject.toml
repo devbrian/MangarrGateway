@@ -88,6 +88,15 @@ ignore_missing_imports = true
 module = ["hdrh.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# websocket-client is an android-solver SIDECAR-only dep (android_solver/
+# requirements.txt) — it is NOT a gateway dependency, so it is absent from the
+# gate venv and mypy cannot resolve it. The sidecar's CDP leg (android_solver/
+# cdp.py) lazily imports `websocket.create_connection`. Treat the import as
+# untyped rather than pulling websocket-client into the gateway's own deps.
+module = ["websocket"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

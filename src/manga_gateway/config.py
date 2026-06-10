@@ -190,6 +190,28 @@ class Settings(BaseSettings):
     # TOML and never commit a real credential. get_secret_value() is unpacked
     # ONLY inside build_proxy.
     cloudflare_proxy_password: SecretStr | None = None
+    # ── Android-WebView Cloudflare solver sidecar (Phase 10, BOT-02) ───────────
+    # Env-overridable ops knobs (D-11), same treatment as the cloudflare_* knobs
+    # (NOT the api_key exclusion); they ride the load_settings TOML→kwargs merge.
+    # The gateway-side ``AndroidSolver`` httpx-POSTs this sidecar's ``/solve`` to
+    # mint a ``cf_clearance`` from a real Android WebView (redroid) for the strict
+    # Cloudflare Turnstile on mangadot/kagane that desktop automation cannot clear
+    # from Linux (resolved debug ``mangadot-cf-linux-fingerprint``). R1 is
+    # preserved: the gateway holds no Android machinery — it reaches the sidecar
+    # over the docker-internal network only. ``None`` URL ⇒ UNCONFIGURED: the
+    # AndroidSolver's warm() boots every android source disabled, so the gate / CI
+    # / a local box without redroid stays green (the sidecar is a DEPLOY-only
+    # dependency). The api key is a SecretStr (repr/log-redacted) sent as the
+    # ``X-Solver-Key`` header (SEC-01); set it via GATEWAY_ANDROID_SOLVER_API_KEY.
+    android_solver_url: str | None = None  # e.g. "http://android-solver:8080"
+    android_solver_api_key: SecretStr | None = None
+    # gt=0: a non-positive timeout would break the httpx request budget. This is the
+    # gateway->sidecar CLIENT timeout; it MUST exceed the sidecar's own per-solve cap
+    # (SOLVER_SOLVE_TIMEOUT_S, default 120s) + margin — otherwise the gateway abandons
+    # a solve the sidecar would complete and re-fires, thrashing the single redroid
+    # (Phase 10 live-verify). Default 180 = the 120s cap + 60s margin, so a clean
+    # out-of-the-box run does not trip the coupling. Raise it if you raise the cap.
+    android_solver_timeout_s: float = Field(default=180.0, gt=0)
     # ── Source enable/disable (reversible ops knob; #198/#202) ─────────────────
     # Comma-separated source keys to SKIP registering at startup, e.g.
     # GATEWAY_DISABLED_SOURCES="kagane,mangadot". A disabled source is dropped

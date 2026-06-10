@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api import api_router
 from .config import Settings
 from .errors import register_error_handlers
+from .framework.android_solver import AndroidSolver
 from .framework.antibot import CloudflareSolver
 from .framework.cooldown import SourceFailureCooldown
 from .framework.enum_cache import EnumerationCache
@@ -35,6 +36,7 @@ from .framework.ratelimit import RateLimiter
 from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
 from .framework.session_prep import CsrfBootstrap
+from .framework.solver_router import SolverRouter
 from .framework.transport import HttpxTransport
 from .handles.store import HandleStore
 from .jobs.manager import JobManager
@@ -164,6 +166,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if getattr(cls, "antibot", "none").startswith("cloudflare")
     }
     cloudflare_keys: frozenset[str] = frozenset(cf_sources)
+    # Phase 10 (BOT-01/SRC-01/SRC-02): partition the cloudflare-gated sources by
+    # ``Source.solver_engine`` (default ``"patchright"``). The PATCHRIGHT leg keeps
+    # comix byte-for-byte unchanged; the ANDROID leg routes mangadot/kagane to the
+    # redroid-WebView sidecar via the AndroidSolver. ``cloudflare_keys`` (the full
+    # union) still feeds the ``source_health`` breaker map + the D-37 watchdog below
+    # — EVERY cloudflare source gets a breaker + supervisor regardless of engine.
+    engine_by_source: dict[str, str] = {
+        key: getattr(cls, "solver_engine", "patchright")
+        for key, cls in cf_sources.items()
+    }
+    patchright_keys: frozenset[str] = frozenset(
+        key for key, engine in engine_by_source.items() if engine != "android"
+    )
+    android_keys: frozenset[str] = frozenset(
+        key for key, engine in engine_by_source.items() if engine == "android"
+    )
     # Per-source health map (D-38): one breaker per cloudflare-gated source.
     # JobManager + the search route read this by reference (deps.get_source_health).
     source_health: dict[str, SourceHealth] = {
@@ -209,10 +227,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # a URL fall back to the framework solver default (an invalid.example
     # placeholder useful only for tests). With exactly one cf source registered
     # (comix today) this collapses to the historic single-domain behavior.
+    # Phase 10: the Patchright leg's challenge-URL map is PARTITIONED to patchright
+    # sources ONLY — so comix's browser warm/solve is byte-for-byte unchanged and
+    # the unclearable-from-Linux mangadot/kagane NEVER enter the Patchright warm set
+    # (they route to the Android sidecar leg below instead).
     challenge_urls: dict[str, str] = {
         key: url
         for key, cls in cf_sources.items()
-        if (url := getattr(cls, "cloudflare_challenge_url", None))
+        if key in patchright_keys
+        and (url := getattr(cls, "cloudflare_challenge_url", None))
     }
     solver_kwargs: dict[str, Any] = {
         "user_data_dir": settings.cloudflare_user_data_dir,
@@ -226,7 +249,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # this to 1 (the _reject_camoufox_parallel validator enforces it —
         # Firefox cannot run parallel CF navs).
         "fetch_concurrency": settings.cloudflare_fetch_concurrency,
-        "cloudflare_keys": cloudflare_keys,
+        # Phase 10: the Patchright leg owns ONLY the patchright sources (comix); the
+        # android sources are warmed/solved by the AndroidSolver leg below.
+        "cloudflare_keys": patchright_keys,
         # #153: bounded eager-warm retry so a cold-deploy launch flake is absorbed
         # before a source is force_disabled (and so advertised down in /caps for 12h).
         "warm_attempts": settings.cloudflare_warm_attempts,
@@ -258,12 +283,40 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     playwright_proxy, _ = build_proxy(settings)
     if playwright_proxy is not None:
         solver_kwargs["proxy"] = playwright_proxy
-    # Swap NoopSolver for the ONE shared CloudflareSolver (R1/BOT-01). Construction is
-    # cheap (no browser yet — the lazy engine-specific launch happens on the first
-    # solve); the eager warm() is fired NON-BLOCKING so a launch/solve failure
-    # degrades only cloudflare-gated sources and NEVER aborts startup (D-33/Pitfall 3).
-    # Non-cloudflare sources (e.g. ``antibot="none"``) resolve no-clearance.
-    solver = CloudflareSolver(**solver_kwargs)
+    # Swap NoopSolver for the ONE shared solver (R1/BOT-01). Construction is cheap
+    # (no browser yet — the lazy engine-specific launch happens on the first solve);
+    # the eager warm() is fired NON-BLOCKING so a launch/solve failure degrades only
+    # cloudflare-gated sources and NEVER aborts startup (D-33/Pitfall 3). Non-cloudflare
+    # sources (e.g. ``antibot="none"``) resolve no-clearance.
+    #
+    # Phase 10: the shared solver is a SolverRouter composing two backends —
+    #  * the Patchright CloudflareSolver (comix, byte-for-byte unchanged), and
+    #  * an AndroidSolver that mints cf_clearance for mangadot/kagane via the
+    #    android-solver sidecar over HTTP (R1 — no Android machinery in-process).
+    # The router dispatches get_clearance/warm/aclose per source via the
+    # ``engine_by_source`` map, so JobManager, the D-37 watchdog, and ``_warm_solver``
+    # below consume it through the SAME AntiBotSolver surface with no call-site change.
+    cloudflare_solver = CloudflareSolver(**solver_kwargs)
+    # The Android leg's challenge-url map covers ONLY the android sources; an
+    # unconfigured ``android_solver_url`` makes warm() boot all android keys disabled
+    # (D-33) so the gate / CI / a local box without redroid stays green.
+    android_challenge_urls: dict[str, str] = {
+        key: url
+        for key, cls in cf_sources.items()
+        if key in android_keys
+        and (url := getattr(cls, "cloudflare_challenge_url", None))
+    }
+    android_solver = AndroidSolver(
+        base_url=settings.android_solver_url,
+        api_key=settings.android_solver_api_key,
+        challenge_urls=android_challenge_urls,
+        timeout_s=settings.android_solver_timeout_s,
+    )
+    solver = SolverRouter(
+        patchright=cloudflare_solver,
+        android=android_solver,
+        engine_by_source=engine_by_source,
+    )
     app.state.solver = solver
 
     async def _warm_solver() -> None:

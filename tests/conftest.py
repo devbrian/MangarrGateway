@@ -88,8 +88,12 @@ def _no_real_cloudflare_warm(monkeypatch: pytest.MonkeyPatch) -> None:
     which wins because it runs after this autouse fixture.
     """
 
-    async def _noop_warm(self: CloudflareSolver) -> None:
-        return None
+    # Return ``[]`` (no failed keys) — matching the real ``warm()`` ``list[str]``
+    # contract. Since Phase 10 the lifespan's shared solver is a ``SolverRouter``
+    # that calls ``list(await backend.warm())``; a ``None`` here would raise a
+    # (swallowed) ``TypeError`` and log noise on every app build.
+    async def _noop_warm(self: CloudflareSolver) -> list[str]:
+        return []
 
     monkeypatch.setattr(CloudflareSolver, "warm", _noop_warm)
 

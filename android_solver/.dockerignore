@@ -1,0 +1,21 @@
+# Build-context filter for the android-solver sidecar image.
+#
+# SECURITY (SEC-01, T-10-10): no secret/runtime-state enters the image layers.
+# The api key + adb target arrive at runtime via env only — never baked. Mirrors
+# the gateway image's .dockerignore stance.
+#
+# The build NEEDS *.py and requirements.txt — those are NOT excluded.
+
+# ── Secrets / runtime state — MUST NOT be baked (T-10-10) ────────────────────
+.env
+*.env
+*.key
+*.pem
+*.db
+
+# ── Python / build caches ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -188,6 +188,12 @@ class KaganeSource(Source):
     max_concurrent_jobs = 2
     antibot = "cloudflare"
     cloudflare_challenge_url = "https://kagane.to/"
+    # Phase 10 (SRC-02): route clearance to the Android-WebView solver sidecar, NOT
+    # the desktop Patchright solver. kagane.to gates ``POST /api/integrity`` behind the
+    # same strict Cloudflare Turnstile that desktop automation cannot clear from Linux
+    # (resolved debug ``mangadot-cf-linux-fingerprint``); the real Android WebView
+    # clears it. This one-line attr is the only per-source code the engine switch needs.
+    solver_engine = "android"
     decrypt_scheme = None
     session_prep = None
     supports_search = True

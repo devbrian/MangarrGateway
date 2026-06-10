@@ -1,0 +1,17 @@
+# android-solver sidecar — third-party pip dependencies.
+#
+# Supply-chain gate T-10-SC: APPROVED 2026-06-09 (blocking-human legitimacy gate,
+# never auto-approved). Every package below was verified legitimate on pypi.org
+# before being pinned here.
+#
+#   websocket-client==1.9.0
+#     pypi.org/project/websocket-client — maintained CDP/page websocket client
+#     (import name `websocket`). Its create_connection(..., suppress_origin=True)
+#     is required because Chrome 111+ rejects a localhost Origin on the WebView
+#     devtools socket (proven in debug mangadot-cf-linux-fingerprint, EXP27).
+#     LGPL-2.1; repo github.com/websocket-client/websocket-client. NOT a typosquat.
+#
+# adbutils was REJECTED — the adb CLI is driven via subprocess (device.py), which
+# needs NO pip dependency. `adb` itself is the Android platform-tools SYSTEM package
+# (apt, installed in the 10-02 sidecar Dockerfile), not a pip dep.
+websocket-client==1.9.0

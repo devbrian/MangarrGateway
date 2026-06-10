@@ -84,18 +84,17 @@ LIVE_SMOKE = LiveSmokeProfile(
     expected_release_pattern={"sourceKey": "kagane", "id_field": "series_id"},
     fixture_drift_paths=[],
     perf_budget_s=None,
-    # CI gate (#198): kagane.to's Cloudflare clearance cannot be earned in the
-    # nightly CI environment — the solver burns its full 60s deadline
-    # ("cf_clearance not captured within 60s") even though comix.to clears in
-    # the IDENTICAL headed-Chromium + Xvfb + residential-proxy run. Leading
-    # cause (see #198): ``https://kagane.to/`` is the SPA shell and is NOT
-    # itself Cloudflare-gated (only ``POST /api/integrity`` is), so the solver's
-    # navigate-and-poll strategy never sees a cf_clearance cookie minted. Not
-    # reliably fixable blind in this PR (needs live CF iteration + an
-    # XHR-triggered solve strategy). Skipping kagane's live smoke keeps it from
-    # being a perpetual nightly false-red; ``<skipped>`` is non-failing to the
-    # triage, so #197 auto-closes. Remove this once #198 lands.
+    # CI gate (Phase 10): kagane.to's strict Cloudflare Turnstile is unclearable
+    # by desktop browser automation from Linux (the same render-consistency
+    # catch-22 as mangadot — debug mangadot-cf-linux-fingerprint). It is cleared on
+    # the DEPLOY via the redroid + android-solver sidecars (a real Android WebView
+    # clears the checkbox). CI (GitHub Actions) has NO `binder` kernel module, so
+    # redroid cannot boot there — the Android solver cannot run in CI and these
+    # live items stay gated. `expected_caps_antibot="cloudflare"` is unchanged (the
+    # Android engine is an internal solver detail, not a /caps classification).
     ci_skip_reason=(
-        "kagane.to Cloudflare clearance unavailable in CI — gated pending #198"
+        "kagane.to Cloudflare cleared on the deploy via the redroid/"
+        "android-solver sidecar (Android WebView); CI has no binder kernel "
+        "module — gated, Phase 10"
     ),
 )

@@ -351,13 +351,25 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
         for key, cls in registry.items()
         if getattr(cls, "antibot", "none").startswith("cloudflare")
     }
-    cloudflare_keys = frozenset(cf_sources)
+    # Phase 10: this session-shared CloudflareSolver IS the router's Patchright leg
+    # (the autouse ``_substitute_app_solver`` injects it where app.py builds the
+    # CloudflareSolver). PARTITION cf_sources to patchright sources ONLY (exclude
+    # ``solver_engine == "android"``) — mirroring app.py's partition — so the live
+    # session never tries to Patchright-warm the unclearable-from-Linux mangadot/
+    # kagane (they route to the AndroidSolver leg, ci_skip-gated, no redroid in CI).
+    patchright_sources = {
+        key: cls
+        for key, cls in cf_sources.items()
+        if getattr(cls, "solver_engine", "patchright") != "android"
+    }
+    cloudflare_keys = frozenset(patchright_sources)
     # Per-domain challenge-URL map (#88) — MUST match app.py's lifespan build
     # field-for-field (this fixture is the documented hand-mirror; a drift here
-    # silently makes the live solver bypass per-domain clearance).
+    # silently makes the live solver bypass per-domain clearance). Partitioned to
+    # patchright sources only, exactly like app.py's Patchright-leg challenge map.
     challenge_urls = {
         key: url
-        for key, cls in cf_sources.items()
+        for key, cls in patchright_sources.items()
         if (url := getattr(cls, "cloudflare_challenge_url", None))
     }
     kwargs: dict[str, Any] = {

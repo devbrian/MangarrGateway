@@ -50,6 +50,16 @@ class Source(ABC):
     # and passes it to ``CloudflareSolver`` so the framework solver itself need
     # not know any source-specific URL by name.
     cloudflare_challenge_url: str | None = None
+    # Phase 10 (SRC-01/SRC-02): the per-source anti-bot ENGINE selector. The
+    # framework's ``SolverRouter`` dispatches ``get_clearance`` to the backend named
+    # here — ``"patchright"`` (the default) keeps the desktop ``CloudflareSolver``
+    # (comix, byte-for-byte unchanged); ``"android"`` routes to the ``AndroidSolver``
+    # (the redroid-WebView sidecar) for the strict Cloudflare Turnstile that desktop
+    # automation cannot clear from Linux (mangadot/kagane — resolved debug
+    # ``mangadot-cf-linux-fingerprint``). The app wiring (Plan 10-04) builds the
+    # ``{source_key: solver_engine}`` map from this attr — the ONLY per-source code a
+    # new android source needs (a one-line override), no framework edit.
+    solver_engine: str = "patchright"
     # D-01: the httpx session-prep style the framework resolves into a SessionPrep
     # provider (framework/session_prep.py). ``None`` = no bootstrap (MangaDex/Comix
     # byte-for-byte unchanged); ``"csrf-bootstrap"`` = GET an HTML page, harvest the
