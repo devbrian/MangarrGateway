@@ -113,8 +113,20 @@ def apply_command(
         uri = command[len(_CMD_SET) :].strip()
         if not uri:
             return "ERR empty upstream uri"
-        # IN-PLACE mutation only — NEVER ``rserver = …`` (Pitfall 2).
-        rserver[:] = [factory(uri)]
+        # WR-03 / T-11-02: a malformed/edge-case URI can make ``factory(uri)`` →
+        # ``pproxy.Server(uri)`` RAISE while parsing — and that exception's message
+        # may echo the parsed ``user:pass`` fragment. Without this guard the raise
+        # escapes ``apply_command`` → ``_handle_control`` (which has no ``except``)
+        # → asyncio's default handler, which logs a full traceback ("Unhandled
+        # exception in client_connected_cb") that can carry the credentials. Catch
+        # it here and return a REDACTED ``ERR`` ack, logging only a redacted warning
+        # — the credential-bearing exception NEVER reaches a logger or traceback.
+        try:
+            # IN-PLACE mutation only — NEVER ``rserver = …`` (Pitfall 2).
+            rserver[:] = [factory(uri)]
+        except Exception:  # noqa: BLE001 — never surface the credential URI in a traceback
+            _log.warning("hop upstream URI rejected (redacted)")
+            return "ERR invalid upstream uri"
         # T-11-02: the credential-bearing URI is intentionally omitted from logs.
         _log.info("hop repointed to a new authenticated upstream")
         return _ACK_OK

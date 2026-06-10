@@ -112,6 +112,38 @@ def test_set_command_never_logs_credentials(caplog: pytest.LogCaptureFixture) ->
     assert "up.example.com" not in blob
 
 
+def test_set_command_redacts_credentials_when_factory_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """WR-03: a factory raise (real ``pproxy.Server`` parse failure) must NOT leak.
+
+    The success branch is exercised elsewhere; this drives the REAL raise path: a
+    factory that raises an exception whose message echoes the ``user:pass`` URI (as
+    ``pproxy.Server`` can on a malformed URI). ``apply_command`` must catch it,
+    return a REDACTED ``ERR`` ack, and never let the credential-bearing exception
+    reach a log/traceback.
+    """
+
+    def raising_factory(uri: str) -> object:
+        # Mimic pproxy surfacing the parsed URI fragment in its error message.
+        raise ValueError(f"cannot parse upstream {uri}")
+
+    rserver: list[object] = []
+    with caplog.at_level(logging.DEBUG, logger="android_solver.proxy_hop"):
+        ack = apply_command(
+            "SET http://up.example.com:8080#user:supersecret",
+            rserver,
+            server_factory=raising_factory,
+        )
+
+    assert ack == "ERR invalid upstream uri"  # redacted ack, no creds
+    assert rserver == []  # the failed SET did not mutate the live upstream
+    blob = " ".join(record.getMessage() for record in caplog.records)
+    assert "supersecret" not in blob
+    assert "user:supersecret" not in blob
+    assert "up.example.com" not in blob
+
+
 async def test_control_channel_roundtrip_preserves_list_identity() -> None:
     """repoint() over a 127.0.0.1 control listener mutates the SAME list in place."""
     factory = _SentinelFactory()
