@@ -58,6 +58,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -127,6 +128,14 @@ _REPORT_DIR = _REPO_ROOT / "_rate_limit_probe_out"
 
 # proxies.txt path (raw host:port:user:pass lines). Gitignored — holds secrets.
 _PROXIES_PATH = _REPO_ROOT / "proxies.txt"
+
+# Repo ``.env`` (gitignored). Production loads it via docker; the probe does NOT use
+# pydantic ``env_file`` (that would change the shared Settings — config.py is left
+# untouched), so we read the android key out of it ourselves (#212).
+_DOTENV_PATH = _REPO_ROOT / ".env"
+
+# The env var carrying the sidecar /solve X-Solver-Key (matches deploy SOLVER_API_KEY).
+_ANDROID_KEY_ENV = "GATEWAY_ANDROID_SOLVER_API_KEY"
 
 # A grid cell is a "sustained RATE-LIMIT block" when its rate-limited fraction crosses
 # this threshold. Rate-limited = a TRUE anti-throttle signal (HTTP 429/403, a Cloudflare
@@ -380,6 +389,38 @@ def _build_registry() -> SourceRegistry:
     return registry
 
 
+def _android_api_key_from_dotenv() -> str | None:
+    """Read ``GATEWAY_ANDROID_SOLVER_API_KEY`` from the repo ``.env`` (#212).
+
+    The shared ``manga_gateway.config.Settings`` has NO ``env_file`` (production loads
+    ``.env`` via docker), so an android-engine probe whose key lives only in ``.env``
+    would send an empty ``X-Solver-Key`` and silently 401. We parse the file ourselves
+    — simple ``KEY=VALUE`` lines, ignoring blanks/comments and stripping surrounding
+    quotes — and return ``None`` when the file or key is absent.
+
+    SECURITY (T-11-02): the value is NEVER logged or printed — it is returned to the
+    caller and handed straight to ``Settings`` (which wraps it in a redacted SecretStr).
+    """
+    if not _DOTENV_PATH.is_file():
+        return None
+    try:
+        lines = _DOTENV_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != _ANDROID_KEY_ENV:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        return value or None
+    return None
+
+
 def _build_settings(proxy: ProxyEntry | None) -> Settings:
     """Construct ``Settings`` with the API key + (optionally) the pinned proxy.
 
@@ -387,8 +428,16 @@ def _build_settings(proxy: ProxyEntry | None) -> Settings:
     existing ``framework.proxy.build_proxy`` applies it to BOTH egress legs (browser +
     httpx) — we do NOT re-implement proxy wiring (CONTEXT.md). Init kwargs beat env
     (config.py D-01), so this never reads a real key or a TOML file.
+
+    The android sidecar key is resolved with OS-env precedence (an explicit export
+    wins), falling back to the repo ``.env`` (#212), so an android-engine probe
+    authenticates ``/solve`` without a manual ``export``. When neither source has it
+    the key is left unset (current behavior). The value is never logged (T-11-02).
     """
     kwargs: dict[str, Any] = {"api_key": _PROBE_API_KEY}
+    android_key = os.environ.get(_ANDROID_KEY_ENV) or _android_api_key_from_dotenv()
+    if android_key:
+        kwargs["android_solver_api_key"] = android_key
     if proxy is not None:
         kwargs["cloudflare_proxy_server"] = proxy.server
         kwargs["cloudflare_proxy_username"] = proxy.username
@@ -648,6 +697,35 @@ async def _select_healthy_proxies(
 # ──────────────────────────── warm-up capture ────────────────────────────
 
 
+# Actionable note when the android sidecar /solve rejects the probe's X-Solver-Key.
+# Names BOTH the probe env var and the deploy-side key so the operator knows exactly
+# what to align — instead of a bare ``HTTPStatusError`` that looks like a proxy fault
+# (#212). The raw key value is NEVER included (T-11-02).
+_ANDROID_401_NOTE = (
+    "android /solve returned 401 (invalid/missing X-Solver-Key) — set "
+    f"{_ANDROID_KEY_ENV} (probe) to match the deploy SOLVER_API_KEY"
+)
+
+
+def _is_android_solve_401(exc: BaseException) -> bool:
+    """True iff ``exc`` is an httpx 401 from the android sidecar /solve (#212)."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == 401
+    )
+
+
+def _warmup_search_skip_reason(exc: BaseException) -> str:
+    """Map a failed warm-up ``search()`` exception to its skip-note reason.
+
+    An android /solve 401 gets the actionable :data:`_ANDROID_401_NOTE`; everything
+    else keeps the generic ``search() raised: <Type>`` note (current behavior).
+    """
+    if _is_android_solve_401(exc):
+        return _ANDROID_401_NOTE
+    return f"search() raised: {type(exc).__name__}"
+
+
 @dataclass
 class WarmupResult:
     """The captured representative request per endpoint category + skip notes."""
@@ -683,7 +761,12 @@ async def _capture_warmup(
     try:
         releases = await source.search(req, ctx)
     except Exception as exc:  # noqa: BLE001 — a failed warm-up search is a clean skip
-        result.note_skip(_CATEGORY_SEARCH, f"search() raised: {type(exc).__name__}")
+        reason = _warmup_search_skip_reason(exc)
+        # A 401 from the android sidecar masquerades as a proxy fault and would be
+        # buried in the JSON report — surface it on stderr once so it is visible (#212).
+        if _is_android_solve_401(exc):
+            print(f"[probe] {reason}", file=sys.stderr)
+        result.note_skip(_CATEGORY_SEARCH, reason)
         releases = []
     search_rows = transport.segment()
     search_req = _pick_representative(transport, search_rows, _CATEGORY_SEARCH)
