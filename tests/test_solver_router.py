@@ -32,6 +32,7 @@ class _FakeBackend:
         self.calls: list[tuple[str, bool]] = []
         self.browser_calls: list[tuple[str, dict[str, object]]] = []
         self.paginated_calls: list[tuple[str, dict[str, object]]] = []
+        self.typed_calls: list[tuple[str, dict[str, object]]] = []
         self.warmed = 0
         self.closed = 0
 
@@ -83,6 +84,30 @@ class _FakeBackend:
             )
         )
         return [f"{self._tag}-paginated-{url}"]
+
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the backend's op-budget kwarg
+    ) -> object:
+        self.typed_calls.append(
+            (
+                url,
+                {
+                    "type_selector": type_selector,
+                    "type_text": type_text,
+                    "extract": extract,
+                    "wait_for": wait_for,
+                    "timeout": timeout,
+                },
+            )
+        )
+        return f"{self._tag}-typed-{url}"
 
     async def warm(self) -> list[str]:
         self.warmed += 1
@@ -214,6 +239,7 @@ def test_router_exposes_comix_browser_primitives() -> None:
     router, _, _ = _router()
     assert hasattr(router, "fetch_via_browser")
     assert hasattr(router, "fetch_via_browser_paginated")
+    assert hasattr(router, "fetch_via_browser_typed")
 
 
 @pytest.mark.asyncio
@@ -259,3 +285,30 @@ async def test_fetch_via_browser_paginated_delegates_to_patchright() -> None:
         )
     ]
     assert android.paginated_calls == []  # android (no browser) is NEVER consulted
+
+
+@pytest.mark.asyncio
+async def test_fetch_via_browser_typed_delegates_to_patchright() -> None:
+    router, patchright, android = _router()
+    result = await router.fetch_via_browser_typed(
+        "https://mangafire.to/home",
+        type_selector=".search-inner input[name=keyword]",
+        type_text="blue lock",
+        extract="return vrf",
+        wait_for="() => !!window.__vrf__",
+        timeout=18.0,
+    )
+    assert result == "pw-typed-https://mangafire.to/home"
+    assert patchright.typed_calls == [
+        (
+            "https://mangafire.to/home",
+            {
+                "type_selector": ".search-inner input[name=keyword]",
+                "type_text": "blue lock",
+                "extract": "return vrf",
+                "wait_for": "() => !!window.__vrf__",
+                "timeout": 18.0,
+            },
+        )
+    ]
+    assert android.typed_calls == []  # android (no browser) is NEVER consulted
