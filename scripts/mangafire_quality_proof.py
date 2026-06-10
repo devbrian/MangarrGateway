@@ -49,6 +49,7 @@ from manga_gateway.sources.mangafire import (  # noqa: E402
     PIECE_SIZE,
     _ceil_div,
     _descramble_image,
+    _parse_cards,
 )
 
 _CAPTURE_DIR = _REPO_ROOT / "artifacts" / "mangafire-218-proof"
@@ -188,38 +189,87 @@ async def _live_capture(capture_dir: Path) -> int:
     return captured
 
 
-async def _live_capture_direct(
-    capture_dir: Path, manga_token: str, scan_limit: int
+async def _capture_title(
+    source: Any, ctx: Any, manga_token: str, chapter_scan: int, capture_dir: Path
 ) -> int:
-    """Find a SCRAMBLED chapter and capture its raw offset>0 pages directly.
+    """Scan one title's chapters for offset>0 pages and dump their raw bytes.
 
-    Not every chapter is scrambled (Blue Lock ch-1 = 72 pages, all offset==0), so
-    this skips the slow typed-search AND the job pipeline: it boots the app, warms
-    the mangafire clearance, builds a real ``SourceContext`` (the same seams the
-    download route uses), lists the manga's chapters, and resolves each manifest —
-    each page URL carries its scramble offset as a ``#scr_{offset}`` fragment — until
-    it finds a chapter with offset>0 pages. It then fetches those pages' RAW bytes via
-    ``ctx.get_bytes`` (exactly the pre-descramble input ``fetch_image`` sees) and dumps
-    them. Returns the captured page count.
+    Each page URL from ``fetch_manifest`` carries its scramble offset as a
+    ``#scr_{offset}`` fragment — so scrambled chapters are found WITHOUT a download.
+    The scrambled pages' RAW bytes (exactly the pre-descramble input ``fetch_image``
+    sees) are fetched via ``ctx.get_bytes`` and dumped. Returns the captured count.
     """
-    import tempfile
     from urllib.parse import urldefrag
 
-    import httpx  # noqa: F401  (ASGITransport not needed — direct ctx path)
+    slug_id = manga_token.rsplit(".", 1)[-1] if "." in manga_token else manga_token
+    try:
+        chapters = await source._chapter_list(slug_id, "en", ctx)
+    except Exception as exc:  # noqa: BLE001 — a dead title must not stop the catalog scan
+        print(f"[scan] {manga_token}: chapter-list error {type(exc).__name__}")
+        return 0
+    for ch in chapters[:chapter_scan]:
+        href = ch.get("href")
+        if not href:
+            continue
+        try:
+            manifest = await source.fetch_manifest(href, ctx)
+        except Exception:  # noqa: BLE001 — skip a bad chapter, keep scanning
+            continue
+        scrambled = [u for u in manifest if "#scr_" in u]
+        if not scrambled:
+            continue
+        print(
+            f"[scan] >>> SCRAMBLED title found: {href} "
+            f"({len(scrambled)}/{len(manifest)} pages) — capturing"
+        )
+        captured = 0
+        for url in scrambled:
+            clean, frag = urldefrag(url)
+            offset = int(frag[4:]) if frag.startswith("scr_") else 0
+            raw = await ctx.get_bytes(clean)
+            (capture_dir / f"page_{captured:03d}_off{offset}.bin").write_bytes(raw)
+            captured += 1
+        return captured
+    return 0
+
+
+def _boot_app() -> Any:
+    """Boot a real gateway app on a throwaway temp dir (mirrors live_client_for)."""
+    import tempfile
+
     from tests.live._helpers import _TEST_API_KEY
 
     from manga_gateway.app import create_app
     from manga_gateway.config import Settings
 
-    slug_id = manga_token.rsplit(".", 1)[-1] if "." in manga_token else manga_token
     tmp = Path(tempfile.mkdtemp(prefix="mf-direct-"))
     settings = Settings(
         api_key=_TEST_API_KEY,
         output_root=str(tmp / "out"),
         db_path=str(tmp / "jobs.db"),
     )
-    app = create_app(settings)
-    captured = 0
+    return create_app(settings)
+
+
+async def _live_capture_direct(
+    capture_dir: Path, manga_token: str, scan_limit: int
+) -> int:
+    """Capture a single named title's scrambled pages (skips search + job pipeline)."""
+    app = _boot_app()
+    async with app.router.lifespan_context(app):
+        await asyncio.wait_for(
+            app.state.solver.get_clearance("mangafire"), timeout=90.0
+        )
+        source = app.state.registry.get("mangafire")()
+        ctx = app.state.job_manager._engine._build_context(source)
+        print(f"[direct] scanning {manga_token} (up to {scan_limit} chapters)…")
+        return await _capture_title(source, ctx, manga_token, scan_limit, capture_dir)
+
+
+async def _live_scan_catalog(capture_dir: Path, max_titles: int) -> int:
+    """Discover MangaFire titles via the no-vrf filter feeds and probe each for a
+    scrambled chapter until one is found and captured. Returns the captured count."""
+    app = _boot_app()
     async with app.router.lifespan_context(app):
         await asyncio.wait_for(
             app.state.solver.get_clearance("mangafire"), timeout=90.0
@@ -227,37 +277,43 @@ async def _live_capture_direct(
         source = app.state.registry.get("mangafire")()
         ctx = app.state.job_manager._engine._build_context(source)
 
-        chapters = await source._chapter_list(slug_id, "en", ctx)
-        print(
-            f"[direct] {manga_token}: {len(chapters)} chapters listed; "
-            f"scanning up to {scan_limit} for scrambled pages…"
-        )
-        for ch in chapters[:scan_limit]:
-            href = ch.get("href")
-            if not href:
-                continue
+        # No-vrf catalog feeds (HTML, parsed by the source's own card parser).
+        feeds = [
+            f"{source.base_url}/filter?sort=most_viewed",
+            f"{source.base_url}/filter?sort=most_viewed&page=2",
+            f"{source.base_url}/filter?sort=recently_updated",
+            f"{source.base_url}/filter?sort=trending",
+        ]
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for feed in feeds:
             try:
-                manifest = await source.fetch_manifest(href, ctx)
-            except Exception as exc:  # noqa: BLE001 — skip a bad chapter, keep scanning
-                print(f"[direct]   {href}: manifest error {type(exc).__name__}")
+                html = await ctx.get_bytes(feed)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[scan] feed error {feed}: {type(exc).__name__}")
                 continue
-            scrambled = [u for u in manifest if "#scr_" in u]
-            print(
-                f"[direct]   {href}: {len(manifest)} pages, {len(scrambled)} scrambled"
-            )
-            if not scrambled:
-                continue
-            print(
-                f"[direct] >>> capturing {len(scrambled)} scrambled pages from {href}"
-            )
-            for url in scrambled:
-                clean, frag = urldefrag(url)
-                offset = int(frag[4:]) if frag.startswith("scr_") else 0
-                raw = await ctx.get_bytes(clean)
-                (capture_dir / f"page_{captured:03d}_off{offset}.bin").write_bytes(raw)
-                captured += 1
-            break
-    return captured
+            for card in _parse_cards(html):
+                href = card.get("href", "")
+                token = href.rsplit("/manga/", 1)[-1].strip("/")
+                if token and token not in seen:
+                    seen.add(token)
+                    tokens.append(token)
+        print(
+            f"[scan] discovered {len(tokens)} unique titles; probing up to "
+            f"{max_titles} (1 chapter each) for scrambling…"
+        )
+        for i, token in enumerate(tokens[:max_titles], 1):
+            n = await _capture_title(source, ctx, token, 1, capture_dir)
+            if n:
+                print(
+                    f"[scan] captured {n} scrambled pages from {token} "
+                    f"(title {i}/{min(len(tokens), max_titles)})"
+                )
+                return n
+        print(
+            f"[scan] no scrambled title found in {min(len(tokens), max_titles)} probed"
+        )
+        return 0
 
 
 # ── report + CBZ build ─────────────────────────────────────────────────────────
@@ -346,6 +402,13 @@ def main() -> None:
         help="manga token to scan in --direct mode (default: Blue Lock)",
     )
     parser.add_argument("--scan-limit", type=int, default=20)
+    parser.add_argument(
+        "--scan-catalog",
+        action="store_true",
+        help="discover titles via the filter feeds and hunt for ANY scrambled title "
+        "(use when the pinned title isn't scrambled)",
+    )
+    parser.add_argument("--max-titles", type=int, default=60)
     args = parser.parse_args()
 
     out_dir: Path = args.capture_dir
@@ -354,7 +417,10 @@ def main() -> None:
     mode = "synthetic"
     if not args.synthetic:
         try:
-            if args.direct:
+            if args.scan_catalog:
+                print("[scan] hunting the catalog for a scrambled title…")
+                n = asyncio.run(_live_scan_catalog(out_dir, args.max_titles))
+            elif args.direct:
                 print("[direct] scanning for a scrambled chapter to capture…")
                 n = asyncio.run(
                     _live_capture_direct(out_dir, args.manga_token, args.scan_limit)
