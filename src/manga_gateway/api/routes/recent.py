@@ -6,7 +6,7 @@ and fans the ``recent`` hook out with per-source isolation (one source failing �
 ``warnings[]`` entry, still 200). The merged ``releases[]`` are sorted newest-first by
 ``publishDate`` (RCNT-01); ``since`` is applied as a defensive client-side cut so the
 contract guarantee holds regardless of whether a source honored the upstream hint
-(RCNT-02 / RESEARCH A3). ``limit`` is clamped to <=100 at the route boundary (T-02-06).
+(RCNT-02 / RESEARCH A3). ``limit`` is clamped to <=2000 at the route boundary (T-02-06).
 """
 
 from __future__ import annotations
@@ -65,8 +65,8 @@ def _emit_source_result(result_count: int, candidates_enumerated: int | None) ->
         pass
 
 
-# Contract ceiling for the recent feed (openapi.yaml: limit maximum 100, T-02-06).
-_MAX_LIMIT = 100
+# Contract ceiling for the recent feed (openapi.yaml: limit maximum 2000, T-02-06).
+_MAX_LIMIT = 2000
 
 # ``_parse_ts`` (ISO-8601 → aware datetime, malformed → epoch-min floor) and the
 # newest-first merge now live in ``api/sorting.py`` so /recent and /search share the
@@ -91,7 +91,7 @@ def _split_multi(raw: list[str] | None) -> list[str] | None:
 
 
 def _parse_limit(raw: str | None) -> int:
-    """Defensively coerce the ``limit`` query value, clamped to <=100 (T-02-06/08).
+    """Defensively coerce the ``limit`` query value, clamped to <=2000 (T-02-06/08).
 
     The contract documents only 200/401 for ``/recent`` — a malformed ``limit`` must
     NOT surface a 400. Bad/empty input falls back to the contract default (100), and
@@ -145,7 +145,7 @@ async def get_recent(
         list[str] | None,
         Query(description="BCP-47 codes: repeated param or CSV"),
     ] = None,
-    limit: Annotated[str | None, Query(description="Max items; clamped <=100")] = None,
+    limit: Annotated[str | None, Query(description="Max items; clamped <=2000")] = None,
     since: Annotated[
         str | None, Query(description="Return items newer than this")
     ] = None,

@@ -58,7 +58,7 @@ paths:
       parameters:
         - { name: sources,   in: query, schema: { type: array, items: { type: string } }, description: "Source keys as repeated params (?sources=a&sources=b); a single CSV value is also accepted. Omit = all enabled" }
         - { name: languages, in: query, schema: { type: array, items: { type: string } }, description: "BCP-47 codes as repeated params; a single CSV value is also accepted" }
-        - { name: limit,     in: query, schema: { type: integer, default: 100, maximum: 100 } }
+        - { name: limit,     in: query, schema: { type: integer, default: 100, maximum: 2000 } }
         - { name: since,     in: query, schema: { type: string, format: date-time }, description: "Return items newer than this (optimization)" }
       responses:
         "200":
