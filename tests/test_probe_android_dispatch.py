@@ -222,6 +222,23 @@ def test_is_android_solve_401_only_matches_401(probe: ModuleType) -> None:
     assert probe._is_android_solve_401(ValueError("x")) is False
 
 
+def test_is_android_solve_401_ignores_non_solve_401(probe: ModuleType) -> None:
+    """CR (#214): a 401 from a SOURCE's own API (not /solve) is NOT the android-key
+    401 — it must not be misattributed to GATEWAY_ANDROID_SOLVER_API_KEY."""
+    request = httpx.Request("GET", "https://mangadot.net/api/search")
+    source_401 = httpx.HTTPStatusError(
+        "Unauthorized",
+        request=request,
+        response=httpx.Response(401, request=request),
+    )
+
+    assert probe._is_android_solve_401(source_401) is False
+    # ...and the warm-up note stays generic, not the android-key message.
+    assert probe._warmup_search_skip_reason(source_401) == (
+        "search() raised: HTTPStatusError"
+    )
+
+
 def test_no_raw_key_value_emitted(
     probe: ModuleType,
     monkeypatch: pytest.MonkeyPatch,

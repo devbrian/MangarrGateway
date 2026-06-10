@@ -708,10 +708,16 @@ _ANDROID_401_NOTE = (
 
 
 def _is_android_solve_401(exc: BaseException) -> bool:
-    """True iff ``exc`` is an httpx 401 from the android sidecar /solve (#212)."""
+    """True iff ``exc`` is an httpx 401 from the android sidecar ``/solve`` (#212).
+
+    The path check (not just status 401) keeps a 401 from a SOURCE's own API from
+    being misattributed to a missing ``GATEWAY_ANDROID_SOLVER_API_KEY`` — only the
+    sidecar ``/solve`` auth failure earns the actionable key message.
+    """
     return (
         isinstance(exc, httpx.HTTPStatusError)
         and exc.response.status_code == 401
+        and exc.request.url.path.endswith("/solve")
     )
 
 
