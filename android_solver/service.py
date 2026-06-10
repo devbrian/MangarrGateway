@@ -32,6 +32,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import socket
 import subprocess
 import sys
 import time
@@ -333,7 +334,13 @@ class AndroidSolvePipeline:
         # is never logged (T-10-04 / T-11-02).
         upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
         repoint(self._hop_control_host, self._hop_control_port, upstream)
-        self._device.set_global_http_proxy(self._hop_host, self._hop_port)
+        # The DEVICE (redroid Android) must reach the hop by IP, not by the docker
+        # service name: redroid's Android resolver is hardcoded to 8.8.8.8 and does
+        # NOT consult docker's embedded DNS, so ``settings put global http_proxy
+        # android-solver:<port>`` yields ERR_PROXY_CONNECTION_FAILED ("unknown
+        # host"). The sidecar DOES resolve its own docker name, so resolve it here
+        # to the on-network IP the WebView can actually connect to (Pitfall 1).
+        self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
         try:
             _raise_if_cancelled(cancel)
             # Learn the egress this SAME upstream should present (stdlib self-probe,
@@ -473,6 +480,26 @@ class AndroidSolvePipeline:
                 last_err = exc
                 continue
         raise SolveError(f"could not read a valid WebView egress IP: {last_err}")
+
+    def _device_hop_host(self) -> str:
+        """The hop host the DEVICE routes ``global http_proxy`` through, as an IP.
+
+        redroid's Android resolver is hardcoded to public DNS (8.8.8.8) and does
+        NOT consult docker's embedded DNS, so a docker SERVICE NAME (the default
+        ``hop_host = "android-solver"``) is an "unknown host" to the WebView. The
+        sidecar, however, DOES resolve its own docker name, so we resolve
+        ``hop_host`` to the on-network IP the device can reach (verified live:
+        ``ping android-solver`` fails inside Android while ``ping <ip>`` succeeds).
+        If ``hop_host`` is already an IP literal this is a no-op; if resolution
+        fails we fall back to the literal name and let the egress-verify backstop
+        surface the bad route (never minting a wrong-IP token).
+        """
+        host = self._hop_host
+        try:
+            return socket.gethostbyname(host)
+        except OSError:
+            _log.warning("could not resolve hop host %r to an IP; using as-is", host)
+            return host
 
     def _clear_proxy_quietly(self) -> None:
         """ALWAYS-run proxy teardown (Req 5): clear global http_proxy + hop IDLE.

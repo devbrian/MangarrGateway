@@ -3,12 +3,14 @@
 Drives the REAL ``AndroidSolvePipeline._solve`` proxied path with fakes — no adb /
 redroid / WebView / network. Asserts:
 
-  * the device-wide proxy is set with ``(hop_host, hop_port)`` BEFORE the tap and
-    ALWAYS cleared in ``finally`` (Req 2/5), including the raise path;
+  * the device-wide proxy is set with ``(resolved_hop_ip, hop_port)`` BEFORE the
+    tap and ALWAYS cleared in ``finally`` (Req 2/5), including the raise path;
+  * the hop is repointed over the LOOPBACK CONTROL endpoint (127.0.0.1:hop_port+1)
+    — NOT the cross-container proxy port (which silently closes a SET line);
   * the WebView egress is verified BEFORE the tap — observed==expected proceeds,
     observed!=expected raises with NO token, a transient/non-IP echo raises (Req 3);
-  * the proxy host is the config ``hop_host`` (``android-solver``), never localhost
-    (Pitfall 1 / T-11-05);
+  * the device proxy host is the RESOLVED hop IP (the device cannot resolve the
+    docker name), never localhost (Pitfall 1 / T-11-05), with a literal fallback;
   * the proxied success result carries the verified ``egress_ip`` (Req 6).
 """
 
@@ -33,6 +35,10 @@ _HOP_PORT = 18081
 # which broke every live proxied solve until the repoint target was corrected.
 _HOP_CONTROL_HOST = "127.0.0.1"
 _HOP_CONTROL_PORT = _HOP_PORT + 1
+# The DEVICE reaches the hop by IP, not by the docker service name: redroid's
+# Android resolver is hardcoded to 8.8.8.8 and cannot resolve "android-solver".
+# The sidecar resolves the name to this on-network IP for the device proxy.
+_RESOLVED_HOP_IP = "172.27.0.3"
 _EXPECTED_IP = "203.0.113.7"
 
 
@@ -162,6 +168,11 @@ def _build_pipeline(
 
     monkeypatch.setattr(service, "repoint", fake_repoint)
 
+    # The sidecar resolves the docker hop name to an on-network IP for the device
+    # (redroid cannot resolve docker names — Pitfall 1). Patch resolution to a
+    # deterministic IP so the device-proxy host assertions are stable offline.
+    monkeypatch.setattr(service.socket, "gethostbyname", lambda host: _RESOLVED_HOP_IP)
+
     # Collapse the pre-tap readiness/scale steps (covered by their own units).
     monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws, cancel=None: None)
     monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
@@ -190,8 +201,9 @@ def test_proxied_solve_verifies_egress_then_taps_and_returns_egress_ip(
 
     assert result.cf_clearance == "TOKEN"
     assert result.egress_ip == _EXPECTED_IP  # Req 6: verified egress on the result
-    # Proxy set with the docker hop host:port (Pitfall 1 — never localhost).
-    assert device.proxy_set == [(_HOP_HOST, _HOP_PORT)]
+    # Proxy set with the RESOLVED hop IP:port — the device cannot resolve the
+    # docker name (Pitfall 1); never localhost.
+    assert device.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
     # Set BEFORE the tap; cleared AFTER (Req 2/5).
     assert device.events == ["set_proxy", "tap", "clear_proxy"]
     assert device.proxy_cleared == 1
@@ -280,14 +292,14 @@ def test_proxy_cleared_even_when_solve_raises_midflight(
     with pytest.raises(RuntimeError):
         pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
 
-    assert device.proxy_set == [(_HOP_HOST, _HOP_PORT)]
+    assert device.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
     assert device.proxy_cleared == 1  # cleared despite the mid-flight raise
 
 
-# ── Pitfall 1: proxy host is the config hop_host, never localhost ─────────────
+# ── Pitfall 1: device proxy host is the RESOLVED hop IP, never the docker name ─
 
 
-def test_proxy_host_is_hop_host_never_localhost(
+def test_proxy_host_is_resolved_ip_never_docker_name_or_localhost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     device = FakeDevice()
@@ -301,9 +313,35 @@ def test_proxy_host_is_hop_host_never_localhost(
     pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
 
     (host, port) = device.proxy_set[0]
-    assert host == _HOP_HOST
+    # The device gets the resolved IP — NOT the docker service name (which redroid
+    # cannot resolve) and never localhost (redroid's own loopback).
+    assert host == _RESOLVED_HOP_IP
+    assert host != _HOP_HOST
     assert host not in ("localhost", "127.0.0.1")
     assert port == _HOP_PORT
+
+
+def test_proxy_host_falls_back_to_literal_when_resolution_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If the hop host cannot be resolved, fall back to the literal value and let
+    # the egress-verify backstop catch a bad route (never mint a wrong-IP token).
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+    )
+
+    def boom(host: str) -> str:
+        raise OSError("name resolution failed")
+
+    monkeypatch.setattr(service.socket, "gethostbyname", boom)
+
+    pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
+
+    assert device.proxy_set == [(_HOP_HOST, _HOP_PORT)]  # literal fallback
 
 
 # ── D-08: a no-proxy solve sets NO device proxy and repoints NO hop ───────────
