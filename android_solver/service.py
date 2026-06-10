@@ -333,15 +333,23 @@ class AndroidSolvePipeline:
         # picks the proxy up on launch (D-02). The credential-bearing upstream URI
         # is never logged (T-10-04 / T-11-02).
         upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
-        repoint(self._hop_control_host, self._hop_control_port, upstream)
-        # The DEVICE (redroid Android) must reach the hop by IP, not by the docker
-        # service name: redroid's Android resolver is hardcoded to 8.8.8.8 and does
-        # NOT consult docker's embedded DNS, so ``settings put global http_proxy
-        # android-solver:<port>`` yields ERR_PROXY_CONNECTION_FAILED ("unknown
-        # host"). The sidecar DOES resolve its own docker name, so resolve it here
-        # to the on-network IP the WebView can actually connect to (Pitfall 1).
-        self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
         try:
+            # WR-01: the hop repoint AND the device-proxy set both live INSIDE the
+            # try so the ``finally: self._clear_proxy_quietly()`` ALWAYS idles the
+            # hop + clears the device — even if ``set_global_http_proxy`` (or the
+            # repoint itself) raises an AdbError mid-flight. Hoisting either above
+            # the try would leak credentialed hop state on that raise: the hop
+            # would stay repointed at the authenticated upstream (its
+            # ``pproxy.Server`` holds ``user:pass``) until the next proxied solve.
+            repoint(self._hop_control_host, self._hop_control_port, upstream)
+            # The DEVICE (redroid Android) must reach the hop by IP, not by the
+            # docker service name: redroid's Android resolver is hardcoded to
+            # 8.8.8.8 and does NOT consult docker's embedded DNS, so ``settings put
+            # global http_proxy android-solver:<port>`` yields
+            # ERR_PROXY_CONNECTION_FAILED ("unknown host"). The sidecar DOES resolve
+            # its own docker name, so resolve it here to the on-network IP the
+            # WebView can actually connect to (Pitfall 1).
+            self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
             _raise_if_cancelled(cancel)
             # Learn the egress this SAME upstream should present (stdlib self-probe,
             # D-05); the WebView's observed egress is asserted against it pre-tap.

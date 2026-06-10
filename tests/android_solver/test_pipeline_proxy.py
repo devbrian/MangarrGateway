@@ -17,6 +17,7 @@ redroid / WebView / network. Asserts:
 from __future__ import annotations
 
 import pytest
+from android_solver.device import AdbError
 from android_solver.service import (
     AndroidSolvePipeline,
     SolveError,
@@ -294,6 +295,48 @@ def test_proxy_cleared_even_when_solve_raises_midflight(
 
     assert device.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
     assert device.proxy_cleared == 1  # cleared despite the mid-flight raise
+
+
+# ── WR-01: a raise from set_global_http_proxy still idles the hop + clears ─────
+
+
+def test_hop_idled_when_set_global_http_proxy_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # WR-01: the hop repoint + the device-proxy set live INSIDE the try whose
+    # finally idles the hop. If set_global_http_proxy raises (AdbError), the hop
+    # must NOT be left holding the authenticated upstream — finally must idle it
+    # back to DIRECT (repoint None) and run the device clear.
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+        repoint_calls=repoint_calls,
+    )
+
+    def boom(host: str, port: int) -> None:
+        raise AdbError("settings put global http_proxy failed")
+
+    monkeypatch.setattr(device, "set_global_http_proxy", boom)
+
+    with pytest.raises(AdbError):
+        pipeline.solve("https://mangadot.net/", "mangadot.net", proxy=_PROXY)
+
+    # The hop WAS repointed to the authed upstream (SET) before the device-proxy
+    # set blew up — and the finally STILL idled it back to DIRECT (IDLE/None), so
+    # no credentialed hop state leaks past the failed solve.
+    assert repoint_calls[0] == (
+        _HOP_CONTROL_HOST,
+        _HOP_CONTROL_PORT,
+        "http://up.example:8080#u:p",
+    )
+    assert repoint_calls[-1] == (_HOP_CONTROL_HOST, _HOP_CONTROL_PORT, None)
+    # The device clear ran in finally even though the set raised.
+    assert device.proxy_cleared == 1
+    assert device.taps == []  # never reached the tap
 
 
 # ── Pitfall 1: device proxy host is the RESOLVED hop IP, never the docker name ─
