@@ -23,6 +23,15 @@ _ENV_TIMEOUT = "SOLVER_SOLVE_TIMEOUT_S"
 _ENV_CANCEL_GRACE = "SOLVER_CANCEL_GRACE_S"
 _ENV_BIND_HOST = "SOLVER_BIND_HOST"
 _ENV_PORT = "SOLVER_PORT"
+# Per-solve proxy knobs (Phase 11, D-07 + Runtime State). A proxied solve does a
+# real cross-container CONNECT hop + egress-verify, so it is allowed a LONGER
+# budget than the base no-proxy solve (whose timeout is unchanged, D-08).
+_ENV_PROXY_TIMEOUT = "SOLVER_PROXY_SOLVE_TIMEOUT_S"
+# The hop proxy the device routes WebView egress through. ``hop_host`` is the
+# docker-network-reachable sidecar SERVICE name (NOT localhost — a loopback value
+# resolves to the redroid container and bypasses the hop, Pitfall 1 / T-11-05).
+_ENV_HOP_PORT = "SOLVER_HOP_PORT"
+_ENV_HOP_HOST = "SOLVER_HOP_HOST"
 
 _DEFAULT_ADB_TARGET = "redroid:5555"
 # The ONLY challenge hosts the sidecar will ever drive a device against — the two
@@ -43,6 +52,11 @@ _DEFAULT_CANCEL_GRACE_S = 20.0
 # GATEWAY_HOST=0.0.0.0 + no-published-port stance.
 _DEFAULT_BIND_HOST = "0.0.0.0"  # noqa: S104 — docker-internal only; no published port (T-10-12)
 _DEFAULT_PORT = 8080
+# Higher than _DEFAULT_TIMEOUT_S — a proxied solve adds CONNECT-hop + verify cost.
+_DEFAULT_PROXY_TIMEOUT_S = 240.0
+_DEFAULT_HOP_PORT = 18081
+# The redroid-reachable sidecar service name (compose service, 10-05). NOT localhost.
+_DEFAULT_HOP_HOST = "android-solver"
 
 
 class ConfigError(RuntimeError):
@@ -60,6 +74,9 @@ class SidecarConfig:
     cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S
     bind_host: str = _DEFAULT_BIND_HOST
     port: int = _DEFAULT_PORT
+    proxy_solve_timeout_s: float = _DEFAULT_PROXY_TIMEOUT_S
+    hop_port: int = _DEFAULT_HOP_PORT
+    hop_host: str = _DEFAULT_HOP_HOST
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> SidecarConfig:
@@ -90,7 +107,15 @@ class SidecarConfig:
         )
 
         bind_host = (source.get(_ENV_BIND_HOST) or _DEFAULT_BIND_HOST).strip()
-        port = _parse_port(source.get(_ENV_PORT))
+        port = _parse_port(source.get(_ENV_PORT), _DEFAULT_PORT, _ENV_PORT)
+
+        proxy_solve_timeout_s = _parse_positive_float(
+            source.get(_ENV_PROXY_TIMEOUT), _DEFAULT_PROXY_TIMEOUT_S, _ENV_PROXY_TIMEOUT
+        )
+        hop_port = _parse_port(
+            source.get(_ENV_HOP_PORT), _DEFAULT_HOP_PORT, _ENV_HOP_PORT
+        )
+        hop_host = (source.get(_ENV_HOP_HOST) or _DEFAULT_HOP_HOST).strip()
 
         return cls(
             api_key=api_key,
@@ -100,6 +125,9 @@ class SidecarConfig:
             cancel_grace_s=cancel_grace_s,
             bind_host=bind_host,
             port=port,
+            proxy_solve_timeout_s=proxy_solve_timeout_s,
+            hop_port=hop_port,
+            hop_host=hop_host,
         )
 
 
@@ -123,13 +151,15 @@ def _parse_positive_float(raw: str | None, default: float, name: str) -> float:
     return value
 
 
-def _parse_port(raw: str | None) -> int:
+def _parse_port(
+    raw: str | None, default: int = _DEFAULT_PORT, name: str = _ENV_PORT
+) -> int:
     if raw is None or not raw.strip():
-        return _DEFAULT_PORT
+        return default
     try:
         port = int(raw)
     except ValueError as exc:
-        raise ConfigError(f"{_ENV_PORT} must be an integer, got {raw!r}") from exc
+        raise ConfigError(f"{name} must be an integer, got {raw!r}") from exc
     if not (1 <= port <= 65535):
-        raise ConfigError(f"{_ENV_PORT} must be in 1..65535, got {port}")
+        raise ConfigError(f"{name} must be in 1..65535, got {port}")
     return port
