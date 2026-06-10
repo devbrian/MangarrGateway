@@ -130,10 +130,24 @@ async def test_fetch_manifest_integrity_guard_passes_on_match() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_image_descrambles_only_when_offset_positive() -> None:
+async def test_fetch_image_descrambles_only_when_offset_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``fetch_image`` strips the #scr_ fragment, get_bytes the clean URL, and only
     descrambles (offload) when offset>0 — never fetching through the browser."""
     captured: list[str] = []
+    descramble_calls: list[tuple[bytes, int]] = []
+
+    def _fake_descramble(content: bytes, offset: int) -> bytes:
+        descramble_calls.append((content, offset))
+        return b"descrambled"
+
+    # Stub the real Pillow descramble so the offset>0 branch returns a
+    # DISTINGUISHABLE value — otherwise both branches return ``b"rawbytes"`` and
+    # the test would pass whether or not descrambling actually ran.
+    monkeypatch.setattr(
+        "manga_gateway.sources.mangafire._descramble_image", _fake_descramble
+    )
 
     class _ImgCtx:
         async def get_bytes(self, url: str) -> bytes:
@@ -142,12 +156,14 @@ async def test_fetch_image_descrambles_only_when_offset_positive() -> None:
 
     src = MangaFireSource()
     ctx = _ImgCtx()
-    # offset==0 → passthrough (clean URL fetched, bytes unchanged).
+    # offset==0 → passthrough (clean URL fetched, bytes unchanged, NO descramble).
     out0 = await src.fetch_image(f"{_CDN}/0.jpg", ctx)  # type: ignore[arg-type]
     assert out0 == b"rawbytes"
     assert captured[-1] == f"{_CDN}/0.jpg"
-    # offset>0 → clean URL fetched (fragment stripped); descramble degrades to
-    # passthrough on the non-image stub but proves the fragment was parsed off.
+    assert descramble_calls == []
+    # offset>0 → clean URL fetched (fragment stripped) AND descramble invoked with
+    # the parsed offset on the fetched bytes.
     out2 = await src.fetch_image(f"{_CDN}/1.jpg#scr_2", ctx)  # type: ignore[arg-type]
     assert captured[-1] == f"{_CDN}/1.jpg"
-    assert out2 == b"rawbytes"
+    assert out2 == b"descrambled"
+    assert descramble_calls == [(b"rawbytes", 2)]
