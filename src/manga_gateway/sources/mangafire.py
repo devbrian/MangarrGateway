@@ -767,7 +767,11 @@ class MangaFireSource(Source):
         )
         slug_id = manga_token.rsplit(".", 1)[-1] if "." in manga_token else manga_token
         title = self._build_title(manga_title, ch_str, lang)
-        guid = f"mangafire:{manga_token}:ch-{ch_str}:{lang}"
+        # The read href is the true per-chapter resolve unit — fold its unique tail
+        # into the guid so chapters with a blank data-number (ch_str=="?") don't
+        # collide and get silently deduped away by Mangarr (issue #219).
+        href_slug = href.rstrip("/").rsplit("/", 1)[-1]
+        guid = f"mangafire:{manga_token}:ch-{ch_str}:{lang}:{href_slug}"
 
         handle = ctx.handle_store.mint(
             ResolutionRecord(

@@ -28,7 +28,7 @@ from manga_gateway.sources.mangafire import (
 )
 from tests.test_mangafire_recent import _cards_html, _chapter_list_html
 
-_GUID_RE = re.compile(r"^mangafire:[\w.-]+:ch-[\d.?]+:[a-z-]+$")
+_GUID_RE = re.compile(r"^mangafire:[\w.-]+:ch-[\d.?]+:[a-z-]+:[\w.-]+$")
 
 
 class _FakeTypedSolver:

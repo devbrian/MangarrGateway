@@ -7,7 +7,20 @@ A malformed fragment yields ``[]`` (never raises).
 
 from __future__ import annotations
 
-from manga_gateway.sources.mangafire import _parse_cards, _parse_chapter_list
+from manga_gateway.handles.store import HandleStore
+from manga_gateway.sources.mangafire import (
+    MangaFireSource,
+    _parse_cards,
+    _parse_chapter_list,
+)
+
+
+class _HandleOnlyCtx:
+    """Minimal ctx — ``_to_release`` only touches ``handle_store`` (#219 regression)."""
+
+    def __init__(self) -> None:
+        self.handle_store = HandleStore()
+
 
 # ── chapter-list `result` HTML (D-06) ──────────────────────────────────────────
 _CHAPTER_LIST = """
@@ -95,3 +108,32 @@ def test_parse_cards_malformed_returns_empty() -> None:
     # A card with no /manga/ info link is skipped.
     no_link = b"<div class='original card-lg'><div class='inner'></div></div>"
     assert _parse_cards(no_link) == []
+
+
+def test_blank_data_number_chapters_get_distinct_guids() -> None:
+    """#219: two chapters with a blank data-number (ch_str=='?') in the same
+    manga+language must NOT share a guid, or Mangarr dedupes one away. The unique
+    read href disambiguates them."""
+    source = MangaFireSource()
+    ctx = _HandleOnlyCtx()
+    common = dict(  # noqa: C408 — readability over literal
+        manga_token="blue-lockk.kw9j9",
+        manga_title="Blue Lock",
+        lang="en",
+        ctx=ctx,
+    )
+    rel_a = source._to_release(
+        chapter={"href": "/read/blue-lockk.kw9j9/en/chapter-extra-a", "number": ""},
+        **common,
+    )
+    rel_b = source._to_release(
+        chapter={"href": "/read/blue-lockk.kw9j9/en/chapter-extra-b", "number": ""},
+        **common,
+    )
+    assert rel_a is not None and rel_b is not None
+    # Both render the ambiguous "?" chapter number ...
+    assert ":ch-?:" in rel_a.guid and ":ch-?:" in rel_b.guid
+    # ... yet the guids are distinct (the href tail disambiguates) → no dedupe loss.
+    assert rel_a.guid != rel_b.guid
+    assert rel_a.guid.endswith(":chapter-extra-a")
+    assert rel_b.guid.endswith(":chapter-extra-b")
