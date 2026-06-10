@@ -76,12 +76,12 @@ def test_offset_positive_round_trip_reconstructs_original() -> None:
     offset = 2
     scrambled = _scramble(original, offset)
     # Sanity: scrambling actually moved pixels (offset>0 is a real permutation).
-    assert list(scrambled.getdata()) != list(original.getdata())
+    assert scrambled.tobytes() != original.tobytes()
 
     out = _descramble_image(_png_bytes(scrambled), offset)
     result = Image.open(io.BytesIO(out)).convert("RGB")
     assert result.size == original.size
-    assert list(result.getdata()) == list(original.getdata())
+    assert result.tobytes() == original.tobytes()
 
 
 def test_non_image_bytes_with_offset_degrade_to_passthrough() -> None:
