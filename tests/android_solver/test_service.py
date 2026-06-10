@@ -40,6 +40,7 @@ class FakePipeline:
         error: Exception | None = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.proxies: list[dict[str, object] | None] = []
         self._result = result
         self._delay = delay
         self._healthy = healthy
@@ -50,13 +51,19 @@ class FakePipeline:
         self.cancelled = False
 
     def solve(
-        self, challenge_url: str, host: str, cancel: threading.Event | None = None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: threading.Event | None = None,
+        *,
+        proxy: dict[str, object] | None = None,
     ) -> SolveResult:
         with self._counter_lock:
             self._active += 1
             self.max_concurrent = max(self.max_concurrent, self._active)
         try:
             self.calls.append((challenge_url, host))
+            self.proxies.append(proxy)
             if self._delay:
                 # Cooperative: poll the cancel signal in small steps (mirrors the
                 # real pipeline's adb/CDP checkpoints) so a timed-out solve frees
@@ -184,8 +191,163 @@ def test_solve_returns_clearance_for_allowlisted_host() -> None:
         "cf_clearance": "MANGADOT_TOKEN",
         "user_agent": "Mozilla/5.0 (Android 11) WebView wv",
         "host": "mangadot.net",
+        "egress_ip": "",  # additive-only on the no-proxy path (D-08)
     }
     assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
+
+
+# ── per-solve proxy validation (Req 1 / T-11-06) ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # proxy is not a dict
+        b'{"challenge_url": "https://mangadot.net/", "proxy": "http://p:1"}',
+        b'{"challenge_url": "https://mangadot.net/", "proxy": 5}',
+        # server missing / not a str
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {}}',
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {"server": 5}}',
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {"server": ""}}',
+        # server scheme not http/https
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "socks5://p:1"}}',
+        # server has no hostname
+        b'{"challenge_url": "https://mangadot.net/", "proxy": {"server": "http://"}}',
+        # WR-04: server port out of range — must be a PRE-device 422, not a 504.
+        # Without port validation in _validate_proxy this body passes validation and
+        # later raises ValueError in _proxy_parts (worker thread) → misleading 504.
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://host:99999"}}',
+        # username/password present but not a str
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "username": 7}}',
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "password": 7}}',
+        # CR-2: a half-specified credential pair (only one of user/pass) would
+        # silently fall back to an unauthenticated upstream and 504 mid-pipeline —
+        # must be a PRE-device 422 instead.
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "username": "u"}}',
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "password": "p"}}',
+    ],
+)
+def test_solve_rejects_malformed_proxy_before_any_device_action(body: bytes) -> None:
+    # Req 1 / T-11-06: a malformed proxy is a PRE-action 422 — the device pipeline
+    # is never invoked (no hop repoint, no global http_proxy set).
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).solve(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # 422 is pre-action — no device action
+    assert "proxy" in payload["error"]
+
+
+def test_solve_forwards_wellformed_proxy_to_pipeline() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/",'
+            b' "proxy": {"server": "http://up.example:8080",'
+            b' "username": "u", "password": "p"}}'
+        ),
+    )
+    assert status == 200
+    assert pipeline.proxies == [
+        {"server": "http://up.example:8080", "username": "u", "password": "p"}
+    ]
+
+
+def test_solve_without_proxy_passes_none_to_pipeline() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert status == 200
+    assert pipeline.proxies == [None]
+
+
+# ── D-07: proxied solves use the longer proxy_solve_timeout_s ─────────────────
+
+
+def test_proxied_solve_uses_proxy_timeout_not_base() -> None:
+    # D-07 / Pitfall 6: with a proxy present the future is bounded by the LONGER
+    # proxy_solve_timeout_s. The pipeline delay sits BETWEEN the base (tiny) and
+    # the proxy (generous) timeout, so the proxied solve completes (200) where a
+    # base-timeout solve would 504.
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/",'
+            b' "proxy": {"server": "http://up.example:8080"}}'
+        ),
+    )
+    assert status == 200
+
+
+def test_no_proxy_solve_uses_base_timeout_and_times_out() -> None:
+    # The same delay under the base (tiny) timeout and NO proxy must 504 — proving
+    # the timeout selection keys off proxy-presence, not a constant.
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert status == 504
+
+
+# ── Req 6 + D-08: egress_ip ships in every payload, no-proxy unchanged ─────────
+
+
+def test_no_proxy_payload_is_today_shape_plus_empty_egress_ip() -> None:
+    # D-08 regression: a no-proxy /solve invokes the pipeline with proxy=None and
+    # returns the today-shape payload keys PLUS an additive empty egress_ip — i.e.
+    # the no-proxy behaviour is unchanged except for the additive field.
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert status == 200
+    assert pipeline.proxies == [None]  # pipeline driven with proxy=None
+    assert set(payload) == {"cf_clearance", "user_agent", "host", "egress_ip"}
+    assert payload["egress_ip"] == ""  # empty on the no-proxy path
+
+
+def test_proxied_payload_carries_verified_egress_ip() -> None:
+    # Req 6: the verified egress on a proxied solve reaches the 200 payload.
+    pipeline = FakePipeline(
+        result=SolveResult(
+            cf_clearance="MANGADOT_TOKEN",
+            user_agent="UA-wv",
+            host="mangadot.net",
+            egress_ip="203.0.113.7",
+        )
+    )
+    status, payload = _service(pipeline, proxy_solve_timeout_s=5.0).solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/",'
+            b' "proxy": {"server": "http://up.example:8080"}}'
+        ),
+    )
+    assert status == 200
+    assert payload["egress_ip"] == "203.0.113.7"
 
 
 # ── serialization + timeout (T-10-11) ────────────────────────────────────────
@@ -852,3 +1014,63 @@ def test_config_defaults_cancel_grace() -> None:
     # issue #207: the post-timeout drain window has a sane default when unset.
     config = SidecarConfig.from_env({"SOLVER_API_KEY": "k"})
     assert config.cancel_grace_s == 20.0
+
+
+def test_boot_defensive_clear_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CR-1: a TRANSIENT adb hiccup at boot must not permanently skip the clear. The
+    # bounded retry recovers once the device becomes ready, so a stale device-wide
+    # proxy from a crashed prior solve cannot survive into the first (no-proxy) solve.
+    attempts = {"connect": 0, "cleared": 0}
+
+    class FlakyDevice:
+        def __init__(self, target: str) -> None:
+            self.target = target
+
+        def connect(self) -> None:
+            attempts["connect"] += 1
+            if attempts["connect"] < 3:
+                raise RuntimeError("adb not ready")
+
+        def clear_global_http_proxy(self) -> None:
+            attempts["cleared"] += 1
+
+    monkeypatch.setattr(service, "AdbDevice", FlakyDevice)
+    slept: list[float] = []
+    ok = service._boot_defensive_clear(
+        _config(), retries=5, sleep_s=0.0, sleep=slept.append
+    )
+
+    assert ok is True
+    assert attempts["cleared"] == 1
+    assert attempts["connect"] == 3  # 2 transient failures, then success
+    assert slept == [0.0, 0.0]  # slept only between the 2 failed attempts
+
+
+def test_boot_defensive_clear_gives_up_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exhausting the bounded retries returns False (logged + swallowed) — it never
+    # blocks startup indefinitely, and never clears (the device never became ready).
+    attempts = {"connect": 0, "cleared": 0}
+
+    class DeadDevice:
+        def __init__(self, target: str) -> None:
+            self.target = target
+
+        def connect(self) -> None:
+            attempts["connect"] += 1
+            raise RuntimeError("adb not ready")
+
+        def clear_global_http_proxy(self) -> None:
+            attempts["cleared"] += 1  # pragma: no cover - never reached
+
+    monkeypatch.setattr(service, "AdbDevice", DeadDevice)
+    ok = service._boot_defensive_clear(
+        _config(), retries=3, sleep_s=0.0, sleep=lambda _: None
+    )
+
+    assert ok is False
+    assert attempts["connect"] == 3
+    assert attempts["cleared"] == 0

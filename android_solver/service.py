@@ -29,9 +29,14 @@ the sidecar image needs no web-framework dependency.
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import logging
+import socket
+import subprocess
+import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
@@ -51,6 +56,8 @@ from android_solver.cdp import (
 )
 from android_solver.config import SidecarConfig
 from android_solver.device import AdbDevice, AdbError
+from android_solver.egress import expected_egress
+from android_solver.proxy_hop import control_endpoint, repoint
 from android_solver.turnstile import locate_checkbox
 
 _log = logging.getLogger("android_solver.service")
@@ -108,6 +115,32 @@ _VERIFY_PROBE_JS = (
     "}catch(e){return false;}})()"
 )
 
+# Per-solve proxied-egress verification (Req 3 / D-03/D-04/D-05). After the device
+# proxy is set and CDP is up, the WebView is navigated to a NEUTRAL IP echo and its
+# observed egress is read in-browser, then compared to the sidecar self-probe's
+# expected egress (learned through the SAME authenticated upstream). A mismatch — a
+# silently-bypassed proxy — or any transient navigate/eval/parse failure raises
+# (NO token, T-11-01). The echo target is a sidecar CONSTANT, never caller-supplied
+# (no new SSRF surface, T-11-06).
+#
+# STICKY-SESSION REQUIREMENT (WR-02 — read before configuring a proxy upstream):
+# the self-probe opens ONE CONNECT through the upstream and the WebView opens a
+# SEPARATE connection through the SAME upstream; the two observed IPs are asserted
+# BYTE-EQUAL. This is the T-11-01 security invariant — the minted cf_clearance must
+# bind to the EXACT egress, so the comparison is deliberately exact-IP (NOT /24 or
+# ASN). It therefore REQUIRES a STICKY upstream that holds one exit IP across both
+# connections. A ROTATING residential endpoint (exit IP changes per TCP connection,
+# the common default unless a "sticky session" plan is selected) will mismatch on
+# nearly every solve and NO proxied solve will ever mint a token. Configure a
+# sticky-session upstream; the mismatch SolveError names the rotating-proxy cause so
+# the failure is not mistaken for a Cloudflare problem.
+_EGRESS_ECHO_URL = "https://api.ipify.org"
+_EGRESS_NAV_CMD_ID = 40
+_EGRESS_READ_CMD_ID = 41
+_CHALLENGE_RENAV_CMD_ID = 42
+_EGRESS_READ_TIMEOUT_S = 15.0
+_EGRESS_READ_JS = "document.body.innerText"
+
 
 class SolveError(RuntimeError):
     """The solve pipeline could not mint a clearance (surfaces as 504)."""
@@ -136,20 +169,53 @@ def _raise_if_cancelled(cancel: Event | None) -> None:
         raise SolveCancelled("solve cancelled after timeout")
 
 
+def _proxy_parts(
+    proxy: dict[str, Any],
+) -> tuple[str, str, int, str | None, str | None]:
+    """Decompose a validated /solve proxy into the hop URI + self-probe inputs.
+
+    Returns ``(upstream_uri, up_host, up_port, user, pw)`` where ``upstream_uri`` is
+    the ``http://HOST:PORT#USER:PASS`` form pproxy needs to inject
+    ``Proxy-Authorization`` on the upstream CONNECT (the ``#user:pass`` fragment is
+    appended only when BOTH are present). ``up_host``/``up_port``/``user``/``pw``
+    feed the stdlib self-probe (``egress.expected_egress``) through the SAME
+    upstream. The credential-bearing URI is NEVER logged (T-11-02).
+    """
+    server = str(proxy["server"])
+    split = urlsplit(server)
+    up_host = split.hostname or ""
+    up_port = split.port or (443 if split.scheme == "https" else 80)
+    user = proxy.get("username")
+    pw = proxy.get("password")
+    upstream = f"{server}#{user}:{pw}" if user and pw else server
+    return upstream, up_host, up_port, user, pw
+
+
 @dataclass(frozen=True)
 class SolveResult:
-    """A successful solve: the minted token + the WebView UA it was minted under."""
+    """A successful solve: the minted token + the WebView UA it was minted under.
+
+    ``egress_ip`` carries the VERIFIED proxied egress on a proxied solve (Req 6);
+    it defaults to ``""`` so a no-proxy solve keeps a stable, byte-for-byte shape
+    (D-08). The egress IP is loggable; ``cf_clearance`` is NEVER logged (T-10-04).
+    """
 
     cf_clearance: str
     user_agent: str
     host: str
+    egress_ip: str = ""
 
 
 class SolvePipeline(Protocol):
     """The solve surface the control API drives (a FAKE is injected in tests)."""
 
     def solve(
-        self, challenge_url: str, host: str, cancel: Event | None = None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None = None,
+        *,
+        proxy: dict[str, Any] | None = None,
     ) -> SolveResult: ...
 
     def health(self) -> bool: ...
@@ -179,6 +245,9 @@ class AndroidSolvePipeline:
         retap_interval_s: float = _RETAP_INTERVAL_S,
         frame_poll_timeout_s: float = _FRAME_POLL_TIMEOUT_S,
         frame_poll_interval_s: float = _FRAME_POLL_INTERVAL_S,
+        hop_host: str = "",
+        hop_port: int = 0,
+        egress_read_timeout_s: float = _EGRESS_READ_TIMEOUT_S,
     ) -> None:
         self._device = device
         self._timeout_s = timeout_s
@@ -187,6 +256,17 @@ class AndroidSolvePipeline:
         self._retap_interval_s = retap_interval_s
         self._frame_poll_timeout_s = frame_poll_timeout_s
         self._frame_poll_interval_s = frame_poll_interval_s
+        # The docker-reachable hop the device routes WebView egress through. Set
+        # from config (hop_host = "android-solver", NOT localhost — Pitfall 1).
+        self._hop_host = hop_host
+        self._hop_port = hop_port
+        # The hop's CONTROL channel is a SEPARATE loopback listener
+        # (127.0.0.1:<hop_port + 1>) — the sidecar (same container as the hop
+        # child) repoints over it. This is NOT the cross-container proxy port:
+        # sending a SET line to the proxy port silently closes (empty ack ⇒
+        # ProxyHopError, blocking every proxied solve). See proxy_hop.serve().
+        self._hop_control_host, self._hop_control_port = control_endpoint(hop_port)
+        self._egress_read_timeout_s = egress_read_timeout_s
         # Lazy default factories live in cdp (same package) — reuse them so the
         # devtools websocket/http plumbing has a single implementation (R1).
         from android_solver.cdp import _default_http_get, _default_ws_factory
@@ -209,7 +289,12 @@ class AndroidSolvePipeline:
             return False
 
     def solve(
-        self, challenge_url: str, host: str, cancel: Event | None = None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None = None,
+        *,
+        proxy: dict[str, Any] | None = None,
     ) -> SolveResult:
         """Mint a clearance, cooperatively cancellable via ``cancel`` (issue #207).
 
@@ -217,9 +302,13 @@ class AndroidSolvePipeline:
         checkpoint and the device is reset (``force_stop_and_clear``) on the way
         out so the NEXT solve starts on a clean WebView, not a half-driven
         challenge page.
+
+        When ``proxy`` is supplied the WebView egress is routed through the
+        per-solve authenticated hop and verified before the tap (Phase 11); when
+        ``None`` today's direct-egress flow runs byte-for-byte unchanged (D-08).
         """
         try:
-            return self._solve(challenge_url, host, cancel)
+            return self._solve(challenge_url, host, cancel, proxy=proxy)
         except SolveCancelled:
             # AC3 (#207): a cancelled solve must leave redroid clean for the next
             # caller — reset the WebView so no wedged challenge state carries over.
@@ -234,12 +323,72 @@ class AndroidSolvePipeline:
             _log.warning("device reset after cancellation failed", exc_info=True)
 
     def _solve(
-        self, challenge_url: str, host: str, cancel: Event | None
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None,
+        proxy: dict[str, Any] | None = None,
     ) -> SolveResult:
         self._device.connect()
         _raise_if_cancelled(cancel)
         self._device.force_stop_and_clear()
         _raise_if_cancelled(cancel)
+
+        if proxy is None:
+            # D-08: no-proxy solves run the direct-egress flow byte-for-byte
+            # unchanged — no hop repoint, no global http_proxy, no egress-verify.
+            return self._drive_solve(challenge_url, host, cancel, expected_egress_ip="")
+
+        # Proxied solve (Req 2/3/5): set the device-wide proxy under the serialized
+        # service Lock and ALWAYS clear it in finally — even on a mid-flight raise
+        # (Req 5, mirroring the #207 cancel-drain discipline). The hop is repointed
+        # to the per-solve authenticated upstream BEFORE the WebView restarts so it
+        # picks the proxy up on launch (D-02). The credential-bearing upstream URI
+        # is never logged (T-10-04 / T-11-02).
+        upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
+        try:
+            # WR-01: the hop repoint AND the device-proxy set both live INSIDE the
+            # try so the ``finally: self._clear_proxy_quietly()`` ALWAYS idles the
+            # hop + clears the device — even if ``set_global_http_proxy`` (or the
+            # repoint itself) raises an AdbError mid-flight. Hoisting either above
+            # the try would leak credentialed hop state on that raise: the hop
+            # would stay repointed at the authenticated upstream (its
+            # ``pproxy.Server`` holds ``user:pass``) until the next proxied solve.
+            repoint(self._hop_control_host, self._hop_control_port, upstream)
+            # The DEVICE (redroid Android) must reach the hop by IP, not by the
+            # docker service name: redroid's Android resolver is hardcoded to
+            # 8.8.8.8 and does NOT consult docker's embedded DNS, so ``settings put
+            # global http_proxy android-solver:<port>`` yields
+            # ERR_PROXY_CONNECTION_FAILED ("unknown host"). The sidecar DOES resolve
+            # its own docker name, so resolve it here to the on-network IP the
+            # WebView can actually connect to (Pitfall 1).
+            self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
+            _raise_if_cancelled(cancel)
+            # Learn the egress this SAME upstream should present (stdlib self-probe,
+            # D-05); the WebView's observed egress is asserted against it pre-tap.
+            expected = expected_egress(up_host, up_port, user, pw)
+            return self._drive_solve(
+                challenge_url, host, cancel, expected_egress_ip=expected
+            )
+        finally:
+            self._clear_proxy_quietly()
+
+    def _drive_solve(
+        self,
+        challenge_url: str,
+        host: str,
+        cancel: Event | None,
+        *,
+        expected_egress_ip: str,
+    ) -> SolveResult:
+        """Launch → CDP → (egress-verify when proxied) → tap → extract.
+
+        When ``expected_egress_ip`` is non-empty (proxied path) the WebView's
+        observed egress is read in-browser and asserted to equal it BEFORE the tap
+        (Req 3); a mismatch or transient echo failure raises with NO token. When it
+        is ``""`` (no-proxy path) the egress-verify is skipped and this flow is
+        byte-for-byte today's direct-egress solve (D-08).
+        """
         self._device.launch_url(challenge_url)
         _raise_if_cancelled(cancel)
         time.sleep(self._launch_settle_s)  # floor before the devtools socket is up
@@ -258,6 +407,37 @@ class AndroidSolvePipeline:
         try:
             cdp_call(ws, "Page.enable", command_id=10)
             cdp_call(ws, "DOM.enable", command_id=11)
+            if expected_egress_ip:
+                # Req 3 / T-11-01: prove the WebView egresses through the verified
+                # proxy IP BEFORE tapping — a silently-bypassed proxy must NOT mint
+                # a wrong-IP clearance. Mismatch/transient echo failure ⇒ no token.
+                observed = self._observe_webview_egress(ws, cancel)
+                if observed != expected_egress_ip:
+                    # WR-02: the egress-verify gate asserts the self-probe IP and
+                    # the WebView IP are byte-equal (T-11-01 — the minted
+                    # cf_clearance MUST bind to the EXACT egress). This REQUIRES a
+                    # STICKY upstream that holds one exit IP across both the
+                    # self-probe CONNECT and the WebView's separate connection. A
+                    # ROTATING residential proxy (exit IP changes per TCP
+                    # connection) will mismatch on nearly every solve, so the
+                    # operator MUST configure a sticky-session upstream. The error
+                    # below names the rotating-proxy cause explicitly so a config
+                    # mismatch is not mistaken for a Cloudflare failure.
+                    raise SolveError(
+                        f"proxied egress IP differed (expected {expected_egress_ip}, "
+                        f"observed {observed}) — is the upstream a rotating/"
+                        f"non-sticky proxy? egress-verify needs a sticky-session "
+                        f"upstream that holds one exit IP across connections"
+                    )
+                _log.info("verified proxied WebView egress %s", observed)
+                # The echo read navigated away; return to the challenge under the
+                # now-verified egress before locating the Turnstile widget.
+                cdp_call(
+                    ws,
+                    "Page.navigate",
+                    {"url": challenge_url},
+                    command_id=_CHALLENGE_RENAV_CMD_ID,
+                )
             # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
             # after load) — the real readiness gate, not the fixed settle above.
             self._wait_for_cf_frame(ws, cancel)
@@ -288,7 +468,89 @@ class AndroidSolvePipeline:
                 exc_info=True,
             )
             user_agent = ""
-        return SolveResult(cf_clearance=token, user_agent=user_agent, host=host)
+        return SolveResult(
+            cf_clearance=token,
+            user_agent=user_agent,
+            host=host,
+            egress_ip=expected_egress_ip,
+        )
+
+    def _observe_webview_egress(self, ws: WebSocketLike, cancel: Event | None) -> str:
+        """Navigate the WebView to the IP echo and return its observed egress IP.
+
+        Uses the existing CDP channel (``Page.navigate`` → ``Runtime.evaluate``
+        ``document.body.innerText`` returnByValue), normalizing the body with
+        ``ipaddress.ip_address``. A failed navigate, a transient eval error, or a
+        non-IP body is NEVER a pass — it raises :class:`SolveError` (T-11-01). The
+        observed IP is loggable; no token is involved here.
+        """
+        try:
+            cdp_call(
+                ws,
+                "Page.navigate",
+                {"url": _EGRESS_ECHO_URL},
+                command_id=_EGRESS_NAV_CMD_ID,
+            )
+        except Exception as exc:  # noqa: BLE001 — any nav failure ⇒ not a pass
+            raise SolveError(f"egress echo navigation failed: {exc}") from exc
+
+        deadline = time.monotonic() + self._egress_read_timeout_s
+        last_err: Exception | None = None
+        while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel)
+            time.sleep(self._poll_interval_s)  # settle for the echo page to load
+            try:
+                result = cdp_call(
+                    ws,
+                    "Runtime.evaluate",
+                    {"expression": _EGRESS_READ_JS, "returnByValue": True},
+                    command_id=_EGRESS_READ_CMD_ID,
+                )
+                value = result.get("result", {}).get("value")
+                return str(ipaddress.ip_address(str(value).strip()))
+            except SolveCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 — retry until the load settles
+                last_err = exc
+                continue
+        raise SolveError(f"could not read a valid WebView egress IP: {last_err}")
+
+    def _device_hop_host(self) -> str:
+        """The hop host the DEVICE routes ``global http_proxy`` through, as an IP.
+
+        redroid's Android resolver is hardcoded to public DNS (8.8.8.8) and does
+        NOT consult docker's embedded DNS, so a docker SERVICE NAME (the default
+        ``hop_host = "android-solver"``) is an "unknown host" to the WebView. The
+        sidecar, however, DOES resolve its own docker name, so we resolve
+        ``hop_host`` to the on-network IP the device can reach (verified live:
+        ``ping android-solver`` fails inside Android while ``ping <ip>`` succeeds).
+        If ``hop_host`` is already an IP literal this is a no-op; if resolution
+        fails we fall back to the literal name and let the egress-verify backstop
+        surface the bad route (never minting a wrong-IP token).
+        """
+        host = self._hop_host
+        try:
+            return socket.gethostbyname(host)
+        except OSError:
+            _log.warning("could not resolve hop host %r to an IP; using as-is", host)
+            return host
+
+    def _clear_proxy_quietly(self) -> None:
+        """ALWAYS-run proxy teardown (Req 5): clear global http_proxy + hop IDLE.
+
+        Runs in the proxied solve's ``finally`` even when the solve raised
+        mid-flight, so the device is never left with a residual ``global
+        http_proxy`` and the hop returns to DIRECT. Neither step is allowed to mask
+        the original error — both are best-effort and only log on failure.
+        """
+        try:
+            self._device.clear_global_http_proxy()
+        except Exception:  # noqa: BLE001 — teardown must not mask the solve outcome
+            _log.warning("clear_global_http_proxy failed in teardown", exc_info=True)
+        try:
+            repoint(self._hop_control_host, self._hop_control_port, None)
+        except Exception:  # noqa: BLE001 — teardown must not mask the solve outcome
+            _log.warning("hop idle-repoint failed during teardown", exc_info=True)
 
     def _tap_until_cleared(
         self,
@@ -544,16 +806,99 @@ class SolverService:
                 "error": "challenge host not allowlisted"
             }
 
-        return self._run_solve(challenge_url, host)
+        # Req 1 / T-11-06: validate the optional per-solve proxy SHAPE BEFORE any
+        # device action — a malformed proxy is a pre-action 422 (no hop repoint, no
+        # global http_proxy set). The ipify egress target is a sidecar constant, so
+        # the only caller-supplied URL here is the upstream proxy server (validated
+        # for scheme + hostname, never blindly fetched). The existing challenge_url
+        # host-allowlist above is untouched.
+        proxy_err = self._validate_proxy(payload.get("proxy"))
+        if proxy_err is not None:
+            return proxy_err
+        proxy = payload.get("proxy")
 
-    def _run_solve(self, challenge_url: str, host: str) -> tuple[int, dict[str, Any]]:
+        return self._run_solve(challenge_url, host, proxy)
+
+    @staticmethod
+    def _validate_proxy(
+        proxy: Any,
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Return a 422 tuple if ``proxy`` is malformed, else ``None`` (valid/absent).
+
+        A present proxy MUST be a dict with a str ``server`` whose ``urlsplit``
+        yields an http/https scheme AND a hostname; ``username``/``password`` are
+        optional and, if present, must be str. The credentials are never logged.
+        """
+        if proxy is None:
+            return None
+        if not isinstance(proxy, dict):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {"error": "malformed proxy"}
+        server = proxy.get("server")
+        if not isinstance(server, str) or not server:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy server"
+            }
+        split = urlsplit(server)
+        if split.scheme not in ("http", "https") or not split.hostname:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy server"
+            }
+        # WR-04: force the lazy port parse HERE, while still pre-device. An
+        # out-of-range/non-numeric port (e.g. ``http://host:99999``) makes
+        # ``urlsplit(...).port`` raise ``ValueError: Port out of range 0-65535``;
+        # without this guard that ValueError surfaces later inside ``_proxy_parts``
+        # (in the worker thread), is swallowed by ``_run_solve``'s broad except, and
+        # becomes a misleading 504 AFTER the device-action stage. Catch it here so a
+        # bad port is the clean pre-action 422 the contract promises.
+        try:
+            _ = split.port
+        except ValueError:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy server"
+            }
+        username = proxy.get("username")
+        password = proxy.get("password")
+        for cred, value in (("username", username), ("password", password)):
+            if value is not None and not isinstance(value, str):
+                return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                    "error": f"malformed proxy {cred}"
+                }
+        # CR-2: reject a half-specified credential pair PRE-device. _proxy_parts only
+        # appends the `#user:pass` fragment when BOTH are present, so a lone
+        # username/password would silently fall back to an UNAUTHENTICATED upstream
+        # and fail later as a 504 — AFTER the device + hop were already mutated. An
+        # XOR presence check returns the 422 up front (same pre-flight discipline as
+        # the WR-04 port check).
+        if bool(username) != bool(password):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy credentials"
+            }
+        return None
+
+    def _run_solve(
+        self, challenge_url: str, host: str, proxy: dict[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any]]:
         cancel = Event()
+        # D-07 / Pitfall 6: a proxied solve adds a cross-container CONNECT hop +
+        # egress-verify BEFORE the tap loop, so the OUTER future wait below is bounded
+        # by the LONGER proxy_solve_timeout_s to absorb that added overhead.
+        # NOTE (CR-3 / IN-01): this extends ONLY the outer future wait. The inner
+        # locate→tap→poll deadline in _drive_solve stays at the base solve_timeout_s
+        # BY DESIGN — the extra budget covers the hop + egress-verify overhead, NOT
+        # more tap time (the live proxied gate passed well within the base tap
+        # budget). A no-proxy solve keeps the base solve_timeout_s end-to-end
+        # (D-08, unchanged).
+        timeout_s = (
+            self._config.proxy_solve_timeout_s
+            if proxy is not None
+            else self._config.solve_timeout_s
+        )
         with self._lock:  # serialize: one WebView solve at a time (T-10-11)
             future = self._executor.submit(
-                self._pipeline.solve, challenge_url, host, cancel
+                self._pipeline.solve, challenge_url, host, cancel, proxy=proxy
             )
             try:
-                result = future.result(timeout=self._config.solve_timeout_s)
+                result = future.result(timeout=timeout_s)
             except FuturesTimeout:
                 _log.warning("solve timed out for host %s", host)
                 # issue #207 / WR-02: the worker can't be force-killed. Signal
@@ -569,11 +914,15 @@ class SolverService:
                 return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve failed"}
 
         # Redacted success event ONLY (T-10-10) — never the minted token value.
-        _log.info("solved %s", host)
+        # The verified egress_ip IS loggable (Req 6 / T-10-04).
+        _log.info("solved %s (egress %s)", host, result.egress_ip or "direct")
         return int(HTTPStatus.OK), {
             "cf_clearance": result.cf_clearance,
             "user_agent": result.user_agent,
             "host": result.host,
+            # Req 6: present on EVERY response — the verified egress on a proxied
+            # solve, "" on the no-proxy path (additive-only; D-08 keys unchanged).
+            "egress_ip": result.egress_ip,
         }
 
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
@@ -692,9 +1041,97 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def build_pipeline(config: SidecarConfig) -> SolvePipeline:
-    """Construct the real device-backed pipeline from the config."""
+    """Construct the real device-backed pipeline from the config.
+
+    Threads the hop ``host``/``port`` into the pipeline so the proxied solve can
+    route the device-wide ``global http_proxy`` through the cross-container hop
+    (``android-solver:<hop_port>`` — never localhost, Pitfall 1).
+    """
     device = AdbDevice(config.adb_target)
-    return AndroidSolvePipeline(device, timeout_s=config.solve_timeout_s)
+    return AndroidSolvePipeline(
+        device,
+        timeout_s=config.solve_timeout_s,
+        hop_host=config.hop_host,
+        hop_port=config.hop_port,
+    )
+
+
+def _spawn_proxy_hop(config: SidecarConfig) -> subprocess.Popen[bytes]:
+    """Start the persistent pproxy CONNECT hop as a sidecar child subprocess.
+
+    Runs ``python -m android_solver.proxy_hop --port <hop_port>`` (Runtime State).
+    The child is terminated on sidecar shutdown by :func:`_terminate_proxy_hop`
+    so it is never orphaned (T-11-04).
+    """
+    _log.info("starting proxy hop child on port %d", config.hop_port)
+    return subprocess.Popen(  # noqa: S603 — argv is built from config ints/constants
+        [
+            sys.executable,
+            "-m",
+            "android_solver.proxy_hop",
+            "--port",
+            str(config.hop_port),
+        ]
+    )
+
+
+def _terminate_proxy_hop(hop: subprocess.Popen[bytes] | None) -> None:
+    """Terminate the hop child on shutdown (bounded), killing it if it lingers."""
+    if hop is None:
+        return
+    hop.terminate()
+    try:
+        hop.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        _log.warning("proxy hop did not exit on terminate; killing")
+        hop.kill()
+
+
+_BOOT_CLEAR_RETRIES = 5
+_BOOT_CLEAR_RETRY_SLEEP_S = 2.0
+
+
+def _boot_defensive_clear(
+    config: SidecarConfig,
+    *,
+    retries: int = _BOOT_CLEAR_RETRIES,
+    sleep_s: float = _BOOT_CLEAR_RETRY_SLEEP_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Clear any residual device-wide ``global http_proxy`` at sidecar boot (Req 5).
+
+    A prior crashed proxied solve could have left ``global http_proxy`` set on the
+    redroid device, and that setting SURVIVES a sidecar restart. This boot-time clear
+    restores direct egress so the first no-proxy solve (D-08, unchanged) is not
+    silently routed through a now-idle hop.
+
+    CR-1: redroid is ``depends_on: service_healthy``, so the device is normally
+    booted before the sidecar starts — but a TRANSIENT adb hiccup at boot must not
+    PERMANENTLY skip the clear (a single failed attempt would strand a stale proxy
+    until the next proxied solve repoints it). Retry a bounded number of times before
+    giving up, so the fix lives entirely at boot and the per-solve no-proxy path
+    stays byte-for-byte unchanged (D-08 — no extra adb call per direct solve).
+    Returns True once the clear ran; False if every attempt failed (logged,
+    swallowed — it never blocks startup indefinitely).
+    """
+    device = AdbDevice(config.adb_target)
+    for attempt in range(1, retries + 1):
+        try:
+            device.connect()
+            device.clear_global_http_proxy()
+            _log.info("boot-time defensive global http_proxy clear ran")
+            return True
+        except Exception:  # noqa: BLE001 — best-effort; device may not be ready yet
+            if attempt == retries:
+                _log.warning(
+                    "boot-time defensive proxy clear gave up after %d attempt(s) "
+                    "(device not ready)",
+                    retries,
+                    exc_info=True,
+                )
+                return False
+            sleep(sleep_s)
+    return False
 
 
 def main() -> None:
@@ -702,6 +1139,10 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
     config = SidecarConfig.from_env()
+    # Boot the persistent hop child + a defensive proxy clear BEFORE serving so the
+    # first solve has a live hop and a clean device (Runtime State / Req 5).
+    hop = _spawn_proxy_hop(config)
+    _boot_defensive_clear(config)
     service = SolverService(config, build_pipeline(config))
     server = _SolverHTTPServer(
         (config.bind_host, config.port), _Handler, service=service
@@ -714,7 +1155,9 @@ def main() -> None:
     try:
         server.serve_forever()
     finally:
+        # Never orphan the hop child (T-11-04); always shut the executor down.
         service.close()
+        _terminate_proxy_hop(hop)
 
 
 if __name__ == "__main__":

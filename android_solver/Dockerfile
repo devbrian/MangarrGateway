@@ -25,7 +25,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Approved supply-chain pins first (cached independently of the source layer).
-# requirements.txt carries only websocket-client==1.9.0 (10-01 gate T-10-SC).
+# requirements.txt carries websocket-client==1.9.0 (10-01 gate T-10-SC) and
+# pproxy==2.7.9 — the auth-injecting CONNECT hop dep (11-01 gate T-11-SC); both
+# flow in automatically through this unchanged install layer on rebuild.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 

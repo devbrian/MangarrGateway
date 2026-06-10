@@ -180,6 +180,22 @@ class AdbDevice:
         """Hardware touch at device pixels ``(x, y)`` — a REAL tap, not synthetic JS."""
         self._device("shell", "input", "tap", str(int(x)), str(int(y)))
 
+    def set_global_http_proxy(self, host: str, port: int) -> None:
+        """Route ALL device WebView egress through ``host:port`` (Req 2).
+
+        ``host`` MUST be the docker-reachable sidecar service name (the caller
+        passes ``config.hop_host`` = ``android-solver``), NEVER ``localhost`` /
+        ``127.0.0.1`` — a loopback value resolves to the redroid container itself
+        and silently bypasses the cross-container hop proxy (Pitfall 1, T-11-05).
+        """
+        self._device(
+            "shell", "settings", "put", "global", "http_proxy", f"{host}:{int(port)}"
+        )
+
+    def clear_global_http_proxy(self) -> None:
+        """Remove the device-wide proxy (``http_proxy :0``) — restore direct egress."""
+        self._device("shell", "settings", "put", "global", "http_proxy", ":0")
+
     def screencap(self) -> bytes:
         """Grab the screen as PNG bytes (``adb exec-out screencap -p``)."""
         result = self._device("exec-out", "screencap", "-p")

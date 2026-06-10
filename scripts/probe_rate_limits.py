@@ -72,6 +72,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 import httpx  # noqa: E402
 
 from manga_gateway.config import Settings  # noqa: E402
+from manga_gateway.framework.android_solver import AndroidSolver  # noqa: E402
 from manga_gateway.framework.antibot import (  # noqa: E402
     CloudflareSolver,
     NoopSolver,
@@ -397,20 +398,45 @@ def _build_settings(proxy: ProxyEntry | None) -> Settings:
 
 def _build_solver(
     source_cls: type[Source], settings: Settings, proxy: ProxyEntry | None
-) -> NoopSolver | CloudflareSolver:
+) -> NoopSolver | CloudflareSolver | AndroidSolver:
     """Build the right solver for the source's ``antibot`` level (mirrors app.py).
 
-    ``antibot="none"`` -> :class:`NoopSolver`. ``cloudflare*`` -> a
-    :class:`CloudflareSolver` keyed to this source only, with the source's
-    challenge URL and the proxy threaded as the Playwright dict leg. The browser is
-    NOT warmed/solved here — the warm-up clearance is best-effort and only needed
-    for the live path (Task 1 does no solve).
+    ``antibot="none"`` -> :class:`NoopSolver`. An android-engine ``cloudflare*``
+    source (``solver_engine == "android"`` — mangadot/kagane) -> an
+    :class:`AndroidSolver` pointed at ``settings.android_solver_url`` (Req 8). Any
+    other ``cloudflare*`` source -> a :class:`CloudflareSolver` keyed to this source
+    only, with the source's challenge URL. In BOTH cloudflare branches the pinned
+    proxy is threaded via the SAME ``build_proxy(settings)`` Playwright dict, so the
+    CF-solve and the httpx replay egress via the SAME residential IP (Req 9 — no
+    IP-mismatch replay challenge). The browser is NOT warmed/solved here — the warm-up
+    clearance is best-effort and only needed for the live path (Task 1 does no solve).
+
+    The probe needs ``GATEWAY_ANDROID_SOLVER_URL=http://<deploy>:18080`` set for the
+    android branch to reach a live sidecar.
     """
     antibot = getattr(source_cls, "antibot", "none")
     if not antibot.startswith("cloudflare"):
         return NoopSolver()
     key = source_cls.key
     challenge_url = getattr(source_cls, "cloudflare_challenge_url", None)
+    # PROXY-01 / Req 9: the Playwright dict leg (first element) is the pinned-proxy
+    # seam BOTH cloudflare solvers share — the pinned ``ProxyEntry`` already reached
+    # ``Settings`` via ``_build_settings``, so this yields the SAME egress the httpx
+    # replay uses. NEVER unpack/log the proxy here — build_proxy is the sole SecretStr
+    # unpacker; reference proxies by ``_mask_proxy`` only (T-w1k-01).
+    from manga_gateway.framework.proxy import build_proxy  # noqa: PLC0415
+
+    playwright_proxy, _ = build_proxy(settings)
+    # Req 8: dispatch android-engine sources to the AndroidSolver BEFORE the browser
+    # branch (mangadot/kagane carry ``antibot="cloudflare"`` too, so this must precede
+    # the CloudflareSolver construction below).
+    if getattr(source_cls, "solver_engine", "patchright") == "android":
+        return AndroidSolver(
+            base_url=settings.android_solver_url,
+            api_key=settings.android_solver_api_key,
+            challenge_urls={key: challenge_url} if challenge_url else {},
+            proxy=playwright_proxy,
+        )
     solver_kwargs: dict[str, Any] = {
         "user_data_dir": settings.cloudflare_user_data_dir,
         "headless": settings.cloudflare_headless,
@@ -421,11 +447,6 @@ def _build_solver(
     }
     if challenge_url:
         solver_kwargs["challenge_urls"] = {key: challenge_url}
-    # PROXY-01: the Playwright dict leg (first element) threads into the browser launch.
-    # NEVER unpack/log the proxy here — build_proxy is the sole SecretStr unpacker.
-    from manga_gateway.framework.proxy import build_proxy  # noqa: PLC0415
-
-    playwright_proxy, _ = build_proxy(settings)
     if playwright_proxy is not None:
         solver_kwargs["proxy"] = playwright_proxy
     return CloudflareSolver(**solver_kwargs)
@@ -465,7 +486,7 @@ def _build_context(
     session: SessionManager,
     ratelimiter: RateLimiter,
     handle_store: HandleStore,
-    solver: NoopSolver | CloudflareSolver,
+    solver: NoopSolver | CloudflareSolver | AndroidSolver,
     session_prep: SessionPrep | None = None,
 ) -> SourceContext:
     """Build a ``SourceContext`` like search.py — but with OUR limiter unlimited.
@@ -1750,7 +1771,7 @@ async def _resolve_proxy_candidates(
 
 def _build_live_seams(
     source: Source, source_cls: type[Source], proxy: ProxyEntry | None
-) -> tuple[InstrumentedTransport, NoopSolver | CloudflareSolver, SourceContext]:
+) -> tuple[InstrumentedTransport, NoopSolver | CloudflareSolver | AndroidSolver, SourceContext]:
     """Construct the per-proxy seams (transport/solver/context) for one live attempt.
 
     Built per attempt so rotate-on-failure gets a fresh transport + solver bound to the
@@ -1778,18 +1799,22 @@ def _build_live_seams(
 
 
 async def _close_seams(
-    transport: InstrumentedTransport, solver: NoopSolver | CloudflareSolver
+    transport: InstrumentedTransport, solver: NoopSolver | CloudflareSolver | AndroidSolver
 ) -> None:
-    """Tear down a live attempt's transport + browser solver before rotate/exit."""
+    """Tear down a live attempt's transport + browser/android solver before rotate/exit."""
     await transport.aclose()
     if isinstance(solver, CloudflareSolver):
+        with contextlib.suppress(Exception):
+            await solver.aclose()
+    # The AndroidSolver owns an httpx client (sidecar /solve leg) — close it too.
+    if isinstance(solver, AndroidSolver):
         with contextlib.suppress(Exception):
             await solver.aclose()
 
 
 async def _warm_clearance_if_needed(
     source_cls: type[Source],
-    solver: NoopSolver | CloudflareSolver,
+    solver: NoopSolver | CloudflareSolver | AndroidSolver,
 ) -> None:
     """Best-effort eager CF solve before the live warm-up (live path only).
 
@@ -1806,7 +1831,7 @@ async def _warm_clearance_if_needed(
 _WarmupOutcome = tuple[
     ProxyEntry | None,
     InstrumentedTransport,
-    NoopSolver | CloudflareSolver,
+    NoopSolver | CloudflareSolver | AndroidSolver,
     SourceContext,
     WarmupResult,
 ]

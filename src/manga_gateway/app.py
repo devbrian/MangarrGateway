@@ -311,6 +311,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         api_key=settings.android_solver_api_key,
         challenge_urls=android_challenge_urls,
         timeout_s=settings.android_solver_timeout_s,
+        # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
+        # the CloudflareSolver (no second build_proxy call, no new setting). The
+        # sidecar's CF-solve egress then matches the gateway's httpx-fetch egress
+        # for the minted clearance. ``None`` when ``cloudflare_proxy_*`` is
+        # unconfigured ⇒ no proxy in the /solve body (D-08). Never logged.
+        proxy=playwright_proxy,
     )
     solver = SolverRouter(
         patchright=cloudflare_solver,
