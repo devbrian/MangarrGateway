@@ -568,3 +568,36 @@ def test_engine_module_contains_no_mangadex_literal() -> None:
     source = Path(engine_mod.__file__).read_text(encoding="utf-8")
     code_lines = [ln for ln in source.splitlines() if not ln.lstrip().startswith("#")]
     assert "mangadex" not in "\n".join(code_lines).lower()
+
+
+# ───────────────────── page filename / extension (issue #204) ──────────────────
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # Plain page URL — extension preserved unchanged.
+        ("https://cdn.example/h/p1.png", "p1.png"),
+        ("https://cdn.example/chapter/03.webp", "03.webp"),
+        # issue #204: a kagane page URL carries a JWT (dotted header.payload.sig)
+        # in ?token=... plus &is_datasaver=false. The query MUST be stripped so the
+        # packager derives ``.jpg`` — not the JWT-signature-plus-query tail.
+        (
+            "https://kstatic.to/api/v2/books/page/BK/PG.jpg"
+            "?token=aaa.bbb.WH4CvZhPRhFjb3IiDckA71FVVcGLKrTbf-ni-tONpDk"
+            "&is_datasaver=false",
+            "PG.jpg",
+        ),
+        # Degenerate manifest URL with no path segment → harmless constant.
+        ("https://cdn.example/", "page"),
+    ],
+)
+def test_page_filename_strips_query_before_extension(url: str, expected: str) -> None:
+    from manga_gateway.jobs.engine import _page_filename
+
+    name = _page_filename(url)
+    assert name == expected
+    # The suffix the packager keys CBZ entries on is now a clean image ext —
+    # never the dotted JWT-signature tail (the #204 garbage extension).
+    assert "&" not in Path(name).suffix
+    assert "is_datasaver" not in Path(name).suffix

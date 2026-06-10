@@ -36,6 +36,7 @@ import logging
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -124,12 +125,20 @@ def _now_iso() -> str:
 def _page_filename(url: str) -> str:
     """The original page filename (last path segment), with extension when present.
 
+    The URL query/fragment is stripped FIRST (issue #204): a kagane page URL is
+    ``.../{page_id}.{ext}?token={jwt}&is_datasaver=false`` whose JWT carries dots
+    (``header.payload.signature``). Splitting the RAW url on ``/`` keeps the query,
+    so the packager's ``Path(name).suffix`` extension derivation grabs the dotted
+    JWT-signature tail (``.<sig>&is_datasaver=false``) as the "extension" — yielding
+    garbage CBZ entry names like ``01.<sig>&is_datasaver=false``. Parsing the URL
+    and taking only its path leaves a clean ``{page_id}.{ext}`` for every source.
+
     For a normal page URL like ``.../h/p1.png`` returns ``p1.png`` (extension
     preserved). For a degenerate manifest URL ending in ``/`` (no path segment)
     returns the constant ``"page"`` — extensionless; the engine writes entries by
     index so the fallback name is harmless (IN-03).
     """
-    return url.rsplit("/", 1)[-1] or "page"
+    return urlsplit(url).path.rsplit("/", 1)[-1] or "page"
 
 
 # Issue #70 (diagnosability): a failed/transitioning job must be tie-able to WHAT it
