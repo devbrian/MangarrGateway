@@ -59,9 +59,10 @@ RESIDENTIAL IP. A DATACENTER IP MAY trip a managed Cloudflare challenge
 one-attribute flip (``antibot = "cloudflare"`` + ``cloudflare_challenge_url``) — no
 glue change, since the framework already owns the clearance path.
 
-Bulk-load caveat (2026-06-09 rate-limit probe): UNLIKE the other none-antibot
-sources, weebcentral DOES server-side rate-limit its HTML endpoints (real HTTP-429):
-the manifest endpoint 429s at ~120 requests/min PER IP (even at concurrency 1), and
+Bulk-load caveat (rate-limit probe; manifest onset pinned 2026-06-10, #189): UNLIKE
+the other none-antibot sources, weebcentral DOES server-side rate-limit its HTML
+endpoints (real HTTP-429): the manifest endpoint is CLEAN through 90 requests/min and
+429s from 120/min PER IP (even at concurrency 1; successes hard-cap ~77/min), and
 search 429s at concurrency >=8. Because every HTML call here uses the UNLIMITED
 ``ctx.get_bytes`` byte path (``limited=False``), the ``rate_limit_per_minute`` limiter
 does NOT gate them — so a bulk grab issuing >~100 manifests/min from one IP CAN 429.
@@ -346,22 +347,28 @@ class WeebCentralSource(Source):
     id_types: list[str] = []
     # English-scanlation focused → no per-chapter language metadata exists.
     languages = ["en"]
-    # Probe-MEASURED (2026-06-09, scripts/probe_rate_limits.py — residential proxies).
-    # UNLIKE the mangaball/mangadot/atsumaru precedent (all "no hard limit" → 480),
-    # weebcentral DOES server-side rate-limit its HTML endpoints (real HTTP-429):
-    #   * manifest (/chapters/{id}/images): 429s at concurrency 1, 120/min (~36 % of
-    #     requests blocked) — the BINDING per-IP rate constraint.
-    #   * search (/search/data): clean at concurrency 1 across 30–120/min (zero 429;
-    #     the 90/120 misses were slow-proxy cell-deadlines, not throttling), but 429s
-    #     at concurrency >=8, 120/min (max clean parallelism = 4).
-    #   * image CDN: NO limit — clean to concurrency 32 and 120/min (a FLOOR).
-    # 60 is the conservative ~50 %-of-onset advisory (well under the manifest 429
-    # onset). CRITICAL CAVEAT: weebcentral is an ALL-HTML source — every search/
-    # chapter-list/recent/manifest call goes through the UNLIMITED ``ctx.get_bytes``
-    # byte path (``limited=False``), so this limiter does NOT actually gate them; the
-    # value is ADVISORY for the /caps display only. The site's real 429 limit is
-    # therefore unenforced on our side — see the module docstring's bulk-load caveat
-    # and the recommended follow-up (route HTML GETs through a limited primitive).
+    # Probe-MEASURED (scripts/probe_rate_limits.py — residential proxies). UNLIKE the
+    # mangaball/mangadot/atsumaru precedent (all "no hard limit" → 480), weebcentral
+    # DOES server-side rate-limit its HTML endpoints (real HTTP-429):
+    #   * manifest (/chapters/{id}/images): the BINDING per-IP rate constraint. The
+    #     2026-06-10 re-probe (#189, faster pool, concurrency 1, cell-timeout 240s)
+    #     PINNED the onset that 2026-06-09 left fuzzy: CLEAN through 90/min (30/60/90
+    #     all 0 blocked), 429 ONSET at 120/min (77 ok / 43 blocked ≈ 36 %, corroborating
+    #     the original 36 % figure), 57 % blocked at 180/min — successes cap ≈ 77/min.
+    #   * search (/search/data): clean at concurrency 1 through 180/min (zero 429; the
+    #     2026-06-09 90/120 misses were slow-proxy cell-deadlines, re-probe confirmed
+    #     clean), but 429s at concurrency >=8, 120/min (max clean parallelism = 4).
+    #   * image CDN: NO limit — clean to concurrency 32 and 180/min (a FLOOR).
+    # 60 is deliberately retained as the conservative advisory: it sits below the now-
+    # PINNED 90/min manifest clean ceiling and at 50 % of the 120/min 429 onset. (The
+    # probe's mechanical ~50 %-of-clean-ceiling suggestion was 45; 60 is kept by choice
+    # — it is still safely under the measured ceiling and onset.) CRITICAL CAVEAT:
+    # weebcentral is an ALL-HTML source — every search/chapter-list/recent/manifest call
+    # goes through the UNLIMITED ``ctx.get_bytes`` byte path (``limited=False``), so the
+    # limiter does NOT actually gate them; the value is ADVISORY for the /caps display
+    # only. The site's real 429 limit is therefore unenforced on our side — see the
+    # module docstring's bulk-load caveat and the recommended follow-up (#187: route
+    # HTML GETs through a limited primitive).
     rate_limit_per_minute = 60
     # D-30 per-source override: the 2026-06-09 parallelism sweep had the image CDN
     # clean to concurrency 32 (downloads are image-dominated), but the manifest
