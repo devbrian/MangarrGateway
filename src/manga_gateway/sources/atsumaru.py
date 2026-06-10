@@ -101,10 +101,21 @@ _SEARCH_PER_PAGE = 12
 # GAP-1 lock). Each candidate is a full allChapters fan-out, so the count is held
 # fixed regardless of ``req.interactive``.
 _DEFAULT_TITLE_CANDIDATES = 5
-# Bounds the per-candidate allChapters fan-out in search() (mirrors MangaBall's
-# ``_CHAPTERS_FANOUT_CONCURRENCY``): at most this many chapter-listing fetches run
-# concurrently, collapsing wall-clock while staying under the per-source budget.
-_CHAPTERS_FANOUT_CONCURRENCY = 6
+# Source-wide fan-out concurrency: the single bound on every per-source fan-out
+# (search()'s per-candidate allChapters fetches AND recent()'s per-title manga.page
+# fetches). Sized to ``_RECENT_TITLE_CAP`` so the widest fan-out — recent's 20-wide
+# ``manga.page`` set — runs in ONE wave. atsu.moe carries a heavy intermittent latency
+# tail (≈0.2s on a CDN hit, ≈4s+ on a cache miss, up to ~21s under load, debug
+# ``atsumaru-unavailable-58171``); at the old search-tuned concurrency 6 a recent
+# poll's cumulative wall-clock spanned ~4 sequential waves and could exceed fanout.py's
+# 30s per-source ``asyncio.timeout``, cancelling the source → ``source_unavailable /
+# "timed out"`` despite every call returning 200. A single wave keeps the worst case at
+# ~recentlyUpdated + the slowest single page, well under 30s. The shared 480/min (8/s)
+# limiter still paces issuance, so atsu.moe never sees more than ~8 concurrent — inside
+# the probe-validated concurrency-32 ceiling (2026-06-08 parallelism sweep, zero
+# throttling). search() enumerates ≤5 candidates, so the wider bound is a harmless
+# ceiling there (already one wave).
+_CHAPTERS_FANOUT_CONCURRENCY = 20
 # recent() fans out one allChapters call per recently-updated title; bound the title
 # count so a single recent poll can never balloon into dozens of full-feed fetches.
 _RECENT_TITLE_CAP = 20
@@ -396,6 +407,10 @@ class AtsumaruSource(Source):
 
         # Bound the per-title fan-out: never more than the requested limit or the cap.
         bound = min(_RECENT_TITLE_CAP, limit or _RECENT_TITLE_CAP)
+        # Single-wave concurrency: the source-wide _CHAPTERS_FANOUT_CONCURRENCY (20) is
+        # sized to the title cap, so the whole manga.page fan-out completes inside the
+        # 30s per-source budget even on atsu.moe's slow latency tail (debug
+        # atsumaru-unavailable-58171).
         sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
 
         async def _newest_release(manga_id: str, manga_title: str) -> Release | None:
