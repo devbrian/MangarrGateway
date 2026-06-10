@@ -121,6 +121,18 @@ _VERIFY_PROBE_JS = (
 # silently-bypassed proxy — or any transient navigate/eval/parse failure raises
 # (NO token, T-11-01). The echo target is a sidecar CONSTANT, never caller-supplied
 # (no new SSRF surface, T-11-06).
+#
+# STICKY-SESSION REQUIREMENT (WR-02 — read before configuring a proxy upstream):
+# the self-probe opens ONE CONNECT through the upstream and the WebView opens a
+# SEPARATE connection through the SAME upstream; the two observed IPs are asserted
+# BYTE-EQUAL. This is the T-11-01 security invariant — the minted cf_clearance must
+# bind to the EXACT egress, so the comparison is deliberately exact-IP (NOT /24 or
+# ASN). It therefore REQUIRES a STICKY upstream that holds one exit IP across both
+# connections. A ROTATING residential endpoint (exit IP changes per TCP connection,
+# the common default unless a "sticky session" plan is selected) will mismatch on
+# nearly every solve and NO proxied solve will ever mint a token. Configure a
+# sticky-session upstream; the mismatch SolveError names the rotating-proxy cause so
+# the failure is not mistaken for a Cloudflare problem.
 _EGRESS_ECHO_URL = "https://api.ipify.org"
 _EGRESS_NAV_CMD_ID = 40
 _EGRESS_READ_CMD_ID = 41
@@ -400,8 +412,21 @@ class AndroidSolvePipeline:
                 # a wrong-IP clearance. Mismatch/transient echo failure ⇒ no token.
                 observed = self._observe_webview_egress(ws, cancel)
                 if observed != expected_egress_ip:
+                    # WR-02: the egress-verify gate asserts the self-probe IP and
+                    # the WebView IP are byte-equal (T-11-01 — the minted
+                    # cf_clearance MUST bind to the EXACT egress). This REQUIRES a
+                    # STICKY upstream that holds one exit IP across both the
+                    # self-probe CONNECT and the WebView's separate connection. A
+                    # ROTATING residential proxy (exit IP changes per TCP
+                    # connection) will mismatch on nearly every solve, so the
+                    # operator MUST configure a sticky-session upstream. The error
+                    # below names the rotating-proxy cause explicitly so a config
+                    # mismatch is not mistaken for a Cloudflare failure.
                     raise SolveError(
-                        "WebView egress did not match the expected proxied egress"
+                        f"proxied egress IP differed (expected {expected_egress_ip}, "
+                        f"observed {observed}) — is the upstream a rotating/"
+                        f"non-sticky proxy? egress-verify needs a sticky-session "
+                        f"upstream that holds one exit IP across connections"
                     )
                 _log.info("verified proxied WebView egress %s", observed)
                 # The echo read navigated away; return to the challenge under the
