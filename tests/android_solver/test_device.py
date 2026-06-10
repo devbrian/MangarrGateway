@@ -115,6 +115,36 @@ def test_input_tap_uses_device_pixels() -> None:
     assert call[-4:] == ["input", "tap", "73", "977"]
 
 
+def test_set_global_http_proxy_emits_host_port_argv() -> None:
+    runner = FakeRunner()
+    dev = AdbDevice(runner=runner)
+
+    # Host MUST be the docker-reachable sidecar name, NOT localhost (Pitfall 1).
+    dev.set_global_http_proxy("android-solver", 18081)
+
+    (call,) = runner.calls
+    assert call[-6:] == [
+        "shell",
+        "settings",
+        "put",
+        "global",
+        "http_proxy",
+        "android-solver:18081",
+    ]
+    assert call[-2:] == ["http_proxy", "android-solver:18081"]
+    assert "localhost" not in call[-1] and "127.0.0.1" not in call[-1]
+
+
+def test_clear_global_http_proxy_emits_colon_zero_argv() -> None:
+    runner = FakeRunner()
+    dev = AdbDevice(runner=runner)
+
+    dev.clear_global_http_proxy()
+
+    (call,) = runner.calls
+    assert call[-6:] == ["shell", "settings", "put", "global", "http_proxy", ":0"]
+
+
 def test_screencap_returns_png_bytes() -> None:
     runner = FakeRunner(stdout_for={"exec-out": b"\x89PNG\r\n\x1a\nDATA"})
     dev = AdbDevice(runner=runner)
