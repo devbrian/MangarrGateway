@@ -224,6 +224,13 @@ def test_solve_returns_clearance_for_allowlisted_host() -> None:
         b' "proxy": {"server": "http://p:1", "username": 7}}',
         b'{"challenge_url": "https://mangadot.net/",'
         b' "proxy": {"server": "http://p:1", "password": 7}}',
+        # CR-2: a half-specified credential pair (only one of user/pass) would
+        # silently fall back to an unauthenticated upstream and 504 mid-pipeline —
+        # must be a PRE-device 422 instead.
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "username": "u"}}',
+        b'{"challenge_url": "https://mangadot.net/",'
+        b' "proxy": {"server": "http://p:1", "password": "p"}}',
     ],
 )
 def test_solve_rejects_malformed_proxy_before_any_device_action(body: bytes) -> None:
@@ -1007,3 +1014,63 @@ def test_config_defaults_cancel_grace() -> None:
     # issue #207: the post-timeout drain window has a sane default when unset.
     config = SidecarConfig.from_env({"SOLVER_API_KEY": "k"})
     assert config.cancel_grace_s == 20.0
+
+
+def test_boot_defensive_clear_retries_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CR-1: a TRANSIENT adb hiccup at boot must not permanently skip the clear. The
+    # bounded retry recovers once the device becomes ready, so a stale device-wide
+    # proxy from a crashed prior solve cannot survive into the first (no-proxy) solve.
+    attempts = {"connect": 0, "cleared": 0}
+
+    class FlakyDevice:
+        def __init__(self, target: str) -> None:
+            self.target = target
+
+        def connect(self) -> None:
+            attempts["connect"] += 1
+            if attempts["connect"] < 3:
+                raise RuntimeError("adb not ready")
+
+        def clear_global_http_proxy(self) -> None:
+            attempts["cleared"] += 1
+
+    monkeypatch.setattr(service, "AdbDevice", FlakyDevice)
+    slept: list[float] = []
+    ok = service._boot_defensive_clear(
+        _config(), retries=5, sleep_s=0.0, sleep=slept.append
+    )
+
+    assert ok is True
+    assert attempts["cleared"] == 1
+    assert attempts["connect"] == 3  # 2 transient failures, then success
+    assert slept == [0.0, 0.0]  # slept only between the 2 failed attempts
+
+
+def test_boot_defensive_clear_gives_up_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exhausting the bounded retries returns False (logged + swallowed) — it never
+    # blocks startup indefinitely, and never clears (the device never became ready).
+    attempts = {"connect": 0, "cleared": 0}
+
+    class DeadDevice:
+        def __init__(self, target: str) -> None:
+            self.target = target
+
+        def connect(self) -> None:
+            attempts["connect"] += 1
+            raise RuntimeError("adb not ready")
+
+        def clear_global_http_proxy(self) -> None:
+            attempts["cleared"] += 1  # pragma: no cover - never reached
+
+    monkeypatch.setattr(service, "AdbDevice", DeadDevice)
+    ok = service._boot_defensive_clear(
+        _config(), retries=3, sleep_s=0.0, sleep=lambda _: None
+    )
+
+    assert ok is False
+    assert attempts["connect"] == 3
+    assert attempts["cleared"] == 0

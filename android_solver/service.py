@@ -36,6 +36,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
@@ -855,12 +856,23 @@ class SolverService:
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "malformed proxy server"
             }
-        for cred in ("username", "password"):
-            value = proxy.get(cred)
+        username = proxy.get("username")
+        password = proxy.get("password")
+        for cred, value in (("username", username), ("password", password)):
             if value is not None and not isinstance(value, str):
                 return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                     "error": f"malformed proxy {cred}"
                 }
+        # CR-2: reject a half-specified credential pair PRE-device. _proxy_parts only
+        # appends the `#user:pass` fragment when BOTH are present, so a lone
+        # username/password would silently fall back to an UNAUTHENTICATED upstream
+        # and fail later as a 504 — AFTER the device + hop were already mutated. An
+        # XOR presence check returns the 422 up front (same pre-flight discipline as
+        # the WR-04 port check).
+        if bool(username) != bool(password):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "malformed proxy credentials"
+            }
         return None
 
     def _run_solve(
@@ -868,8 +880,14 @@ class SolverService:
     ) -> tuple[int, dict[str, Any]]:
         cancel = Event()
         # D-07 / Pitfall 6: a proxied solve adds a cross-container CONNECT hop +
-        # egress-verify, so it is bounded by the LONGER proxy_solve_timeout_s; a
-        # no-proxy solve keeps the base solve_timeout_s (D-08, unchanged).
+        # egress-verify BEFORE the tap loop, so the OUTER future wait below is bounded
+        # by the LONGER proxy_solve_timeout_s to absorb that added overhead.
+        # NOTE (CR-3 / IN-01): this extends ONLY the outer future wait. The inner
+        # locate→tap→poll deadline in _drive_solve stays at the base solve_timeout_s
+        # BY DESIGN — the extra budget covers the hop + egress-verify overhead, NOT
+        # more tap time (the live proxied gate passed well within the base tap
+        # budget). A no-proxy solve keeps the base solve_timeout_s end-to-end
+        # (D-08, unchanged).
         timeout_s = (
             self._config.proxy_solve_timeout_s
             if proxy is not None
@@ -1069,24 +1087,51 @@ def _terminate_proxy_hop(hop: subprocess.Popen[bytes] | None) -> None:
         hop.kill()
 
 
-def _boot_defensive_clear(config: SidecarConfig) -> None:
+_BOOT_CLEAR_RETRIES = 5
+_BOOT_CLEAR_RETRY_SLEEP_S = 2.0
+
+
+def _boot_defensive_clear(
+    config: SidecarConfig,
+    *,
+    retries: int = _BOOT_CLEAR_RETRIES,
+    sleep_s: float = _BOOT_CLEAR_RETRY_SLEEP_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
     """Clear any residual device-wide ``global http_proxy`` at sidecar boot (Req 5).
 
     A prior crashed proxied solve could have left ``global http_proxy`` set on the
-    redroid device. This best-effort boot-time clear restores direct egress so the
-    first no-proxy solve is not silently routed through a dead hop. It never blocks
-    startup — the device may not be booted yet (logged, swallowed).
+    redroid device, and that setting SURVIVES a sidecar restart. This boot-time clear
+    restores direct egress so the first no-proxy solve (D-08, unchanged) is not
+    silently routed through a now-idle hop.
+
+    CR-1: redroid is ``depends_on: service_healthy``, so the device is normally
+    booted before the sidecar starts — but a TRANSIENT adb hiccup at boot must not
+    PERMANENTLY skip the clear (a single failed attempt would strand a stale proxy
+    until the next proxied solve repoints it). Retry a bounded number of times before
+    giving up, so the fix lives entirely at boot and the per-solve no-proxy path
+    stays byte-for-byte unchanged (D-08 — no extra adb call per direct solve).
+    Returns True once the clear ran; False if every attempt failed (logged,
+    swallowed — it never blocks startup indefinitely).
     """
     device = AdbDevice(config.adb_target)
-    try:
-        device.connect()
-        device.clear_global_http_proxy()
-        _log.info("boot-time defensive global http_proxy clear ran")
-    except Exception:  # noqa: BLE001 — best-effort; device may not be ready yet
-        _log.warning(
-            "boot-time defensive proxy clear skipped (device not ready)",
-            exc_info=True,
-        )
+    for attempt in range(1, retries + 1):
+        try:
+            device.connect()
+            device.clear_global_http_proxy()
+            _log.info("boot-time defensive global http_proxy clear ran")
+            return True
+        except Exception:  # noqa: BLE001 — best-effort; device may not be ready yet
+            if attempt == retries:
+                _log.warning(
+                    "boot-time defensive proxy clear gave up after %d attempt(s) "
+                    "(device not ready)",
+                    retries,
+                    exc_info=True,
+                )
+                return False
+            sleep(sleep_s)
+    return False
 
 
 def main() -> None:
