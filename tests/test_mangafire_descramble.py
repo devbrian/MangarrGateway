@@ -89,3 +89,79 @@ def test_non_image_bytes_with_offset_degrade_to_passthrough() -> None:
     # (the packaging is_valid_image guard rejects it downstream, T-12-07).
     junk = b"this is not an image"
     assert _descramble_image(junk, 5) == junk
+
+
+# ── #218: descramble must NOT recompress at Pillow's lossy defaults ─────────────
+
+
+def _photographic(width: int, height: int) -> Image.Image:
+    """A deterministic high-frequency RGB image — flat fills would mask the JPEG
+    quantization loss this test is designed to detect."""
+    pixels = [
+        (
+            (x * y + x * 3) % 256,
+            (x ^ y) % 256,
+            ((x // 2 + y // 3) * 97 + x * 7) % 256,
+        )
+        for y in range(height)
+        for x in range(width)
+    ]
+    img = Image.new("RGB", (width, height))
+    img.putdata(pixels)
+    return img
+
+
+def _mean_abs_err(a: Image.Image, b: Image.Image) -> float:
+    pa, pb = a.convert("RGB").tobytes(), b.convert("RGB").tobytes()
+    return sum(abs(x - y) for x, y in zip(pa, pb, strict=True)) / len(pa)
+
+
+def test_jpeg_descramble_preserves_source_quantization_no_quality_loss() -> None:
+    """#218: an offset>0 JPEG page must re-encode with the SOURCE quantization
+    tables (visually lossless), NOT Pillow's default q75 which degrades the page."""
+    offset = 2
+    original = _photographic(600, 600)
+    scrambled = _scramble(original, offset)
+    # What the MangaFire CDN serves: a real, finely-quantized JPEG (q92, 4:4:4).
+    s_buf = io.BytesIO()
+    scrambled.save(s_buf, format="JPEG", quality=92, subsampling=0)
+    s_bytes = s_buf.getvalue()
+
+    out = _descramble_image(s_bytes, offset)
+    out_img = Image.open(io.BytesIO(out))
+    src_img = Image.open(io.BytesIO(s_bytes))
+
+    # The core guarantee: format kept and the source qtables carried over verbatim.
+    assert out_img.format == "JPEG"
+    assert out_img.quantization == src_img.quantization
+
+    # Contrast with the OLD behaviour (plain default save of the SAME pixels): it
+    # requantizes to a coarser table and measurably shifts pixels off the truth.
+    truth = Image.open(io.BytesIO(out)).convert("RGB")  # ≈ descrambled ground truth
+    old_buf = io.BytesIO()
+    truth.save(old_buf, format="JPEG")  # Pillow default q75 == the pre-fix path
+    old_img = Image.open(io.BytesIO(old_buf.getvalue()))
+    assert old_img.quantization != src_img.quantization
+    # New path adds no further loss vs its own output; old path does.
+    assert _mean_abs_err(truth, old_img) > 1.0
+
+
+def test_webp_descramble_reencodes_at_high_quality() -> None:
+    """#218: an offset>0 WebP page must re-encode at high quality, not the ~q80
+    default — a default save of the same pixels is smaller (more lossy)."""
+    offset = 2
+    original = _photographic(600, 600)
+    scrambled = _scramble(original, offset)
+    s_buf = io.BytesIO()
+    scrambled.save(s_buf, format="WEBP", quality=95, method=6)
+    s_bytes = s_buf.getvalue()
+
+    out = _descramble_image(s_bytes, offset)
+    out_img = Image.open(io.BytesIO(out))
+    assert out_img.format == "WEBP"
+
+    truth = Image.open(io.BytesIO(out)).convert("RGB")
+    old_buf = io.BytesIO()
+    truth.save(old_buf, format="WEBP")  # Pillow default quality (~80) == pre-fix path
+    # Higher quality retains more bytes than the lossier default re-encode.
+    assert len(out) > len(old_buf.getvalue())

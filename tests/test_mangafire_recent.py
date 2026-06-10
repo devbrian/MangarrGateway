@@ -21,7 +21,7 @@ import pytest
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.sources.mangafire import MangaFireSource
 
-_GUID_RE = re.compile(r"^mangafire:[\w.-]+:ch-[\d.?]+:[a-z-]+$")
+_GUID_RE = re.compile(r"^mangafire:[\w.-]+:ch-[\d.?]+:[a-z-]+:[\w.-]+$")
 
 
 def _cards_html(cards: list[tuple[str, str]]) -> bytes:

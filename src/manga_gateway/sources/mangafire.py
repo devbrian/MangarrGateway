@@ -194,6 +194,11 @@ def _descramble_image(content: bytes, offset: int) -> bytes:
     try:
         with Image.open(io.BytesIO(content)) as src_img:
             fmt = src_img.format or "PNG"
+            # Capture the source JPEG quantization tables BEFORE the context closes
+            # — the reassembled image is built from scratch and carries none, so
+            # ``quality="keep"`` can't preserve fidelity (PKG-02, issue #218). Re-
+            # encoding with the SOURCE qtables keeps the page visually lossless.
+            qtables = getattr(src_img, "quantization", None)
             img = src_img.convert(src_img.mode)
         width, height = img.size
         piece_w = min(PIECE_SIZE, _ceil_div(width, MIN_SPLIT_COUNT))
@@ -213,7 +218,20 @@ def _descramble_image(content: bytes, offset: int) -> bytes:
                 region = img.crop((x_src, y_src, x_src + w, y_src + h))
                 dst.paste(region, (x_dst, y_dst))
         buf = io.BytesIO()
-        dst.save(buf, format=fmt)
+        # Never recompress at Pillow's defaults (JPEG q75 / WebP ~q80) — that
+        # degrades every offset>0 page (PKG-02, issue #218). JPEG re-encodes with
+        # the captured source qtables (+ no chroma subsampling) for a visually
+        # lossless result; WebP has no qtables so the best we can do is q95/method6.
+        # PNG (and any other format) stays lossless under a plain re-encode.
+        save_kwargs: dict[str, Any] = {}
+        if fmt == "JPEG":
+            if qtables:
+                save_kwargs = {"qtables": qtables, "subsampling": 0}
+            else:
+                save_kwargs = {"quality": 95, "subsampling": 0}
+        elif fmt == "WEBP":
+            save_kwargs = {"quality": 95, "method": 6}
+        dst.save(buf, format=fmt, **save_kwargs)
         return buf.getvalue()
     except (UnidentifiedImageError, OSError, ValueError):
         return content
@@ -749,7 +767,11 @@ class MangaFireSource(Source):
         )
         slug_id = manga_token.rsplit(".", 1)[-1] if "." in manga_token else manga_token
         title = self._build_title(manga_title, ch_str, lang)
-        guid = f"mangafire:{manga_token}:ch-{ch_str}:{lang}"
+        # The read href is the true per-chapter resolve unit — fold its unique tail
+        # into the guid so chapters with a blank data-number (ch_str=="?") don't
+        # collide and get silently deduped away by Mangarr (issue #219).
+        href_slug = href.rstrip("/").rsplit("/", 1)[-1]
+        guid = f"mangafire:{manga_token}:ch-{ch_str}:{lang}:{href_slug}"
 
         handle = ctx.handle_store.mint(
             ResolutionRecord(
