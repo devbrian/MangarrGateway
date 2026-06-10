@@ -201,3 +201,39 @@ async def live_client_for(
             timeout=120.0,
         ) as client:
             yield client
+
+
+def app_of(client: httpx.AsyncClient) -> Any:
+    """The ASGI app behind a ``live_client_for`` client.
+
+    ``live_client_for`` wraps the app in an ``httpx.ASGITransport``; reach it back
+    so a live test can drive the source layer directly (build a real
+    ``SourceContext``, list chapters, resolve manifests) without re-booting the app
+    or duplicating the autouse session-solver substitution.
+    """
+    return client._transport.app  # type: ignore[attr-defined]
+
+
+def assert_descramble_preserves_quality(raw: bytes, out: bytes) -> None:
+    """Assert a MangaFire ``offset>0`` descramble kept the page's quality (#218).
+
+    Guards the three things the packaging ``is_valid_image`` check does NOT:
+      1. the output is NOT the still-scrambled input bytes — i.e. the geometric
+         descramble actually ran rather than degrading to a passthrough;
+      2. the output decodes as a valid image (Pillow ``verify()``);
+      3. for JPEG, the output carries the SAME quantization tables as the source —
+         the #218 guarantee that the page was re-encoded losslessly, not at Pillow's
+         default q75. (WebP/PNG have no comparable qtables; (1)+(2) cover them.)
+    """
+    assert out != raw, (
+        "descramble returned the scrambled bytes unchanged (passthrough — the "
+        "offset>0 page was NOT descrambled)"
+    )
+    Image.open(io.BytesIO(out)).verify()  # raises on truncated / non-image bytes
+    src = Image.open(io.BytesIO(raw))
+    dst = Image.open(io.BytesIO(out))
+    if src.format == "JPEG" and dst.format == "JPEG":
+        assert dst.quantization == src.quantization, (
+            "descramble re-encoded the JPEG with DIFFERENT quantization tables — "
+            "quality was dropped (regression of #218; expected source qtables kept)"
+        )
