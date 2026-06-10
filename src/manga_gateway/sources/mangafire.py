@@ -465,7 +465,12 @@ class MangaFireSource(Source):
                 )
 
             enum = await ctx.cached_enumerate(
-                ctx.cached_enumerate_key(slug_id, []), _enum_fn
+                # ``_chapter_list`` fetches the ``/{lang}``-scoped chapter feed, so the
+                # Layer-2 key MUST be namespaced by ``lang`` — keying on ``slug_id``
+                # alone lets one language's warmed rows leak into a later search for
+                # the same manga in another language (mismatched releases/handles).
+                ctx.cached_enumerate_key(slug_id, [lang]),
+                _enum_fn,
             )
             return self._chapters_to_releases(
                 enum.items,
