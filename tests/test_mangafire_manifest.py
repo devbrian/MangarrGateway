@@ -40,7 +40,7 @@ class _FakeSolver:
         *,
         extract: str,
         wait_for: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 30.0,  # noqa: ASYNC109 — op-budget kwarg mirror
     ) -> Any:
         self.calls.append(
             {"url": url, "extract": extract, "wait_for": wait_for, "timeout": timeout}

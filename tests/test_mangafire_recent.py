@@ -37,7 +37,9 @@ def _cards_html(cards: list[tuple[str, str]]) -> bytes:
         """
         for href, title in cards
     )
-    return f"<div class='original card-lg'><div class='unit'>{inners}</div></div>".encode()
+    return (
+        f"<div class='original card-lg'><div class='unit'>{inners}</div></div>".encode()
+    )
 
 
 def _chapter_list_html(chapters: list[dict[str, Any]]) -> str:
@@ -46,7 +48,8 @@ def _chapter_list_html(chapters: list[dict[str, Any]]) -> str:
         f"""
         <li class="item" data-number="{ch["number"]}">
           <a href="{ch["href"]}">
-            <span>Chapter {ch["number"]}: </span><span>{ch.get("date", "May 21, 2026")}</span>
+            <span>Chapter {ch["number"]}: </span>
+            <span>{ch.get("date", "May 21, 2026")}</span>
           </a>
         </li>
         """
@@ -56,9 +59,7 @@ def _chapter_list_html(chapters: list[dict[str, Any]]) -> str:
 
 
 class _FakeCtx:
-    def __init__(
-        self, *, filter_html: bytes, chapter_lists: dict[str, str]
-    ) -> None:
+    def __init__(self, *, filter_html: bytes, chapter_lists: dict[str, str]) -> None:
         self.handle_store = HandleStore()
         self._filter_html = filter_html
         self._chapter_lists = chapter_lists

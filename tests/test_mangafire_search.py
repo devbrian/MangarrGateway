@@ -47,7 +47,7 @@ class _FakeTypedSolver:
         type_text: str,
         extract: str,
         wait_for: str | None = None,
-        timeout: float = 30.0,
+        timeout: float = 30.0,  # noqa: ASYNC109 — op-budget kwarg mirror
     ) -> Any:
         self.calls.append(
             {
