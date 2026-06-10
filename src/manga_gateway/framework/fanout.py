@@ -84,6 +84,13 @@ async def fan_out[S: _HasKey, R](
         # additive — does not change any control flow / exception propagation below.
         token = current_source.set(src.key)
         try:
+            # Capture FIRST inside the try so ``started`` is always bound before any
+            # statement that could raise (e.g. cooldown.in_cooldown) — the except
+            # handlers below read ``started`` for their elapsed log, and an unbound
+            # ``started`` there would raise NameError out of _guarded and break the
+            # per-source isolation guarantee (SRCH-03). The cooldown-check time it
+            # now includes is negligible vs the actual source run (CodeRabbit, #223).
+            started = time.perf_counter()
             # 260606-lyb Change 2: a source in cooldown is SKIPPED — no upstream
             # call, no retry, no backoff. This return happens INSIDE the try (like
             # the success return below), so it never reaches the trailing
@@ -93,7 +100,6 @@ async def fan_out[S: _HasKey, R](
                     (src.key, "source_unavailable", "upstream unavailable (cooldown)")
                 )
                 return src.key, []
-            started = time.perf_counter()
             async with asyncio.timeout(per_source_timeout):
                 result = await run_one(src)
             if collect_warnings is not None:
