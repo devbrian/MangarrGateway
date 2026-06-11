@@ -217,10 +217,14 @@ async def test_search_mints_specific_guid_and_direct_chapter_id() -> None:
     # Opaque, non-composite handle.
     assert rel.download_handle
     assert ":" not in rel.download_handle
-    # ResolutionRecord.chapter_id == the bare chapter id (DIRECT, no :DEFERRED).
+    # ResolutionRecord.chapter_id is the COMPOSITE {id}|{source} (debug
+    # mangadot-resolve-404) — DIRECT, no :DEFERRED. The guid + ids above stay BARE
+    # ("388872"); only the handle's resolve unit carries the packed source so
+    # fetch_manifest can route to /api/uploads vs /api/chapters.
     record = ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
-    assert record.chapter_id == "388872"
+    assert record.chapter_id == "388872|user"
+    assert MangadotSource._parse_resolve_id(record.chapter_id) == ("388872", "user")
     assert record.source_key == "mangadot"
     assert record.page_count == 75
     assert rel.page_count == 75

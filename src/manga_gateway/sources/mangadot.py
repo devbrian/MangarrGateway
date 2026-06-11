@@ -47,27 +47,43 @@ ENDPOINT SHAPES (live-pinned 2026-06-02, RESEARCH.md):
   ``Decimal(str(x))``; ``date_added`` is space-separated + ``+00`` offset
   (``"2026-05-12 12:21:39+00"``) → RFC3339 normalize; one ``chapter_number`` can
   have multiple language/group rows → one Release each.
-* manifest: ``GET /api/chapters/{chapter_id}/images`` →
-  ``{chapter,images:[{url,w,h}],prev_chapter_id,next_chapter_id,…}``. ``images[].url``
-  is **relative, same-origin** (``/chapters/manga_5296/chapter_26/001.webp``);
-  prepend ``base_url``. No separate CDN. ``w/h`` often ``0`` → ignored.
+* manifest: **two namespaces** (debug mangadot-resolve-404) keyed off the chapter
+  row's ``source`` field — ``GET /api/uploads/{chapter_id}/images`` for
+  ``source=="user"`` (user-uploaded) chapters and
+  ``GET /api/chapters/{chapter_id}/images`` for scraped chapters. Both return the
+  SAME shape ``{chapter,manga,images:[{url,w,h,filename}],prev_chapter_id,…}``;
+  ``images[].url`` is **relative, same-origin**
+  (``/chapters/manga_43/chapter_83_g17423/001.webp``); prepend ``base_url``. No
+  separate CDN. ``w/h`` often ``0`` → ignored. The two id namespaces OVERLAP
+  numerically, so the id alone is ambiguous — ``fetch_manifest`` MUST pick the
+  endpoint from the packed ``source`` (see :meth:`_build_resolve_id`).
 * image: ``GET https://mangadot.net{images[].url}`` (webp/jpg/png) via
   ``ctx.get_bytes`` (one-line delegate).
 
 guid (D-08): ``mangadot:{manga_id}:ch-{number}:{language}:{chapter_id}`` — the
 language + chapter id are required because one chapter number maps to N
-language/group rows. ``ResolutionRecord.chapter_id`` is the bare chapter ``id``
-(DIRECT, no ``:DEFERRED`` — Mangadot exposes the stable id, unlike Comix's recent
-feed).
+language/group rows. The guid (and ``Release.ids.mangadotChapterId``) carry the BARE
+chapter ``id`` (wire-stable / display-only). ``ResolutionRecord.chapter_id`` carries
+a COMPOSITE ``{id}|{source}`` (debug mangadot-resolve-404) so the stateless
+``fetch_manifest`` hook can route to the right manifest namespace; this mirrors
+comix's composite-chapter-id idiom. Still DIRECT — no ``:DEFERRED`` (Mangadot exposes
+the stable id, unlike Comix's recent feed).
 
 recent(): a verbatim no-op (``return []``, ``supports_recent=False``). Mangadot
 exposes no clean chapter-level JSON feed (CONTEXT.md / RESEARCH.md — live-probed
 2026-06-02). The core value (search → handle → download → CBZ, R1/R6) is fully
 delivered without recent(). Tracked for revisit as a GitHub issue (mirrors comix #31).
 
-⚠️ Chapter-id provenance oddity (RESEARCH.md, CONFIRMED LIVE): some junk/aggregated
-manga entries (e.g. manga 101) list chapter ids that resolve to OTHER manga. The
-live-smoke ``default_query`` is chosen so its ``chapters/list`` ids resolve back to
+⚠️ Chapter-id namespace split (debug mangadot-resolve-404, CONFIRMED LIVE via the
+reader's own network calls): mangadot has TWO manifest namespaces —
+``/api/uploads/{id}`` (user-uploaded, ``source=="user"``) and ``/api/chapters/{id}``
+(scraped) — whose numeric ids OVERLAP. A ``source=="user"`` id fetched on the
+``/api/chapters`` endpoint either
+404s (absent there) or returns a DIFFERENT manga's chapter (e.g. id 451326 →
+"Selfish Romance" on ``/api/chapters`` but "Solo Max-Level Newbie" ch 262 on
+``/api/uploads``). This was earlier mis-described as junk/aggregated entries listing
+foreign ids; it is actually the namespace split, now handled by routing on ``source``.
+The live-smoke ``default_query`` is chosen so its ``chapters/list`` ids resolve back to
 the SAME manga with a matching ``page_count`` (see ``tests/live/profiles/mangadot.py``).
 """
 
@@ -107,6 +123,15 @@ _CHAPTERS_FANOUT_CONCURRENCY = 6
 
 # Floor for empty/malformed timestamps so they sort oldest and never crash.
 _TS_FLOOR = datetime.min.replace(tzinfo=UTC)
+
+# Separator packing each chapter row's ``source`` into the minted
+# ``ResolutionRecord.chapter_id`` so the stateless ``fetch_manifest(chapter_id, ctx)``
+# hook can route to the correct manifest namespace (debug mangadot-resolve-404).
+# mangadot serves user-uploaded chapters from ``/api/uploads/{id}/images`` and scraped
+# chapters from ``/api/chapters/{id}/images`` — two namespaces whose numeric ids
+# OVERLAP, so the id ALONE is ambiguous. Mirrors comix's composite-chapter-id idiom
+# (comix.py ``_CID_SEP``).
+_CHAPTER_ID_SEP = "|"
 
 # SSRF allowlist for the EXTRACTED page-image URLs (T-07-07/T-07-09, CLAUDE.md).
 # Unlike mangaball's varying CDN, Mangadot serves images SAME-ORIGIN, so the host
@@ -421,17 +446,34 @@ class MangadotSource(Source):
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
         """Resolve a chapter id → ordered page-image URLs, INTERNALLY (PKG-01/R6).
 
-        GETs ``/api/chapters/{chapter_id}/images`` (a JSON object) via
-        ``ctx.get_json``, reads the ordered ``images`` array (array order = page
-        order), prepends ``base_url`` to each RELATIVE ``/chapters/...`` url, and
+        Routes by the chapter's upstream namespace, then GETs the manifest JSON
+        object via ``ctx.get_json``, reads the ordered ``images`` array (array order =
+        page order), prepends ``base_url`` to each RELATIVE ``/chapters/...`` url, and
         SSRF-allowlists every resulting URL (:func:`_is_allowed_image_url`) BEFORE
         return. The image URLs are EXTRACTED from the response, NEVER reconstructed
         (T-07 / CLAUDE.md SSRF). Empty ``images`` OR any URL failing the allowlist
         raises ``SourceError("source_unavailable", …)`` — no blind fetch
         (T-07-07/09). The manifest is consumed only by the gateway's own engine,
         never returned to a caller (R6).
+
+        Namespace routing (debug mangadot-resolve-404): mangadot serves
+        **user-uploaded** chapters from ``/api/uploads/{id}/images`` and **scraped**
+        chapters from ``/api/chapters/{id}/images`` — two id namespaces whose numeric
+        ranges OVERLAP. The search step packs the row's ``source`` into the resolve id
+        (:meth:`_build_resolve_id`); here we unpack it and pick the endpoint:
+        ``source == "user"`` → ``uploads`` (the reader's own choice for these rows),
+        else ``chapters`` (scraped — the pre-existing default; a BARE id with no packed
+        source also lands here, so older handles resolve unchanged). Using the wrong
+        namespace previously caused either an upstream 404 (id absent there) OR a
+        SILENT wrong-manga manifest (id collided with a different scraped chapter).
+        The response shape is identical across both endpoints, so the parse below is
+        namespace-agnostic.
         """
-        body = await ctx.get_json(f"{self.base_url}/api/chapters/{chapter_id}/images")
+        raw_chapter_id, source = self._parse_resolve_id(chapter_id)
+        endpoint = "uploads" if source == "user" else "chapters"
+        body = await ctx.get_json(
+            f"{self.base_url}/api/{endpoint}/{raw_chapter_id}/images"
+        )
         images = body.get("images")
         # WR-01: guard the nested ``images`` shape explicitly. ``get_json`` only
         # validates the top-level object; a non-list ``images`` (string/dict/null)
@@ -497,6 +539,9 @@ class MangadotSource(Source):
         if chapter_id is None:
             return None
         chapter_id = str(chapter_id)
+        # Capture the upstream namespace ("user" upload vs scraped) so fetch_manifest
+        # can route to the right manifest endpoint (debug mangadot-resolve-404).
+        chapter_source = row.get("source")
 
         language = str(row.get("language") or "en")
         chapter_number = self._parse_decimal(row.get("chapter_number"))
@@ -526,10 +571,15 @@ class MangadotSource(Source):
         # language/group rows.
         guid = f"mangadot:{manga_id}:ch-{ch_str}:{language}:{chapter_id}"
 
+        # Pack the chapter's source into the resolve id so the stateless
+        # fetch_manifest hook routes to /api/uploads vs /api/chapters (debug
+        # mangadot-resolve-404). The guid + ids below stay the BARE chapter id
+        # (wire-stable / display-only); only the handle's resolve unit carries it.
+        resolve_id = self._build_resolve_id(chapter_id, chapter_source)
         handle = ctx.handle_store.mint(
             ResolutionRecord(
                 source_key=self.key,
-                chapter_id=chapter_id,  # the bare /api/chapters/{id}/images unit
+                chapter_id=resolve_id,  # bare id (+ packed source) → manifest route
                 language=language,
                 title=title,
                 manga_title=manga_title,
@@ -623,3 +673,31 @@ class MangadotSource(Source):
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _build_resolve_id(cls, chapter_id: str, source: Any) -> str:
+        """Pack ``chapter_id`` + chapter ``source`` into the handle's resolve id.
+
+        mangadot serves user-uploaded chapters from ``/api/uploads/{id}/images`` and
+        scraped chapters from ``/api/chapters/{id}/images`` — two namespaces whose
+        numeric ids OVERLAP (debug mangadot-resolve-404). The row's ``source`` decides
+        which, so it is packed into ``ResolutionRecord.chapter_id`` (the only datum
+        :meth:`fetch_manifest` receives). A falsy/blank source yields a BARE id (no
+        separator) so scraped rows — and any pre-existing handle — keep hitting
+        ``/api/chapters`` exactly as before.
+        """
+        src = str(source).strip() if source not in (None, "") else ""
+        return f"{chapter_id}{_CHAPTER_ID_SEP}{src}" if src else chapter_id
+
+    @classmethod
+    def _parse_resolve_id(cls, composite: str) -> tuple[str, str | None]:
+        """Unpack ``{chapter_id}|{source}`` → ``(chapter_id, source|None)``.
+
+        Tolerant of a BARE id (no separator → ``source=None`` → scraped namespace),
+        so older handles and scraped rows resolve exactly as before. Inverse of
+        :meth:`_build_resolve_id`.
+        """
+        raw_id, sep, src = composite.partition(_CHAPTER_ID_SEP)
+        if not sep:
+            return composite, None
+        return raw_id, (src or None)
