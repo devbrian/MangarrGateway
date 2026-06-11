@@ -660,8 +660,9 @@ class _ManifestSequenceSolver:
 
     Backs the Issue #171 cold-race test: stage e.g. ``[[], [url]]`` and assert
     ``fetch_manifest`` re-navigates once and resolves the warm second capture.
-    ``fetch_via_browser_paginated`` exists only so ``_solver_from_ctx``'s hasattr
-    guard passes — the resolved (non-DEFERRED) composite never walks the series.
+    ``fetch_via_browser_parallel_pages`` exists only so ``_solver_from_ctx``'s
+    hasattr guard passes — the resolved (non-DEFERRED) composite never walks the
+    series.
     """
 
     def __init__(self, results: list[object]) -> None:
@@ -684,7 +685,7 @@ class _ManifestSequenceSolver:
         self.browser_calls += 1
         return self._results.pop(0)
 
-    async def fetch_via_browser_paginated(  # pragma: no cover — never called
+    async def fetch_via_browser_parallel_pages(  # pragma: no cover — never called
         self, url: str, **kwargs: object
     ) -> object:
         raise AssertionError("resolved composite must not walk the series list")

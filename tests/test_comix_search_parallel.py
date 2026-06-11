@@ -137,22 +137,24 @@ class _SlowComixSolver:
         self.browser_fetch_calls.append(url)
         return await self._gated_fetch(url)
 
-    async def fetch_via_browser_paginated(
+    async def fetch_via_browser_parallel_pages(
         self,
         url: str,
         *,
         extract: str,
         wait_for: str | None = None,
-        next_selector: str,
-        route_limit_rewrite: tuple[str, int] | None = None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int] | None = None,
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
     ) -> object:
-        # #146: ``_series_chapters`` always-walks via the paginated primitive, so
-        # the parallel-concurrency bounding test must exercise THIS method (the
+        # #222: ``_series_chapters`` always-enumerates via the PARALLEL primitive,
+        # so the parallel-concurrency bounding test must exercise THIS method (the
         # one the source actually calls). Same in-flight/gate/delay accounting as
         # the one-shot fetch so the max_in_flight / wall-clock assertions hold.
-        _ = (extract, wait_for, next_selector, route_limit_rewrite, max_pages, timeout)
+        _ = (extract, wait_for, last_page_selector, page_param, route_rewrite)
+        _ = (max_pages, timeout)
         self.browser_fetch_calls.append(url)
         return await self._gated_fetch(url)
 
