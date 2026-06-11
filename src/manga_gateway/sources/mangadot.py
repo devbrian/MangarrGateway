@@ -501,6 +501,11 @@ class MangadotSource(Source):
         language = str(row.get("language") or "en")
         chapter_number = self._parse_decimal(row.get("chapter_number"))
         page_count = self._parse_int(row.get("page_count"))
+        # REL-03: display-only votes from the per-chapter discussion counter
+        # (unit = comments). Live values are often 0 (a data property, not a
+        # wiring concern) and None-safe when absent. NOT added to the minted
+        # ResolutionRecord (display-only).
+        votes = self._parse_int(row.get("comment_count"))
         volume = self._parse_int(row.get("volume_number"))
         publish_date = self._normalize_publish_date(row.get("date_added"))
         group_name = (
@@ -547,6 +552,7 @@ class MangadotSource(Source):
             language=language,
             scanlation_group=group_name,
             page_count=page_count,
+            votes=votes,
             ids={"mangaId": manga_id, "mangadotChapterId": chapter_id},
         )
 
