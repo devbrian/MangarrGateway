@@ -18,12 +18,13 @@ backend owns the key — detected via ``inspect.signature`` exactly like context
 lifespan force-disables exactly the failed sources across both engines); ``aclose()``
 closes BOTH (each guarded so one failure does not skip the other).
 
-Beyond the clearance Protocol the router ALSO passes through the three off-Protocol
+Beyond the clearance Protocol the router ALSO passes through the four off-Protocol
 browser primitives (``fetch_via_browser`` / ``fetch_via_browser_paginated`` /
-``fetch_via_browser_typed``, D-41) so that swapping the bare :class:`CloudflareSolver`
-for this router as ``app.state.solver`` does not break a source's ``_solver_from_ctx``
-``hasattr`` gate (comix uses the first two; MangaFire keyword search uses the typed
-one). All three delegate to the patchright backend (the only engine with a real
+``fetch_via_browser_typed`` / ``fetch_via_browser_parallel_pages``, D-41) so that
+swapping the bare :class:`CloudflareSolver` for this router as ``app.state.solver``
+does not break a source's ``_solver_from_ctx`` ``hasattr`` gate (comix uses
+``fetch_via_browser`` + ``fetch_via_browser_parallel_pages``; MangaFire keyword search
+uses the typed one). All delegate to the patchright backend (the only engine with a real
 browser; the android backend is a WebView-clearance sidecar with no browser and never
 needs these), keeping criterion 4 "comix unaffected" true.
 """
@@ -81,6 +82,19 @@ class _BrowserFetchSolver(Protocol):
         wait_for: str | None = None,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
     ) -> Any: ...
+
+    async def fetch_via_browser_parallel_pages(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int],
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> list[Any]: ...
 
 
 # The android engine name (matches ``Source.solver_engine`` on mangadot/kagane).
@@ -170,6 +184,36 @@ class SolverRouter:
             wait_for=wait_for,
             next_selector=next_selector,
             route_limit_rewrite=route_limit_rewrite,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+
+    async def fetch_via_browser_parallel_pages(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int],
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
+    ) -> list[Any]:
+        """Delegate the parallel-pagination browser fan-out to the patchright backend.
+
+        comix's chapter-list enumeration (``_fetch_series_chapters_raw``) runs against
+        the production ``app.state.solver`` — which is THIS router — so the router must
+        expose the parallel primitive too (D-41). Always delegates to
+        ``self._patchright`` (the android backend has no real browser)."""
+        backend = cast("_BrowserFetchSolver", self._patchright)
+        return await backend.fetch_via_browser_parallel_pages(
+            url,
+            extract=extract,
+            wait_for=wait_for,
+            last_page_selector=last_page_selector,
+            page_param=page_param,
+            route_rewrite=route_rewrite,
             max_pages=max_pages,
             timeout=timeout,
         )
