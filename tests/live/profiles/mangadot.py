@@ -31,13 +31,17 @@ on ``id_field = "mangaId"``.
 
 Default-query selection — provenance-verify requirement (RESEARCH ⚠️)
 --------------------------------------------------------------------
-RESEARCH.md CONFIRMED a chapter-id provenance oddity: some junk/aggregated manga
-entries (e.g. manga 101) list ``chapters/list`` ids that resolve to OTHER manga
-(manga 101's ``id:388872`` resolves to manga 5296). So the ``default_query`` MUST
-resolve to a REAL manga whose ``chapters/list`` ids resolve back to the SAME manga
-with a matching ``page_count``, and the download leg MUST pick a ``source:"user"``
-chapter with present (non-404) image files (recon §4: ``scraper`` chapters can 404
-their page files).
+RESEARCH.md observed ``chapters/list`` ids that resolve to OTHER manga / 404 and
+mis-attributed it to junk/aggregated entries. Debug mangadot-resolve-404 (2026-06-11)
+found the real cause: mangadot has TWO manifest namespaces with OVERLAPPING ids —
+``/api/uploads/{id}/images`` (``source=="user"``) and ``/api/chapters/{id}/images``
+(scraped). ``MangadotSource.fetch_manifest`` now ROUTES by the row's ``source``, so a
+user-source chapter resolves on ``/api/uploads`` (the reader's own choice) instead of
+404-ing or silently returning a different manga off ``/api/chapters``. The
+``default_query`` should still resolve to a REAL manga whose ``chapters/list`` ids
+resolve back to the SAME manga with a matching ``page_count`` — that invariant now
+holds BECAUSE of the source-routing, and is the live guard against a routing
+regression (a wrong-namespace fetch would resurface as a page_count/manga-id mismatch).
 
 ``default_query = "Murim Psychopath"`` (manga 20277) — a real title seen live in
 latest-updates (RESEARCH §provenance). The live-smoke loop verifies the leading hit's
