@@ -264,7 +264,7 @@ class _FakeSolver:
     """Records the ``chapter_url`` passed to ``fetch_via_browser`` so the test
     can assert the deferred branch resolved the sentinel before navigating.
 
-    Also backs the #146 always-walk paginated primitive: tests that exercise the
+    Also backs the #222 always-walk PARALLEL primitive: tests that exercise the
     REAL deferred path (no ``_series_chapters`` monkeypatch) stage the full
     series chapter list on ``paginated_results`` keyed by the series URL."""
 
@@ -291,22 +291,24 @@ class _FakeSolver:
         self.last_url = url
         return self._urls
 
-    async def fetch_via_browser_paginated(
+    async def fetch_via_browser_parallel_pages(
         self,
         url: str,
         *,
         extract: str,
         wait_for: Any = None,
-        next_selector: str,
-        route_limit_rewrite: tuple[str, int] | None = None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int] | None = None,
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
     ) -> list[dict[str, Any]]:
-        _ = (extract, wait_for, next_selector, route_limit_rewrite, max_pages, timeout)
+        _ = (extract, wait_for, last_page_selector, page_param, route_rewrite)
+        _ = (max_pages, timeout)
         self.paginated_fetch_calls.append(url)
         if url not in self.paginated_results:
             raise AssertionError(
-                f"unmocked fetch_via_browser_paginated({url!r}); "
+                f"unmocked fetch_via_browser_parallel_pages({url!r}); "
                 f"call stage_browser_paginated first"
             )
         return self.paginated_results[url]

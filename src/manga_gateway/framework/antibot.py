@@ -234,6 +234,37 @@ def _build_limit_rewrite_route_handler(
     return _handler
 
 
+def _build_page_limit_rewrite_route_handler(
+    url_substring: str, target_page: int, target_limit: int, page_param: str
+) -> Callable[[Any], Awaitable[None]]:
+    """Build a ``page.route`` handler that pins BOTH ``page`` and ``limit`` params.
+
+    Mirrors :func:`_build_limit_rewrite_route_handler` but, on a URL containing
+    ``url_substring``, ALSO rewrites the caller-named ``page_param=\\d+`` query
+    value to ``target_page`` (in addition to the ``limit=\\d+`` → ``target_limit``
+    rewrite). Used by the parallel-pagination fan-out: each fan-out page pins its
+    own ``page`` so the SPA renders that page at the SAME ``limit`` discovery used
+    (the load-bearing consistency point — discovery and fan-out must share the
+    limit or P is mis-counted). Every other request is continued untouched. The
+    rewrites reflect no client input — ``url_substring``/``target_*``/``page_param``
+    are source constants (T-u7f-01). The ``limit`` rewrite reuses the shared
+    :data:`_LIMIT_PARAM_RE`; the page param NAME is a caller argument (D-41 — no
+    source literal; ``limit``/``page`` are generic HTTP params).
+    """
+    page_re = re.compile(rf"([?&]{re.escape(page_param)}=)\d+")
+
+    async def _handler(route: Any) -> None:
+        req_url = route.request.url
+        if url_substring in req_url:
+            new_url = _LIMIT_PARAM_RE.sub(rf"\g<1>{target_limit}", req_url)
+            new_url = page_re.sub(rf"\g<1>{target_page}", new_url)
+            await route.continue_(url=new_url)
+        else:
+            await route.continue_()
+
+    return _handler
+
+
 async def _evaluate_guarded(
     page: Any,
     script: str,
@@ -363,6 +394,14 @@ class AntiBotSolver(Protocol):
       ``keyboard.type``→optional post-type wait→evaluate, for tokens minted
       only by trusted keyboard events (``event.isTrusted``); the ``wait_for``
       runs AFTER typing (D-01/D-03, #192).
+    * ``async def fetch_via_browser_parallel_pages(url, *, extract,
+      wait_for=None, last_page_selector, page_param, route_rewrite,
+      max_pages=200, timeout=30.0) -> list`` — discovers the page count P via
+      the caller's "Last page" button + ``?page=N`` URL sync, then fans pages
+      1..P out CONCURRENTLY (each pinned by its own ``page.route()`` ``page``+
+      ``limit`` rewrite, bounded by the SAME ``_browser_lock`` semaphore), and
+      merges deduped-by-``id`` in newest-first order. A page that fails or yields
+      no rows fails closed (raises) — never a partial list (#222, spike 014).
     """
 
     async def get_clearance(self, source_key: str) -> Clearance | None:
@@ -1238,6 +1277,312 @@ class CloudflareSolver:
             page_count += 1
 
         return accumulator
+
+    # ``timeout`` is the per-call Playwright operation budget (goto/wait_for and
+    # each evaluate receive ``timeout``), NOT a cancellation wrapper — same
+    # justification as ``fetch_via_browser``.
+    async def fetch_via_browser_parallel_pages(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int],
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — see comment above
+    ) -> list[Any]:
+        """Navigate ``url``, discover the page count P via the caller's "Last page"
+        button, then fan pages 1..P out CONCURRENTLY and merge the deduped row list
+        (generic, source-agnostic; #222, spike 014).
+
+        The 4th sibling browser primitive (alongside :meth:`fetch_via_browser`,
+        :meth:`fetch_via_browser_paginated`, :meth:`fetch_via_browser_typed`). It
+        replaces the SEQUENTIAL in-page Next-walk of
+        :meth:`fetch_via_browser_paginated` with a PARALLEL browser-page fan-out for
+        sites whose long lists paginate via a ``?page=N`` URL the SPA reads on first
+        paint (spike 014 proved this recovers the byte-identical deduped newest-first
+        list ~3.5-5.9x faster). The walk has three phases:
+
+        1. **Discovery** — install the LIMIT-ONLY ``route_rewrite`` route (so the
+           "Last page" button computes P at the SAME limit the fan-out uses — the
+           load-bearing consistency point), ``goto``, then probe
+           ``last_page_selector``. Absent/disabled → P=1; else JS-click it and read
+           ``?{page_param}=N`` off the synced URL. P is clamped to ``max_pages``.
+        2. **Fan-out** — ``asyncio.gather`` one single-page browser call per page
+           1..P, each pinning its own ``page``+``limit`` via ``page.route()`` and
+           bounded by the EXISTING ``_browser_lock`` semaphore (no second gate). A
+           page that fails OR yields no rows FAILS CLOSED (raises) — the first
+           exception is re-raised verbatim, never a partial list.
+        3. **Merge** — dedup by ``id``, first-seen (newest-first) order.
+
+        Every site-specific value (the ``last_page_selector``, the ``page_param``,
+        the ``route_rewrite`` substring + target, the ``extract`` body, the
+        ``wait_for``) is a CALLER argument — this framework method names no source.
+        Detected by sources via ``hasattr`` (off-Protocol, D-41).
+
+        Dead-driver recovery mirrors :meth:`fetch_via_browser`: a
+        :func:`_looks_like_dead_driver` ``BrowserFetchError`` triggers ONE
+        ``recycle_now`` + retry of the WHOLE op (re-discover + re-fan-out, since the
+        shared context is dead) against a fresh context (same retry-once cap).
+
+        Args:
+            url: The full series/list URL to navigate to.
+            extract: A JS function body returning a JSON-serializable list of rows;
+                wrapped as ``async () => { ...extract... }``. Rows dedup by ``id``.
+            wait_for: Optional pre-read readiness wait (CSS selector or JS
+                predicate, routed exactly like :meth:`fetch_via_browser`).
+            last_page_selector: CSS selector for the "Last page" control. Absent or
+                disabled means a single page (P=1).
+            page_param: The query param name the SPA reads the page index from
+                (e.g. ``"page"``) — used BOTH to parse the synced Last-page URL and
+                to pin each fan-out page's request.
+            route_rewrite: ``(url_substring, target_limit)`` — the ``page.route()``
+                rewrite applied to requests whose URL contains ``url_substring``.
+            max_pages: Infinite-loop guard — P is clamped to this (logs a warning).
+            timeout: Seconds budget applied to goto/wait_for and each evaluate.
+
+        Returns:
+            The merged, deduped list of rows across pages 1..P, first-seen order.
+
+        Raises:
+            BrowserFetchError: navigation/wait/evaluate failed, a fan-out page
+                yielded no rows (fail-closed), or the context could not be acquired
+                (after the single dead-driver retry).
+        """
+        try:
+            return await self._parallel_pages_once(
+                url,
+                extract=extract,
+                wait_for=wait_for,
+                last_page_selector=last_page_selector,
+                page_param=page_param,
+                route_rewrite=route_rewrite,
+                max_pages=max_pages,
+                timeout=timeout,
+                attempt=1,
+            )
+        except BrowserFetchError as exc:
+            if not _looks_like_dead_driver(exc):
+                raise
+            _log.warning(
+                "fetch_via_browser_parallel_pages: dead-driver signal detected — "
+                "recycling browser context and retrying once (url=%s)",
+                url,
+            )
+            await self._lifecycle.recycle_now()
+            return await self._parallel_pages_once(
+                url,
+                extract=extract,
+                wait_for=wait_for,
+                last_page_selector=last_page_selector,
+                page_param=page_param,
+                route_rewrite=route_rewrite,
+                max_pages=max_pages,
+                timeout=timeout,
+                attempt=2,
+            )
+
+    async def _parallel_pages_once(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int],
+        max_pages: int,
+        timeout: float,  # noqa: ASYNC109 — same justification as fetch_via_browser
+        attempt: int,
+    ) -> list[Any]:
+        """One attempt of discover-P → parallel fan-out → merge (no retry).
+
+        The dead-driver retry wraps the WHOLE op in the public method, so this
+        re-runs discovery AND the fan-out against the (possibly freshly relaunched)
+        context. Each phase is its own ``_browser_call`` (op=
+        ``fetch_via_browser_parallel_pages``); the fan-out's ``return_exceptions``
+        gather lets all tasks settle (no orphan-task warnings) before the first
+        exception is re-raised verbatim — never a partial list.
+        """
+        page_count = await self._discover_page_count(
+            url,
+            wait_for=wait_for,
+            last_page_selector=last_page_selector,
+            page_param=page_param,
+            route_rewrite=route_rewrite,
+            max_pages=max_pages,
+            timeout=timeout,
+            attempt=attempt,
+        )
+        # FAN-OUT: one single-page browser call per page, gathered concurrently.
+        # Each ``_fetch_one_page`` acquires the EXISTING ``_browser_lock`` inside
+        # ``_browser_call``, so the gather self-throttles to ``fetch_concurrency``
+        # globally — NO second semaphore. ``return_exceptions=True`` lets every
+        # task settle so a failure on one page does not orphan the others.
+        settled = await asyncio.gather(
+            *[
+                self._fetch_one_page(
+                    url,
+                    target=n,
+                    extract=extract,
+                    wait_for=wait_for,
+                    route_rewrite=route_rewrite,
+                    page_param=page_param,
+                    timeout=timeout,
+                    attempt=attempt,
+                )
+                for n in range(1, page_count + 1)
+            ],
+            return_exceptions=True,
+        )
+        # FAIL-CLOSED: re-raise the FIRST exception verbatim (preserving its
+        # ``__cause__`` so the public wrapper's dead-driver check still works);
+        # never return a partial list. The narrowed ``pages`` list is then merge-safe.
+        pages: list[list[Any]] = []
+        for result in settled:
+            if isinstance(result, BaseException):
+                raise result
+            pages.append(result)
+        # MERGE: dedup by ``id``, first-seen-wins, in page order (gather preserves
+        # the launch order) — identical accumulator shape to ``_walk_next``.
+        accumulator: list[Any] = []
+        seen: set[Any] = set()
+        for rows in pages:
+            for row in rows:
+                rid = row.get("id") if isinstance(row, dict) else None
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                accumulator.append(row)
+        return accumulator
+
+    async def _discover_page_count(
+        self,
+        url: str,
+        *,
+        wait_for: str | None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int],
+        max_pages: int,
+        timeout: float,  # noqa: ASYNC109 — per-evaluate budget, not a cancel wrapper
+        attempt: int,
+    ) -> int:
+        """Discover the page count P via the "Last page" button + ``?page=N`` sync.
+
+        Installs the LIMIT-ONLY ``route_rewrite`` route BEFORE goto so the Last
+        button computes P at the SAME ``limit`` the fan-out uses (consistency
+        point), then probes ``last_page_selector``: absent/disabled → P=1; else
+        JS-clicks it and bounded-polls ``page.url`` for ``?{page_param}=N``. P is
+        ``max(1, parsed)`` (or 1 if never synced), clamped to ``max_pages``. The
+        selector is ``json.dumps``-encoded into the probe/click JS (T-u7f-02 — no
+        raw concatenation), same discipline as :meth:`_walk_next`.
+        """
+        timeout_ms = int(timeout * 1000)
+        selector_literal = json.dumps(last_page_selector)
+        probe_script = (
+            "() => { const el = document.querySelector("
+            + selector_literal
+            + "); if (!el) return { present: false, disabled: false };"
+            " const disabled = !!el.disabled"
+            " || el.getAttribute('aria-disabled') === 'true';"
+            " return { present: true, disabled: disabled }; }"
+        )
+        click_script = (
+            "() => { const b = document.querySelector("
+            + selector_literal
+            + "); if (b) b.click(); }"
+        )
+        page_re = re.compile(rf"[?&]{re.escape(page_param)}=(\d+)")
+        url_substring, target_limit = route_rewrite
+
+        async def _body(page: Any) -> int:
+            # LIMIT-ONLY route (no page pin) BEFORE goto — the Last button must
+            # compute P at the same limit the fan-out renders.
+            handler = _build_limit_rewrite_route_handler(url_substring, target_limit)
+            try:
+                await page.route("**/*", handler)
+            except Exception as exc:  # noqa: BLE001
+                raise BrowserFetchError(f"page.route install failed: {exc}") from exc
+            await self._goto_and_wait(page, url, wait_for, timeout_ms)
+            state = await _evaluate_guarded(page, probe_script, timeout)
+            if (
+                not isinstance(state, dict)
+                or not state.get("present")
+                or state.get("disabled")
+            ):
+                return 1  # Last absent or disabled → single page
+            await _evaluate_guarded(page, click_script, timeout)
+            # Bounded, non-blocking poll for the synced ``?page=N`` URL. ``page.url``
+            # is the property (read directly, not awaited).
+            found: int | None = None
+            for _ in range(_PAGINATE_POLL_TICKS):
+                match = page_re.search(page.url)
+                if match:
+                    found = int(match.group(1))
+                    break
+                await asyncio.sleep(_PAGINATE_POLL_INTERVAL)
+            page_count = max(1, found) if found is not None else 1
+            if page_count > max_pages:
+                _log.warning(
+                    "fetch_via_browser_parallel_pages: discovered P=%d > max_pages="
+                    "%d on %s — clamping (infinite-loop guard)",
+                    page_count,
+                    max_pages,
+                    url,
+                )
+                page_count = max_pages
+            return page_count
+
+        return await self._browser_call(
+            url, op="fetch_via_browser_parallel_pages", attempt=attempt, body=_body
+        )
+
+    async def _fetch_one_page(
+        self,
+        url: str,
+        *,
+        target: int,
+        extract: str,
+        wait_for: str | None,
+        route_rewrite: tuple[str, int],
+        page_param: str,
+        timeout: float,  # noqa: ASYNC109 — same justification as fetch_via_browser
+        attempt: int,
+    ) -> list[Any]:
+        """Render ONE fan-out page pinned to ``target`` and return its rows.
+
+        Installs the page+limit rewrite route (pinning ``page_param`` to ``target``
+        and ``limit`` to the ``route_rewrite`` target) BEFORE goto, navigates, runs
+        the extract, and FAILS CLOSED — raises :class:`BrowserFetchError` if the
+        result is not a NON-EMPTY list (a blank page would silently drop chapters).
+        Its own ``_browser_call`` acquires the EXISTING ``_browser_lock`` so the
+        parent gather self-throttles to ``fetch_concurrency``.
+        """
+        timeout_ms = int(timeout * 1000)
+        url_substring, target_limit = route_rewrite
+
+        async def _body(page: Any) -> list[Any]:
+            handler = _build_page_limit_rewrite_route_handler(
+                url_substring, target, target_limit, page_param
+            )
+            try:
+                await page.route("**/*", handler)
+            except Exception as exc:  # noqa: BLE001
+                raise BrowserFetchError(f"page.route install failed: {exc}") from exc
+            await self._goto_and_wait(page, url, wait_for, timeout_ms)
+            rows = await _evaluate_guarded(
+                page, "async () => { " + extract + " }", timeout
+            )
+            if not isinstance(rows, list) or not rows:
+                raise BrowserFetchError(f"parallel page {target} returned no rows")
+            return rows
+
+        return await self._browser_call(
+            url, op="fetch_via_browser_parallel_pages", attempt=attempt, body=_body
+        )
 
     async def aclose(self) -> None:
         """Tear the bounded lifecycle down + stop playwright (Pitfall 4)."""

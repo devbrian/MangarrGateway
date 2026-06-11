@@ -819,6 +819,14 @@ _CHAPTER_LIST_WAIT_FOR = (
     "() => document.querySelectorAll('a.mchap-row__primary').length > 0"
 )
 
+# CSS selector for the chapter-list "Last page" pagination control. The parallel
+# enumeration (#222) discovers the page count P by JS-clicking this button and
+# reading the SPA's synced ``?page=N`` URL — NOT the windowed numbered buttons,
+# which show only ~5 and silently under-report P on long series (spike 014's
+# load-bearing correctness step). The old sequential Next-walk used
+# ``button[aria-label*="Next"]``; the parallel path needs the Last jump instead.
+_LAST_PAGE_SELECTOR = 'button[aria-label*="Last"]'
+
 
 def _title_to_slug(title: str) -> str:
     """Best-effort title → URL slug fallback (lowercase + hyphenate non-alnum runs).
@@ -1410,24 +1418,26 @@ class ComixSource(Source):
         DOM reads we ALSO need TWO off-Protocol browser primitives (D-41), same
         instance, distinct from the request-clearance use:
 
-        * ``fetch_via_browser_paginated`` — the always-walk chapter-list
-          enumeration in :meth:`_series_chapters` (#146); and
+        * ``fetch_via_browser_parallel_pages`` — the always-walk PARALLEL
+          chapter-list enumeration in :meth:`_series_chapters` (#222); and
         * ``fetch_via_browser`` — the one-shot chapter-pages manifest read in
           :meth:`fetch_manifest`.
 
         Raises ``SourceError`` when the solver is missing OR lacks EITHER
-        primitive (a wiring bug, not a runtime condition).
+        primitive (a wiring bug, not a runtime condition). (The sequential
+        ``fetch_via_browser_paginated`` is no longer required — #222 switched the
+        chapter-list path to the parallel fan-out.)
         """
         solver = getattr(ctx, "_solver", None)
         if (
             solver is None
             or not hasattr(solver, "fetch_via_browser")
-            or not hasattr(solver, "fetch_via_browser_paginated")
+            or not hasattr(solver, "fetch_via_browser_parallel_pages")
         ):
             raise SourceError(
                 "source_unavailable",
                 "comix browser-fetch requires a solver with fetch_via_browser "
-                "and fetch_via_browser_paginated",
+                "and fetch_via_browser_parallel_pages",
             )
         return solver
 
@@ -1536,34 +1546,43 @@ class ComixSource(Source):
         cached enumeration is the complete, unfiltered list (CACHE-02). Because the
         walk is COMPLETE, ``search()`` marks the cached ``Enumeration`` exhausted.
 
-        #146: ALWAYS walk the FULL paginated chapter list, not just the ~20 rows on
-        first paint. The series page renders only the newest chapter's group-uploads
-        initially, so a low/old chapter (e.g. #5) lives on a later pagination page
-        and was never enumerated by the old one-shot read. The generic paginated
-        primitive (a) rewrites the chapter-list request's ``limit`` to 100 via
-        ``page.route()`` before goto, and (b) walks the in-page Next control WITHIN
-        ONE page nav (no extra goto, no extra Cloudflare cost). All comix-side
-        literals — the ``/chapters`` URL substring, the ``100`` target limit, the
-        ``button[aria-label*="Next"]`` selector — live HERE, never in the framework.
+        #146 / #222: ALWAYS enumerate the FULL paginated chapter list, not just the
+        ~20 rows on first paint. The series page renders only the newest chapter's
+        group-uploads initially, so a low/old chapter (e.g. #5) lives on a later
+        pagination page and was never enumerated by the old one-shot read. The
+        parallel-pagination primitive (a) discovers the page count P via the
+        ``button[aria-label*="Last"]`` jump + the SPA's ``?page=N`` URL sync — NOT
+        the windowed numbered buttons, which under-report P on long series and
+        silently DROP chapters (spike 014's load-bearing correctness step) — then
+        (b) fans pages 1..P out CONCURRENTLY, each pinned by a ``page.route()``
+        ``page``+``limit`` rewrite, bounded by the EXISTING
+        ``_browser_lock``/``fetch_concurrency`` semaphore, and merges deduped by
+        ``id`` newest-first. A fan-out page that fails or yields no rows FAILS CLOSED
+        (raises) — a partial list is never returned. All comix-side literals — the
+        ``/chapters`` URL substring, the ``100`` target limit, the
+        ``button[aria-label*="Last"]`` selector, the ``page`` param name — live
+        HERE, never in the framework.
 
-        PERF NOTE (accepted, user direction 2026-06-06): always-walking adds ~3-4
-        in-page Next-clicks per series (a ~320-chapter series at 100 rows/page)
-        WITHIN one navigation — a handful of JS-clicks + bounded DOM polls, no extra
-        goto/clearance. Bounded by the 30s primitive timeout (≤ the framework's
-        30s per-source fan-out timeout, ``framework/fanout.py::_DEFAULT_TIMEOUT``)
-        with headroom over the ~7-18s live baseline; the per-source aiolimiter still
+        PERF / CONTENTION NOTE (accepted trade-off, spike 014 note 5): the parallel
+        fan-out now consumes UP TO ``fetch_concurrency`` browser slots concurrently
+        (vs 1 for the old sequential Next-walk), shared across the whole solver —
+        bounded (no second semaphore) and FAR less wall-time (spike 014: ~8.7s →
+        ~1.5-2.5s, byte-identical 386-id result). Bounded by the 30s primitive
+        timeout (≤ the framework's 30s per-source fan-out timeout,
+        ``framework/fanout.py::_DEFAULT_TIMEOUT``); the per-source aiolimiter still
         bounds outer cadence. A failed fetch surfaces as
         ``SourceError("source_unavailable")`` → per-source warning (WR-06).
         """
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
         try:
-            raw = await solver.fetch_via_browser_paginated(
+            raw = await solver.fetch_via_browser_parallel_pages(
                 series_url,
                 extract=_CHAPTER_LIST_EXTRACT_JS,
                 wait_for=_CHAPTER_LIST_WAIT_FOR,
-                next_selector='button[aria-label*="Next"]',
-                route_limit_rewrite=("/chapters", _MAX_FEED_LIMIT),
+                last_page_selector=_LAST_PAGE_SELECTOR,
+                page_param="page",
+                route_rewrite=("/chapters", _MAX_FEED_LIMIT),
                 timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as typed source failure
@@ -1594,9 +1613,9 @@ class ComixSource(Source):
         """Browser-DOM read of the FULL paginated series chapter list (#146).
 
         Navigates ``{base_url}/title/{hid}-{slug}`` in the warm Patchright
-        browser and ALWAYS walks the FULL paginated chapter list via
-        ``solver.fetch_via_browser_paginated`` — reading
-        ``[{id, chapter, lang, groups, publishedAtRelative}, …]`` off every
+        browser and ALWAYS enumerates the FULL paginated chapter list via
+        ``solver.fetch_via_browser_parallel_pages`` (#222 parallel fan-out) —
+        reading ``[{id, chapter, lang, groups, publishedAtRelative}, …]`` off every
         pagination page, not just the ~20 rows on first paint. Before #146 this
         was a one-shot read of the first render (mostly the newest chapter's
         group-uploads), so a low/old chapter that only appears on a later

@@ -32,6 +32,7 @@ class _FakeBackend:
         self.calls: list[tuple[str, bool]] = []
         self.browser_calls: list[tuple[str, dict[str, object]]] = []
         self.paginated_calls: list[tuple[str, dict[str, object]]] = []
+        self.parallel_calls: list[tuple[str, dict[str, object]]] = []
         self.typed_calls: list[tuple[str, dict[str, object]]] = []
         self.warmed = 0
         self.closed = 0
@@ -84,6 +85,34 @@ class _FakeBackend:
             )
         )
         return [f"{self._tag}-paginated-{url}"]
+
+    async def fetch_via_browser_parallel_pages(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        last_page_selector: str,
+        page_param: str,
+        route_rewrite: tuple[str, int],
+        max_pages: int = 200,
+        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the backend's op-budget kwarg
+    ) -> list[object]:
+        self.parallel_calls.append(
+            (
+                url,
+                {
+                    "extract": extract,
+                    "wait_for": wait_for,
+                    "last_page_selector": last_page_selector,
+                    "page_param": page_param,
+                    "route_rewrite": route_rewrite,
+                    "max_pages": max_pages,
+                    "timeout": timeout,
+                },
+            )
+        )
+        return [f"{self._tag}-parallel-{url}"]
 
     async def fetch_via_browser_typed(
         self,
@@ -239,6 +268,7 @@ def test_router_exposes_comix_browser_primitives() -> None:
     router, _, _ = _router()
     assert hasattr(router, "fetch_via_browser")
     assert hasattr(router, "fetch_via_browser_paginated")
+    assert hasattr(router, "fetch_via_browser_parallel_pages")
     assert hasattr(router, "fetch_via_browser_typed")
 
 
@@ -285,6 +315,37 @@ async def test_fetch_via_browser_paginated_delegates_to_patchright() -> None:
         )
     ]
     assert android.paginated_calls == []  # android (no browser) is NEVER consulted
+
+
+@pytest.mark.asyncio
+async def test_fetch_via_browser_parallel_pages_delegates_to_patchright() -> None:
+    router, patchright, android = _router()
+    result = await router.fetch_via_browser_parallel_pages(
+        "https://comix.to/series",
+        extract="return rows",
+        wait_for="#ready",
+        last_page_selector='button[aria-label*="Last"]',
+        page_param="page",
+        route_rewrite=("/chapters", 100),
+        max_pages=50,
+        timeout=20.0,
+    )
+    assert result == ["pw-parallel-https://comix.to/series"]
+    assert patchright.parallel_calls == [
+        (
+            "https://comix.to/series",
+            {
+                "extract": "return rows",
+                "wait_for": "#ready",
+                "last_page_selector": 'button[aria-label*="Last"]',
+                "page_param": "page",
+                "route_rewrite": ("/chapters", 100),
+                "max_pages": 50,
+                "timeout": 20.0,
+            },
+        )
+    ]
+    assert android.parallel_calls == []  # android (no browser) is NEVER consulted
 
 
 @pytest.mark.asyncio
