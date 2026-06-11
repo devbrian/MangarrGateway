@@ -348,7 +348,8 @@ async def test_per_page_page_and_limit_rewrite() -> None:
         assert rewrite is not None
         page_match = _PAGE_RE.search(rewrite)
         limit_match = _LIMIT_RE.search(rewrite)
-        assert page_match is not None and limit_match is not None
+        assert page_match is not None, f"page= param missing in {rewrite}"
+        assert limit_match is not None, f"limit= param missing in {rewrite}"
         # page= rewritten to this page's pinned target.
         assert page_match.group(1) == str(target)
         # limit= rewritten to the route target (100), at the SAME limit discovery used.
