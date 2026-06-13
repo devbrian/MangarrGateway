@@ -130,11 +130,46 @@ _log = logging.getLogger("manga_gateway")
 _DEFAULT_SERIES_CANDIDATES = 5
 # Comix chapter-feed page-size ceiling (live recon: server default limit=20).
 _MAX_FEED_LIMIT = 100
-# Comix search page size (live recon: full-results page uses limit=28).
-_SEARCH_PAGE_SIZE = 28
 # Default content_rating param (live recon: "suggestive" pulls the same items
 # that the public site shows — `safe` would drop suggestive titles).
 _CONTENT_RATING = "suggestive"
+
+# ── Search token gate (debug ``comix-search-api-403``, 2026-06-13) ────────────
+# Comix moved the plaintext search API ``GET /api/v1/manga`` behind a JS-minted
+# ``_=`` request token — exactly as it earlier did to
+# ``/api/v1/manga/{hid}/chapter-indexes`` ("Invalid token."). A plain httpx call
+# carrying a valid cf_clearance now 403s ``{"message":"Missing token."}``; so does
+# an in-page ``fetch`` WITHOUT the token (proven live: the gate is the token, not
+# the IP/fingerprint — the same cleared+proxied client still fetches the image
+# CDN, and the SPA on the same IP gets 200). The token is minted by the
+# VM-obfuscated ``secure-*.js`` on the search box's keyup handler and is a
+# SIGNATURE bound to the EXACT query string (replaying the captured URL with
+# ``limit=6``→``18`` → 403 "Invalid token."), so it can be neither minted
+# statically NOR replayed with different params. So search drives the SPA's own
+# search box (the MangaFire ``fetch_via_browser_typed`` pattern, Plan 12-01): type
+# the keyword, let the page mint the token + fire the XHR, read the EXACT tokenized
+# URL off the Resource-Timing buffer, and replay THAT url verbatim via httpx. The
+# search response is PLAINTEXT (not encrypted), so the ``result.items`` shape
+# ``_result_items`` parses — incl. ``altTitles``/``hasChapters`` — is unchanged.
+# The SPA autocomplete fixes ``limit=6``; ``search()`` only keeps 5 candidates
+# (``_DEFAULT_SERIES_CANDIDATES``) after the prune, so 6 is sufficient.
+_SEARCH_INPUT_SELECTOR = "input[placeholder*='earch']"
+# Distinguishes the keyword-result dropdown rows from the homepage "latest" feed
+# (which renders matching ``a[href^="/title/"]`` anchors immediately, before the
+# search XHR fires) so the typed-read waits for the REAL results.
+_SEARCH_RESULT_SELECTOR = ".search-pop__item--result a.search-pop__item-link"
+# Reads the tokenized ``/api/v1/manga?keyword=…&_=…`` URL the SPA fetched off the
+# Resource-Timing buffer. The box debounces, so the full-keyword XHR fires last;
+# take the last matching entry. Returns ``null`` when none fired (capture failed).
+_SEARCH_TOKEN_URL_EXTRACT_JS = (
+    "const m = performance.getEntriesByType('resource')"
+    ".map(e => e.name)"
+    ".filter(n => n.includes('/api/v1/manga') && n.includes('keyword='));"
+    "return m.length ? m[m.length - 1] : null;"
+)
+# Seconds budget for the typed search nav (type + dropdown render). Matches the
+# MangaFire typed-search budget — a CF-warm page plus a debounced XHR.
+_SEARCH_TYPED_TIMEOUT = 60.0
 
 # Composite chapter-id separator. ``chapter_id`` for Comix is the composite
 # string ``"{numeric_chapter_id}|{hid}|{slug}|{chapter_number}"`` so the
@@ -1410,20 +1445,23 @@ class ComixSource(Source):
         return parts[0], parts[1], parts[2], parts[3]
 
     @staticmethod
-    def _solver_from_ctx(ctx: SourceContext) -> Any:
+    def _solver_from_ctx(ctx: SourceContext, *, need_typed: bool = False) -> Any:
         """Pull the AntiBotSolver out of ``ctx`` for the browser-fetch paths.
 
         The framework wires the solver into ``SourceContext`` for any
         ``cloudflare*`` source (D-40 clearance injection). For Comix's browser-
-        DOM reads we ALSO need TWO off-Protocol browser primitives (D-41), same
+        DOM reads we ALSO need off-Protocol browser primitives (D-41), same
         instance, distinct from the request-clearance use:
 
         * ``fetch_via_browser_parallel_pages`` — the always-walk PARALLEL
-          chapter-list enumeration in :meth:`_series_chapters` (#222); and
+          chapter-list enumeration in :meth:`_series_chapters` (#222);
         * ``fetch_via_browser`` — the one-shot chapter-pages manifest read in
-          :meth:`fetch_manifest`.
+          :meth:`fetch_manifest`; and
+        * ``fetch_via_browser_typed`` — the real-keyboard typed search that mints
+          the ``_=`` request token (``need_typed=True``, :meth:`_search_series`;
+          debug ``comix-search-api-403``).
 
-        Raises ``SourceError`` when the solver is missing OR lacks EITHER
+        Raises ``SourceError`` when the solver is missing OR lacks a REQUIRED
         primitive (a wiring bug, not a runtime condition). (The sequential
         ``fetch_via_browser_paginated`` is no longer required — #222 switched the
         chapter-list path to the parallel fan-out.)
@@ -1439,6 +1477,11 @@ class ComixSource(Source):
                 "comix browser-fetch requires a solver with fetch_via_browser "
                 "and fetch_via_browser_parallel_pages",
             )
+        if need_typed and not hasattr(solver, "fetch_via_browser_typed"):
+            raise SourceError(
+                "source_unavailable",
+                "comix search requires a solver with fetch_via_browser_typed",
+            )
         return solver
 
     # ─────────────────────────── Comix fetch helpers ──────────────────────────
@@ -1446,7 +1489,7 @@ class ComixSource(Source):
     async def _search_series(
         self, query: str, limit: int, ctx: SourceContext
     ) -> list[tuple[str, str, str, list[str]]]:
-        """PLAINTEXT search → ``(hid, slug, title, alt_titles)`` via ``/api/v1/manga``.
+        """Token-gated ``/api/v1/manga`` search → ``(hid, slug, title, alt_titles)``.
 
         Returns ``(hid, slug, title, alt_titles)`` tuples. The 5-char ``hid`` is
         the canonical series identifier; the ``slug`` is extracted from the
@@ -1456,22 +1499,38 @@ class ComixSource(Source):
         browser-DOM chapter rows do not repeat the series title — it's on the
         series-page header). ``alt_titles`` are the item's ``altTitles`` (a clean
         ``list[str]`` from the same payload, e.g. the Korean native name) and feed
-        the alt-title-aware prune (#139) — nothing extra is fetched. Plain query
-        params; the ``order[relevance]=desc`` and ``content_rating=suggestive``
-        match what the public site sends.
+        the alt-title-aware prune (#139) — nothing extra is fetched.
+
+        ``GET /api/v1/manga`` now requires a JS-minted ``_=`` request token (debug
+        ``comix-search-api-403``; see ``_SEARCH_TOKEN_URL_EXTRACT_JS``). We drive
+        the SPA's own search box so the page mints the token and fires the XHR,
+        read the EXACT tokenized URL off the Resource-Timing buffer, then replay
+        THAT url verbatim (the ``_=`` signature is bound to the exact query string,
+        so no param is added or rewritten — ``get_json_plain`` GETs it as-is). The
+        ``limit`` arg is no longer threaded into the request: the SPA autocomplete
+        fixes ``limit=6`` and ``search()`` keeps only ``_DEFAULT_SERIES_CANDIDATES``
+        candidates after the prune, so 6 covers it.
         """
-        params: dict[str, Any] = {
-            "keyword": query,
-            "limit": min(limit or _SEARCH_PAGE_SIZE, _SEARCH_PAGE_SIZE),
-            "page": 1,
-            "content_rating": _CONTENT_RATING,
-            # httpx encodes ``order[relevance]`` as a bracketed key by default; the
-            # live API tolerates either bracketed or repeated keys.
-            "order[relevance]": "desc",
-        }
-        # PLAINTEXT endpoint (live recon) — use get_json_plain so the framework
-        # decrypt seam stays out of this path.
-        data = await ctx.get_json_plain(f"{self.base_url}/api/v1/manga", **params)
+        _ = limit  # SPA-controlled (autocomplete limit=6); see docstring.
+        solver = self._solver_from_ctx(ctx, need_typed=True)
+        token_url = await solver.fetch_via_browser_typed(
+            f"{self.base_url}/",
+            type_selector=_SEARCH_INPUT_SELECTOR,
+            type_text=query,
+            extract=_SEARCH_TOKEN_URL_EXTRACT_JS,
+            wait_for=_SEARCH_RESULT_SELECTOR,
+            timeout=_SEARCH_TYPED_TIMEOUT,
+        )
+        if not isinstance(token_url, str) or "/api/v1/manga" not in token_url:
+            # The typed nav ran but no tokenized search XHR was captured — surface
+            # as the source's own failure (WR-06 per-source warning), not a crash.
+            raise SourceError(
+                "source_unavailable",
+                "comix search token capture failed (no tokenized /api/v1/manga URL)",
+            )
+        # PLAINTEXT endpoint (search is not encrypted) — get_json_plain keeps the
+        # framework decrypt seam out of this path and replays the URL verbatim.
+        data = await ctx.get_json_plain(token_url)
         items = self._result_items(data)
         out: list[tuple[str, str, str, list[str]]] = []
         for item in items:

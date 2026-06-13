@@ -137,6 +137,27 @@ class _SlowComixSolver:
         self.browser_fetch_calls.append(url)
         return await self._gated_fetch(url)
 
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        # Comix search mints a `_=` token by typing into the SPA search box
+        # (debug comix-search-api-403). The production extract reads the tokenized
+        # /api/v1/manga URL off Resource-Timing; the fake returns the equivalent
+        # URL so the source's verbatim get_json_plain replay hits the respx mock
+        # (respx matches /api/v1/manga by path, ignoring the query/token).
+        _ = (url, type_selector, extract, wait_for, timeout)
+        return (
+            f"{_COMIX}/api/v1/manga?keyword={type_text}"
+            "&limit=6&content_rating=suggestive&_=faketoken"
+        )
+
     async def fetch_via_browser_parallel_pages(
         self,
         url: str,

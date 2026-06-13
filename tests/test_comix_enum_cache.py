@@ -80,6 +80,28 @@ class _CountingComixSolver:
             raise AssertionError(f"unmocked fetch_via_browser({url!r})")
         return self.browser_results[url]
 
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        # Search mints a `_=` token by typing into the SPA box (debug
+        # comix-search-api-403). This is the SEARCH-token nav, distinct from the
+        # chapter-enumeration navs ``fetch_calls`` witnesses — so it deliberately
+        # does NOT bump ``fetch_calls`` (and the Layer-1 resolve cache skips it on
+        # repeat anyway). Returns the tokenized /api/v1/manga URL the source then
+        # replays verbatim into the respx mock (matched by path, query ignored).
+        _ = (url, type_selector, extract, wait_for, timeout)
+        return (
+            f"{_COMIX}/api/v1/manga?keyword={type_text}"
+            "&limit=6&content_rating=suggestive&_=faketoken"
+        )
+
     async def fetch_via_browser_parallel_pages(
         self,
         url: str,
