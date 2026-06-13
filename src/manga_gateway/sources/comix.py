@@ -151,10 +151,20 @@ _MAX_FEED_LIMIT = 100
 # The SPA autocomplete fixes ``limit=6``; ``search()`` only keeps 5 candidates
 # (``_DEFAULT_SERIES_CANDIDATES``) after the prune, so 6 is sufficient.
 _SEARCH_INPUT_SELECTOR = "input[placeholder*='earch']"
-# Distinguishes the keyword-result dropdown rows from the homepage "latest" feed
-# (which renders matching ``a[href^="/title/"]`` anchors immediately, before the
-# search XHR fires) so the typed-read waits for the REAL results.
-_SEARCH_RESULT_SELECTOR = ".search-pop__item--result a.search-pop__item-link"
+# Wait for the tokenized keyword XHR itself to have COMPLETED (it lands in the
+# Resource-Timing buffer regardless of how many results it returned), NOT for a
+# result ROW to render. A legitimately zero-result query renders no
+# ``.search-pop__item--result`` row, so waiting on the row would hang to the 60s
+# timeout and surface a spurious ``source_unavailable`` instead of an empty result
+# (CodeRabbit, PR #235). The ``keyword=`` filter still distinguishes the search XHR
+# from the homepage "latest" feed (whose ``/api/v1/manga`` call carries
+# ``order[...]`` and no ``keyword=``), so the pre-rendered feed can't satisfy this
+# early. Mirrors what ``_SEARCH_TOKEN_URL_EXTRACT_JS`` reads, so once this is true
+# the extract has a URL to return. JS predicate (``=>``) → page.wait_for_function.
+_SEARCH_REQUEST_FIRED_JS = (
+    "() => performance.getEntriesByType('resource')"
+    ".some(e => e.name.includes('/api/v1/manga') && e.name.includes('keyword='))"
+)
 # Reads the tokenized ``/api/v1/manga?keyword=…&_=…`` URL the SPA fetched off the
 # Resource-Timing buffer. The box debounces, so the full-keyword XHR fires last;
 # take the last matching entry. Returns ``null`` when none fired (capture failed).
@@ -1584,7 +1594,7 @@ class ComixSource(Source):
             type_selector=_SEARCH_INPUT_SELECTOR,
             type_text=query,
             extract=_SEARCH_TOKEN_URL_EXTRACT_JS,
-            wait_for=_SEARCH_RESULT_SELECTOR,
+            wait_for=_SEARCH_REQUEST_FIRED_JS,
             timeout=_SEARCH_TYPED_TIMEOUT,
         )
         if not isinstance(token_url, str) or "/api/v1/manga" not in token_url:
