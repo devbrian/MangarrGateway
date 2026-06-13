@@ -356,7 +356,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (app.state.ratelimiter is created earlier, before CsrfBootstrap, so the
     # bootstrap GET shares the per-source limiter — see above.)
     app.state.caps_cache = TTLCache(maxsize=1, ttl=_CAPS_TTL_SECONDS)  # PLAT-04
-    app.state.handle_store = HandleStore()  # opaque downloadHandle store (HDL-01/02)
+    app.state.handle_store = HandleStore(
+        maxsize=settings.handle_maxsize
+    )  # opaque downloadHandle store (HDL-01/02)
     # CACHE-01: ONE process-wide enumeration cache for the whole lifespan (R1), built
     # from settings exactly like RateLimiter()/HandleStore() above. The per-source TTL
     # override map (D-09) is harvested from the registry the SAME way cf_sources /

@@ -24,7 +24,12 @@ _log = logging.getLogger("manga_gateway.handles")
 
 # 60-min handle TTL (HDL-02, >= the 30-min Mangarr interactive-search floor).
 _HANDLE_TTL_SECONDS = 3600
-_HANDLE_MAXSIZE = 10_000
+# Cap MUST exceed a full library-sync burst so handles are never evicted before
+# their 60-min HDL-02 TTL (production telemetry saw ~23k handles minted in a
+# 2-hour window — 2.3x the prior 10_000 cap — causing 739 `bad_handle`
+# rejections, the GAP-2 hazard). A `ResolutionRecord` is small (~9 short fields),
+# so 200k is ~tens of MB RAM. Operator-overridable via GATEWAY_HANDLE_MAXSIZE.
+_HANDLE_MAXSIZE = 200_000
 
 
 @dataclass(frozen=True)
