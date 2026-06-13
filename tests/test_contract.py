@@ -145,6 +145,20 @@ def _stub_source_hosts(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
     monkeypatch.setattr(CloudflareSolver, "get_clearance", _canned_clearance)
 
+    # Comix's token-gated search/recent/chapter-list now route through the
+    # off-Protocol browser primitives (debug comix-search-api-403 / #232) — a
+    # SEPARATE browser entry point from get_clearance above. Stub them too, or each
+    # generated search/getRecent case would launch a real Patchright browser and
+    # hang the offline gate (the very regression this fixture's get_clearance stub
+    # exists to prevent). Returning None makes comix fail fast as source_unavailable
+    # — the same contract-shaped outcome as the stubbed 403 hosts below, no browser.
+    async def _no_browser(self: CloudflareSolver, *_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(CloudflareSolver, "fetch_via_browser", _no_browser)
+    monkeypatch.setattr(CloudflareSolver, "fetch_via_browser_typed", _no_browser)
+    monkeypatch.setattr(CloudflareSolver, "fetch_via_browser_paginated", _no_browser)
+
     with respx.mock(assert_all_called=False) as mock:
         mock.route(host="api.mangadex.org").mock(
             return_value=httpx.Response(

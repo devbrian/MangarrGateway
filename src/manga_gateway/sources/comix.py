@@ -130,9 +130,6 @@ _log = logging.getLogger("manga_gateway")
 _DEFAULT_SERIES_CANDIDATES = 5
 # Comix chapter-feed page-size ceiling (live recon: server default limit=20).
 _MAX_FEED_LIMIT = 100
-# Default content_rating param (live recon: "suggestive" pulls the same items
-# that the public site shows — `safe` would drop suggestive titles).
-_CONTENT_RATING = "suggestive"
 
 # ── Search token gate (debug ``comix-search-api-403``, 2026-06-13) ────────────
 # Comix moved the plaintext search API ``GET /api/v1/manga`` behind a JS-minted
@@ -170,6 +167,41 @@ _SEARCH_TOKEN_URL_EXTRACT_JS = (
 # Seconds budget for the typed search nav (type + dropdown render). Matches the
 # MangaFire typed-search budget — a CF-warm page plus a debounced XHR.
 _SEARCH_TYPED_TIMEOUT = 60.0
+
+# ── Recent feed token gate (debug ``comix-chapters-token-232``, 2026-06-13) ───
+# Comix also moved the recent feed ``GET /api/v1/manga?order[chapter_updated_at]=desc``
+# behind the JS-minted ``_=`` request token (same SIGNATURE-over-query-string gate
+# as search/chapter-list). A plain httpx call now 403s ``{"message":"Missing
+# token."}``, and there is NO keyword to type. Live recon (#232) found the trigger:
+# the ``/browse`` page's DEFAULT view fires the EXACT tokenized
+# ``/api/v1/manga?order[chapter_updated_at]=desc&page=1&limit=28&content_rating=
+# suggestive&_=<token>`` XHR. So ``recent()`` navigates ``/browse`` and PASSIVELY
+# captures that tokenized URL off the Resource-Timing buffer (the same technique
+# the search fix uses — NEVER mint or rewrite the token; Patchright suppresses
+# init-script injection), then replays it verbatim via ``get_json_plain``. The
+# PLAINTEXT response is the unchanged ``/api/v1/manga`` ``result.items`` shape, so
+# the deferred-composite synthesis below is untouched. The homepage "Most Recent"
+# tab is server-rendered (no tokenized XHR — recon-confirmed), so it is NOT used.
+_BROWSE_PATH = "/browse"
+# Reads the tokenized ``order[chapter_updated_at]`` ``/api/v1/manga`` URL off the
+# Resource-Timing buffer. ``order[...]`` is URL-encoded as ``order%5B…%5D`` in the
+# Resource-Timing ``name`` — match either form. Returns ``null`` when none fired.
+_RECENT_TOKEN_URL_EXTRACT_JS = (
+    "const m = performance.getEntriesByType('resource')"
+    ".map(e => e.name)"
+    ".filter(n => n.includes('/api/v1/manga')"
+    " && (n.includes('order%5Bchapter_updated_at%5D')"
+    " || n.includes('order[chapter_updated_at]')));"
+    "return m.length ? m[m.length - 1] : null;"
+)
+# JS predicate: the ``/browse`` feed's tokenized XHR has resolved by the time its
+# ``/title/`` cards paint, so wait for at least one to render before reading the
+# Resource-Timing buffer. JS predicate (contains ``=>``) → page.wait_for_function.
+_BROWSE_FEED_WAIT_FOR = (
+    "() => document.querySelectorAll('a[href*=\"/title/\"]').length > 0"
+)
+# Seconds budget for the browse nav (CF-warm page + the feed XHR).
+_RECENT_NAV_TIMEOUT = 60.0
 
 # Composite chapter-id separator. ``chapter_id`` for Comix is the composite
 # string ``"{numeric_chapter_id}|{hid}|{slug}|{chapter_number}"`` so the
@@ -854,13 +886,21 @@ _CHAPTER_LIST_WAIT_FOR = (
     "() => document.querySelectorAll('a.mchap-row__primary').length > 0"
 )
 
-# CSS selector for the chapter-list "Last page" pagination control. The parallel
-# enumeration (#222) discovers the page count P by JS-clicking this button and
-# reading the SPA's synced ``?page=N`` URL — NOT the windowed numbered buttons,
-# which show only ~5 and silently under-report P on long series (spike 014's
-# load-bearing correctness step). The old sequential Next-walk used
-# ``button[aria-label*="Next"]``; the parallel path needs the Last jump instead.
-_LAST_PAGE_SELECTOR = 'button[aria-label*="Last"]'
+# CSS selector for the chapter-list "Next page" pagination control. The
+# SEQUENTIAL enumeration (#232) JS-clicks this button page-by-page; each click is
+# a NATURAL SPA navigation that mints a FRESH valid ``_=`` token for the next
+# ``/api/v1/manga/{hid}/chapters?page=N&limit=20&…`` request (token-compatible).
+#
+# #232 — comix made the chapter-list ``_=`` token a SIGNATURE bound to the EXACT
+# query string, so the #222 PARALLEL primitive
+# (``fetch_via_browser_parallel_pages``), which PINS each page by REWRITING the
+# SPA's own token-signed request URL (limit-bump + ``?page=N``) via
+# ``page.route()``, invalidates the signature → 403 → 0 rows. Walking the natural
+# Next control at the SPA's own ``limit=20`` (NO route-rewrite) is the
+# token-compatible path. ``_LAST_PAGE_SELECTOR`` (the parallel path's
+# P-discovery jump) is retired from comix; the framework primitive + its unit
+# tests stay intact for other sources.
+_NEXT_PAGE_SELECTOR = 'button[aria-label*="Next"]'
 
 
 def _title_to_slug(title: str) -> str:
@@ -1127,35 +1167,58 @@ class ComixSource(Source):
         since: str | None,
         ctx: SourceContext,
     ) -> list[Release]:
-        """Newest-first recent chapters via the plaintext list-mangas feed (RCNT-01/02).
+        """Newest-first recent chapters via the list-mangas feed (RCNT-01/02).
 
         Issue #42 (supersedes #31): synthesizes one ``Release`` per viable item
-        from a single plaintext ``GET /api/v1/manga?order[chapter_updated_at]=desc``
-        call (the same plaintext path search uses, one of 120/min rate budget).
-        Each Release carries a ``:DEFERRED`` guid suffix and a deferred
-        composite ``chapter_id`` whose numeric id is late-bound by
-        :meth:`fetch_manifest` at download time (one extra browser nav per
-        FIRST download of a recent-minted Release — not per ``/recent`` poll).
+        from the ``/api/v1/manga?order[chapter_updated_at]=desc`` feed. #232: that
+        feed is now ``_=``-token-gated (a plain httpx call 403s "Missing token."),
+        so instead of a direct ``get_json_plain`` we navigate ``/browse`` in the
+        warm browser, PASSIVELY capture the tokenized feed URL the SPA mints off
+        the Resource-Timing buffer, and replay it verbatim (see ``_BROWSE_PATH`` /
+        ``_RECENT_TOKEN_URL_EXTRACT_JS``). The plaintext response shape is
+        unchanged, so the per-item synthesis below is identical. Each Release
+        carries a ``:DEFERRED`` guid suffix and a deferred composite ``chapter_id``
+        whose numeric id is late-bound by :meth:`fetch_manifest` at download time
+        (one extra browser nav per FIRST download of a recent-minted Release — not
+        per ``/recent`` poll).
 
         Recent and search Releases for the same chapter intentionally do not
         dedup — they are different objects (a late-binding promise vs a
         concrete upload). See locked decisions 1, 3, 7 in the PLAN.
 
-        ``since`` and ``languages`` are noted unused: Comix is English-only
-        (live recon) and ``since`` is enforced upstream by the route-level cut
-        already (same no-op pattern as today). Items missing ``hid``,
-        ``hasChapters: false``, an unparseable ``latestChapter``, no slug, or
-        an unparseable ``chapterUpdatedAtFormatted`` are SKIPPED rather than
-        faked (REL-01 requires ``format: date-time``).
+        ``since``, ``languages`` and ``limit`` are noted unused: Comix is
+        English-only (live recon); ``since`` is enforced upstream by the
+        route-level cut already; and the ``/browse`` feed's page size is
+        SPA-fixed (``limit=28``, token-bound — we cannot vary it without
+        invalidating the signature), so the route's merged-list
+        ``releases[:limit]`` cut (recent.py) is what honors the caller's limit.
+        Items missing ``hid``, ``hasChapters: false``, an unparseable
+        ``latestChapter``, no slug, or an unparseable
+        ``chapterUpdatedAtFormatted`` are SKIPPED rather than faked (REL-01
+        requires ``format: date-time``).
         """
-        _ = (languages, since)  # see docstring — both deliberately unused here
-        params: dict[str, Any] = {
-            "order[chapter_updated_at]": "desc",
-            "limit": min(limit or _MAX_FEED_LIMIT, _MAX_FEED_LIMIT),
-            "page": 1,
-            "content_rating": _CONTENT_RATING,
-        }
-        data = await ctx.get_json_plain(f"{self.base_url}/api/v1/manga", **params)
+        _ = (languages, since, limit)  # see docstring — all deliberately unused
+        # #232: capture the SPA-minted tokenized recent-feed URL off /browse and
+        # replay it verbatim (the token is a signature over the EXACT query string,
+        # so no param is added or rewritten). NEVER mint/rewrite the token.
+        solver = self._solver_from_ctx(ctx)
+        token_url = await solver.fetch_via_browser(
+            f"{self.base_url}{_BROWSE_PATH}",
+            extract=_RECENT_TOKEN_URL_EXTRACT_JS,
+            wait_for=_BROWSE_FEED_WAIT_FOR,
+            timeout=_RECENT_NAV_TIMEOUT,
+        )
+        if not isinstance(token_url, str) or "/api/v1/manga" not in token_url:
+            # The browse nav ran but no tokenized recent XHR was captured — surface
+            # as the source's own failure (WR-06 per-source warning), not a crash.
+            raise SourceError(
+                "source_unavailable",
+                "comix recent token capture failed (no tokenized "
+                "order[chapter_updated_at] /api/v1/manga URL)",
+            )
+        # PLAINTEXT endpoint — replay the tokenized URL verbatim (same path the
+        # search fix uses); the unchanged ``result.items`` parse follows.
+        data = await ctx.get_json_plain(token_url)
         items = self._result_items(data)
 
         releases: list[Release] = []
@@ -1453,8 +1516,10 @@ class ComixSource(Source):
         DOM reads we ALSO need off-Protocol browser primitives (D-41), same
         instance, distinct from the request-clearance use:
 
-        * ``fetch_via_browser_parallel_pages`` — the always-walk PARALLEL
-          chapter-list enumeration in :meth:`_series_chapters` (#222);
+        * ``fetch_via_browser_paginated`` — the always-walk SEQUENTIAL
+          chapter-list enumeration in :meth:`_series_chapters` (#232 reverted
+          #222's parallel fan-out: the signed ``_=`` token is incompatible with
+          the parallel primitive's URL-rewrite — see ``_NEXT_PAGE_SELECTOR``);
         * ``fetch_via_browser`` — the one-shot chapter-pages manifest read in
           :meth:`fetch_manifest`; and
         * ``fetch_via_browser_typed`` — the real-keyboard typed search that mints
@@ -1462,20 +1527,21 @@ class ComixSource(Source):
           debug ``comix-search-api-403``).
 
         Raises ``SourceError`` when the solver is missing OR lacks a REQUIRED
-        primitive (a wiring bug, not a runtime condition). (The sequential
-        ``fetch_via_browser_paginated`` is no longer required — #222 switched the
-        chapter-list path to the parallel fan-out.)
+        primitive (a wiring bug, not a runtime condition). (The PARALLEL
+        ``fetch_via_browser_parallel_pages`` is no longer required — #232 moved
+        the chapter-list path back to the sequential Next-walk; the framework
+        primitive itself stays for other sources.)
         """
         solver = getattr(ctx, "_solver", None)
         if (
             solver is None
             or not hasattr(solver, "fetch_via_browser")
-            or not hasattr(solver, "fetch_via_browser_parallel_pages")
+            or not hasattr(solver, "fetch_via_browser_paginated")
         ):
             raise SourceError(
                 "source_unavailable",
                 "comix browser-fetch requires a solver with fetch_via_browser "
-                "and fetch_via_browser_parallel_pages",
+                "and fetch_via_browser_paginated",
             )
         if need_typed and not hasattr(solver, "fetch_via_browser_typed"):
             raise SourceError(
@@ -1635,13 +1701,18 @@ class ComixSource(Source):
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
         try:
-            raw = await solver.fetch_via_browser_parallel_pages(
+            raw = await solver.fetch_via_browser_paginated(
                 series_url,
                 extract=_CHAPTER_LIST_EXTRACT_JS,
                 wait_for=_CHAPTER_LIST_WAIT_FOR,
-                last_page_selector=_LAST_PAGE_SELECTOR,
-                page_param="page",
-                route_rewrite=("/chapters", _MAX_FEED_LIMIT),
+                next_selector=_NEXT_PAGE_SELECTOR,
+                # #232: NO ``route_limit_rewrite``. Bumping the SPA's natural
+                # ``limit=20``→``100`` rewrites its token-signed ``/chapters`` URL
+                # and invalidates the ``_=`` signature → 403 → 0 rows. Walk the
+                # natural ``limit=20`` Next control; each click mints a fresh valid
+                # token. Slower than the #222 parallel fan-out (sequential vs
+                # concurrent pages) but reliably token-compatible — the explicit
+                # reliability-over-speed trade in #232.
                 timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as typed source failure
