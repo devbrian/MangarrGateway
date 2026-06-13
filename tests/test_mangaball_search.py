@@ -438,7 +438,8 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
 
     A long-running title (One Piece ≈ 1382 chapters × thousands of translations)
     must NOT mint a handle per (chapter×translation) for the whole listing — that
-    blew past ``HandleStore`` ``maxsize`` (10_000) so the TTLCache evicted the very
+    blew past ``HandleStore`` ``maxsize`` (default 200_000, GATEWAY_HANDLE_MAXSIZE) so
+    the TTLCache evicted the very
     handles attached to the returned releases, and ``POST /downloads`` for
     ``releases[0]`` resolved to a miss. Here a 40-chapter listing with ``limit=3``
     yields 3 releases AND mints exactly 3 handles — and every returned handle still

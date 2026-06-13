@@ -323,7 +323,8 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     """GAP-2 (mangaball): a handle is minted ONLY for the post-slice survivors.
 
     A long listing (N >> limit) must NOT mint a handle per row — that blows past
-    ``HandleStore`` ``maxsize`` (10_000) and evicts the returned releases' own
+    ``HandleStore`` ``maxsize`` (default 200_000, GATEWAY_HANDLE_MAXSIZE) and evicts
+    the returned releases' own
     handles, breaking ``POST /downloads``. Here a 40-row listing with ``limit=3``
     yields 3 releases AND mints exactly 3 handles, all of which still resolve.
     """

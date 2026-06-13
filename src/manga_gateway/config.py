@@ -316,6 +316,17 @@ class Settings(BaseSettings):
     # a repeat search returns instantly with zero upstream calls. ge=0 (NOT ge=1)
     # precisely because 0 is the documented DISABLE value (every in_cooldown → False).
     source_failure_cooldown_seconds: int = Field(default=300, ge=0)
+    # HDL-02/GAP-2: in-memory downloadHandle store capacity. An env-overridable
+    # ops knob (D-11, same host/port treatment — NOT the api_key exclusion):
+    # GATEWAY_HANDLE_MAXSIZE, default 200_000. The cap MUST stay >= one full
+    # library-sync burst so handles survive their 60-min HDL-02 TTL instead of
+    # being evicted early (production saw ~23k handles minted in a 2-hour window,
+    # 2.3x the prior 10_000 cap → 739 `bad_handle` rejections). Field(ge=1): a
+    # zero/negative override would break the store's TTLCache construction
+    # (T-txd-02), so reject it at Settings construction (fail-fast at startup).
+    # Rides the existing load_settings model_fields TOML->kwargs merge — no extra
+    # wiring needed.
+    handle_maxsize: int = Field(default=200_000, ge=1)
 
     @field_validator("metrics_cors_origins")
     @classmethod

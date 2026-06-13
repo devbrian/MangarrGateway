@@ -295,6 +295,32 @@ def test_env_overrides_enum_cache_knobs(
     assert settings.enum_cache_maxsize == 64
 
 
+def test_handle_maxsize_default() -> None:
+    """HDL-02/GAP-2: raised default cap (was 10_000 → 739 production rejections)."""
+    settings = Settings(api_key=_DUMMY_KEY)
+    assert settings.handle_maxsize == 200_000
+
+
+def test_handle_maxsize_rejects_non_positive() -> None:
+    """T-txd-02: ge=1 — a zero/negative maxsize is rejected at construction."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=_DUMMY_KEY, handle_maxsize=0)
+
+
+def test_env_overrides_handle_maxsize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-11: GATEWAY_HANDLE_MAXSIZE env var overrides the default."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'api_key = "{_DUMMY_KEY}"\n', encoding="utf-8")
+
+    monkeypatch.setenv("GATEWAY_HANDLE_MAXSIZE", "50000")
+
+    settings = load_settings(cfg)
+
+    assert settings.handle_maxsize == 50000
+
+
 def test_warm_retry_defaults() -> None:
     """#153: eager-warm retry defaults — 3 attempts, 2.0s base backoff."""
     settings = Settings(api_key=_DUMMY_KEY)

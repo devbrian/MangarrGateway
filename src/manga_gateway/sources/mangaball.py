@@ -678,7 +678,8 @@ class MangaBallSource(Source):
         GAP-2 (live): mint handles ONLY for the post-slice survivors. A long-running
         title (One Piece ≈ 1382 chapters × thousands of translations) would otherwise
         mint tens of thousands of handles per candidate — blowing past the
-        ``HandleStore`` ``maxsize`` (10_000) so the TTLCache EVICTS the very handles
+        ``HandleStore`` ``maxsize`` (default 200_000, GATEWAY_HANDLE_MAXSIZE) so the
+        TTLCache EVICTS the very handles
         attached to the releases we return, and a later ``POST /downloads`` for
         ``releases[0]`` resolves to a miss ("release no longer resolvable"). Collect
         sort keys first, slice to ``limit``, THEN mint — handle count per candidate is
