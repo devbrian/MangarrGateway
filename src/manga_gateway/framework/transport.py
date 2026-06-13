@@ -12,6 +12,7 @@ implementation replaces only that helper, not this injection point.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -34,6 +35,20 @@ _LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 # Lives HERE with the other client-level config; the per-job asyncio.timeout wrapper
 # is a separate concern handled in the job engine, not added here.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+
+# TOTAL wall-clock ceiling per outbound request (debug all-sources-pooltimeout,
+# 2026-06-13). httpx's ``read`` timeout above is PER-CHUNK — it resets on every byte
+# received — so a slow-trickling / tarpitting upstream (e.g. a Cloudflare-flagged
+# host dribbling a byte every few seconds) NEVER trips ``read`` and holds its pooled
+# connection indefinitely. With the ONE shared 100-connection pool, enough such stuck
+# requests drain every slot and EVERY source then fails with ``PoolTimeout`` — a
+# permanent outage that only a restart clears. This hard total deadline bounds each
+# request's wall-time regardless of per-chunk progress; on expiry the request is
+# cancelled, which cleanly releases the connection back to the pool (httpx closes the
+# response on ``BaseException``), so a tarpit becomes a bounded, retryable timeout
+# instead of a permanent leak. 60s is generous headroom over connect(10)+read(30) for
+# any legitimate API call or CDN image fetch while still killing a tarpit.
+_TOTAL_REQUEST_DEADLINE = 60.0
 
 # HTTP/2 needs the optional ``h2`` package; enable only when present so the gateway
 # runs with the locked dependency set (falls back to HTTP/1.1 transparently).
@@ -83,7 +98,25 @@ class HttpxTransport:
         self._client = httpx.AsyncClient(**client_kwargs)
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        return await self._client.request(method, url, **kwargs)
+        # Wrap the buffered call in a TOTAL wall-clock deadline
+        # (_TOTAL_REQUEST_DEADLINE) so a tarpitting upstream cannot defeat httpx's
+        # PER-CHUNK ``read`` timeout and pin a pooled connection forever (debug
+        # all-sources-pooltimeout). On expiry ``asyncio.timeout`` cancels the
+        # in-flight request; httpx closes the response on the resulting cancellation,
+        # returning the connection to the shared pool. The deadline is surfaced as
+        # ``httpx.ReadTimeout`` (a ``TransportError``) so the context's existing
+        # ``_is_retryable`` / tenacity policy treats it like any other timeout —
+        # retried with backoff, then terminal → source cooldown. An EXTERNAL
+        # cancellation (job timeout, shutdown) is NOT from this scope, so
+        # ``asyncio.timeout`` re-raises ``CancelledError`` unchanged and it propagates.
+        try:
+            async with asyncio.timeout(_TOTAL_REQUEST_DEADLINE):
+                return await self._client.request(method, url, **kwargs)
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout(
+                f"total request deadline ({_TOTAL_REQUEST_DEADLINE}s) exceeded",
+                request=httpx.Request(method, url),
+            ) from exc
 
     async def aclose(self) -> None:
         await self._client.aclose()
