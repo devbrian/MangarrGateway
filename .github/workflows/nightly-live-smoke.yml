@@ -72,15 +72,20 @@ jobs:
       GATEWAY_CLOUDFLARE_PROXY_SERVER: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_SERVER }}
       GATEWAY_CLOUDFLARE_PROXY_USERNAME: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_USERNAME }}
       GATEWAY_CLOUDFLARE_PROXY_PASSWORD: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_PASSWORD }}
-      # #198/#202: kagane.to + mangadot.net serve a Cloudflare managed challenge
-      # the headed-Xvfb-Linux solver cannot clear (comix clears in the same run;
-      # only a headed-macOS fingerprint clears these). Disabling them drops both
-      # from the registry → out of /caps, search, and the solver warm set, so they
-      # stop nightly-false-redding AND stop the ~6-min doomed-warm storm that
-      # starves comix at startup. REVERSIBLE: clear this when the Patchright
-      # Linux-fingerprint work (#202) lands. Supersedes their ci_skip_reason gates
-      # (now redundant but kept as a fallback for runs without this env).
-      GATEWAY_DISABLED_SOURCES: kagane,mangadot
+      # #198/#202/#234: kagane.to + mangadot.net + comix.to serve a Cloudflare
+      # managed challenge the headed-Xvfb-Linux solver cannot clear (only a
+      # headed-macOS fingerprint clears these). comix joined this set 2026-06-13
+      # (#234): it ESCALATED its challenge so the Linux nightly now gets
+      # `cf_clearance not captured within 60s` on every warm — every comix live
+      # test TimeoutErrors (incl. caps_smoke, which only waits for the warm).
+      # Disabling drops them from the registry → out of /caps, search, and the
+      # solver warm set, so they stop nightly-false-redding AND stop the doomed-warm
+      # storm at startup. REVERSIBLE: drop a source here once the Patchright
+      # Linux-fingerprint work (#202) restores its clearance. (The comix `_=` token
+      # fix in this same branch/#232 is correct + macOS-verified — it works wherever
+      # comix clears; it is just unverifiable in this Linux nightly until #234.)
+      # Supersedes their ci_skip_reason gates (redundant but kept as a fallback).
+      GATEWAY_DISABLED_SOURCES: kagane,mangadot,comix
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.
