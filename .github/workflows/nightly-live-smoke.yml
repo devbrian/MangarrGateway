@@ -72,20 +72,20 @@ jobs:
       GATEWAY_CLOUDFLARE_PROXY_SERVER: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_SERVER }}
       GATEWAY_CLOUDFLARE_PROXY_USERNAME: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_USERNAME }}
       GATEWAY_CLOUDFLARE_PROXY_PASSWORD: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_PASSWORD }}
-      # #198/#202/#234: kagane.to + mangadot.net + comix.to serve a Cloudflare
-      # managed challenge the headed-Xvfb-Linux solver cannot clear (only a
-      # headed-macOS fingerprint clears these). comix joined this set 2026-06-13
-      # (#234): it ESCALATED its challenge so the Linux nightly now gets
-      # `cf_clearance not captured within 60s` on every warm — every comix live
-      # test TimeoutErrors (incl. caps_smoke, which only waits for the warm).
-      # Disabling drops them from the registry → out of /caps, search, and the
-      # solver warm set, so they stop nightly-false-redding AND stop the doomed-warm
-      # storm at startup. REVERSIBLE: drop a source here once the Patchright
-      # Linux-fingerprint work (#202) restores its clearance. (The comix `_=` token
-      # fix in this same branch/#232 is correct + macOS-verified — it works wherever
-      # comix clears; it is just unverifiable in this Linux nightly until #234.)
-      # Supersedes their ci_skip_reason gates (redundant but kept as a fallback).
-      GATEWAY_DISABLED_SOURCES: kagane,mangadot,comix
+      # #198/#202: kagane.to + mangadot.net serve a Cloudflare managed challenge
+      # the headed-Xvfb-Linux solver cannot clear (only a headed-macOS fingerprint
+      # clears these). Disabling drops them from the registry → out of /caps, search,
+      # and the solver warm set, so they stop nightly-false-redding AND stop the
+      # doomed-warm storm at startup. REVERSIBLE: drop a source once the Patchright
+      # Linux-fingerprint work (#202) restores its clearance.
+      #
+      # comix was briefly in this list (#234) but is RE-ENABLED 2026-06-14: spike 016
+      # proved #234 was a TRANSIENT CF IP-flag (from the 2026-06-13 pool-exhaustion
+      # incident, #233 — now fixed), NOT a fingerprint/IP-class escalation. comix
+      # clears on the stock Linux fingerprint in ~1.5s. NOTE: comix DOWNLOAD live
+      # tests still fail on #169 (per-page encryption); search/recent/caps pass. The
+      # self-healing-warm follow-up is #236.
+      GATEWAY_DISABLED_SOURCES: kagane,mangadot
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.
