@@ -264,9 +264,9 @@ class _FakeSolver:
     """Records the ``chapter_url`` passed to ``fetch_via_browser`` so the test
     can assert the deferred branch resolved the sentinel before navigating.
 
-    Also backs the #222 always-walk PARALLEL primitive: tests that exercise the
-    REAL deferred path (no ``_series_chapters`` monkeypatch) stage the full
-    series chapter list on ``paginated_results`` keyed by the series URL."""
+    Also backs the #232 always-walk SEQUENTIAL paginated primitive: tests that
+    exercise the REAL deferred path (no ``_series_chapters`` monkeypatch) stage the
+    full series chapter list on ``paginated_results`` keyed by the series URL."""
 
     def __init__(self, urls: list[str] | None = None) -> None:
         self.last_url: str | None = None
@@ -291,24 +291,23 @@ class _FakeSolver:
         self.last_url = url
         return self._urls
 
-    async def fetch_via_browser_parallel_pages(
+    async def fetch_via_browser_paginated(
         self,
         url: str,
         *,
         extract: str,
         wait_for: Any = None,
-        last_page_selector: str,
-        page_param: str,
-        route_rewrite: tuple[str, int] | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
     ) -> list[dict[str, Any]]:
-        _ = (extract, wait_for, last_page_selector, page_param, route_rewrite)
+        _ = (extract, wait_for, next_selector, route_limit_rewrite)
         _ = (max_pages, timeout)
         self.paginated_fetch_calls.append(url)
         if url not in self.paginated_results:
             raise AssertionError(
-                f"unmocked fetch_via_browser_parallel_pages({url!r}); "
+                f"unmocked fetch_via_browser_paginated({url!r}); "
                 f"call stage_browser_paginated first"
             )
         return self.paginated_results[url]
@@ -488,20 +487,63 @@ async def test_fetch_manifest_deferred_resolves_against_full_walked_list() -> No
 # ───────────────────────── recent() shape (Task 3) ──────────────────────────
 
 
-class _FakeCtxForRecent:
-    """Minimal ``SourceContext`` stand-in for the ``recent()`` plaintext path.
+# The tokenized recent-feed URL the SPA mints on /browse (#232). recent() reads
+# this verbatim off the Resource-Timing buffer (via the fake solver below) and
+# replays it through get_json_plain — the ``order[...]`` is URL-encoded and the
+# ``_=`` token signs the EXACT query string, so recent() adds NO params.
+_RECENT_TOKEN_URL = (
+    "https://comix.to/api/v1/manga?order%5Bchapter_updated_at%5D=desc"
+    "&page=1&limit=28&content_rating=suggestive&_=faketoken"
+)
 
-    ``recent()`` reads ``ctx`` only via :meth:`get_json_plain` (one call) and
-    ``handle_store.mint``. We capture the URL + params for assertion and serve
-    a canned payload. No respx needed — ``recent()`` does not touch httpx
-    directly; the production ``SourceContext.get_json_plain`` is the layer
-    that does.
+
+class _RecentFakeSolver:
+    """Fake solver for the ``recent()`` browse-capture path (#232).
+
+    ``recent()`` navigates ``/browse`` via ``fetch_via_browser`` and reads the
+    tokenized ``order[chapter_updated_at]`` URL the SPA minted; this fake records
+    the nav target and returns ``_RECENT_TOKEN_URL``. ``fetch_via_browser_paginated``
+    exists only so ``_solver_from_ctx``'s hasattr guard passes — recent() never
+    enumerates a chapter list (locked decision 7).
+    """
+
+    def __init__(self) -> None:
+        self.browse_navs: list[str] = []
+
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: Any = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
+    ) -> str:
+        _ = (extract, wait_for, timeout)
+        self.browse_navs.append(url)
+        return _RECENT_TOKEN_URL
+
+    async def fetch_via_browser_paginated(  # pragma: no cover — never called
+        self, url: str, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        raise AssertionError("recent() must not enumerate a chapter list")
+
+
+class _FakeCtxForRecent:
+    """Minimal ``SourceContext`` stand-in for the ``recent()`` browse-capture path.
+
+    ``recent()`` (#232) reads ``ctx`` via ``_solver`` (the browse nav + token
+    capture), :meth:`get_json_plain` (one verbatim-URL call) and
+    ``handle_store.mint``. We capture the get_json_plain URL + params for
+    assertion and serve a canned payload. No respx needed — ``recent()`` does not
+    touch httpx directly; the production ``SourceContext.get_json_plain`` is the
+    layer that does.
     """
 
     def __init__(self, payload: dict[str, Any]) -> None:
         self.handle_store = HandleStore()
         self._payload = payload
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._solver = _RecentFakeSolver()
 
     async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
         self.calls.append((url, params))
@@ -544,8 +586,10 @@ async def test_recent_returns_releases_with_deferred_guids_and_composites() -> N
       ``_make_deferred_composite(hid, slug, ch_str)``.
     * ``chapter_number`` for the ``"30.1"`` row equals ``Decimal('30.1')``
       (decimal-normalized; not ``Decimal('30.10')``).
-    * The fake ctx records exactly one ``get_json_plain`` call (locked
-      decision 7: no series-page nav from the ``recent`` path).
+    * recent() navigates ``/browse`` once (token capture) and records exactly
+      one ``get_json_plain`` call replaying the captured URL VERBATIM with NO
+      added params (#232: the ``_=`` token signs the exact query string), and
+      no series-page chapter-list enumeration (locked decision 7).
     """
     payload = {
         "status": "ok",
@@ -647,14 +691,15 @@ async def test_recent_returns_releases_with_deferred_guids_and_composites() -> N
     releases = await source.recent(languages=None, limit=20, since=None, ctx=ctx)
 
     assert len(releases) == 10
-    # Locked decision 7: exactly one outbound plaintext call from recent().
+    # #232: recent() navigates /browse ONCE to capture the SPA-minted token URL.
+    assert ctx._solver.browse_navs == ["https://comix.to/browse"]  # type: ignore[attr-defined]
+    # Locked decision 7: exactly one outbound plaintext call from recent() — the
+    # captured tokenized URL replayed VERBATIM, with NO added params (the ``_=``
+    # token signs the exact query string, so get_json_plain GETs it as-is).
     assert len(ctx.calls) == 1  # type: ignore[attr-defined]
     called_url, called_params = ctx.calls[0]  # type: ignore[attr-defined]
-    assert called_url == "https://comix.to/api/v1/manga"
-    assert called_params["order[chapter_updated_at]"] == "desc"
-    assert called_params["page"] == 1
-    assert called_params["content_rating"] == "suggestive"
-    assert called_params["limit"] == 20
+    assert called_url == _RECENT_TOKEN_URL
+    assert called_params == {}
 
     # Locked decision 1: literal `:DEFERRED` guid suffix on every Release.
     for rel in releases:

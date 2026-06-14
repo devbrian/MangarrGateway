@@ -48,12 +48,12 @@ class _CountingComixSolver:
 
     ``fetch_calls`` is the cross-search witness the headline assertion reads: a
     Layer-2 cache HIT must never reach the browser, so the delta across the second
-    search is exactly 0. The search path enumerates the FULL chapter list in
-    PARALLEL (#222) via ``fetch_via_browser_parallel_pages`` — that is the method
-    the source actually calls now (``_fetch_series_chapters_raw``), so it increments
-    ``fetch_calls``. ``fetch_via_browser`` (the one-shot chapter-pages read) is
-    present so ``_solver_from_ctx`` (which requires BOTH primitives) accepts the
-    fake; it is unused on the search path.
+    search is exactly 0. The search path enumerates the FULL chapter list
+    SEQUENTIALLY (#232 reverted #222) via ``fetch_via_browser_paginated`` — that is
+    the method the source actually calls now (``_fetch_series_chapters_raw``), so it
+    increments ``fetch_calls``. ``fetch_via_browser`` (the one-shot chapter-pages
+    read) is present so ``_solver_from_ctx`` (which requires BOTH primitives)
+    accepts the fake; it is unused on the search path.
     """
 
     def __init__(self) -> None:
@@ -80,23 +80,44 @@ class _CountingComixSolver:
             raise AssertionError(f"unmocked fetch_via_browser({url!r})")
         return self.browser_results[url]
 
-    async def fetch_via_browser_parallel_pages(
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        # Search mints a `_=` token by typing into the SPA box (debug
+        # comix-search-api-403). This is the SEARCH-token nav, distinct from the
+        # chapter-enumeration navs ``fetch_calls`` witnesses — so it deliberately
+        # does NOT bump ``fetch_calls`` (and the Layer-1 resolve cache skips it on
+        # repeat anyway). Returns the tokenized /api/v1/manga URL the source then
+        # replays verbatim into the respx mock (matched by path, query ignored).
+        _ = (url, type_selector, extract, wait_for, timeout)
+        return (
+            f"{_COMIX}/api/v1/manga?keyword={type_text}"
+            "&limit=6&content_rating=suggestive&_=faketoken"
+        )
+
+    async def fetch_via_browser_paginated(
         self,
         url: str,
         *,
         extract: str,
         wait_for: str | None = None,
-        last_page_selector: str,
-        page_param: str,
-        route_rewrite: tuple[str, int] | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
     ) -> object:
-        _ = (extract, wait_for, last_page_selector, page_param, route_rewrite)
+        _ = (extract, wait_for, next_selector, route_limit_rewrite)
         _ = (max_pages, timeout)
         self.fetch_calls += 1
         if url not in self.browser_results:
-            raise AssertionError(f"unmocked fetch_via_browser_parallel_pages({url!r})")
+            raise AssertionError(f"unmocked fetch_via_browser_paginated({url!r})")
         return self.browser_results[url]
 
 

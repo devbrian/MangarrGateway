@@ -864,7 +864,18 @@ class SourceContext:
         metric failure can never break search/download (T-08-15).
         """
         kwargs = await self._clearance_kwargs(force_resolve=force_resolve)
-        if params is not None:
+        # Pass ``params`` to httpx ONLY when NON-EMPTY. httpx treats ``params=`` as
+        # the COMPLETE query and REPLACES any query already present on ``url`` — so
+        # an EMPTY dict (``get_json``/``get_json_plain(url)`` forward ``**params``
+        # == ``{}``) would STRIP the URL's own query string. This is a latent
+        # footgun that bit comix search (debug ``comix-search-api-403``): the source
+        # replays a fully-formed, JS-pre-signed URL carrying the ``_=`` request
+        # token in its query, and ``params={}`` wiped the entire query (token and
+        # all) → ``{"message":"Missing token."}`` 403. Existing callers build their
+        # query via a real (non-empty) ``params`` dict on a query-LESS ``url``, so
+        # skipping the empty-dict case is byte-for-byte unchanged for them while
+        # letting a caller GET a pre-signed URL verbatim.
+        if params:
             kwargs["params"] = params
         if data is not None:
             kwargs["data"] = data

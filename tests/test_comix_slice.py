@@ -72,13 +72,14 @@ class _ComixSolver:
         # paginated contract (next_selector + route_limit_rewrite) distinctly
         # from the one-shot chapter-pages reads (which stay on fetch_via_browser).
         self.paginated_results: dict[str, object] = {}
-        # #222: the always-walk series enumeration now routes through the PARALLEL
-        # primitive. The call record carries the parallel-primitive shape
-        # ``(url, extract, wait_for, last_page_selector, page_param, route_rewrite)``
-        # so tests assert the comix literals (Last selector + page param + route)
-        # passed to the framework.
-        self.parallel_fetch_calls: list[
-            tuple[str, str, str | None, str, str, tuple[str, int] | None]
+        # #232: the always-walk series enumeration routes through the SEQUENTIAL
+        # paginated primitive (reverted #222's parallel fan-out — incompatible with
+        # the signed ``_=`` token). The call record carries the paginated-primitive
+        # shape ``(url, extract, wait_for, next_selector, route_limit_rewrite)`` so
+        # tests assert the comix literals (Next selector + NO route-rewrite) passed
+        # to the framework.
+        self.paginated_fetch_calls: list[
+            tuple[str, str, str | None, str, tuple[str, int] | None]
         ] = []
 
     def stage_browser_fetch(self, url: str, result: object) -> None:
@@ -87,7 +88,7 @@ class _ComixSolver:
 
     def stage_browser_paginated(self, url: str, result: object) -> None:
         """Register the value the series-enumeration browser call returns (the
-        parallel ``fetch_via_browser_parallel_pages(url)`` reads the same registry)."""
+        sequential ``fetch_via_browser_paginated(url)`` reads the same registry)."""
         self.paginated_results[url] = result
 
     async def get_clearance(self, source_key: str) -> Clearance:
@@ -112,25 +113,45 @@ class _ComixSolver:
             )
         return self.browser_results[url]
 
-    async def fetch_via_browser_parallel_pages(
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        # Comix search mints a `_=` token by typing into the SPA search box
+        # (debug comix-search-api-403). The production extract reads the tokenized
+        # /api/v1/manga URL off Resource-Timing; the fake returns the equivalent
+        # URL so the source's verbatim get_json_plain replay hits the respx mock
+        # (respx matches /api/v1/manga by path, ignoring the query/token).
+        _ = (url, type_selector, extract, wait_for, timeout)
+        return (
+            f"{_COMIX}/api/v1/manga?keyword={type_text}"
+            "&limit=6&content_rating=suggestive&_=faketoken"
+        )
+
+    async def fetch_via_browser_paginated(
         self,
         url: str,
         *,
         extract: str,
         wait_for: str | None = None,
-        last_page_selector: str,
-        page_param: str,
-        route_rewrite: tuple[str, int] | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
     ) -> object:
         _ = (extract, max_pages, timeout)
-        self.parallel_fetch_calls.append(
-            (url, extract, wait_for, last_page_selector, page_param, route_rewrite)
+        self.paginated_fetch_calls.append(
+            (url, extract, wait_for, next_selector, route_limit_rewrite)
         )
         if url not in self.paginated_results:
             raise AssertionError(
-                f"unmocked solver.fetch_via_browser_parallel_pages({url!r}); "
+                f"unmocked solver.fetch_via_browser_paginated({url!r}); "
                 f"call stage_browser_paginated first"
             )
         return self.paginated_results[url]
@@ -525,18 +546,18 @@ async def test_comix_fetch_manifest_routes_through_browser(
     # would double-wait the same condition and add ~1 s of pure overhead.
     assert wait_for is None
 
-    # The series-page chapter-list enumeration is now ONE parallel call (#222)
-    # — recorded on ``parallel_fetch_calls``, NOT ``browser_fetch_calls``. The
-    # chapter-pages manifest read above stays on the one-shot fetch_via_browser.
-    assert len(solver.parallel_fetch_calls) == 1
+    # The series-page chapter-list enumeration is now ONE sequential paginated
+    # call (#232 reverted #222's parallel fan-out) — recorded on
+    # ``paginated_fetch_calls``, NOT ``browser_fetch_calls``. The chapter-pages
+    # manifest read above stays on the one-shot fetch_via_browser.
+    assert len(solver.paginated_fetch_calls) == 1
     (
         series_url,
         _series_extract,
         series_wait,
-        series_last,
-        series_page_param,
+        series_next,
         series_route,
-    ) = solver.parallel_fetch_calls[0]
+    ) = solver.paginated_fetch_calls[0]
     assert series_url == f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
     # JS predicate (not CSS selector) — routes to page.wait_for_function and
     # polls DOM attachment of `a.mchap-row__primary` so anchors that render
@@ -544,12 +565,13 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert series_wait is not None
     assert "mchap-row__primary" in series_wait
     assert series_wait.startswith("() =>")
-    # The comix-side parallel-pagination literals are passed from comix.py (the
-    # framework stays source-agnostic): the Last-page selector for P-discovery, the
-    # ``page`` param name, and the ``/chapters`` limit-rewrite.
-    assert series_last == 'button[aria-label*="Last"]'
-    assert series_page_param == "page"
-    assert series_route == ("/chapters", 100)
+    # The comix-side sequential-pagination literals are passed from comix.py (the
+    # framework stays source-agnostic): the Next-page selector for the natural
+    # Next-walk, and — load-bearing for #232 — NO ``route_limit_rewrite`` (bumping
+    # the SPA's ``limit=20``→``100`` rewrites its token-signed ``/chapters`` URL and
+    # invalidates the ``_=`` signature → 403).
+    assert series_next == 'button[aria-label*="Next"]'
+    assert series_route is None
     # And NO series-page read leaked onto the one-shot primitive.
     assert not any("-chapter-" not in c[0] for c in solver.browser_fetch_calls)
 
@@ -788,9 +810,10 @@ async def test_comix_search_walks_full_list_finds_low_chapter(
     # release, proving #5 was enumerated from the FULL walked list.
     releases = body["releases"]
     assert [r["chapterNumber"] for r in releases] == [5]
-    # And the enumeration went through the always-walk parallel primitive.
-    assert len(solver.parallel_fetch_calls) == 1
-    assert solver.parallel_fetch_calls[0][5] == ("/chapters", 100)
+    # And the enumeration went through the always-walk sequential paginated
+    # primitive (#232) with NO route-rewrite (index 4 = route_limit_rewrite).
+    assert len(solver.paginated_fetch_calls) == 1
+    assert solver.paginated_fetch_calls[0][4] is None
 
 
 # ─── (debug comix-page-walker-100-cap) a >100-chapter series honors req.limit ──
@@ -867,10 +890,11 @@ async def test_comix_search_returns_more_than_100_when_limit_is_higher(
         f"expected 150 releases for a 150-chapter series at limit=150, "
         f"got {len(releases)} (warnings={body.get('warnings')})"
     )
-    # The per-PAGE fetch ceiling is UNCHANGED — the fix decouples the result
-    # window from the fetch size, it does not widen the upstream page request.
-    assert len(solver.parallel_fetch_calls) == 1
-    assert solver.parallel_fetch_calls[0][5] == ("/chapters", 100)
+    # The sequential paginated primitive walks the natural ``limit=20`` pages with
+    # NO route-rewrite (#232; index 4 = route_limit_rewrite) — the result window is
+    # decoupled from the per-page fetch size, which stays the SPA's own limit.
+    assert len(solver.paginated_fetch_calls) == 1
+    assert solver.paginated_fetch_calls[0][4] is None
 
 
 @respx.mock

@@ -137,23 +137,45 @@ class _SlowComixSolver:
         self.browser_fetch_calls.append(url)
         return await self._gated_fetch(url)
 
-    async def fetch_via_browser_parallel_pages(
+    async def fetch_via_browser_typed(
+        self,
+        url: str,
+        *,
+        type_selector: str,
+        type_text: str,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+    ) -> object:
+        # Comix search mints a `_=` token by typing into the SPA search box
+        # (debug comix-search-api-403). The production extract reads the tokenized
+        # /api/v1/manga URL off Resource-Timing; the fake returns the equivalent
+        # URL so the source's verbatim get_json_plain replay hits the respx mock
+        # (respx matches /api/v1/manga by path, ignoring the query/token).
+        _ = (url, type_selector, extract, wait_for, timeout)
+        return (
+            f"{_COMIX}/api/v1/manga?keyword={type_text}"
+            "&limit=6&content_rating=suggestive&_=faketoken"
+        )
+
+    async def fetch_via_browser_paginated(
         self,
         url: str,
         *,
         extract: str,
         wait_for: str | None = None,
-        last_page_selector: str,
-        page_param: str,
-        route_rewrite: tuple[str, int] | None = None,
+        next_selector: str,
+        route_limit_rewrite: tuple[str, int] | None = None,
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
     ) -> object:
-        # #222: ``_series_chapters`` always-enumerates via the PARALLEL primitive,
-        # so the parallel-concurrency bounding test must exercise THIS method (the
-        # one the source actually calls). Same in-flight/gate/delay accounting as
-        # the one-shot fetch so the max_in_flight / wall-clock assertions hold.
-        _ = (extract, wait_for, last_page_selector, page_param, route_rewrite)
+        # #232: ``_series_chapters`` always-enumerates via the SEQUENTIAL paginated
+        # primitive (reverted #222's parallel fan-out — the signed ``_=`` token is
+        # incompatible with the parallel URL-rewrite), so the per-candidate
+        # concurrency test must exercise THIS method (the one the source actually
+        # calls). The per-candidate ``search()`` gather is still concurrent; this
+        # fake's in-flight/gate/delay accounting is what those assertions read.
+        _ = (extract, wait_for, next_selector, route_limit_rewrite)
         _ = (max_pages, timeout)
         self.browser_fetch_calls.append(url)
         return await self._gated_fetch(url)
