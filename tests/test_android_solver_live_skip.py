@@ -23,7 +23,9 @@ import respx
 
 from tests.live.conftest import _android_solver_reachable
 
-_SOLVER_URL = "http://REDACTED-INTERNAL-IP:18080"
+# Non-routable placeholder (RFC 6761 reserved `.test` TLD): every probe in this
+# module is respx-mocked, so the host is never dialed — no real infra IP belongs here.
+_SOLVER_URL = "http://android-solver.test:18080"
 
 
 def test_unset_url_skips(monkeypatch: pytest.MonkeyPatch) -> None:
