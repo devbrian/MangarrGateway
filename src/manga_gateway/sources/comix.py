@@ -102,12 +102,15 @@ the extractor never snapshots a partial scaffold.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+from PIL import Image, UnidentifiedImageError
 
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
@@ -227,19 +230,125 @@ _CID_SEP = "|"
 # ``_parse_composite_chapter_id`` accepts it unchanged (locked decision 8).
 _DEFERRED_SENTINEL = "DEFERRED"
 
-# Page-image encryption (spike-012-verified). The CDN byte-encrypts the first
-# ``x-enc-len`` (4096) bytes of every 4th page image, keyed by the per-response
-# ``x-enc-seed`` header; ``x-enc-seed == 0`` means plaintext (no-op). The cipher
-# is a fully static 32-bit LCG keystream XORed over the prefix — pure stdlib, no
-# browser, no re-encode. These constants are the spike-012-verified LCG params.
+# Page-image protection (spike-012 + spike-017-verified). A page carries AT MOST ONE
+# of two header-dispatched transforms; ``fetch_image`` reverses both statically (no
+# browser for image bytes):
+#
+#  (A) BYTE cipher — ``x-enc-seed``/``x-enc-len``/``x-enc-algo``. XOR a PRNG keystream
+#      over the first ``x-enc-len`` (4096) bytes. ``x-enc-seed == 0`` ⇒ plaintext.
+#        * ``x-enc-algo`` 1 (or MISSING, back-compat) → 32-bit LCG, XOR ``state>>24``.
+#        * ``x-enc-algo`` 2 → xorshift32 seeded ``(seed|1)``, XOR ``state & 0xFF``.
+#      Output stays a valid WebP — no re-encode.
+#  (B) TILE scramble — ``x-scramble-seed``/``x-scramble-grid`` (e.g. "5x5")/
+#      ``x-scramble-algo``. Bytes are ALREADY a valid WebP (so they silently pass the
+#      packaging ``is_valid_image`` guard); must DECODE → seeded Fisher-Yates tile
+#      un-permute → RE-ENCODE lossless.
+#        * ``x-scramble-algo`` 1/2 (or MISSING) → LegacyLcg (1664525/1013904223).
+#        * ``x-scramble-algo`` 3 → BuildOrderV2 = the SAME xorshift32 core as byte-2.
+#
+# An UNKNOWN algo (byte or scramble) FAILS LOUD rather than silently applying the wrong
+# transform — PR #170 regressed (#169) precisely because it blind-applied algo-1 to
+# algo-2 ciphertext. Verified end-to-end in spike 017 (decode → Pillow → coherent art).
 _ENC_MASK = 0xFFFFFFFF
-_ENC_MULTIPLIER = 1000005
+_ENC_MULTIPLIER = 1000005  # byte-algo-1 LCG (spike 012 / PR #170)
 _ENC_INCREMENT = 1234567891
 _ENC_LEN_DEFAULT = 4096
 # Defensive ceiling on the decoded prefix length (T-iy5-01): a hostile/garbage
 # ``x-enc-len`` must NOT be able to force a whole-image per-byte XOR loop on the
 # event loop. The verified scheme length is 4096; this gives 16x headroom.
 _ENC_LEN_MAX = 65536
+# Byte-cipher algorithm ids (``x-enc-algo``).
+_ENC_ALGO_LCG = 1
+_ENC_ALGO_XORSHIFT = 2
+# Tile-scramble (spike 017): LegacyLcg PRNG params + ``x-scramble-algo`` ids.
+_SCRAMBLE_LCG_MULTIPLIER = 1664525
+_SCRAMBLE_LCG_INCREMENT = 1013904223
+_SCRAMBLE_ALGO_LEGACY_LCG = (1, 2)  # both map to the LegacyLcg PRNG
+_SCRAMBLE_ALGO_BUILDORDER_V2 = 3
+_SCRAMBLE_GRID_DEFAULT = (5, 5)  # C# ParseGrid default when the header is absent
+# Cap the tile grid so a hostile ``x-scramble-grid`` can't force a huge tile loop.
+_SCRAMBLE_GRID_MAX = 64
+
+
+def _xorshift32_step(state: int) -> int:
+    """One xorshift32 step (Marsaglia 13/17/5, 32-bit). Shared by byte-algo-2 (XOR the
+    low byte) and scramble-algo-3/BuildOrderV2 (permutation index = ``state % n``)."""
+    state ^= (state << 13) & _ENC_MASK
+    state &= _ENC_MASK
+    state ^= state >> 17
+    state ^= (state << 5) & _ENC_MASK
+    return state & _ENC_MASK
+
+
+def _scramble_permutation(seed: int, count: int, algo: int) -> list[int]:
+    """Seeded Fisher-Yates permutation; PRNG per ``x-scramble-algo`` (spike 017).
+
+    ``algo`` 1/2 → LegacyLcg (1664525/1013904223); ``algo`` 3 → BuildOrderV2 xorshift32
+    (seed ``| 1``). Raises ``ValueError`` on an unknown algo (caller maps to fail-loud).
+    """
+    if algo in _SCRAMBLE_ALGO_LEGACY_LCG:
+        state = seed & _ENC_MASK
+
+        def _next(bound: int) -> int:
+            nonlocal state
+            state = (
+                state * _SCRAMBLE_LCG_MULTIPLIER + _SCRAMBLE_LCG_INCREMENT
+            ) & _ENC_MASK
+            return state % bound
+
+    elif algo == _SCRAMBLE_ALGO_BUILDORDER_V2:
+        state = (seed | 1) & _ENC_MASK
+
+        def _next(bound: int) -> int:
+            nonlocal state
+            state = _xorshift32_step(state)
+            return state % bound
+
+    else:
+        raise ValueError(f"unknown x-scramble-algo: {algo}")
+
+    values = list(range(count))
+    for i in range(count - 1, 0, -1):
+        j = _next(i + 1)
+        values[i], values[j] = values[j], values[i]
+    return values
+
+
+def _unscramble_image(
+    content: bytes, seed: int, cols: int, rows: int, algo: int
+) -> bytes:
+    """Un-permute a Comix tile-scrambled page image and re-encode LOSSLESS (spike 017).
+
+    The scrambled bytes are a valid WebP, so the gateway would otherwise package the
+    visually-shuffled page. We decode with Pillow, move each scrambled tile back to its
+    original grid cell (mode: "scrambled position i holds original tile permutation[i]",
+    the C# reference default), and re-encode **lossless** WebP — manga pages must never
+    take an added lossy requant (PKG-02). A non-image / truncated body degrades to a
+    passthrough (the downstream ``is_valid_image`` guard rejects it), never raising —
+    but an UNKNOWN ``x-scramble-algo`` is allowed to propagate (caller fails loud).
+    """
+    perm = _scramble_permutation(seed, cols * rows, algo)  # may raise on unknown algo
+    try:
+        with Image.open(io.BytesIO(content)) as src_img:
+            img = src_img.convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError):
+        return content
+    width, height = img.size
+    tile_w, tile_h = width // cols, height // rows
+    if tile_w <= 0 or tile_h <= 0:
+        return content  # image too small for the advertised grid — leave untouched
+    out = img.copy()
+    for s_idx in range(cols * rows):
+        # Scrambled position ``s_idx`` holds the original tile ``perm[s_idx]`` → move it
+        # back to original cell ``perm[s_idx]``. Last row/col remainder pixels (beyond
+        # the fixed-size grid) are preserved by cloning ``img`` into ``out`` above.
+        dst = perm[s_idx]
+        sx, sy = (s_idx % cols) * tile_w, (s_idx // cols) * tile_h
+        dx, dy = (dst % cols) * tile_w, (dst // cols) * tile_h
+        out.paste(img.crop((sx, sy, sx + tile_w, sy + tile_h)), (dx, dy))
+    buf = io.BytesIO()
+    out.save(buf, format="WEBP", lossless=True, quality=100, method=6)
+    return buf.getvalue()
 
 
 def _make_deferred_composite(hid: str, slug: str, chapter_number: str) -> str:
@@ -1408,21 +1517,40 @@ class ComixSource(Source):
         return urls
 
     @staticmethod
-    def _decode_enc_prefix(data: bytes, seed: int, enc_len: int) -> bytes:
-        """Return ``data`` with its first ``enc_len`` bytes LCG-XOR-decoded.
+    def _decode_enc_prefix(
+        data: bytes, seed: int, enc_len: int, algo: int = _ENC_ALGO_LCG
+    ) -> bytes:
+        """Return ``data`` with its first ``enc_len`` bytes keystream-XOR-decoded.
 
-        Spike-012-verified static cipher: ``seed == 0`` is a no-op (returns ``data``
-        unchanged — the ~75% plaintext pages); otherwise a 32-bit LCG keystream is
-        XORed over the prefix, taking the TOP byte of each advanced state. Pure stdlib,
-        bit-exact against the spike's captured (ciphertext, seed, plaintext) vector.
+        ``seed == 0`` is a no-op (the ~75% plaintext pages). The PRNG is selected by
+        ``x-enc-algo`` (defaulting to the legacy LCG so an absent header / old call site
+        is byte-identical):
+
+        * ``algo == 1`` (``_ENC_ALGO_LCG``, spike 012 / PR #170) — 32-bit LCG, XOR the
+          TOP byte (``state >> 24``) of each advanced state.
+        * ``algo == 2`` (``_ENC_ALGO_XORSHIFT``, spike 017) — xorshift32 seeded
+          ``(seed | 1)``, XOR the LOW byte (``state & 0xFF``).
+
+        An UNKNOWN algo raises ``ValueError`` (the caller maps it to a loud SourceError)
+        rather than silently applying the wrong cipher — that silent mismatch is exactly
+        how PR #170 regressed (#169). Pure stdlib, bit-exact against the spike vectors.
         """
         if seed == 0:
             return data
         out = bytearray(data)
-        state = seed & _ENC_MASK
-        for i in range(min(enc_len, len(out))):
-            state = (state * _ENC_MULTIPLIER + _ENC_INCREMENT) & _ENC_MASK
-            out[i] ^= (state >> 24) & 0xFF
+        limit = min(enc_len, len(out))
+        if algo == _ENC_ALGO_LCG:
+            state = seed & _ENC_MASK
+            for i in range(limit):
+                state = (state * _ENC_MULTIPLIER + _ENC_INCREMENT) & _ENC_MASK
+                out[i] ^= (state >> 24) & 0xFF
+        elif algo == _ENC_ALGO_XORSHIFT:
+            state = (seed | 1) & _ENC_MASK
+            for i in range(limit):
+                state = _xorshift32_step(state)
+                out[i] ^= state & 0xFF
+        else:
+            raise ValueError(f"unknown x-enc-algo: {algo}")
         return bytes(out)
 
     @staticmethod
@@ -1456,34 +1584,95 @@ class ComixSource(Source):
             return 0
         return parsed
 
+    @staticmethod
+    def _algo_header(raw: str | None, default: int) -> int:
+        """Parse an ``x-*-algo`` header. Missing/blank → ``default`` (back-compat for
+        pages that predate the algo header); a well-formed value is returned verbatim so
+        the decode dispatch resolves it (and FAILS LOUD on an unknown id). A malformed
+        (non-decimal / over-long) value returns ``-1`` — a guaranteed-unknown id that
+        also fails loud rather than silently falling back to the default cipher."""
+        if raw is None:
+            return default
+        value = raw.strip()
+        if not value:
+            return default
+        if not value.isdecimal() or len(value) > 3:
+            return -1
+        return int(value)
+
+    @staticmethod
+    def _scramble_grid(raw: str | None) -> tuple[int, int]:
+        """Parse ``x-scramble-grid`` (e.g. ``"5x5"`` or ``"5"``) → ``(cols, rows)``.
+
+        Missing/blank/malformed → the ``5x5`` default (C# ``ParseGrid``). Each dimension
+        is clamped to ``[1, _SCRAMBLE_GRID_MAX]`` so a hostile header can't force a huge
+        tile loop. ``"5x5"``, ``"5X5"``, ``"5,5"``, and ``"5"`` are all accepted.
+        """
+        if raw is None:
+            return _SCRAMBLE_GRID_DEFAULT
+        parts = re.split(r"[x,\s]+", raw.strip().lower())
+        nums = [p for p in parts if p.isdecimal() and len(p) <= 3]
+        if not nums:
+            return _SCRAMBLE_GRID_DEFAULT
+        cols = int(nums[0])
+        rows = int(nums[1]) if len(nums) > 1 else cols
+        if cols <= 0 or rows <= 0:
+            return _SCRAMBLE_GRID_DEFAULT
+        return min(cols, _SCRAMBLE_GRID_MAX), min(rows, _SCRAMBLE_GRID_MAX)
+
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
-        """Fetch one page image's raw bytes via the shared session (PKG-02).
+        """Fetch one page image's bytes + reverse Comix's page protection (PKG-02).
 
         Delegates to ``ctx.get_bytes_plain_with_headers`` — cleared by the framework
         seam (D-40), the framework decrypt seam opted out — so the source sees the raw
-        CDN bytes PLUS the response headers. The Comix CDN now serves byte-encrypted
-        WebP on every 4th page (``x-enc-seed != 0``): we decode statically over the
-        first ``x-enc-len`` bytes per the spike-012-verified cipher. The ~75% plaintext
-        pages (``x-enc-seed == 0`` / missing / malformed header) pass through
-        byte-for-byte (the fast path). Still NO browser for image bytes, NO re-encode —
-        pages stay WebP.
+        CDN bytes PLUS the response headers, and dispatches on them (spike 012 + 017):
 
-        ``x-enc-len`` is clamped to ``_ENC_LEN_MAX`` (T-iy5-01) so a hostile header
-        cannot force a whole-image XOR loop. The clamped (≤65536-byte) integer loop is
-        trivial CPU (sub-millisecond) and runs inline on the event loop — NO
-        ``asyncio.to_thread`` offload is needed (unlike the Pillow/zipfile packaging
-        path). ``httpx.Headers.get`` is case-insensitive, so the lowercase header names
-        match regardless of wire casing.
+        1. **Byte cipher** (``x-enc-seed != 0``): decode the first ``x-enc-len`` bytes
+           via the PRNG per ``x-enc-algo`` (1 = LCG, 2 = xorshift32; absent → 1). The
+           clamped (≤``_ENC_LEN_MAX``) integer XOR loop is sub-millisecond and runs
+           inline on the event loop. Output is still WebP — no re-encode.
+        2. **Tile scramble** (``x-scramble-seed`` present): decode → un-permute the
+           ``x-scramble-grid`` tiles (PRNG per ``x-scramble-algo``; 1/2 = LCG, 3 =
+           BuildOrderV2) → re-encode LOSSLESS. This is Pillow CPU work → offloaded via
+           ``asyncio.to_thread`` (ruff ASYNC), like the packaging path. Only scrambled
+           pages pay this cost; plaintext / byte-cipher pages stay byte-identical WebP.
+
+        The two transforms are applied decrypt-THEN-unscramble (the C# reference order)
+        so a future page carrying both still decodes. An UNKNOWN ``x-enc-algo`` /
+        ``x-scramble-algo`` raises a loud ``SourceError`` rather than silently applying
+        the wrong transform — PR #170 regressed (#169) by blind-applying algo-1 to
+        algo-2. ``httpx.Headers.get`` is case-insensitive, so casing does not matter.
         """
         data, headers = await ctx.get_bytes_plain_with_headers(url)
+
+        # 1. byte cipher
         seed = self._enc_header_int(headers.get("x-enc-seed"))
-        if seed == 0:
-            return data  # plaintext page — untouched (fast path)
-        enc_len = self._enc_header_int(headers.get("x-enc-len"))
-        if enc_len <= 0:
-            enc_len = _ENC_LEN_DEFAULT
-        enc_len = min(enc_len, _ENC_LEN_MAX)
-        return self._decode_enc_prefix(data, seed, enc_len)
+        if seed != 0:
+            enc_len = self._enc_header_int(headers.get("x-enc-len"))
+            if enc_len <= 0:
+                enc_len = _ENC_LEN_DEFAULT
+            enc_len = min(enc_len, _ENC_LEN_MAX)
+            algo = self._algo_header(headers.get("x-enc-algo"), _ENC_ALGO_LCG)
+            try:
+                data = self._decode_enc_prefix(data, seed, enc_len, algo)
+            except ValueError as exc:
+                raise SourceError("source_unavailable", str(exc)) from exc
+
+        # 2. tile scramble
+        scramble_seed = self._enc_header_int(headers.get("x-scramble-seed"))
+        if scramble_seed != 0:
+            cols, rows = self._scramble_grid(headers.get("x-scramble-grid"))
+            scramble_algo = self._algo_header(
+                headers.get("x-scramble-algo"), _SCRAMBLE_ALGO_LEGACY_LCG[0]
+            )
+            try:
+                data = await asyncio.to_thread(
+                    _unscramble_image, data, scramble_seed, cols, rows, scramble_algo
+                )
+            except ValueError as exc:
+                raise SourceError("source_unavailable", str(exc)) from exc
+
+        return data
 
     # ─────────────────────────── composite chapter-id ────────────────────────────
 
