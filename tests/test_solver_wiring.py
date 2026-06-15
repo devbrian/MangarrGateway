@@ -60,8 +60,9 @@ async def test_lifespan_swaps_in_solver_router() -> None:
 async def test_engine_partition_splits_patchright_and_android_challenge_urls() -> None:
     """Phase 10 (T-10-13): the lifespan partitions the per-domain challenge-URL map
     by ``Source.solver_engine``. The Patchright leg owns ONLY the patchright sources
-    — comix (``https://comix.to/``) + mangafire (``https://mangafire.to/``, Phase 12)
-    — so its browser warm/solve is byte-for-byte unchanged and the unclearable-from-
+    — comix (``https://comix.to/``), mangafire (``https://mangafire.to/``, Phase 12),
+    and mangaball (``https://mangaball.net/``, debug mangaball-cloudflare-csrf-243) —
+    so its browser warm/solve is byte-for-byte unchanged and the unclearable-from-
     Linux mangadot/kagane NEVER enter the Patchright warm set. The Android leg covers
     the android sources (mangadot ``https://mangadot.net/`` + kagane
     ``https://kagane.to/``), routed to the redroid-WebView sidecar. Guards against
@@ -71,10 +72,11 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
     async with app.router.lifespan_context(app):
         solver = app.state.solver
         assert isinstance(solver, SolverRouter)
-        # Patchright leg: comix + mangafire (NOT mangadot/kagane).
+        # Patchright leg: comix + mangafire + mangaball (NOT mangadot/kagane).
         assert solver._patchright._challenge_urls == {
             "comix": "https://comix.to/",
             "mangafire": "https://mangafire.to/",
+            "mangaball": "https://mangaball.net/",
         }
         # Android leg: mangadot + kagane (NOT comix).
         assert solver._android._challenge_urls == {

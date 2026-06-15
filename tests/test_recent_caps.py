@@ -396,17 +396,20 @@ async def test_caps_advertises_live_mangadex_source(client: httpx.AsyncClient) -
 
 
 @pytest.mark.asyncio
-async def test_caps_advertises_mangaball_antibot_none(
+async def test_caps_advertises_mangaball_antibot_cloudflare(
     client: httpx.AsyncClient,
 ) -> None:
     # 07-03: registering MangaBallSource auto-advertises it via registry.caps()
-    # (CAPS-02). MangaBall is antibot none (passive Cloudflare only, D-07/D-12).
+    # (CAPS-02). Since the 2026-06-15 site-wide managed-challenge escalation (debug
+    # mangaball-cloudflare-csrf-243) MangaBall is antibot "cloudflare" (was "none").
+    # Deterministic gate: CloudflareSolver.warm is the conftest no-op, so mangaball is
+    # NOT force_disabled and stays advertised enabled.
     resp = await client.get("/caps")
     assert resp.status_code == 200
     sources = resp.json()["sources"]
     mb = next((s for s in sources if s["key"] == "mangaball"), None)
     assert mb is not None, "mangaball not advertised in /caps"
-    assert mb["antibot"] == "none"
+    assert mb["antibot"] == "cloudflare"
     assert mb["enabled"] is True
     assert mb["rateLimitPerMinute"] > 0
     assert mb["languages"]  # non-empty ALL_LANGUAGES set

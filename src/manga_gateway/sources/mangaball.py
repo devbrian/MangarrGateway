@@ -15,14 +15,21 @@ GET-HTML, token harvest, header injection, and CSRF-403 refresh-and-retry. This
 module adds **ZERO networking glue**: every outbound call is ``ctx.post_json`` /
 ``ctx.get_bytes``, exactly like MangaDex's ``ctx.get_json`` (SRC-01/SRC-02).
 
-Anti-bot caveat (D-12): MangaBall fronts Cloudflare in **passive** mode only on
-the residential IP recon was run from — no interactive challenge fired on any data
-endpoint, so ``antibot = "none"`` is correct. A datacenter IP MAY trip a managed
-challenge; the escalation path is the existing Patchright clearance seam (flip
-``antibot`` to ``"cloudflare"`` + set ``cloudflare_challenge_url``). The
-``rate_limit_per_minute = 480`` is a conservative ~50%-of-floor value set from the
-2026-06-04 probe (no hard limit found; manifest/image sustained 960/min at c=8),
-mirroring the mangadot precedent (#101).
+Anti-bot (D-12; debug mangaball-cloudflare-csrf-243, 2026-06-15): MangaBall
+ORIGINALLY fronted Cloudflare in **passive** mode only on the residential recon IP —
+no interactive challenge fired, so ``antibot = "none"`` was correct. As of 2026-06-15
+MangaBall enabled a **site-wide managed challenge** (``cf-mitigated: challenge``,
+HTTP 403 on ``/``, ``/manga``, ``/search``), which broke the bare-httpx csrf-bootstrap
+GET: it received the interstitial → no ``meta[name=csrf-token]`` → ``ValueError`` →
+``source_unavailable`` on every search/recent/download. Per the documented
+one-attribute escalation, ``antibot`` is now ``"cloudflare"`` +
+``cloudflare_challenge_url = "https://mangaball.net/"`` — routing BOTH the
+csrf-bootstrap GET and every data POST through the shared Patchright clearance seam.
+The framework already unions cf + csrf-bootstrap (``context.py:_clearance_kwargs``);
+``session_prep.py:CsrfBootstrap`` now threads cf_clearance into the bootstrap GET too,
+so MangaBall stays zero-networking-glue. The ``rate_limit_per_minute = 480`` is a
+conservative ~50%-of-floor value set from the 2026-06-04 probe (no hard limit found;
+manifest/image sustained 960/min at c=8), mirroring the mangadot precedent (#101).
 
 ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md`` / GAP-1 probe):
 
@@ -460,13 +467,16 @@ def _extract_chapter_image_urls(html: bytes) -> list[str]:
 
 
 class MangaBallSource(Source):
-    """MangaBall (mangaball.net) — antibot none + csrf-bootstrap session prep.
+    """MangaBall (mangaball.net) — antibot cloudflare + csrf-bootstrap session prep.
 
-    A MangaDex-class clean-JSON source whose only new requirement is the
-    ``csrf-bootstrap`` session-prep style (D-06): the framework GETs an HTML page,
-    harvests the ``meta[name=csrf-token]`` + ``PHPSESSID``, and injects
-    ``X-CSRF-Token`` + the cookie on every ``/api/v1`` POST. This source adds zero
-    networking glue — see the module docstring.
+    A MangaDex-class clean-JSON source whose requirements are the ``csrf-bootstrap``
+    session-prep style (D-06: the framework GETs an HTML page, harvests the
+    ``meta[name=csrf-token]`` + ``PHPSESSID``, and injects ``X-CSRF-Token`` + the
+    cookie on every ``/api/v1`` POST) AND — since the 2026-06-15 site-wide Cloudflare
+    managed-challenge escalation (debug mangaball-cloudflare-csrf-243) — the shared
+    Patchright cf_clearance seam. It is the FIRST source to use the cf + csrf-bootstrap
+    UNION; the framework still owns BOTH (this source adds zero networking glue — see
+    the module docstring).
     """
 
     key = "mangaball"
@@ -507,10 +517,24 @@ class MangaBallSource(Source):
     # global max_concurrent_chapters. (The CSRF-bootstrap search path stays
     # sequential — this override governs downloads, not search.)
     max_concurrent_jobs = 3
-    # Passive Cloudflare only on a residential IP (D-07/D-12) — see module
-    # docstring's anti-bot caveat. No decrypt (plain .jpg, D-06).
-    antibot = "none"
+    # Cloudflare ESCALATION (debug mangaball-cloudflare-csrf-243, 2026-06-15):
+    # MangaBall enabled a SITE-WIDE managed challenge (``cf-mitigated: challenge``,
+    # HTTP 403 on /, /manga, /search — direct-probe confirmed). The D-07/D-12
+    # residential-IP "passive Cloudflare" classification no longer holds: a bare httpx
+    # GET now receives the interstitial, so the csrf-bootstrap GET failed with "no
+    # meta[name=csrf-token]" → source_unavailable. Flipped "none" → "cloudflare" per
+    # the documented one-attribute escalation (module docstring + the live profile):
+    # this routes BOTH the csrf-bootstrap GET and every data POST through the shared
+    # Patchright cf_clearance seam. MangaBall is the first source to use the cf +
+    # csrf-bootstrap UNION (framework/context.py:_clearance_kwargs +
+    # session_prep.py:CsrfBootstrap). No decrypt (plain .jpg, D-06).
+    antibot = "cloudflare"
     decrypt_scheme = None
+    # Host the shared CloudflareSolver solves the managed challenge against (#88
+    # per-domain challenge URL), mirroring comix's "https://comix.to/". Required for a
+    # cloudflare source — without it the solver falls back to the framework placeholder
+    # host and never earns clearance for mangaball.net.
+    cloudflare_challenge_url = "https://mangaball.net/"
     # NEW class-attr (Plan 01, D-06): the framework maps this onto the shared
     # CsrfBootstrap provider (Plan 02). ``post_json`` injects the harvested
     # X-CSRF-Token + PHPSESSID on every /api/v1 form POST.

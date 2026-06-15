@@ -10,30 +10,34 @@ Cross-reference ``src/manga_gateway/sources/mangaball.py`` for the production
 source metadata — this profile is the TEST-ONLY mirror; production data stays out
 of this file (D-49 keeps profiles structurally separate from the Source class).
 
-Anti-bot expectations
-----------------------
-* ``expected_caps_antibot = "none"`` — matches ``MangaBallSource.antibot`` (D-12).
-  MangaBall serves passive Cloudflare only; the search/recent/manifest API is plain
-  JSON/HTML over the httpx ``csrf-bootstrap`` session-prep seam.
-* ``needs_solver_warm = False`` — MangaBall rides the httpx ``csrf-bootstrap``
-  session-prep (PHPSESSID + X-CSRF-Token), NOT the Patchright browser warm. The
-  Cloudflare solver is never engaged, so the harness must not ``await solver.warm()``.
+Anti-bot expectations (ESCALATED 2026-06-15 — debug mangaball-cloudflare-csrf-243)
+----------------------------------------------------------------------------------
+* ``expected_caps_antibot = "cloudflare"`` — matches ``MangaBallSource.antibot``.
+  MangaBall ORIGINALLY served passive Cloudflare only (``antibot="none"``), but on
+  2026-06-15 it enabled a site-wide managed challenge (``cf-mitigated: challenge``,
+  HTTP 403 on /, /manga, /search). The escalation documented below was executed: the
+  source is now ``cloudflare`` and the search/recent/manifest API rides the shared
+  Patchright cf_clearance seam UNDER the httpx ``csrf-bootstrap`` session-prep.
+* ``needs_solver_warm = True`` — MangaBall now needs a cleared Cloudflare session
+  (cf_clearance) BEFORE the csrf-bootstrap GET, so the harness must warm the solver.
+  The bootstrap GET itself carries the captured cf_clearance cookie + bound UA
+  (framework ``session_prep.py:CsrfBootstrap``), then the X-CSRF-Token + PHPSESSID
+  ride on top — the cf + csrf-bootstrap union.
 
-RESIDENTIAL-ONLY caveat + ONE-ATTRIBUTE escalation path (D-12)
---------------------------------------------------------------
-The ``antibot="none"`` classification was established from a RESIDENTIAL IP only.
-Running this smoke from a DATACENTER IP MAY surface a managed Cloudflare challenge
-that this profile does not account for — that is the unproven #65/#82 datacenter-IP
-gap, NOT a profile or source regression. Phase completion is deliberately NOT gated
-on a datacenter-IP CF check.
+CF-CLEARABILITY caveat (the open verification, like comix/kagane/mangadot)
+--------------------------------------------------------------------------
+Whether the deploy/CI (headed-Xvfb-Linux + residential proxy) fingerprint can CLEAR
+MangaBall's new managed challenge is the open question this profile cannot assert
+statically — same class of risk as kagane/mangadot (unclearable on that fingerprint)
+vs comix (clearable). If the branch nightly shows mangaball still red after this
+escalation, mangaball joins ``GATEWAY_DISABLED_SOURCES`` in
+``.github/workflows/nightly-live-smoke.yml`` (precedent: kagane,mangadot) and the
+production fix stands on its own (the residential-IP headed solver clears it).
 
-If a datacenter-IP run does surface a managed challenge, escalation is a
-ONE-ATTRIBUTE flip on the production source — set
-``MangaBallSource.antibot = "cloudflare"`` in ``src/manga_gateway/sources/mangaball.py``
-(which routes it through the shared CloudflareSolver, exactly like Comix) and then
-flip this profile's ``expected_caps_antibot`` to ``"cloudflare"`` and
-``needs_solver_warm`` to ``True`` to match. No networking/glue code changes — the
-framework already owns the clearance path.
+ESCALATION HISTORY (D-12): this was the documented ONE-ATTRIBUTE escalation —
+``MangaBallSource.antibot`` flipped ``"none"`` → ``"cloudflare"`` + a
+``cloudflare_challenge_url``, with no networking/glue code change beyond threading
+cf_clearance into the bootstrap GET (the framework already owned the clearance path).
 
 Release shape (D-08): MangaBall releases carry ``title_id`` as the leading guid
 segment (``mangaball:{title_id}:ch-{number}:{language}:{translation_id}``); the
@@ -59,9 +63,11 @@ confirms / tunes:
 
 * **default_query stability** — confirm "one piece" still returns a deterministic
   leading hit with an available short chapter; swap if the catalog shifts.
-* **download_timeout_s** — currently 180.0 (no Cloudflare warm + plaintext CDN
-  ``.jpg`` fetch → far shorter than Comix's 480s; matches MangaDex's 180s). Re-size
-  against the real end-to-end download wall-clock.
+* **download_timeout_s** — currently 180.0. NOTE (2026-06-15 escalation): the
+  Cloudflare warm is now eager at startup, so by download time clearance is cached and
+  the per-chapter wall-clock is still the plaintext CDN ``.jpg`` fetch (far shorter
+  than Comix's 480s; matches MangaDex's 180s). Re-size against the real end-to-end
+  download wall-clock; bump if a cold CF re-solve mid-download pushes past 180s.
 * **Referer on the CDN image GET (A5; RECON §4 / Open Q4)** — the
   ``chikorita.red-and-blue.net/storage/...`` CDN likely enforces hotlink
   protection. If the bare image GET 403s live, ``MangaBallSource.fetch_image`` must
@@ -96,8 +102,10 @@ LIVE_SMOKE = LiveSmokeProfile(
     # (07-RECON-mangaball.md §1). Live-tune for a deterministic short-chapter
     # leading hit if the catalog shifts (see docstring "Default-query selection").
     default_query="one piece",
-    expected_caps_antibot="none",
-    needs_solver_warm=False,
+    # ESCALATED 2026-06-15 (debug mangaball-cloudflare-csrf-243): site-wide managed
+    # challenge → MangaBallSource.antibot is now "cloudflare" + needs solver warm.
+    expected_caps_antibot="cloudflare",
+    needs_solver_warm=True,
     # No Cloudflare warm + plaintext CDN images → far shorter than Comix's 480s;
     # 180s matches MangaDex's plain-CDN budget. Refined against the real
     # end-to-end download wall-clock on the first deploy-host smoke.
