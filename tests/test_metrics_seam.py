@@ -351,6 +351,55 @@ async def test_job_transition_and_fail_emit_job_events(
 
 
 @pytest.mark.asyncio
+async def test_emit_job_carries_explicit_manga_title_and_chapter_number(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """#238: ``_emit_job`` threads the job's resolved series/chapter into the
+    ``kind="job"`` event so a failure burst is attributable (was always null).
+
+    The job runs OUTSIDE request scope, so the request-stash seam never fires here —
+    the explicit args are the ONLY attribution path, and they must win regardless of
+    ``kind != "request"`` (the historic gate that Noned them by construction)."""
+    from manga_gateway.jobs.engine import _emit_job
+
+    _emit_job(
+        "mangaball",
+        op="failed",
+        outcome="error",
+        error='page 4 invalid: 512 bytes, sniff=html, head="<!DOCTYPE html>"',
+        manga_title="Solo Leveling",
+        chapter_number=40.2,
+    )
+
+    _c, store = collector
+    jobs = [e for e in store.iter_recent() if e.kind == "job"]
+    assert len(jobs) == 1
+    fail = jobs[0]
+    assert fail.op == "failed"
+    assert fail.source_key == "mangaball"
+    # The attribution the 1024-failure burst lacked is now carried on the event.
+    assert fail.manga_title == "Solo Leveling"
+    assert fail.chapter_number == 40.2
+
+
+@pytest.mark.asyncio
+async def test_emit_job_without_attribution_stays_null(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """A ``_emit_job`` call that passes no series/chapter still records ``None`` —
+    the new path is strictly additive and never invents attribution (#238)."""
+    from manga_gateway.jobs.engine import _emit_job
+
+    _emit_job("comix", op="downloading", outcome="ok", error=None)
+
+    _c, store = collector
+    jobs = [e for e in store.iter_recent() if e.kind == "job"]
+    assert len(jobs) == 1
+    assert jobs[0].manga_title is None
+    assert jobs[0].chapter_number is None
+
+
+@pytest.mark.asyncio
 async def test_package_callsite_emits_package_with_nonzero_duration(
     collector: tuple[Collector, CapturingRingWriter],
 ) -> None:

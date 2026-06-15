@@ -76,6 +76,8 @@ class Collector:
         error: str | None,
         result_count: int | None = None,
         candidates_enumerated: int | None = None,
+        manga_title: str | None = None,
+        chapter_number: float | None = None,
     ) -> None:
         req = current_request.get()
         # 260605-e9a: the umbrella ``request`` event's request_blob / result_count /
@@ -114,10 +116,19 @@ class Collector:
             # 260605-nqo: resolved manga_title/chapter_number stashed into
             # current_request by the download routes (POST from the record;
             # GET/DELETE-by-id from the persisted Job). Read back for the umbrella
-            # ``request`` event only — None for every other kind (keys are absent).
-            manga_title=_req_str(req, "manga_title") if kind == "request" else None,
+            # ``request`` event from the request stash; for a ``kind="job"`` event
+            # (260615-238) the engine passes them EXPLICITLY (it runs outside
+            # request scope), so an explicit arg WINS — mirroring how result_count
+            # lets a per-source event override the contextvar above.
+            manga_title=(
+                manga_title
+                if manga_title is not None
+                else (_req_str(req, "manga_title") if kind == "request" else None)
+            ),
             chapter_number=(
-                _req_float(req, "chapter_number") if kind == "request" else None
+                chapter_number
+                if chapter_number is not None
+                else (_req_float(req, "chapter_number") if kind == "request" else None)
             ),
             # 260605-wab: per-item GET /downloads queue contents stashed into
             # current_request by the route. Read back for the umbrella ``request``
@@ -241,7 +252,13 @@ class Collector:
         outcome: str,
         duration_ms: float = 0.0,
         error: str | None = None,
+        manga_title: str | None = None,
+        chapter_number: float | None = None,
     ) -> None:
+        # 260615-238: the engine runs OUTSIDE request scope, so the request-stash
+        # seam that populates manga_title/chapter_number for ``request`` events is
+        # unavailable here. The engine threads them EXPLICITLY from the ``Job`` so a
+        # ``kind="job"`` event self-attributes to a series/chapter instead of null.
         self._ingest(
             kind="job",
             op=op,
@@ -252,6 +269,8 @@ class Collector:
             duration_ms=duration_ms,
             attempt=1,
             error=error,
+            manga_title=manga_title,
+            chapter_number=chapter_number,
         )
 
     def emit_request(

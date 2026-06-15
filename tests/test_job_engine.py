@@ -277,6 +277,64 @@ async def test_run_fails_on_invalid_image_blob(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalid_page_failure_is_attributed_and_self_diagnosing(
+    tmp_path: Path,
+) -> None:
+    """#238: an invalid-image (non-image bytes) page failure must (1) attribute the
+    ``kind="job"`` failure event to the job's resolved series/chapter — the 1024
+    MangaBall failures recorded null — and (2) carry a self-diagnosing message that
+    sniffs the non-image body (byte length + class + head) so a recurrence is
+    diagnosable from telemetry alone."""
+    from manga_gateway.metrics.collector import Collector, set_collector
+    from manga_gateway.metrics.context import current_source
+    from manga_gateway.metrics.store import InMemoryStore
+
+    from ._metrics_helpers import CapturingRingWriter
+
+    ring = CapturingRingWriter()
+    set_collector(Collector(InMemoryStore(slow_factor=3.0), ring_writer=ring))  # type: ignore[arg-type]
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        urls = ["http://node/data/h/p1.png", "http://node/data/h/p2.png"]
+        # A Cloudflare-style HTML challenge body in place of page 2's image — the
+        # exact non-image shape the bounded MangaBall window returned.
+        html_blob = b"<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+        src = _StubSource(
+            manifest=urls,
+            image_map={urls[0]: _png_bytes(), urls[1]: html_blob},
+        )
+        engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
+        job = _make_job()
+        job.manga_title = "Solo Leveling"
+        job.chapter_number = 40.2
+        await store.insert(job)
+
+        await engine.run(job)
+
+        assert job.status == JobStatus.FAILED
+        assert not _has_cbz_under(tmp_path / "out")
+
+        # (1) the persisted/wire message is self-diagnosing: byte length + sniff + head.
+        assert job.message is not None
+        assert "page 2 invalid" in job.message
+        assert "sniff=html" in job.message
+        assert f"{len(html_blob)} bytes" in job.message
+
+        # (2) the kind="job" failure event is ATTRIBUTED (was null pre-#238).
+        fail = next(
+            e for e in ring.iter_recent() if e.kind == "job" and e.op == "failed"
+        )
+        assert fail.source_key == "stub"
+        assert fail.manga_title == "Solo Leveling"
+        assert fail.chapter_number == 40.2
+        assert fail.error is not None and "sniff=html" in fail.error
+    finally:
+        await store.close()
+        set_collector(None)
+        current_source.set(None)
+
+
+@pytest.mark.asyncio
 async def test_run_fails_when_manifest_unresolvable(tmp_path: Path) -> None:
     store = await open_store(str(tmp_path / "jobs.db"))
     try:

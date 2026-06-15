@@ -59,6 +59,55 @@ def test_is_valid_image_rejects_empty() -> None:
     assert package.is_valid_image(b"") is False
 
 
+# ─────────────────────────── describe_non_image (#238) ──────────────────────────
+
+
+def test_describe_non_image_empty_body() -> None:
+    assert package.describe_non_image(b"") == "0 bytes (empty body)"
+
+
+def test_describe_non_image_classifies_html_challenge() -> None:
+    # A Cloudflare-style challenge page — the realistic MangaBall #238 non-image body.
+    body = b"<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+    out = package.describe_non_image(body)
+    assert "sniff=html" in out
+    assert f"{len(body)} bytes" in out
+    assert "<!DOCTYPE html>" in out  # head preview is printable-verbatim
+
+
+def test_describe_non_image_classifies_html_with_leading_whitespace() -> None:
+    body = b"\n\n   <html><body>520 origin error</body></html>"
+    assert "sniff=html" in package.describe_non_image(body)
+
+
+def test_describe_non_image_classifies_json_error_body() -> None:
+    body = b'{"error":"rate limited","retryAfter":60}'
+    assert "sniff=json" in package.describe_non_image(body)
+
+
+def test_describe_non_image_classifies_plain_text() -> None:
+    assert "sniff=text" in package.describe_non_image(b"520: Web server returned error")
+
+
+def test_describe_non_image_classifies_gzip_magic() -> None:
+    assert "sniff=gzip" in package.describe_non_image(b"\x1f\x8b\x08\x00rest")
+
+
+def test_describe_non_image_classifies_unknown_binary() -> None:
+    # A truncated PNG header is binary, not text/html/json/gzip.
+    out = package.describe_non_image(_png_bytes()[:20])
+    assert "sniff=binary" in out
+
+
+def test_describe_non_image_escapes_nonprintable_head_and_truncates() -> None:
+    body = b"\x00\x01\x02\xff" + b"A" * 100
+    out = package.describe_non_image(body)
+    # Non-printable head bytes are \xNN-escaped (log/JSON-safe) and long bodies elide.
+    assert "\\x00" in out and "\\x01" in out and "\\xff" in out
+    assert "…" in out
+    assert f"{len(body)} bytes" in out
+
+
 # ──────────────────────────────────── write_cbz ─────────────────────────────────
 
 

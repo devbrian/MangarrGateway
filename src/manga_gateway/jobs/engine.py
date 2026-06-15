@@ -46,6 +46,7 @@ from ..metrics.collector import get_collector
 from .model import Job, JobStatus
 from .package import (
     compute_output_path,
+    describe_non_image,
     is_valid_image,
     write_cbt,
     write_cbz,
@@ -55,13 +56,26 @@ from .package import (
 _log = logging.getLogger("manga_gateway.jobs.engine")
 
 
-def _emit_job(source_key: str, *, op: str, outcome: str, error: str | None) -> None:
+def _emit_job(
+    source_key: str,
+    *,
+    op: str,
+    outcome: str,
+    error: str | None,
+    manga_title: str | None = None,
+    chapter_number: float | None = None,
+) -> None:
     """No-op-safe, failure-isolated ``emit_job`` (OBS-01/05, T-08-15).
 
     The engine runs OUTSIDE a fan-out child, so ``current_source`` is unbound here;
     ``source_scope`` binds the job's source_key for the duration of the emit so the
     job event self-attributes. Strictly additive — a ``None`` collector is a no-op
     and a collector error never breaks a job transition.
+
+    #238: ``manga_title``/``chapter_number`` are threaded EXPLICITLY from the ``Job``
+    (the job runs outside HTTP-request scope, so the request-stash seam the routes
+    use is unavailable here) so ``kind="job"`` failure/transition events are
+    attributable to a specific series/chapter instead of recording ``null``.
     """
     collector = get_collector()
     if collector is None:
@@ -70,7 +84,13 @@ def _emit_job(source_key: str, *, op: str, outcome: str, error: str | None) -> N
         from ..metrics.context import source_scope
 
         with source_scope(source_key):
-            collector.emit_job(op=op, outcome=outcome, error=error)
+            collector.emit_job(
+                op=op,
+                outcome=outcome,
+                error=error,
+                manga_title=manga_title,
+                chapter_number=chapter_number,
+            )
     except Exception:  # noqa: BLE001 — a metric failure must never break a job
         pass
 
@@ -408,7 +428,15 @@ class JobEngine:
                     ) from exc
             ok = await asyncio.to_thread(is_valid_image, content)
             if not ok:
-                raise SourceError("source_unavailable", f"page {index + 1} invalid")
+                # #238: a bare "page N invalid" is undiagnosable — surface a cheap
+                # byte-length + magic-byte sniff + head preview of the non-image
+                # body so a recurrence (CDN HTML error / anti-bot challenge /
+                # truncation / empty) is self-diagnosing from the error alone. No
+                # recompress, no full parse (PKG-04) — prefix inspection only.
+                raise SourceError(
+                    "source_unavailable",
+                    f"page {index + 1} invalid: {describe_non_image(content)}",
+                )
             results[index] = (_page_filename(url), content)
             # Progress lives in the projection only — no per-page SQLite write
             # (RESEARCH Pattern 2 / DL-05).
@@ -489,7 +517,16 @@ class JobEngine:
         # Additive job-state metric (OBS-05): every RESOLVING→…→COMPLETED change
         # flows through here. op = the new state; outcome ok (the failure twin is
         # in _fail). Strictly additive — no effect on the write-through above.
-        _emit_job(job.source_key, op=status.value, outcome="ok", error=None)
+        # #238: carry the job's resolved series/chapter so the transition event is
+        # attributable (symmetry with the failure emit below).
+        _emit_job(
+            job.source_key,
+            op=status.value,
+            outcome="ok",
+            error=None,
+            manga_title=job.manga_title,
+            chapter_number=job.chapter_number,
+        )
 
     async def _fail(self, job: Job, message: str) -> None:
         previous = job.status
@@ -508,7 +545,16 @@ class JobEngine:
             message,
         )
         # Additive job-failure metric (OBS-05): the failure twin of _transition.
-        _emit_job(job.source_key, op="failed", outcome="error", error=message)
+        # #238: thread the job's resolved series/chapter so the 1024-style failure
+        # burst is attributable (was recording null manga_title/chapter_number).
+        _emit_job(
+            job.source_key,
+            op="failed",
+            outcome="error",
+            error=message,
+            manga_title=job.manga_title,
+            chapter_number=job.chapter_number,
+        )
 
 
 class _StaleManifest(Exception):
