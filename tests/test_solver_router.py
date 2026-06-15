@@ -17,6 +17,7 @@ from manga_gateway.framework.antibot import AntiBotSolver, Clearance
 from manga_gateway.framework.base import Source
 from manga_gateway.framework.solver_router import SolverRouter
 from manga_gateway.sources.kagane import KaganeSource
+from manga_gateway.sources.mangaball import MangaBallSource
 from manga_gateway.sources.mangadot import MangadotSource
 
 
@@ -178,6 +179,9 @@ def test_source_default_engine_is_patchright() -> None:
 def test_mangadot_and_kagane_select_android() -> None:
     assert MangadotSource.solver_engine == "android"
     assert KaganeSource.solver_engine == "android"
+    # #243: mangaball joined the android leg after its CF escalation proved
+    # unclearable by desktop Chromium from Linux (see mangaball-cloudflare-csrf-243).
+    assert MangaBallSource.solver_engine == "android"
 
 
 # ───────────────────────────── per-source dispatch ─────────────────────────────

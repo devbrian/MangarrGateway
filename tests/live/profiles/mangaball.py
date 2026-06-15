@@ -16,28 +16,34 @@ Anti-bot expectations (ESCALATED 2026-06-15 — debug mangaball-cloudflare-csrf-
   MangaBall ORIGINALLY served passive Cloudflare only (``antibot="none"``), but on
   2026-06-15 it enabled a site-wide managed challenge (``cf-mitigated: challenge``,
   HTTP 403 on /, /manga, /search). The escalation documented below was executed: the
-  source is now ``cloudflare`` and the search/recent/manifest API rides the shared
-  Patchright cf_clearance seam UNDER the httpx ``csrf-bootstrap`` session-prep.
+  source is now ``cloudflare`` with ``solver_engine = "android"`` and the
+  search/recent/manifest API rides the cf_clearance seam UNDER the httpx
+  ``csrf-bootstrap`` session-prep.
 * ``needs_solver_warm = True`` — MangaBall now needs a cleared Cloudflare session
   (cf_clearance) BEFORE the csrf-bootstrap GET, so the harness must warm the solver.
   The bootstrap GET itself carries the captured cf_clearance cookie + bound UA
   (framework ``session_prep.py:CsrfBootstrap``), then the X-CSRF-Token + PHPSESSID
   ride on top — the cf + csrf-bootstrap union.
 
-CF-CLEARABILITY caveat (the open verification, like comix/kagane/mangadot)
---------------------------------------------------------------------------
-Whether the deploy/CI (headed-Xvfb-Linux + residential proxy) fingerprint can CLEAR
-MangaBall's new managed challenge is the open question this profile cannot assert
-statically — same class of risk as kagane/mangadot (unclearable on that fingerprint)
-vs comix (clearable). If the branch nightly shows mangaball still red after this
-escalation, mangaball joins ``GATEWAY_DISABLED_SOURCES`` in
-``.github/workflows/nightly-live-smoke.yml`` (precedent: kagane,mangadot) and the
-production fix stands on its own (the residential-IP headed solver clears it).
+CF-CLEARABILITY (RESOLVED 2026-06-15 — Android solver, NOT desktop Chromium)
+---------------------------------------------------------------------------
+Desktop Patchright/Chromium could NOT clear MangaBall's managed challenge from our
+headed-Xvfb-Linux fingerprint — BOTH the branch nightly AND the 192.168.0.246 deploy
+timed out at 60s (``cf_clearance not captured``), the same wall as kagane/mangadot.
+``solver_engine = "android"`` routes clearance to the redroid-WebView sidecar, which
+DID mint clearance for mangaball on the deploy (verified: ``AndroidSolver minted
+clearance for source 'mangaball'`` → search returned 50 releases). CI has no redroid
+(no binder kernel module), so mangaball joins ``GATEWAY_DISABLED_SOURCES`` in
+``.github/workflows/nightly-live-smoke.yml`` (precedent: kagane,mangadot) AND carries a
+``ci_skip_reason``; the production fix stands on the deploy's Android solver.
 
-ESCALATION HISTORY (D-12): this was the documented ONE-ATTRIBUTE escalation —
-``MangaBallSource.antibot`` flipped ``"none"`` → ``"cloudflare"`` + a
-``cloudflare_challenge_url``, with no networking/glue code change beyond threading
-cf_clearance into the bootstrap GET (the framework already owned the clearance path).
+ESCALATION HISTORY (D-12): ``MangaBallSource.antibot`` flipped ``"none"`` →
+``"cloudflare"`` + a ``cloudflare_challenge_url``, then ``solver_engine = "android"``
+once desktop Chromium proved unable to clear it (above). The only glue beyond those
+attrs was threading cf_clearance into the bootstrap GET (the framework already owned
+the clearance path) — and adding ``mangaball.net`` to the sidecar SSRF allowlist
+(``SOLVER_ALLOWED_HOSTS`` / ``android_solver/config.py``), without which the sidecar
+422s the solve.
 
 Release shape (D-08): MangaBall releases carry ``title_id`` as the leading guid
 segment (``mangaball:{title_id}:ch-{number}:{language}:{translation_id}``); the
@@ -120,4 +126,14 @@ LIVE_SMOKE = LiveSmokeProfile(
     # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
     alt_title_query="나 혼자만 레벨업",
     alt_title_expected_substring="Solo Leveling",
+    # #243: mangaball.net's managed challenge is cleared on the deploy via the redroid/
+    # android-solver sidecar (Android WebView) — desktop Chromium times out from Linux.
+    # CI has no `binder` kernel module so redroid cannot boot there; gated like
+    # kagane/mangadot. expected_caps_antibot stays "cloudflare" (engine is an internal
+    # solver detail, not a /caps classification).
+    ci_skip_reason=(
+        "mangaball.net Cloudflare cleared on the deploy via the redroid/"
+        "android-solver sidecar (Android WebView); CI has no binder kernel "
+        "module — gated, #243"
+    ),
 )

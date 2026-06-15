@@ -34,10 +34,12 @@ _ENV_HOP_PORT = "SOLVER_HOP_PORT"
 _ENV_HOP_HOST = "SOLVER_HOP_HOST"
 
 _DEFAULT_ADB_TARGET = "redroid:5555"
-# The ONLY challenge hosts the sidecar will ever drive a device against — the two
+# The ONLY challenge hosts the sidecar will ever drive a device against — the
 # strict-Turnstile sources proven by the debug spike. A request for any other
-# host is rejected before any device action (SSRF guard, T-10-09).
-_DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("mangadot.net", "kagane.to")
+# host is rejected before any device action (SSRF guard, T-10-09). mangaball.net
+# joined 2026-06-15 (#243) after its managed-challenge escalation proved unclearable
+# by desktop Chromium from our Linux fingerprint (CI + deploy both timed out).
+_DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("mangadot.net", "kagane.to", "mangaball.net")
 _DEFAULT_TIMEOUT_S = 120.0
 # Bounded cleanup window (issue #207 / WR-02): when a solve exceeds the timeout
 # its worker thread CANNOT be force-killed, so the service signals cooperative

@@ -24,10 +24,14 @@ GET: it received the interstitial → no ``meta[name=csrf-token]`` → ``ValueEr
 ``source_unavailable`` on every search/recent/download. Per the documented
 one-attribute escalation, ``antibot`` is now ``"cloudflare"`` +
 ``cloudflare_challenge_url = "https://mangaball.net/"`` — routing BOTH the
-csrf-bootstrap GET and every data POST through the shared Patchright clearance seam.
-The framework already unions cf + csrf-bootstrap (``context.py:_clearance_kwargs``);
-``session_prep.py:CsrfBootstrap`` now threads cf_clearance into the bootstrap GET too,
-so MangaBall stays zero-networking-glue. The ``rate_limit_per_minute = 480`` is a
+csrf-bootstrap GET and every data POST through the shared clearance seam. Desktop
+Chromium/Patchright could NOT clear the new managed challenge from our Linux
+fingerprint (CI + the deploy both timed out at 60s), so ``solver_engine = "android"``
+routes clearance to the redroid-WebView solver that already clears kagane/mangadot
+(resolved debug ``mangadot-cf-linux-fingerprint``). The framework already unions cf +
+csrf-bootstrap (``context.py:_clearance_kwargs``); ``session_prep.py:CsrfBootstrap``
+now threads cf_clearance into the bootstrap GET too, so MangaBall stays
+zero-networking-glue. The ``rate_limit_per_minute = 480`` is a
 conservative ~50%-of-floor value set from the 2026-06-04 probe (no hard limit found;
 manifest/image sustained 960/min at c=8), mirroring the mangadot precedent (#101).
 
@@ -535,6 +539,16 @@ class MangaBallSource(Source):
     # cloudflare source — without it the solver falls back to the framework placeholder
     # host and never earns clearance for mangaball.net.
     cloudflare_challenge_url = "https://mangaball.net/"
+    # #243: route clearance to the Android-WebView solver, NOT desktop Patchright.
+    # MangaBall's 2026-06-15 managed-challenge escalation is the same strict Turnstile
+    # that desktop Chromium cannot clear from our Linux fingerprint — both the branch
+    # nightly AND the 192.168.0.246 deploy timed out at 60s (``cf_clearance not
+    # captured``), exactly like kagane/mangadot (resolved debug
+    # ``mangadot-cf-linux-fingerprint``); the real Android WebView clears it. The shared
+    # ``get_clearance`` wiring dispatches the csrf-bootstrap GET + every data POST via
+    # this engine, so MangaBall is the first android + csrf-bootstrap UNION source. CI
+    # has no redroid sidecar, so the nightly disables mangaball (with kagane/mangadot).
+    solver_engine = "android"
     # NEW class-attr (Plan 01, D-06): the framework maps this onto the shared
     # CsrfBootstrap provider (Plan 02). ``post_json`` injects the harvested
     # X-CSRF-Token + PHPSESSID on every /api/v1 form POST.

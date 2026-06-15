@@ -72,11 +72,14 @@ jobs:
       GATEWAY_CLOUDFLARE_PROXY_SERVER: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_SERVER }}
       GATEWAY_CLOUDFLARE_PROXY_USERNAME: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_USERNAME }}
       GATEWAY_CLOUDFLARE_PROXY_PASSWORD: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_PASSWORD }}
-      # #198/#202: kagane.to + mangadot.net serve a Cloudflare managed challenge
-      # the headed-Xvfb-Linux solver cannot clear (only a headed-macOS fingerprint
-      # clears these). Disabling drops them from the registry → out of /caps, search,
-      # and the solver warm set, so they stop nightly-false-redding AND stop the
-      # doomed-warm storm at startup. REVERSIBLE: drop a source once the Patchright
+      # #198/#202/#243: kagane.to + mangadot.net + mangaball.net serve a Cloudflare
+      # managed challenge the headed-Xvfb-Linux solver cannot clear (these route to the
+      # Android-WebView solver, which the CI runner has no redroid sidecar for; only a
+      # headed-macOS fingerprint clears them with desktop Chromium). Disabling drops them
+      # from the registry → out of /caps, search, and the solver warm set, so they stop
+      # nightly-false-redding AND stop the doomed-warm storm at startup. mangaball joined
+      # 2026-06-15 (#243 — site-wide CF escalation; verified clearing on the deploy via
+      # the Android solver). REVERSIBLE: drop a source once the Patchright
       # Linux-fingerprint work (#202) restores its clearance.
       #
       # comix was briefly in this list (#234) but is RE-ENABLED 2026-06-14: spike 016
@@ -85,7 +88,7 @@ jobs:
       # clears on the stock Linux fingerprint in ~1.5s. NOTE: comix DOWNLOAD live
       # tests still fail on #169 (per-page encryption); search/recent/caps pass. The
       # self-healing-warm follow-up is #236.
-      GATEWAY_DISABLED_SOURCES: kagane,mangadot
+      GATEWAY_DISABLED_SOURCES: kagane,mangadot,mangaball
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.

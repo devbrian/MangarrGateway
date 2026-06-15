@@ -19,6 +19,7 @@ import pytest
 import respx
 
 from manga_gateway.api.routes.recent import _split_multi
+from manga_gateway.sources.mangaball import MangaBallSource
 
 _MANGADEX = "https://api.mangadex.org"
 
@@ -395,26 +396,25 @@ async def test_caps_advertises_live_mangadex_source(client: httpx.AsyncClient) -
     assert md["languages"]  # non-empty
 
 
-@pytest.mark.asyncio
-async def test_caps_advertises_mangaball_antibot_cloudflare(
-    client: httpx.AsyncClient,
-) -> None:
-    # 07-03: registering MangaBallSource auto-advertises it via registry.caps()
-    # (CAPS-02). Since the 2026-06-15 site-wide managed-challenge escalation (debug
-    # mangaball-cloudflare-csrf-243) MangaBall is antibot "cloudflare" (was "none").
-    # Deterministic gate: CloudflareSolver.warm is the conftest no-op, so mangaball is
-    # NOT force_disabled and stays advertised enabled.
-    resp = await client.get("/caps")
-    assert resp.status_code == 200
-    sources = resp.json()["sources"]
-    mb = next((s for s in sources if s["key"] == "mangaball"), None)
-    assert mb is not None, "mangaball not advertised in /caps"
-    assert mb["antibot"] == "cloudflare"
-    assert mb["enabled"] is True
-    assert mb["rateLimitPerMinute"] > 0
-    assert mb["languages"]  # non-empty ALL_LANGUAGES set
-    assert mb["supportsSearch"] is True
-    assert mb["supportsRecent"] is True
+def test_mangaball_class_declares_cloudflare_android_antibot() -> None:
+    # Since the 2026-06-15 site-wide managed-challenge escalation (debug
+    # mangaball-cloudflare-csrf-243) MangaBall is antibot "cloudflare" (was "none")
+    # and routes to the Android-WebView solver (``solver_engine == "android"``) because
+    # desktop Chromium cannot clear it from Linux. Asserted at the CLASS level (mirrors
+    # test_comix_caps / test_mangafire_caps): like mangadot/kagane, mangaball is an
+    # android source that boots force_disabled in any env without a redroid sidecar, so
+    # a live ``/caps`` enabled check cannot hold deterministically (the conftest no-ops
+    # only CloudflareSolver.warm, not AndroidSolver.warm). The engine is an internal
+    # solver detail — ``antibot`` stays the "cloudflare" /caps classification.
+    assert MangaBallSource.antibot == "cloudflare"
+    assert MangaBallSource.solver_engine == "android"
+    assert MangaBallSource.cloudflare_challenge_url == "https://mangaball.net/"
+    assert MangaBallSource.session_prep == "csrf-bootstrap"
+    assert MangaBallSource.key == "mangaball"
+    assert MangaBallSource.rate_limit_per_minute > 0
+    assert MangaBallSource.languages  # non-empty ALL_LANGUAGES set
+    assert MangaBallSource.supports_search is True
+    assert MangaBallSource.supports_recent is True
 
 
 @pytest.mark.asyncio
