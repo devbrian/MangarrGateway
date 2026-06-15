@@ -117,8 +117,11 @@ async def _recovery_watchdog(
 
     On a tripped breaker, re-probe the source on an ESCALATING schedule (+1h, then
     +6h by default) — NOT on the request path. A probe that succeeds resets the
-    breaker (``record_success`` → re-enabled); after the last backoff step the
-    source stays down until a manual restart (no busy retry, D-37).
+    breaker (``record_success`` → re-enabled). This call returns after the last
+    backoff step WITHOUT recovery, but the caller (``_supervise_source``) re-enters
+    it after its next 60s poll — so a still-down source keeps being re-probed on a
+    repeating +1h/+6h cadence and is NEVER pinned down until restart (#236). The
+    escalating backoff (not a busy retry) is the doomed-warm-storm guard (D-37).
 
     ``sleep``/``probe`` are injectable so tests assert the schedule with a fake clock
     and no real waiting. The probe returns ``True`` on recovery, ``False`` otherwise.
@@ -132,8 +135,10 @@ async def _recovery_watchdog(
             health.record_success()  # breaker resets → source re-enabled
             _log.info("Recovery watchdog re-enabled a source after a re-probe")
             return
-    # Exhausted the backoff schedule — stay down until manual restart (D-37).
-    _log.warning("Recovery watchdog exhausted backoff; source stays down until restart")
+    # Exhausted this backoff cycle without recovery. The caller's supervisor loop
+    # re-enters the watchdog after its next poll, so the source is re-probed again
+    # on the same +1h/+6h schedule rather than staying down until restart (#236).
+    _log.warning("Recovery watchdog exhausted backoff cycle; will re-probe next cycle")
 
 
 @asynccontextmanager
