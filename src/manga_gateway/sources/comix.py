@@ -94,9 +94,21 @@ path, not just a drift-test bug: every Comix CBZ shipped for a chapter
 longer than ~4 pages was missing middle pages. The fix walks pages
 SEQUENTIALLY again, scroll → small await → poll for the page's img with
 a tight per-page budget, accepting an O(pages) wall-clock term in exchange
-for correctness. The Step-1 scaffold wait is also hardened to wait for
-COUNT STABILITY (count unchanged for 3 x 100ms ticks, capped at 8s) so
-the extractor never snapshots a partial scaffold.
+for correctness. The Step-1 scaffold wait was originally hardened to a
+count-unchanged-for-3-ticks (300ms) stabilization — superseded below.
+
+Issue (debug comix-scaffold-partial-capture, 2026-06-15): that 3-tick (300ms)
+Step-1 stabilization could still declare a still-building incremental scaffold
+"stable" at a PARTIAL count (a >300ms mid-build pause fooled it), so Step-4
+synthesized a truncated 1..N manifest → a SILENTLY-short CBZ (the #32 class on
+the scaffold-readiness axis — proven by the drift fixture's page count varying
+12→15→17→84 for an invariant 84-page chapter). FIX: read the chapter's TRUE
+length from the reader's own per-page counter ``<span class="rpage-page__counter">
+{n} / {TOTAL}</span>`` (live-probe-verified authoritative N) and wait until the
+scaffold has materialized that many divs, falling back to a hardened 5-tick
+stabilization only when no counter is rendered. Step-4 also synthesizes up to
+that authoritative total as a backstop so the manifest can never be SHORTER than
+the reader's declared page count. See ``_CHAPTER_PAGES_EXTRACT_JS`` Step 1 / 4.
 """
 
 from __future__ import annotations
@@ -693,8 +705,16 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 # page is genuinely broken/gated and we return ``[]`` → fetch_manifest raises
 # ``malformed chapter manifest`` (fast, correct) rather than fabricating URLs.
 #
-# Step-1 scaffold wait is unchanged: count-unchanged-for-3-consecutive-ticks
-# (8s cap) so a partial scaffold cannot race the capture/synthesis.
+# Step-1 scaffold wait (debug comix-scaffold-partial-capture, 2026-06-15): the
+# old count-unchanged-for-3-ticks (300ms) stabilization could snapshot a PARTIAL
+# scaffold (a >300ms mid-build pause fooled it → silently-short manifest). Step 1
+# now reads the chapter's TRUE length from the reader's per-page counter
+# (`.rpage-page__counter` "{n} / {TOTAL}", live-verified authoritative N) and
+# waits until the scaffold has materialized that many divs — falling back to a
+# hardened 5-tick stabilization only when no counter is present. Step 4 also
+# synthesizes up to that authoritative total so the manifest can never be shorter
+# than the reader's declared page count (the engine is all-or-nothing, so
+# complete-or-loud-fail is correct; silently-short is the bug). 8s cap.
 _CHAPTER_PAGES_EXTRACT_JS = """
   // Comix's chapter reader is a Swiper.js component. Historically a long-strip
   // (`rpage--long-strip rpage--ttb`); as of 2026-06-03 a single-page paginated
@@ -703,7 +723,11 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   // `<div class="rpage-page" data-page="N">` whose <img> child is LAZY-LOADED.
   //
   // Strategy (debug comix-manifest-60s-timeout, 2026-06-03):
-  //   Step 1 — wait for the data-page scaffold COUNT to stabilize (gives N).
+  //   Step 1 — read the TRUE page count N from the reader's authoritative
+  //            `.rpage-page__counter` denominator and wait until the data-page
+  //            scaffold has materialized N divs (hardened 5-tick fallback when
+  //            no counter is rendered). Old 3-tick stabilization could snapshot
+  //            a partial scaffold (debug comix-scaffold-partial-capture).
   //   Step 2 — find the inner Swiper scroll container by ancestor walk, then
   //            scrollTo(scrollHeight/2) + scrollTo(scrollHeight) with ~500ms
   //            settle each; capture every CDN-matching <img> after each scroll
@@ -722,19 +746,49 @@ _CHAPTER_PAGES_EXTRACT_JS = """
   // token/filename shape (and the _COMIX_CDN_PATH_RE allowlist) carry the trust.
   const rx = /\\/[a-z0-9]{2,4}\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
 
-  // Step 1: wait for the page scaffold COUNT TO STABILIZE. Returning on the
-  // first .rpage-page[data-page] div would race Swiper's incremental
-  // scaffold and snapshot a partial pageDivs list. Poll every 100ms;
-  // declare the scaffold ready once the count has been unchanged for 3
-  // consecutive ticks (with a non-zero count so "still zero" isn't stable).
-  // Cap at 8s wall-clock — beyond that the page is genuinely broken.
+  // Step 1: determine the TRUE page count and wait for the scaffold to reach it.
+  //
+  // AUTHORITATIVE SOURCE (debug comix-scaffold-partial-capture, 2026-06-15):
+  // the reader renders the chapter's true length in EVERY page's counter
+  // `<span class="rpage-page__counter">{n} / {TOTAL}</span>` — live-probe-
+  // verified TOTAL=84 on the 84-page chapter, present the instant the scaffold
+  // appears. That denominator is a single scalar from the decrypted page-list
+  // metadata (atomic), NOT a running count of incrementally-appended divs, so
+  // it is IMMUNE to the mid-build race that made the old
+  // count-unchanged-for-3-ticks (300ms) heuristic snapshot a PARTIAL scaffold
+  // count (captured 12/15/17 instead of 84 → silently-truncated CBZ, the #32
+  // failure class on the scaffold-readiness axis). Parse the MAX denominator
+  // (monotonic — survives a transient counter re-render) and exit as soon as
+  // the .rpage-page[data-page] scaffold has materialized that many divs (the
+  // scaffold is built 1..N; verified live). Fall back to a HARDENED
+  // count-stabilization (unchanged for 5 consecutive ticks, up from 3) ONLY
+  // when no counter is rendered (other/future reader variants). 8s cap either
+  // way — in the common case the authoritative break fires in ~1s (faster than
+  // the old quiet-window wait).
+  const readAuthoritativeTotal = () => {
+    let total = 0;
+    for (const el of document.querySelectorAll('.rpage-page__counter')) {
+      const m = (el.textContent || '').match(/\\/\\s*(\\d+)\\s*$/);
+      if (m) { const d = parseInt(m[1], 10); if (d > total) total = d; }
+    }
+    return total;
+  };
+  let authTotal = 0;
   let stable = 0;
   let lastCount = -1;
   for (let i = 0; i < 80; i++) {
     const count = document.querySelectorAll('.rpage-page[data-page]').length;
-    if (count > 0 && count === lastCount) {
+    authTotal = Math.max(authTotal, readAuthoritativeTotal());
+    if (authTotal > 0) {
+      // Authoritative path: stop once the scaffold holds every declared page.
+      // Append-only scaffold ⇒ count never regresses below a value we passed.
+      if (count >= authTotal) break;
+    } else if (count > 0 && count === lastCount) {
+      // Fallback path (no counter): require a LONGER quiet window than the old
+      // 3-tick (300ms) heuristic so a brief mid-build pause is less likely to
+      // be mistaken for "scaffold done".
       stable += 1;
-      if (stable >= 3) break;
+      if (stable >= 5) break;
     } else {
       stable = 0;
       lastCount = count;
@@ -861,9 +915,23 @@ _CHAPTER_PAGES_EXTRACT_JS = """
       const width = sm[2].length;
       const ext = sm[3];
       const offset = sampleFile - sampleN;
+      // Target page numbers = the scaffold's data-page numbers UNION 1..authTotal.
+      // The scaffold is the primary source (it carries the real 0-/1-indexed +
+      // gappy numbering); authTotal (the authoritative .rpage-page__counter
+      // denominator, debug comix-scaffold-partial-capture) is the BACKSTOP that
+      // guarantees the manifest is never SHORTER than the reader's declared page
+      // count even if the scaffold under-materialized at the 8s cap. The engine
+      // is all-or-nothing (jobs/engine.py) — a manifest that is COMPLETE (or a
+      // loud fetch fail on a non-existent page) is correct; a silently-short one
+      // is the #32 bug. NEVER synthesize from an empty capture (guarded above).
+      const targets = new Set();
       for (const div of pageDivs) {
         const n = parseInt(div.getAttribute('data-page') || '0', 10);
-        if (!n || seen.has(n)) continue;
+        if (n) targets.add(n);
+      }
+      for (let n = 1; n <= authTotal; n++) targets.add(n);
+      for (const n of targets) {
+        if (seen.has(n)) continue;
         const fileNum = n + offset;
         if (fileNum < 0) continue;
         const padded = String(fileNum).padStart(width, '0');

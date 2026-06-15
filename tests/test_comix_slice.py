@@ -541,6 +541,19 @@ async def test_comix_fetch_manifest_routes_through_browser(
     # The per-page walk is gone: no scrollIntoView CALL remains (the strategy
     # comment may still name it, so match the invocation form, not the word).
     assert ".scrollIntoView(" not in extract_body
+    # debug comix-scaffold-partial-capture (2026-06-15): Step 1 now reads the
+    # chapter's TRUE length from the reader's authoritative per-page counter
+    # ``.rpage-page__counter`` ("{n} / {TOTAL}") and waits until the scaffold has
+    # materialized that many divs, instead of the old count-unchanged-for-3-ticks
+    # stabilization that could snapshot a PARTIAL scaffold (silently-short
+    # manifest, the #32 class). Step 4 also synthesizes up to that authoritative
+    # total (``authTotal``) as a backstop. Assert both markers are present so a
+    # regression that drops the authoritative read is caught offline, not only by
+    # the live nightly. The old 3-tick literal must be gone (now a 5-tick fallback
+    # for the no-counter variant).
+    assert "rpage-page__counter" in extract_body
+    assert "authTotal" in extract_body
+    assert "stable >= 3" not in extract_body
     # Issue #20: wait_for is now None — the extractor's own Step-1 polls for
     # the scaffold from inside ``page.evaluate``. A Python-side wait_for_selector
     # would double-wait the same condition and add ~1 s of pure overhead.
