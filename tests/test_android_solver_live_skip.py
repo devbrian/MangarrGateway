@@ -62,7 +62,7 @@ def test_healthz_503_skips(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_connection_error_skips_without_raising(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """URL set + connection error -> (False, reason naming the error type), never raises."""
+    """URL set + connection error -> (False, reason names error type); never raises."""
     _android_solver_reachable.cache_clear()
     monkeypatch.setenv("GATEWAY_ANDROID_SOLVER_URL", _SOLVER_URL)
     respx.get(f"{_SOLVER_URL}/healthz").mock(
