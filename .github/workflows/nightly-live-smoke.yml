@@ -29,6 +29,27 @@
 # Action SHA pinning + persist-credentials:false mirror ci.yml's supply-chain
 # discipline (RESEARCH security domain — CodeRabbit/zizmor: excessive-permissions
 # + tampering via floating tag).
+#
+# Connectivity model (Model A / #215): the three Android-WebView sources
+# (mangadot, kagane, mangaball) clear their Cloudflare managed-challenge ONLY
+# via the home redroid + android-solver sidecar (CI has no `binder` kernel
+# module, so redroid cannot boot on ubuntu-latest). Rather than run a
+# self-hosted runner, this nightly joins the home tailnet as an EPHEMERAL
+# tag:ci node (the Tailscale step below, before the live step) and reaches the
+# home android-solver's authenticated `/solve` control API at
+# REDACTED-INTERNAL-IP:18080. Trust boundary discipline:
+#   * Only the authenticated, host-allowlisted `/solve` (tcp:18080) crosses the
+#     boundary — the tailnet ACL MUST grant tag:ci egress to the solver host on
+#     :18080 ONLY (no other ports, no whole-LAN reachability).
+#   * adb (5555) is NEVER exposed — the redroid adb host-publish was removed in
+#     commit bfc3627; the solver speaks to the device in-network only.
+#   * The home android-solver/redroid stack MUST be up; when it is down (or the
+#     solver secrets are unset on forks) the conftest reachability gate SKIPS
+#     the three sources' live tests (JUnit <skipped>, non-failing) instead of
+#     erroring — an offline home stack never reds the nightly.
+#   * The residential proxy secrets MUST point at a STICKY-session entry: the
+#     android solve asserts exact solve-IP == fetch-IP equality (egress-verify),
+#     so a rotating upstream fails every solve and looks like a CF problem.
 
 name: nightly-live-smoke
 
@@ -72,23 +93,33 @@ jobs:
       GATEWAY_CLOUDFLARE_PROXY_SERVER: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_SERVER }}
       GATEWAY_CLOUDFLARE_PROXY_USERNAME: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_USERNAME }}
       GATEWAY_CLOUDFLARE_PROXY_PASSWORD: ${{ secrets.GATEWAY_CLOUDFLARE_PROXY_PASSWORD }}
-      # #198/#202/#243: kagane.to + mangadot.net + mangaball.net serve a Cloudflare
-      # managed challenge the headed-Xvfb-Linux solver cannot clear (these route to the
-      # Android-WebView solver, which the CI runner has no redroid sidecar for; only a
-      # headed-macOS fingerprint clears them with desktop Chromium). Disabling drops them
-      # from the registry → out of /caps, search, and the solver warm set, so they stop
-      # nightly-false-redding AND stop the doomed-warm storm at startup. mangaball joined
-      # 2026-06-15 (#243 — site-wide CF escalation; verified clearing on the deploy via
-      # the Android solver). REVERSIBLE: drop a source once the Patchright
-      # Linux-fingerprint work (#202) restores its clearance.
+      # Android-solver wiring (#215 Model A). These bind via the GATEWAY_ prefix to
+      # settings.android_solver_url / settings.android_solver_api_key (SecretStr,
+      # sent as X-Solver-Key), which app.py's lifespan uses to build the AndroidSolver
+      # leg that mangadot/kagane/mangaball route their Cloudflare solve through. Both
+      # come from repo secrets so GitHub auto-masks them in logs (never hardcode the
+      # IP or key). When the URL secret is UNSET (forks / unconfigured repos) the app
+      # boots all android sources with no solver and the conftest reachability gate
+      # SKIPS their live tests — today's behavior preserved.
+      GATEWAY_ANDROID_SOLVER_URL: ${{ secrets.GATEWAY_ANDROID_SOLVER_URL }}
+      GATEWAY_ANDROID_SOLVER_API_KEY: ${{ secrets.GATEWAY_ANDROID_SOLVER_API_KEY }}
+      # #198/#202/#243/#215: mangadot, kagane, and mangaball are RE-ENABLED (was the
+      # disabled set). They serve a Cloudflare managed challenge the headed-Xvfb-Linux
+      # solver cannot clear, so they route to the Android-WebView solver leg — and the
+      # nightly now reaches the home android-solver over Tailscale (Model A, #215, the
+      # ephemeral tag:ci join below), so the runner CAN drive that leg. The conftest
+      # reachability gate skips (does NOT fail) these three whenever the home solver is
+      # unreachable, so a down home-stack triages clean. REVERSIBLE ops knob: re-add a
+      # key to the value below (e.g. set it to ``mangadot``) if that source's home
+      # solve regresses — kept explicit (not deleted) so the knob stays visible.
       #
-      # comix was briefly in this list (#234) but is RE-ENABLED 2026-06-14: spike 016
+      # comix was briefly disabled (#234) but is RE-ENABLED 2026-06-14: spike 016
       # proved #234 was a TRANSIENT CF IP-flag (from the 2026-06-13 pool-exhaustion
       # incident, #233 — now fixed), NOT a fingerprint/IP-class escalation. comix
       # clears on the stock Linux fingerprint in ~1.5s. NOTE: comix DOWNLOAD live
       # tests still fail on #169 (per-page encryption); search/recent/caps pass. The
       # self-healing-warm follow-up is #236.
-      GATEWAY_DISABLED_SOURCES: kagane,mangadot,mangaball
+      GATEWAY_DISABLED_SOURCES: ""
     steps:
       # Actions pinned to full commit SHAs (supply-chain hardening); trailing
       # comment records the human-readable tag — same discipline as ci.yml.
@@ -119,11 +150,32 @@ jobs:
       # realistic fonts reduce the Linux font-fingerprint anomaly.
       - run: sudo apt-get update && sudo apt-get install -y xvfb fonts-liberation fonts-noto-color-emoji
 
+      # Join the home tailnet as an EPHEMERAL tag:ci node so the live app's
+      # AndroidSolver can POST `/solve` to the home android-solver at
+      # REDACTED-INTERNAL-IP:18080 (#215 Model A). The OAuth-client + tags flow
+      # registers an ephemeral node that auto-deregisters when the runner exits
+      # (no manual cleanup, no lingering device). SHA-pinned + trailing version
+      # comment, matching ci.yml's supply-chain discipline. No `id-token: write`
+      # and no widened `permissions:` — the OAuth-secret flow needs neither.
+      - name: Join tailnet (ephemeral, tag:ci) to reach the home android-solver
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
       # Live step — D-58 / Pitfall 4: `continue-on-error: true` so a per-source
       # failure does NOT short-circuit the triage step below. The job's final
       # exit code is owned by the triage step, not by this `pytest` invocation.
+      #
+      # `timeout-minutes: 90` (#215 Model A): each android source needs a real
+      # Android-WebView solve (~1-2 min) and the per-test AndroidSolver is built
+      # per app-build, so three android sources add meaningful wall-clock. 90 min
+      # is a generous-but-bounded guard so a stuck home-stack solve cannot burn
+      # the full 6h runner budget. LIVE-TUNE: resize from the first real dispatch.
       - id: live
         continue-on-error: true
+        timeout-minutes: 90
         run: uv run nox -s live 2>&1 | tee pytest-live.log
 
       # Triage step — `if: always()` so it runs whether the live step passed
