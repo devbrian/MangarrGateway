@@ -60,26 +60,29 @@ async def test_lifespan_swaps_in_solver_router() -> None:
 async def test_engine_partition_splits_patchright_and_android_challenge_urls() -> None:
     """Phase 10 (T-10-13): the lifespan partitions the per-domain challenge-URL map
     by ``Source.solver_engine``. The Patchright leg owns ONLY the patchright sources
-    — comix (``https://comix.to/``) + mangafire (``https://mangafire.to/``, Phase 12)
+    — comix (``https://comix.to/``) and mangafire (``https://mangafire.to/``, Phase 12)
     — so its browser warm/solve is byte-for-byte unchanged and the unclearable-from-
-    Linux mangadot/kagane NEVER enter the Patchright warm set. The Android leg covers
-    the android sources (mangadot ``https://mangadot.net/`` + kagane
-    ``https://kagane.to/``), routed to the redroid-WebView sidecar. Guards against
-    drift that would let either source leak into the wrong engine's challenge map.
+    Linux android sources NEVER enter the Patchright warm set. The Android leg covers
+    the android sources (mangadot ``https://mangadot.net/``, kagane
+    ``https://kagane.to/``, and mangaball ``https://mangaball.net/`` — debug
+    mangaball-cloudflare-csrf-243, whose managed challenge desktop Chromium could not
+    clear from Linux), routed to the redroid-WebView sidecar. Guards against drift that
+    would let either source leak into the wrong engine's challenge map.
     """
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
         solver = app.state.solver
         assert isinstance(solver, SolverRouter)
-        # Patchright leg: comix + mangafire (NOT mangadot/kagane).
+        # Patchright leg: comix + mangafire (NOT the android sources).
         assert solver._patchright._challenge_urls == {
             "comix": "https://comix.to/",
             "mangafire": "https://mangafire.to/",
         }
-        # Android leg: mangadot + kagane (NOT comix).
+        # Android leg: mangadot + kagane + mangaball (NOT comix/mangafire).
         assert solver._android._challenge_urls == {
             "mangadot": "https://mangadot.net/",
             "kagane": "https://kagane.to/",
+            "mangaball": "https://mangaball.net/",
         }
 
 

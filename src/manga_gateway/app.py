@@ -27,7 +27,7 @@ from .api import api_router
 from .config import Settings
 from .errors import register_error_handlers
 from .framework.android_solver import AndroidSolver
-from .framework.antibot import CloudflareSolver
+from .framework.antibot import Clearance, CloudflareSolver
 from .framework.cooldown import SourceFailureCooldown
 from .framework.enum_cache import EnumerationCache
 from .framework.health import SourceHealth
@@ -208,6 +208,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # share the SAME per-source limiter the SourceContext data path uses. One shared
     # RateLimiter instance for the whole lifespan (CsrfBootstrap + contexts + jobs).
     app.state.ratelimiter = RateLimiter()
+
+    # Cloudflare union (debug mangaball-cloudflare-csrf-243): a csrf-bootstrap source
+    # that is ALSO cloudflare-gated (MangaBall, after its 2026-06-15 site-wide managed
+    # challenge) needs the bootstrap GET to ride cf_clearance — else it receives the CF
+    # interstitial (no meta csrf-token) and every search/recent/download fails with
+    # source_unavailable. The provider resolves the clearance LAZILY from the shared
+    # ``solver`` (a SolverRouter built below in this same lifespan scope, long before
+    # the first request triggers a bootstrap GET). For a non-cloudflare csrf source the
+    # solver returns None → the bootstrap GET stays a bare httpx request (unchanged).
+    async def _bootstrap_clearance(source_key: str) -> Clearance | None:
+        return await solver.get_clearance(source_key)
+
     session_prep = CsrfBootstrap(
         keys=frozenset(csrf_bootstrap_keys),
         session=app.state.session,
@@ -218,6 +230,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         rates={
             key: cls.rate_limit_per_minute for key, cls in csrf_bootstrap_keys.items()
         },
+        get_clearance=_bootstrap_clearance,
     )
     app.state.session_prep = session_prep
     # Build the per-domain Cloudflare challenge-URL map (#88): each

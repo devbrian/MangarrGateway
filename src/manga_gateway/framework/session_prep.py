@@ -41,13 +41,20 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
 
+    from .antibot import Clearance
     from .ratelimit import RateLimiter
     from .session import SessionManager
+
+    # The cf_clearance lookup the bootstrap GET rides when the source is ALSO
+    # cloudflare-gated (debug mangaball-cloudflare-csrf-243). Structurally the
+    # solver's ``get_clearance`` — typed as a bare callable so this module does not
+    # depend on the antibot Protocol at runtime (it stays a plain httpx provider).
+    ClearanceProvider = Callable[[str], Awaitable[Clearance | None]]
 
 _log = logging.getLogger("manga_gateway")
 
@@ -135,6 +142,17 @@ class CsrfBootstrap:
 
     ``force_refresh`` is the internal escalation kwarg kept OFF the
     :class:`SessionPrep` Protocol (mirror antibot's ``force_resolve``, D-41).
+
+    Cloudflare union (debug mangaball-cloudflare-csrf-243): a csrf-bootstrap source
+    that is ALSO cloudflare-gated (MangaBall, after its 2026-06-15 site-wide managed
+    challenge) needs the bootstrap GET itself to carry cf_clearance — a bare GET
+    receives the CF interstitial (no ``meta[name=csrf-token]``) and raises. The
+    optional ``get_clearance`` provider supplies the browser-issued cookie + bound UA
+    for that GET; it returns ``None`` for a non-cloudflare source, so the GET stays a
+    plain httpx request (byte-for-byte the pre-243 path). This composes with
+    ``context.py:_clearance_kwargs``, whose cf half solves + caches the clearance
+    BEFORE the session-prep half runs — so the lookup here is a warm-cache read, not
+    a second browser solve.
     """
 
     # Cookie names harvested from the bootstrap response. PHPSESSID is the
@@ -150,6 +168,7 @@ class CsrfBootstrap:
         bootstrap_urls: Mapping[str, str],
         ratelimiter: RateLimiter,
         rates: Mapping[str, int],
+        get_clearance: ClearanceProvider | None = None,
     ) -> None:
         self._keys = frozenset(keys)
         self._session = session
@@ -158,6 +177,13 @@ class CsrfBootstrap:
         # instance) so the bootstrap/refresh GET shares the source's token budget.
         self._ratelimiter = ratelimiter
         self._rates = dict(rates)
+        # Optional cf_clearance lookup for the bootstrap GET (debug
+        # mangaball-cloudflare-csrf-243). ``None`` ⇒ the GET is a bare httpx request,
+        # exactly as before — every non-cloudflare csrf source is unchanged. When
+        # wired (the lifespan passes the shared solver's ``get_clearance``), the GET
+        # rides the browser-issued cf_clearance cookie + bound UA for a source that is
+        # BOTH cloudflare-gated and csrf-bootstrap.
+        self._get_clearance = get_clearance
         self._cache: dict[str, SessionCredentials] = {}
         # Per-source-key single-flight registry (#260604-rnm). Each key gets ONE
         # asyncio.Lock, created lazily on first use (see ``_lock_for``) so locks bind
@@ -236,8 +262,12 @@ class CsrfBootstrap:
             # runtime condition — surface it loudly (no credential value leak).
             raise KeyError(f"no bootstrap URL configured for source {source_key!r}")
         limiter = self._ratelimiter.for_source(source_key, self._rates[source_key])
+        # Cloudflare union (debug mangaball-cloudflare-csrf-243): carry cf_clearance
+        # on the bootstrap GET when this source is also cloudflare-gated, else ``{}``
+        # (a bare GET — the pre-243 path for every non-cloudflare csrf source).
+        kwargs = await self._clearance_headers(source_key)
         async with limiter:  # gate at CALL SITE (mirror context.py:_request_bytes)
-            resp = await self._session.transport.request("GET", url)
+            resp = await self._session.transport.request("GET", url, **kwargs)
         token = _parse_csrf_token(resp.text)
         if not token:
             raise ValueError(
@@ -255,3 +285,30 @@ class CsrfBootstrap:
             len(cookies),
         )
         return SessionCredentials(cookies=cookies, csrf_token=token)
+
+    async def _clearance_headers(self, source_key: str) -> dict[str, Any]:
+        """Build the bootstrap-GET ``headers=`` kwarg from the cf clearance (or ``{}``).
+
+        Mirrors the cf half of ``context.py:_clearance_kwargs`` (debug
+        mangaball-cloudflare-csrf-243): the cf_clearance cookies ride a single
+        per-request ``Cookie`` header alongside the EXACT bound ``User-Agent`` — NEVER
+        the httpx ``cookies=`` kwarg, which would pin the credential onto the
+        R1-shared client jar and leak it across sources. Returns ``{}`` when no
+        provider is wired OR the source is not cloudflare-gated (the provider returns
+        ``None``), so the bootstrap GET stays byte-for-byte the pre-243 bare request
+        for every non-cloudflare csrf source. A mismatched UA silently invalidates the
+        cookie (Pitfall 1), so the cookie + UA are emitted together or not at all.
+        Credentials are never logged (T-07-01).
+        """
+        if self._get_clearance is None:
+            return {}
+        clearance = await self._get_clearance(source_key)
+        if clearance is None:
+            return {}
+        headers = {
+            "User-Agent": clearance.user_agent,
+            "Cookie": "; ".join(
+                f"{name}={value}" for name, value in clearance.cookies.items()
+            ),
+        }
+        return {"headers": headers}
