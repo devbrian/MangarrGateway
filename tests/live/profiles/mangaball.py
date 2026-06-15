@@ -126,14 +126,12 @@ LIVE_SMOKE = LiveSmokeProfile(
     # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
     alt_title_query="나 혼자만 레벨업",
     alt_title_expected_substring="Solo Leveling",
-    # #243: mangaball.net's managed challenge is cleared on the deploy via the redroid/
-    # android-solver sidecar (Android WebView) — desktop Chromium times out from Linux.
-    # CI has no `binder` kernel module so redroid cannot boot there; gated like
-    # kagane/mangadot. expected_caps_antibot stays "cloudflare" (engine is an internal
-    # solver detail, not a /caps classification).
-    ci_skip_reason=(
-        "mangaball.net Cloudflare cleared on the deploy via the redroid/"
-        "android-solver sidecar (Android WebView); CI has no binder kernel "
-        "module — gated, #243"
-    ),
+    # No ci_skip_reason (#215 Model A): mangaball is NO LONGER unconditionally
+    # CI-skipped. Its managed challenge is still unclearable by desktop Chromium from
+    # Linux and is cleared via the redroid + android-solver sidecar (Android WebView) —
+    # but the nightly now reaches that home android-solver over Tailscale. So this
+    # source RUNS when the tailnet-reachable home solver answers /healthz and is
+    # SKIPPED (not failed) by the conftest reachability gate when the solver is
+    # unreachable. expected_caps_antibot stays "cloudflare" (the Android engine is an
+    # internal solver detail, not a /caps classification).
 )

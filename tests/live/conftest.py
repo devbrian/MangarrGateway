@@ -45,6 +45,7 @@ restored automatically once the live-test session ends.
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib
 import logging
 import os
@@ -53,6 +54,7 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -64,6 +66,22 @@ from manga_gateway.framework.registry import SourceRegistry
 from manga_gateway.sources import register_builtin_sources
 
 from .profiles._base import LiveSmokeProfile
+
+
+def _disabled_from_env() -> frozenset[str]:
+    """Parse ``GATEWAY_DISABLED_SOURCES`` exactly as the app does.
+
+    Mirrors ``Settings.disabled_source_keys()`` without constructing
+    ``Settings`` (which would require an api_key just to read one env var).
+    Used by BOTH ``_registered_keys`` (D-47 collection) and ``_ANDROID_KEYS``
+    (the #215 reachability gate) so collection, the gate, and the app agree
+    byte-for-byte on the disabled set.
+    """
+    return frozenset(
+        key.strip().lower()
+        for key in os.environ.get("GATEWAY_DISABLED_SOURCES", "").split(",")
+        if key.strip()
+    )
 
 
 def _registered_keys() -> list[str]:
@@ -78,16 +96,62 @@ def _registered_keys() -> list[str]:
     reg = SourceRegistry()
     # #198/#202: honor GATEWAY_DISABLED_SOURCES so live-smoke collection matches
     # what the app actually serves — a disabled source is not registered, hence
-    # not parametrized (no profile load, no ci_skip_reason needed for it). Mirrors
-    # Settings.disabled_source_keys() without constructing Settings (which would
-    # require an api_key just to read one env var).
-    disabled = frozenset(
-        key.strip().lower()
-        for key in os.environ.get("GATEWAY_DISABLED_SOURCES", "").split(",")
-        if key.strip()
-    )
-    register_builtin_sources(reg, disabled=disabled)
+    # not parametrized (no profile load needed for it).
+    register_builtin_sources(reg, disabled=_disabled_from_env())
     return reg.keys()
+
+
+def _android_keys() -> frozenset[str]:
+    """Registered source keys whose ``solver_engine`` is ``"android"`` (#215).
+
+    Built the SAME way ``_registered_keys`` builds — a fresh ``SourceRegistry``
+    honoring ``GATEWAY_DISABLED_SOURCES`` — then filtered to classes that route
+    their Cloudflare solve through the Android-WebView leg. These are the only
+    keys the runtime reachability gate probes, so a non-android live item makes
+    ZERO network calls.
+    """
+    reg = SourceRegistry()
+    register_builtin_sources(reg, disabled=_disabled_from_env())
+    return frozenset(
+        key
+        for key, cls in reg.items()
+        if getattr(cls, "solver_engine", "patchright") == "android"
+    )
+
+
+@functools.cache
+def _android_solver_reachable() -> tuple[bool, str]:
+    """Once-per-session probe of the home android-solver's ``/healthz`` (#215).
+
+    Returns ``(True, "")`` only when ``GATEWAY_ANDROID_SOLVER_URL`` is set AND
+    ``GET {url}/healthz`` answers HTTP 200. Otherwise returns
+    ``(False, <reason>)`` — URL unset, a non-200 status, or any transport error
+    — WITHOUT raising, so the live-collection gate can turn an unreachable home
+    stack into a clean ``<skipped>`` instead of a test ERROR (a down home stack
+    must never red the nightly). ``functools.cache`` makes this a single probe
+    for the whole session. Never logs or interpolates the api key.
+    """
+    url = os.environ.get("GATEWAY_ANDROID_SOLVER_URL", "").strip()
+    if not url:
+        return (
+            False,
+            "GATEWAY_ANDROID_SOLVER_URL unset — android solver not configured",
+        )
+    healthz = f"{url.rstrip('/')}/healthz"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(healthz)
+    except Exception as exc:  # noqa: BLE001 — gate must never raise (httpx.HTTPError/OSError/anything)
+        return (
+            False,
+            f"android solver unreachable ({type(exc).__name__})",
+        )
+    if resp.status_code == 200:
+        return (True, "")
+    return (
+        False,
+        f"android solver /healthz returned {resp.status_code} (not 200)",
+    )
 
 
 # D-47: materialize at conftest-import (= live-test-collection) time, NOT
@@ -96,6 +160,13 @@ def _registered_keys() -> list[str]:
 # Type is inferred from _registered_keys' return annotation. The literal
 # assignment shape is also the contract the acceptance-criteria grep checks.
 REGISTERED_KEYS = _registered_keys()
+
+# #215 Model A: the subset of REGISTERED_KEYS that route their Cloudflare solve
+# through the Android-WebView leg (mangadot/kagane/mangaball). Materialized at
+# collection time alongside REGISTERED_KEYS; the collection hook probes the home
+# android-solver ONLY for items keyed to one of these, so the deterministic gate
+# (live items already deselected) makes no network call.
+_ANDROID_KEYS: frozenset[str] = _android_keys()
 
 
 # CR-02 (issue #29): capture the real ``CloudflareSolver.warm`` at conftest
@@ -270,6 +341,24 @@ def pytest_collection_modifyitems(
         # tracked in the referenced issue.
         if profile.ci_skip_reason:
             item.add_marker(pytest.mark.skip(reason=profile.ci_skip_reason))
+        # Android reachability gate (#215 Model A). The three android-engine
+        # sources (mangadot/kagane/mangaball) are no longer unconditionally
+        # ci_skip'd — they RUN when the home android-solver answers /healthz and
+        # SKIP (not fail) when it does not, so a down home stack triages clean
+        # instead of ERRORing the search leg's AndroidSolver /solve. Probe ONLY
+        # android-keyed items (the cached probe fires at most once per session),
+        # so non-android live items make zero network calls.
+        if source_key in _ANDROID_KEYS:
+            reachable, reason = _android_solver_reachable()
+            if not reachable:
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=(
+                            f"android solver unreachable ({reason}) — #215 Model A: "
+                            "home android-solver must be up + tailnet-reachable"
+                        )
+                    )
+                )
         item.add_marker(
             pytest.mark.timeout(profile.download_timeout_s, method=timeout_method)
         )

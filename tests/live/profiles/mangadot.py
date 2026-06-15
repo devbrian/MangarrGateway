@@ -101,17 +101,12 @@ LIVE_SMOKE = LiveSmokeProfile(
     # Alt-title live smoke (#139) — recon-verified 2026-06-05 (see module docstring).
     alt_title_query="나 혼자만 레벨업",
     alt_title_expected_substring="Solo Leveling",
-    # CI gating (Phase 10): mangadot's strict Cloudflare Turnstile is unclearable
-    # by ANY desktop browser automation from Linux (the render-consistency
-    # catch-22 proven in debug mangadot-cf-linux-fingerprint). It is cleared on the
-    # DEPLOY via the redroid + android-solver sidecars (a real Android WebView is a
-    # trusted fingerprint class). CI (GitHub Actions) has NO `binder` kernel module,
-    # so redroid cannot boot there — the Android solver cannot run in CI and these
-    # live items stay gated. `expected_caps_antibot="cloudflare"` is unchanged (the
-    # Android engine is an internal solver detail, not a /caps classification).
-    ci_skip_reason=(
-        "mangadot.net Cloudflare cleared on the deploy via the redroid/"
-        "android-solver sidecar (Android WebView); CI has no binder kernel "
-        "module — gated, Phase 10"
-    ),
+    # No ci_skip_reason (#215 Model A): mangadot is NO LONGER unconditionally
+    # CI-skipped. Its strict Cloudflare Turnstile is still unclearable by desktop
+    # browser automation from Linux and is cleared via the redroid + android-solver
+    # sidecar (Android WebView) — but the nightly now reaches that home android-solver
+    # over Tailscale. So this source RUNS when the tailnet-reachable home solver
+    # answers /healthz and is SKIPPED (not failed) by the conftest reachability gate
+    # when the solver is unreachable. `expected_caps_antibot="cloudflare"` is
+    # unchanged (the Android engine is an internal solver detail, not a /caps class).
 )
