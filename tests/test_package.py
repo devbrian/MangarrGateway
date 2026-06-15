@@ -108,6 +108,21 @@ def test_describe_non_image_escapes_nonprintable_head_and_truncates() -> None:
     assert f"{len(body)} bytes" in out
 
 
+def test_describe_non_image_escapes_quotes_and_backslashes_in_preview() -> None:
+    # A JSON error body's literal " and \ must be backslash-escaped so they cannot
+    # break the surrounding head="..." quoting (#238 CodeRabbit).
+    body = b'{"error": "C:\\\\fail"}'
+    out = package.describe_non_image(body)
+    head_field = out.split('head="', 1)[1]
+    assert head_field.endswith('"')
+    inner = head_field[:-1]
+    # Every literal body quote is escaped to \" and every backslash doubled, so
+    # stripping the escape sequences leaves no bare " or \ that could break quoting.
+    stripped = inner.replace('\\"', "").replace("\\\\", "")
+    assert '"' not in stripped and "\\" not in stripped
+    assert inner.count('\\"') == body.count(b'"')  # all three body quotes escaped
+
+
 # ──────────────────────────────────── write_cbz ─────────────────────────────────
 
 

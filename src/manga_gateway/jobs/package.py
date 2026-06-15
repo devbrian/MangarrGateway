@@ -105,14 +105,23 @@ def describe_non_image(content: bytes, *, head_len: int = _SNIFF_HEAD_LEN) -> st
     printable preview of the head so a ``page N invalid`` failure is self-diagnosing
     from telemetry alone (CDN HTML error page vs anti-bot challenge vs truncation vs
     empty body) — WITHOUT recompressing or fully parsing the body. Non-printable
-    head bytes are escaped ``\\xNN`` so the preview is always log/JSON-safe.
+    head bytes are escaped ``\\xNN`` and printable ``"``/``\\`` are backslash-escaped,
+    so the preview never breaks the surrounding ``head="..."`` quoting (#238).
     """
     n = len(content)
     if n == 0:
         return "0 bytes (empty body)"
     kind = _classify_non_image(content)
     head = content[:head_len]
-    preview = "".join(chr(b) if 0x20 <= b <= 0x7E else f"\\x{b:02x}" for b in head)
+
+    def _escape(b: int) -> str:
+        if b == 0x5C:  # backslash
+            return "\\\\"
+        if b == 0x22:  # double quote
+            return '\\"'
+        return chr(b) if 0x20 <= b <= 0x7E else f"\\x{b:02x}"
+
+    preview = "".join(_escape(b) for b in head)
     suffix = "…" if n > head_len else ""
     return f'{n} bytes, sniff={kind}, head="{preview}{suffix}"'
 
