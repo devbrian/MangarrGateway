@@ -45,6 +45,7 @@ restored automatically once the live-test session ends.
 from __future__ import annotations
 
 import asyncio
+import functools
 import importlib
 import logging
 import os
@@ -53,17 +54,35 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
 
 import manga_gateway.app as _app_module
 from manga_gateway.config import Settings
+from manga_gateway.framework.android_solver import AndroidSolver
 from manga_gateway.framework.antibot import CloudflareSolver
 from manga_gateway.framework.proxy import build_proxy
 from manga_gateway.framework.registry import SourceRegistry
 from manga_gateway.sources import register_builtin_sources
 
 from .profiles._base import LiveSmokeProfile
+
+
+def _disabled_from_env() -> frozenset[str]:
+    """Parse ``GATEWAY_DISABLED_SOURCES`` exactly as the app does.
+
+    Mirrors ``Settings.disabled_source_keys()`` without constructing
+    ``Settings`` (which would require an api_key just to read one env var).
+    Used by BOTH ``_registered_keys`` (D-47 collection) and ``_ANDROID_KEYS``
+    (the #215 reachability gate) so collection, the gate, and the app agree
+    byte-for-byte on the disabled set.
+    """
+    return frozenset(
+        key.strip().lower()
+        for key in os.environ.get("GATEWAY_DISABLED_SOURCES", "").split(",")
+        if key.strip()
+    )
 
 
 def _registered_keys() -> list[str]:
@@ -78,16 +97,62 @@ def _registered_keys() -> list[str]:
     reg = SourceRegistry()
     # #198/#202: honor GATEWAY_DISABLED_SOURCES so live-smoke collection matches
     # what the app actually serves — a disabled source is not registered, hence
-    # not parametrized (no profile load, no ci_skip_reason needed for it). Mirrors
-    # Settings.disabled_source_keys() without constructing Settings (which would
-    # require an api_key just to read one env var).
-    disabled = frozenset(
-        key.strip().lower()
-        for key in os.environ.get("GATEWAY_DISABLED_SOURCES", "").split(",")
-        if key.strip()
-    )
-    register_builtin_sources(reg, disabled=disabled)
+    # not parametrized (no profile load needed for it).
+    register_builtin_sources(reg, disabled=_disabled_from_env())
     return reg.keys()
+
+
+def _android_keys() -> frozenset[str]:
+    """Registered source keys whose ``solver_engine`` is ``"android"`` (#215).
+
+    Built the SAME way ``_registered_keys`` builds — a fresh ``SourceRegistry``
+    honoring ``GATEWAY_DISABLED_SOURCES`` — then filtered to classes that route
+    their Cloudflare solve through the Android-WebView leg. These are the only
+    keys the runtime reachability gate probes, so a non-android live item makes
+    ZERO network calls.
+    """
+    reg = SourceRegistry()
+    register_builtin_sources(reg, disabled=_disabled_from_env())
+    return frozenset(
+        key
+        for key, cls in reg.items()
+        if getattr(cls, "solver_engine", "patchright") == "android"
+    )
+
+
+@functools.cache
+def _android_solver_reachable() -> tuple[bool, str]:
+    """Once-per-session probe of the home android-solver's ``/healthz`` (#215).
+
+    Returns ``(True, "")`` only when ``GATEWAY_ANDROID_SOLVER_URL`` is set AND
+    ``GET {url}/healthz`` answers HTTP 200. Otherwise returns
+    ``(False, <reason>)`` — URL unset, a non-200 status, or any transport error
+    — WITHOUT raising, so the live-collection gate can turn an unreachable home
+    stack into a clean ``<skipped>`` instead of a test ERROR (a down home stack
+    must never red the nightly). ``functools.cache`` makes this a single probe
+    for the whole session. Never logs or interpolates the api key.
+    """
+    url = os.environ.get("GATEWAY_ANDROID_SOLVER_URL", "").strip()
+    if not url:
+        return (
+            False,
+            "GATEWAY_ANDROID_SOLVER_URL unset — android solver not configured",
+        )
+    healthz = f"{url.rstrip('/')}/healthz"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(healthz)
+    except Exception as exc:  # noqa: BLE001 — gate must never raise (httpx.HTTPError/OSError/anything)
+        return (
+            False,
+            f"android solver unreachable ({type(exc).__name__})",
+        )
+    if resp.status_code == 200:
+        return (True, "")
+    return (
+        False,
+        f"android solver /healthz returned {resp.status_code} (not 200)",
+    )
 
 
 # D-47: materialize at conftest-import (= live-test-collection) time, NOT
@@ -96,6 +161,13 @@ def _registered_keys() -> list[str]:
 # Type is inferred from _registered_keys' return annotation. The literal
 # assignment shape is also the contract the acceptance-criteria grep checks.
 REGISTERED_KEYS = _registered_keys()
+
+# #215 Model A: the subset of REGISTERED_KEYS that route their Cloudflare solve
+# through the Android-WebView leg (mangadot/kagane/mangaball). Materialized at
+# collection time alongside REGISTERED_KEYS; the collection hook probes the home
+# android-solver ONLY for items keyed to one of these, so the deterministic gate
+# (live items already deselected) makes no network call.
+_ANDROID_KEYS: frozenset[str] = _android_keys()
 
 
 # CR-02 (issue #29): capture the real ``CloudflareSolver.warm`` at conftest
@@ -270,6 +342,24 @@ def pytest_collection_modifyitems(
         # tracked in the referenced issue.
         if profile.ci_skip_reason:
             item.add_marker(pytest.mark.skip(reason=profile.ci_skip_reason))
+        # Android reachability gate (#215 Model A). The three android-engine
+        # sources (mangadot/kagane/mangaball) are no longer unconditionally
+        # ci_skip'd — they RUN when the home android-solver answers /healthz and
+        # SKIP (not fail) when it does not, so a down home stack triages clean
+        # instead of ERRORing the search leg's AndroidSolver /solve. Probe ONLY
+        # android-keyed items (the cached probe fires at most once per session),
+        # so non-android live items make zero network calls.
+        if source_key in _ANDROID_KEYS:
+            reachable, reason = _android_solver_reachable()
+            if not reachable:
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=(
+                            f"android solver unreachable ({reason}) — #215 Model A: "
+                            "home android-solver must be up + tailnet-reachable"
+                        )
+                    )
+                )
         item.add_marker(
             pytest.mark.timeout(profile.download_timeout_s, method=timeout_method)
         )
@@ -396,6 +486,81 @@ def _build_session_solver_kwargs() -> dict[str, Any]:
     return kwargs
 
 
+def _build_session_android_solver_kwargs() -> dict[str, Any]:
+    """Documented hand-mirror of app.py's ``AndroidSolver(...)`` build.
+
+    Kept in LOCKSTEP with ``manga_gateway.app.lifespan``'s android-leg
+    construction (the ``android_challenge_urls`` map + the ``AndroidSolver(...)``
+    kwargs) exactly as ``_build_session_solver_kwargs`` mirrors the Patchright
+    leg. A silent drift here breaks the live android leg: the session-shared
+    AndroidSolver would warm/solve a different set of sources (or none) than the
+    per-test ``create_app`` lifespan expects, so the held ``cf_clearance`` would
+    not be reused and every android live test would re-mint via the sidecar.
+
+    Like ``_build_session_solver_kwargs`` this uses a default-constructed
+    ``Settings()`` (picking up env vars exactly as production does), a fresh
+    ``SourceRegistry`` honoring ``GATEWAY_DISABLED_SOURCES``, and the SAME
+    registry partition app.py performs: cloudflare-gated sources whose
+    ``solver_engine`` is ``"android"``. The ``proxy`` kwarg mirrors app.py's
+    ``proxy=playwright_proxy`` — passed unconditionally (``None`` when
+    ``cloudflare_proxy_*`` is unconfigured, exactly like the lifespan).
+    """
+    # ``api_key`` is a required Settings field but does not feed any AndroidSolver
+    # kwarg; supply a session-internal placeholder. All android_solver_* fields
+    # still resolve from env vars exactly as production does.
+    settings = Settings(api_key="session-solver-fixture-not-an-api-key")
+    registry = SourceRegistry()
+    register_builtin_sources(registry, disabled=settings.disabled_source_keys())
+    cf_sources = {
+        key: cls
+        for key, cls in registry.items()
+        if getattr(cls, "antibot", "none").startswith("cloudflare")
+    }
+    # PARTITION cf_sources to ANDROID sources ONLY (``solver_engine == "android"``)
+    # — the mirror image of ``_build_session_solver_kwargs``'s patchright partition.
+    android_sources = {
+        key: cls
+        for key, cls in cf_sources.items()
+        if getattr(cls, "solver_engine", "patchright") == "android"
+    }
+    # Per-domain android challenge-URL map — MUST match app.py's lifespan build
+    # field-for-field (app.py: ``key in android_keys and (url := ...)``).
+    android_challenge_urls = {
+        key: url
+        for key, cls in android_sources.items()
+        if (url := getattr(cls, "cloudflare_challenge_url", None))
+    }
+    # PROXY-01 / Req 7: mirror the lifespan's proxy wiring so the session-shared
+    # AndroidSolver's /solve egress matches the per-test httpx-fetch egress (one
+    # IP — cf_clearance is IP-bound). app.py passes ``proxy=playwright_proxy``
+    # UNCONDITIONALLY (None when unconfigured), so do the same here.
+    playwright_proxy, _ = build_proxy(settings)
+    return {
+        "base_url": settings.android_solver_url,
+        "api_key": settings.android_solver_api_key,
+        "challenge_urls": android_challenge_urls,
+        "timeout_s": settings.android_solver_timeout_s,
+        "proxy": playwright_proxy,
+    }
+
+
+def _session_android_warm_budget_s(num_android_keys: int) -> float:
+    """Total wall-clock ceiling for the shared-session ANDROID warm.
+
+    An android solve routes through the redroid-WebView sidecar's ``/solve`` and
+    is SERIALIZED through ONE device — each mint is ~1–2 min (the gateway client
+    timeout is ``android_solver_timeout_s``, default 180s). The flat CF budget
+    (``_PER_DOMAIN_WARM_BUDGET_S`` = 75s) is far too tight here, so scale the
+    ceiling by the number of android challenge keys at the per-solve timeout plus
+    a launch/transport margin, floored at one key so a zero/one-android session
+    still gets a sane budget. EAGER warming in ``_session_android_solver`` keeps
+    this whole budget OFF every per-test clock (see that fixture).
+    """
+    settings = Settings(api_key="session-solver-fixture-not-an-api-key")
+    margin_s = 30.0
+    return settings.android_solver_timeout_s * max(1, num_android_keys) + margin_s
+
+
 async def _noop_aclose() -> None:
     """No-op aclose: bound onto the session solver so per-test lifespan
     teardown (``app.py`` line 276 ``await solver.aclose()``) does NOT
@@ -440,6 +605,47 @@ async def _session_solver() -> AsyncIterator[CloudflareSolver]:
         await solver.aclose()
 
 
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def _session_android_solver() -> AsyncIterator[AndroidSolver]:
+    """Build ONE AndroidSolver for the live-test session; EAGER-warm it once.
+
+    The android live tests (mangadot/kagane/mangaball) route their Cloudflare
+    solve through the redroid-WebView sidecar, serialized through ONE device at
+    ~1–2 min per mint. Building a fresh AndroidSolver per ``create_app`` lifespan
+    (the prior baseline) leaves ``AndroidSolver._held`` empty each test, so every
+    android live test re-mints ``cf_clearance`` via ``/solve`` — unacceptable
+    wall-clock + device load. Sharing ONE instance across the session means the
+    held clearance is reused: ONE ``/solve`` per source, not per test.
+
+    The warm is EAGER and BEST-EFFORT (mirroring ``_session_solver``): we warm at
+    session-fixture setup so the ~1–2 min first-mint per source lands OFF every
+    per-test clock (the D-55 ``pytest.mark.timeout`` is the per-source
+    ``download_timeout_s`` — far too tight to absorb an inline first-mint). An
+    unconfigured/unreachable/uncleared android stack must NOT error the session
+    and take comix/mangadex tests down: ``warm()`` raises per key when
+    ``android_solver_url`` is unset, and ``_warm_best_effort`` swallows it. The
+    #215 reachability gate already skips the android items in that case, so a
+    non-android live run pays ~no cost here.
+    """
+    kwargs = _build_session_android_solver_kwargs()
+    solver = AndroidSolver(**kwargs)
+    # AndroidSolver.warm is NOT monkeypatched by the gate (the no-op warm patch in
+    # tests/conftest.py targets CloudflareSolver.warm only), so call it directly —
+    # no _ORIGINAL_* capture dance needed.
+    num_android_keys = len(kwargs.get("challenge_urls") or ())
+    await _warm_best_effort(
+        solver.warm, timeout=_session_android_warm_budget_s(num_android_keys)
+    )
+    real_aclose = solver.aclose
+    try:
+        yield solver
+    finally:
+        # Restore and run the real teardown exactly once (closes the owned httpx
+        # client to the sidecar). Per-test SolverRouter teardown neutered it.
+        solver.aclose = real_aclose  # type: ignore[method-assign]
+        await solver.aclose()
+
+
 @pytest.fixture(autouse=True)
 def _substitute_app_solver(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
@@ -480,6 +686,27 @@ def _substitute_app_solver(
     # ``CloudflareSolver(**solver_kwargs)`` call from inside lifespan()
     # now returns the session instance. monkeypatch auto-undoes on teardown.
     monkeypatch.setattr(_app_module, "CloudflareSolver", _factory)
+
+    # ── share ONE AndroidSolver across the session, same pattern (#215 follow-up) ──
+    # Each per-test ``create_app`` lifespan builds a fresh AndroidSolver, leaving its
+    # ``_held`` clearance cache empty → every android live test would re-mint
+    # ``cf_clearance`` via the sidecar ``/solve`` (~1–2 min each, serialized through
+    # ONE redroid). Substituting the shared instance means the per-test lifespan's
+    # ``AndroidSolver(**kwargs)`` returns it, so ``_held`` persists across every live
+    # test: ONE ``/solve`` per source, not per test.
+    session_android: AndroidSolver = request.getfixturevalue("_session_android_solver")
+    # Neuter aclose on the shared android instance for the session: the per-test
+    # SolverRouter wraps BOTH shared backends and its lifespan teardown calls
+    # ``await solver.aclose()`` — which (SolverRouter.aclose) closes BOTH legs. Left
+    # un-neutered, per-test teardown would close the shared sidecar httpx client.
+    # The real aclose is restored + run once in ``_session_android_solver``'s
+    # finalizer (same contract as the CloudflareSolver above).
+    session_android.aclose = _noop_aclose  # type: ignore[method-assign]
+
+    def _android_factory(**_kwargs: Any) -> AndroidSolver:
+        return session_android
+
+    monkeypatch.setattr(_app_module, "AndroidSolver", _android_factory)
 
 
 # ─────────────────────── subprocess-count diagnostic ───────────────────────
