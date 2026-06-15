@@ -1659,8 +1659,22 @@ class ComixSource(Source):
                 raise SourceError("source_unavailable", str(exc)) from exc
 
         # 2. tile scramble
-        scramble_seed = self._enc_header_int(headers.get("x-scramble-seed"))
-        if scramble_seed != 0:
+        raw_scramble_seed = headers.get("x-scramble-seed")
+        scramble_seed = self._enc_header_int(raw_scramble_seed)
+        if scramble_seed == 0:
+            # A present-but-MALFORMED ``x-scramble-seed`` must NOT silently skip
+            # unscrambling: unlike the byte cipher (where un-decrypted ciphertext fails
+            # the downstream ``is_valid_image`` guard), a scrambled page is a *valid*
+            # WebP, so skipping it would silently package visually-corrupt pixels — the
+            # exact bug class this fix exists to close. Fail loud instead. An absent /
+            # blank / explicit ``"0"`` header is a genuine "not scrambled" signal and
+            # passes through (mirrors the byte cipher's seed==0 no-op).
+            if raw_scramble_seed is not None and raw_scramble_seed.strip() not in (
+                "",
+                "0",
+            ):
+                raise SourceError("source_unavailable", "invalid x-scramble-seed")
+        else:
             cols, rows = self._scramble_grid(headers.get("x-scramble-grid"))
             scramble_algo = self._algo_header(
                 headers.get("x-scramble-algo"), _SCRAMBLE_ALGO_LEGACY_LCG[0]

@@ -225,8 +225,10 @@ def test_unscramble_round_trip_recovers_original(algo: int) -> None:
     cols, rows, seed = 5, 5, 4010719162
     original = _make_grid_image(cols, rows)
     scrambled = _scramble_to_webp(original, seed, cols, rows, algo)
-    # a non-trivial permutation actually moved tiles
-    assert scrambled != original.tobytes()
+    # a non-trivial permutation actually moved tiles (compare DECODED pixels — the raw
+    # `scrambled` bytes are compressed WebP, so a byte-compare would be trivially true)
+    with Image.open(io.BytesIO(scrambled)) as scrambled_img:
+        assert scrambled_img.convert("RGB").tobytes() != original.tobytes()
     restored_bytes = _unscramble_image(scrambled, seed, cols, rows, algo)
     restored = Image.open(io.BytesIO(restored_bytes)).convert("RGB")
     assert restored.tobytes() == original.tobytes()
@@ -274,6 +276,31 @@ async def test_fetch_image_unknown_scramble_algo_fails_loud() -> None:
     )
     with pytest.raises(SourceError):
         await ComixSource().fetch_image("https://cdn.example.store/i4/T/04.webp", ctx)
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_malformed_scramble_seed_fails_loud() -> None:
+    """A present-but-invalid ``x-scramble-seed`` must fail loud, NOT silently ship a
+    valid-but-scrambled WebP (that page would pass ``is_valid_image`` → corruption)."""
+    img = _make_grid_image(5, 5)
+    buf = io.BytesIO()
+    img.save(buf, format="WEBP", lossless=True)
+    src = ComixSource()
+    for bad in ("abc", "-1", "4294967296"):
+        ctx: Any = _FakeCtx(buf.getvalue(), {"x-scramble-seed": bad})
+        with pytest.raises(SourceError, match="invalid x-scramble-seed"):
+            await src.fetch_image("https://cdn.example.store/i4/T/04.webp", ctx)
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_absent_or_zero_scramble_seed_passthrough() -> None:
+    """Absent / blank / explicit ``"0"`` x-scramble-seed = not scrambled → untouched."""
+    payload = b"RIFF\x10\x00\x00\x00WEBPVP8 "  # plaintext, no scramble
+    src = ComixSource()
+    for headers in ({}, {"x-scramble-seed": ""}, {"x-scramble-seed": "0"}):
+        ctx: Any = _FakeCtx(payload, headers)
+        out = await src.fetch_image("https://cdn.example.store/i4/T/01.webp", ctx)
+        assert out == payload
 
 
 def test_scramble_grid_parser() -> None:
