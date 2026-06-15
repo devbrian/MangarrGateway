@@ -36,8 +36,9 @@
 # module, so redroid cannot boot on ubuntu-latest). Rather than run a
 # self-hosted runner, this nightly joins the home tailnet as an EPHEMERAL
 # tag:ci node (the Tailscale step below, before the live step) and reaches the
-# home android-solver's authenticated `/solve` control API at
-# REDACTED-INTERNAL-IP:18080. Trust boundary discipline:
+# home android-solver's authenticated `/solve` control API on the tailnet
+# (host + port supplied by the GATEWAY_ANDROID_SOLVER_URL secret — NOT hardcoded
+# here, tcp:18080 by convention). Trust boundary discipline:
 #   * Only the authenticated, host-allowlisted `/solve` (tcp:18080) crosses the
 #     boundary — the tailnet ACL MUST grant tag:ci egress to the solver host on
 #     :18080 ONLY (no other ports, no whole-LAN reachability).
@@ -151,8 +152,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y xvfb fonts-liberation fonts-noto-color-emoji
 
       # Join the home tailnet as an EPHEMERAL tag:ci node so the live app's
-      # AndroidSolver can POST `/solve` to the home android-solver at
-      # REDACTED-INTERNAL-IP:18080 (#215 Model A). The OAuth-client + tags flow
+      # AndroidSolver can POST `/solve` to the home android-solver on the tailnet
+      # (host:port from the GATEWAY_ANDROID_SOLVER_URL secret, #215 Model A). The
+      # OAuth-client + tags flow
       # registers an ephemeral node that auto-deregisters when the runner exits
       # (no manual cleanup, no lingering device). SHA-pinned + trailing version
       # comment, matching ci.yml's supply-chain discipline. No `id-token: write`
