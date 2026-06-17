@@ -151,7 +151,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # issue #65). No extra wiring needed here: the transport reads settings.
     transport = HttpxTransport(settings)
     app.state.transport = transport
-    app.state.session = SessionManager(transport)  # R1 shared session
+    # debug pool-starves-search-cooldown (2026-06-17): a SEPARATE client/pool for
+    # the download surface so a large download backlog can never exhaust the
+    # connection pool the search fan-out needs (which would trip every source's
+    # 300s failure-cooldown → all-sources outage). Same settings → same UA / proxy
+    # egress / per-request deadline; clearance rides per-request headers (not a
+    # client cookie jar) so the two pools share ONE authenticated identity (R1).
+    download_transport = HttpxTransport(settings)
+    app.state.download_transport = download_transport
+    app.state.session = SessionManager(transport, download_transport)  # R1 identity
     # SRC-01: build the registry first so the rest of the lifespan can inspect
     # per-source metadata (antibot level, decrypt scheme) WITHOUT hardcoding any
     # source key by name. Adding the 50+ planned sources is a register call and
@@ -613,7 +621,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             await job_manager.cancel_all()
         await store.close()  # release the job-store connection
-        await transport.aclose()  # release the one shared client
+        await transport.aclose()  # release the search/recent client
+        await download_transport.aclose()  # release the download client (split pool)
         # Metrics teardown LAST (independent of solver/job/transport): a FINAL
         # snapshot so nothing in-memory since the last timer tick is lost
         # (Pitfall 4), then close the snapshot connection. set_collector(None) so a
