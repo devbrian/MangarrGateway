@@ -144,9 +144,19 @@ class SourceContext:
         candidates_enumerated: int | None = None,
         enum_cache: EnumerationCache | None = None,
         retry_attempts: int = 4,
+        use_download_transport: bool = False,
     ) -> None:
         self._source_key = source_key
         self._session = session
+        # debug pool-starves-search-cooldown (2026-06-17): the DOWNLOAD path
+        # (engine._build_context passes use_download_transport=True) routes its
+        # manifest + image fetches through session.download_transport — a SEPARATE
+        # connection pool — so a download backlog can never exhaust the pool the
+        # search fan-out needs. The search/recent path leaves this False and uses
+        # session.transport. Default False keeps every existing caller on the search
+        # transport (which itself falls back to the single shared pool when no
+        # distinct download transport was wired into the SessionManager).
+        self._use_download_transport = use_download_transport
         # 260606-lyb Change 1: per-context tenacity attempt budget. A class-level
         # ``@tenacity.retry`` decorator is evaluated ONCE at import and cannot read
         # ``self``, so each HTTP method drives its retryer from this value at call
@@ -933,8 +943,16 @@ class SourceContext:
         5xx to the except branch, this classification is correct + harmless.)
         """
         start = time.perf_counter()
+        # Route to the download pool on the download path, else the search pool
+        # (debug pool-starves-search-cooldown). Both share one identity (clearance
+        # rides per-request headers), so this only picks which connection pool.
+        transport = (
+            self._session.download_transport
+            if self._use_download_transport
+            else self._session.transport
+        )
         try:
-            resp = await self._session.transport.request(method, url, **kwargs)
+            resp = await transport.request(method, url, **kwargs)
         except Exception as exc:
             duration_ms = (time.perf_counter() - start) * 1000.0
             self._emit_http(

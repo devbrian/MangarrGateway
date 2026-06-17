@@ -494,6 +494,10 @@ class JobEngine:
             source_health=self._source_health.get(key),
             session_prep=self._session_prep,
             expected_pages=expected_pages,
+            # debug pool-starves-search-cooldown (2026-06-17): the whole download
+            # surface (manifest + image fetches) uses the SEPARATE download pool so
+            # a download backlog can never starve the search fan-out's pool.
+            use_download_transport=True,
         )
 
     async def _transition(self, job: Job, status: JobStatus) -> None:

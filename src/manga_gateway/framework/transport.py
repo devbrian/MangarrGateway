@@ -27,9 +27,25 @@ if TYPE_CHECKING:
 # Contract; SRC-05). One place the outbound identity lives.
 _USER_AGENT = "MangaGateway/1.0"
 
-# Per-host connection limits — the ONE place they live (SRC-04). Sources never
-# construct their own client, so this bounds outbound concurrency process-wide.
-_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+# Per-client connection limits — the ONE place they live (SRC-04). Sources never
+# construct their own client, so this bounds outbound concurrency per pool.
+#
+# Raised 100→500 / keepalive 20→100 and SPLIT INTO TWO POOLS (debug
+# pool-starves-search-cooldown, 2026-06-17). Previously a SINGLE 100-connection
+# pool served BOTH the search/recent fan-out AND the download image fetches. A
+# large download backlog (per-source max_concurrent_jobs × image_fetch_concurrency)
+# plus a concurrent search fan-out (8 sources, each deep-enumerating candidates at
+# _CHAPTERS_FANOUT_CONCURRENCY) jointly drove the one pool to its 100 ceiling;
+# whichever side lost the acquisition race raised PoolTimeout, and a search source
+# that PoolTimeouts trips the 300s SourceFailureCooldown → ALL sources report
+# source_unavailable. The fix gives the download surface its OWN client/pool
+# (app.py builds two HttpxTransport instances; SessionManager.download_transport
+# routes the engine's download contexts there) so download saturation can never
+# starve search. The 500/100 bump is extra headroom on top of the structural split
+# (file-descriptor cost is trivial — container nofile is 1,048,576). Clearance is
+# injected as a PER-REQUEST Cookie header (context.py _clearance_kwargs), NOT on a
+# client cookie jar, so the two clients need no cookie/clearance mirroring.
+_LIMITS = httpx.Limits(max_connections=500, max_keepalive_connections=100)
 
 # Explicit per-request deadlines so no outbound call can hang unbounded (CR-02).
 # Lives HERE with the other client-level config; the per-job asyncio.timeout wrapper
@@ -40,8 +56,8 @@ _TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 # 2026-06-13). httpx's ``read`` timeout above is PER-CHUNK — it resets on every byte
 # received — so a slow-trickling / tarpitting upstream (e.g. a Cloudflare-flagged
 # host dribbling a byte every few seconds) NEVER trips ``read`` and holds its pooled
-# connection indefinitely. With the ONE shared 100-connection pool, enough such stuck
-# requests drain every slot and EVERY source then fails with ``PoolTimeout`` — a
+# connection indefinitely. Within any single pool, enough such stuck requests drain
+# every slot and every request sharing that pool then fails with ``PoolTimeout`` — a
 # permanent outage that only a restart clears. This hard total deadline bounds each
 # request's wall-time regardless of per-chunk progress; on expiry the request is
 # cancelled, which cleanly releases the connection back to the pool (httpx closes the
