@@ -136,6 +136,7 @@ class SourceContext:
         handle_store: HandleStore,
         solver: AntiBotSolver | None = None,
         antibot: AntibotLevel = "none",
+        cloudflare_challenge_optional: bool = False,
         decrypt_scheme: str | None = None,
         decrypt_config: dict[str, Any] | None = None,
         source_health: SourceHealth | None = None,
@@ -174,6 +175,13 @@ class SourceContext:
         # Phase-4 anti-bot seams (default-off so MangaDex/test sites stay minimal).
         self._solver = solver
         self._antibot = antibot
+        # On-demand clearance (debug pooltimeout-recurrence): when True, the cf half
+        # of ``_clearance_kwargs`` attaches only ALREADY-HELD clearance on the first
+        # attempt (``solve_if_missing=False``) and defers a fresh solve to the
+        # challenge-triggered D-35 reconcile, so a source with an intermittent CF
+        # challenge self-heals either way. Default False keeps every eager
+        # ``cloudflare*`` source unchanged.
+        self._cloudflare_challenge_optional = cloudflare_challenge_optional
         self._decrypt_scheme = decrypt_scheme
         self._decrypt_config = decrypt_config
         self._source_health = source_health
@@ -251,7 +259,19 @@ class SourceContext:
         # cf_clearance half (D-40) — browser-issued cookie + its bound UA.
         if self._is_cloudflare:
             assert self._solver is not None  # guarded by _is_cloudflare
-            clearance = await self._call_solver(force_resolve=force_resolve)
+            # On-demand clearance: for an intermittent-challenge source on the FIRST
+            # attempt (not a forced D-35 reconcile), peek the held clearance only —
+            # never block on a fresh solve. If no challenge fires, the request just
+            # succeeds with no solve; if one does, ``_request_response`` detects it
+            # (``is_cf_challenge``) and retries with ``force_resolve=True``, which
+            # drives a real solve through the ``else`` branch below. Eager sources
+            # (``cloudflare_challenge_optional=False``) keep ``solve_if_missing=True``.
+            solve_if_missing = not (
+                self._cloudflare_challenge_optional and not force_resolve
+            )
+            clearance = await self._call_solver(
+                force_resolve=force_resolve, solve_if_missing=solve_if_missing
+            )
             if clearance is not None:
                 headers["User-Agent"] = clearance.user_agent
                 cookie_parts.extend(
@@ -300,19 +320,30 @@ class SourceContext:
             return await prepare(self._source_key, force_refresh=True)  # type: ignore[call-arg]
         return await prepare(self._source_key)
 
-    async def _call_solver(self, *, force_resolve: bool) -> Any:
-        """Call ``get_clearance``, passing the internal ``force_resolve`` path if the
-        solver supports it.
+    async def _call_solver(
+        self, *, force_resolve: bool, solve_if_missing: bool = True
+    ) -> Any:
+        """Call ``get_clearance``, passing the internal escalation kwargs the solver
+        supports.
 
-        ``force_resolve`` is an internal escalation kwarg kept OFF the ``AntiBotSolver``
-        Protocol so the public seam does not churn (D-41). A solver that does not accept
-        it (the ``NoopSolver`` default) is called with ``source_key`` only.
+        ``force_resolve`` (D-35 re-solve) and ``solve_if_missing`` (on-demand peek —
+        ``False`` means "serve only already-held clearance, do NOT block on a fresh
+        solve") are internal kwargs kept OFF the ``AntiBotSolver`` Protocol so the
+        public seam does not churn (D-41). Each is forwarded ONLY when the chosen
+        solver declares it, via ``inspect.signature`` — a solver that accepts neither
+        (the ``NoopSolver`` default) is called with ``source_key`` only.
+        ``solve_if_missing=True`` (the default) is never forwarded, so eager callers
+        stay byte-for-byte unchanged.
         """
         assert self._solver is not None
         get = self._solver.get_clearance
-        if force_resolve and "force_resolve" in inspect.signature(get).parameters:
-            return await get(self._source_key, force_resolve=True)  # type: ignore[call-arg]
-        return await get(self._source_key)
+        params = inspect.signature(get).parameters
+        kwargs: dict[str, Any] = {}
+        if force_resolve and "force_resolve" in params:
+            kwargs["force_resolve"] = True
+        if not solve_if_missing and "solve_if_missing" in params:
+            kwargs["solve_if_missing"] = False
+        return await get(self._source_key, **kwargs)
 
     async def _decrypt(self, body: bytes) -> bytes:
         """Route ``body`` through the framework decrypt seam (D-39; None = identity).

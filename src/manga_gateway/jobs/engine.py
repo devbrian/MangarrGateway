@@ -489,6 +489,9 @@ class JobEngine:
             handle_store=self._handle_store,
             solver=self._solver,
             antibot=getattr(source, "antibot", "none"),
+            cloudflare_challenge_optional=getattr(
+                source, "cloudflare_challenge_optional", False
+            ),
             decrypt_scheme=getattr(source, "decrypt_scheme", None),
             decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
             source_health=self._source_health.get(key),

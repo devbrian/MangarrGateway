@@ -85,7 +85,11 @@ class AndroidSolver:
         self._held: dict[str, Clearance] = {}
 
     async def get_clearance(
-        self, source_key: str, *, force_resolve: bool = False
+        self,
+        source_key: str,
+        *,
+        force_resolve: bool = False,
+        solve_if_missing: bool = True,
     ) -> Clearance | None:
         """Return clearance for ``source_key`` (``None`` for non-android keys).
 
@@ -95,6 +99,14 @@ class AndroidSolver:
         FRESH sidecar solve (D-35, the 403 self-heal). ``force_resolve`` is a declared
         keyword so context.py's ``_call_solver`` ``inspect.signature`` detection passes
         it through (D-41).
+
+        ``solve_if_missing=False`` (the on-demand peek, debug pooltimeout-recurrence):
+        serve the held clearance if present but return ``None`` instead of running a
+        BLOCKING sidecar solve when none is held — the caller (a
+        ``cloudflare_challenge_optional`` source) will let the request go out without
+        clearance and only force a real solve if the response is an actual challenge.
+        This is what stops an intermittent-challenge source from hanging on the sidecar
+        for a clearance the site is not currently demanding.
         """
         if source_key not in self._challenge_urls:
             return None  # MangaDex et al. — no android clearance needed
@@ -108,6 +120,9 @@ class AndroidSolver:
             held = self._held.get(source_key)
             if held is not None:
                 return held
+            if not solve_if_missing:
+                # On-demand peek with nothing held — do NOT block on a sidecar solve.
+                return None
         clearance = await self._solve(source_key)
         self._held[source_key] = clearance
         return clearance

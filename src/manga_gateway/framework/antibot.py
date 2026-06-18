@@ -549,15 +549,31 @@ class CloudflareSolver:
         return self._engine
 
     async def get_clearance(
-        self, source_key: str, *, force_resolve: bool = False
+        self,
+        source_key: str,
+        *,
+        force_resolve: bool = False,
+        solve_if_missing: bool = True,
     ) -> Clearance | None:
         """Return clearance for ``source_key`` (``None`` for non-cloudflare keys).
 
         ``force_resolve`` (internal, D-35) skips the held clearance and runs a fresh
-        solve. It is NOT part of the ``AntiBotSolver`` Protocol (D-41).
+        solve. ``solve_if_missing=False`` is the on-demand peek (debug
+        pooltimeout-recurrence). Both are internal kwargs, NOT part of the
+        ``AntiBotSolver`` Protocol (D-41).
+
+        Unlike the AndroidSolver, this desktop solver keeps NO in-memory held cache —
+        cf_clearance persists in the browser ``cloudflare-userdata`` dir and every
+        solve re-navigates (short-circuiting on the on-disk cookie). There is therefore
+        nothing to return cheaply for a peek, so ``solve_if_missing=False`` on a
+        non-force call returns ``None`` and defers to the challenge-triggered
+        force-resolve. (No patchright source sets ``cloudflare_challenge_optional``
+        today; this keeps the seam correct for the router's signature pass-through.)
         """
         if source_key not in self._cloudflare_keys:
             return None  # MangaDex et al. — no clearance needed
+        if not force_resolve and not solve_if_missing:
+            return None
         return await self._lifecycle.solve(source_key, force=force_resolve)
 
     async def warm(
