@@ -153,9 +153,9 @@ class _GatedBrowserSolver:
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
     ) -> object:
-        # #232: present so ``_solver_from_ctx``'s hasattr guard passes. These
-        # DOWNLOAD-path tests drive RESOLVED composites only, so the deferred
-        # always-walk enumeration never runs — this stub is never invoked.
+        # Retired on the comix path (spike 019) and kept only for back-compat.
+        # These DOWNLOAD-path tests drive RESOLVED composites only, so the deferred
+        # chapter-list enumeration never runs — this stub is never invoked.
         raise AssertionError(  # pragma: no cover — never called on the resolved path
             f"fetch_via_browser_paginated unexpectedly called ({url!r})"
         )

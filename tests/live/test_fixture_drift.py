@@ -99,34 +99,35 @@ pytestmark = [
 _COMIX_CDN_URL_RE = re.compile(
     r"^https://[a-z0-9-]+\.wowpic\d+\.store"  # rotating host (noise)
     r"/[a-z0-9]{2,4}"  # rotating /iN/ shard segment (noise)
-    r"/(?P<token>[A-Za-z0-9_-]{16,})"  # rotating signed token (noise, #181)
-    r"/(?P<page>\d+\.(?:webp|jpg|jpeg|png))$",  # page ordinal/filename (STRICT)
+    r"/[A-Za-z0-9_-]{16,}"  # rotating per-page signed token (noise)
+    r"(?:/\d+\.(?:webp|jpg|jpeg|png))?"  # OPTIONAL legacy /NN.ext ordinal
+    r"(?:\?[^\s]*)?$",  # OPTIONAL cache-buster query (e.g. ?v3) — noise
     re.IGNORECASE,
 )
 
 
 def _normalize_comix_cdn_url(url: object) -> object:
-    """Collapse the rotating Comix CDN host, ``/iN/`` segment + token to a placeholder.
+    """Collapse any Comix-CDN page URL (both schemes) to one placeholder.
 
-    Issue #166: the Comix image CDN periodically rotates its host and leading
-    ``/iN/`` shard segment (``/si`` → ``/i3`` → ``/i4`` so far). Issue #181: the
-    per-chapter signed token rotates the same way (``…4oENYsQ`` →
-    ``…4oENYsai3R0VvqA``). Each rotation re-flagged this comparator even though
-    production already treats all three parts as untrusted noise (shape-only
-    SSRF pin). This normalizes those rotating parts of a Comix-CDN-shaped URL,
-    keeping ONLY the per-page filename/ordinal strict (page-count parity is
-    checked separately on the raw lists).
+    Issue #166/#181: the Comix image CDN rotates its host, ``/iN/`` shard segment,
+    and per-page signed token — all untrusted noise that production pins by SHAPE
+    only. Spike 019 / debug comix-cdn-scheme-rotation: comix then dropped the
+    per-page ``/NN.ext`` filename entirely (the new ``/{seg}/{per-page-token}``
+    scheme), so there is no longer a stable per-page ordinal to keep strict — every
+    page is an opaque token that rotates each fetch. The durable structural signal
+    is now the page COUNT (asserted via raw-length parity below), so any Comix-CDN-
+    shaped URL — old ``/{seg}/{token}/{NN}.{ext}`` or new ``/{seg}/{token}`` —
+    collapses to a single ``comix-cdn://page`` placeholder.
 
-    Non-Comix-CDN inputs (any URL that does not match ``_COMIX_CDN_URL_RE``, or
-    a non-string) are returned UNCHANGED, so the normalization cannot silently
+    Non-Comix-CDN inputs (any URL that does not match ``_COMIX_CDN_URL_RE``, or a
+    non-string) are returned UNCHANGED, so the normalization cannot silently
     swallow genuine drift on other fixtures/sources.
     """
     if not isinstance(url, str):
         return url
-    m = _COMIX_CDN_URL_RE.match(url)
-    if m is None:
+    if _COMIX_CDN_URL_RE.match(url) is None:
         return url
-    return f"comix-cdn://{m.group('page')}"
+    return "comix-cdn://page"
 
 
 # Imported lazily inside the test so MangaDex (which skips before touching
@@ -159,7 +160,8 @@ async def test_fixture_drift(
     # Comix-specific imports (only loaded once the test will actually run —
     # MangaDex skips above).
     from manga_gateway.sources.comix import (
-        _CHAPTER_PAGES_EXTRACT_JS,
+        _CHAPTER_PAGES_API_EXTRACT_JS,
+        _CHAPTER_PAGES_WAIT_FOR,
         ComixSource,
     )
 
@@ -177,15 +179,14 @@ async def test_fixture_drift(
         # there is no public httpx accessor in this version.
         solver = client._transport.app.state.solver
 
-        # Issue #32: mirror ``ComixSource.fetch_manifest`` exactly — same
-        # ``wait_for=None`` (the JS extractor's Step-1 scaffold wait does
-        # the readiness check) and same 60s ceiling. Any deviation between
-        # this call site and production reintroduces the harness-vs-prod
-        # divergence the original issue chased.
+        # Spike 019: mirror ``ComixSource.fetch_manifest`` exactly — the internal
+        # ``chapters/{id}`` API extractor + the reader-scaffold ``wait_for`` + the
+        # 60s ceiling. Any deviation between this call site and production
+        # reintroduces the harness-vs-prod divergence #32 chased.
         captured = await solver.fetch_via_browser(
             chapter_url,
-            extract=_CHAPTER_PAGES_EXTRACT_JS,
-            wait_for=None,
+            extract=_CHAPTER_PAGES_API_EXTRACT_JS,
+            wait_for=_CHAPTER_PAGES_WAIT_FOR,
             timeout=60.0,
         )
 

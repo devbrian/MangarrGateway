@@ -169,12 +169,12 @@ class _SlowComixSolver:
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
     ) -> object:
-        # #232: ``_series_chapters`` always-enumerates via the SEQUENTIAL paginated
-        # primitive (reverted #222's parallel fan-out — the signed ``_=`` token is
-        # incompatible with the parallel URL-rewrite), so the per-candidate
-        # concurrency test must exercise THIS method (the one the source actually
-        # calls). The per-candidate ``search()`` gather is still concurrent; this
-        # fake's in-flight/gate/delay accounting is what those assertions read.
+        # Retired on the comix path (spike 019): ``_series_chapters`` now enumerates
+        # via comix's own internal ``chapters()`` loader on the one-shot
+        # ``fetch_via_browser`` (the method the source actually calls — and which
+        # routes through the SAME ``_gated_fetch`` accounting above, so the
+        # per-candidate concurrency assertions still hold). This stub stays only for
+        # back-compat and shares the gate; it is no longer invoked by the source.
         _ = (extract, wait_for, next_selector, route_limit_rewrite)
         _ = (max_pages, timeout)
         self.browser_fetch_calls.append(url)
