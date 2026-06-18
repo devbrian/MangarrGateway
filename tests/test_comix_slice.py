@@ -235,11 +235,12 @@ def _mock_comix_search(solver: _ComixSolver) -> None:
             },
         )
     )
-    # Browser-DOM chapter-list: the series page URL is now enumerated via the
-    # always-walk paginated primitive (#146), so stage it on the paginated
-    # registry. The chapter-pages manifest read stays on fetch_via_browser.
+    # Chapter-list: the series page URL is enumerated via comix's own internal
+    # chapters() loader on the one-shot fetch_via_browser (spike 019), so stage it
+    # on the browser-fetch registry (keyed by series URL). The chapter-pages
+    # manifest read also rides fetch_via_browser, keyed by its distinct chapter URL.
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    solver.stage_browser_paginated(
+    solver.stage_browser_fetch(
         series_url,
         [
             {
@@ -559,46 +560,45 @@ async def test_comix_fetch_manifest_routes_through_browser(
     # would double-wait the same condition and add ~1 s of pure overhead.
     assert wait_for is None
 
-    # The series-page chapter-list enumeration is now ONE sequential paginated
-    # call (#232 reverted #222's parallel fan-out) — recorded on
-    # ``paginated_fetch_calls``, NOT ``browser_fetch_calls``. The chapter-pages
-    # manifest read above stays on the one-shot fetch_via_browser.
-    assert len(solver.paginated_fetch_calls) == 1
-    (
-        series_url,
-        _series_extract,
-        series_wait,
-        series_next,
-        series_route,
-    ) = solver.paginated_fetch_calls[0]
+    # The series-page chapter-list enumeration now runs comix's OWN internal
+    # ``chapters(hid, {limit:100})`` loader in the warm tab (spike 019), so it
+    # rides the ONE-SHOT ``fetch_via_browser`` (recorded on ``browser_fetch_calls``,
+    # keyed by the series URL) — the retired paginated Next-walk is never used.
+    assert solver.paginated_fetch_calls == []
+    series_calls = [c for c in solver.browser_fetch_calls if "-chapter-" not in c[0]]
+    assert len(series_calls) == 1
+    series_url, series_extract, series_wait = series_calls[0]
     assert series_url == f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    # JS predicate (not CSS selector) — routes to page.wait_for_function and
-    # polls DOM attachment of `a.mchap-row__primary` so anchors that render
-    # off-screen / inside scroll containers don't trip a visibility wait.
+    # JS predicate (not CSS selector) — routes to page.wait_for_function and polls
+    # DOM attachment of `a.mchap-row__primary`, which guarantees the SPA has booted
+    # and its API ES module is loaded (interceptors wired) before the extract
+    # ``import()``s it.
     assert series_wait is not None
     assert "mchap-row__primary" in series_wait
     assert series_wait.startswith("() =>")
-    # The comix-side sequential-pagination literals are passed from comix.py (the
-    # framework stays source-agnostic): the Next-page selector for the natural
-    # Next-walk, and — load-bearing for #232 — NO ``route_limit_rewrite`` (bumping
-    # the SPA's ``limit=20``→``100`` rewrites its token-signed ``/chapters`` URL and
-    # invalidates the ``_=`` signature → 403).
-    assert series_next == 'button[aria-label*="Next"]'
-    assert series_route is None
-    # And NO series-page read leaked onto the one-shot primitive.
-    assert not any("-chapter-" not in c[0] for c in solver.browser_fetch_calls)
+    # The comix-side spike-019 literals live in the extract JS (the framework stays
+    # source-agnostic): runtime env-*.js discovery, the dynamic import, and the
+    # internal ``chapters()`` call at ``LIMIT = 100``.
+    assert "env-" in series_extract
+    assert "import(" in series_extract
+    assert ".chapters(" in series_extract
+    assert "LIMIT = 100" in series_extract
 
 
 # ─── (5b) chapter-list extractor reads the per-row likes span ─────────────────
 
 
-def test_chapter_list_extract_js_reads_likes_span() -> None:
-    """The chapter-list extractor JS references the ``mchap-row__likes`` row
-    span so per-row likes flow into ``Release.votes`` (REL-03)."""
-    from manga_gateway.sources.comix import _CHAPTER_LIST_EXTRACT_JS
+def test_chapter_list_api_extract_js_maps_votes_to_likes() -> None:
+    """The chapter-list extractor runs comix's own internal ``chapters()`` loader
+    (spike 019) — discovered via a runtime ``env-*.js`` import — and maps the API
+    row's ``votes`` → ``likes`` so per-chapter likes flow into ``Release.votes``
+    (REL-03)."""
+    from manga_gateway.sources.comix import _CHAPTER_LIST_API_EXTRACT_JS
 
-    assert "mchap-row__likes" in _CHAPTER_LIST_EXTRACT_JS
-    assert "likes" in _CHAPTER_LIST_EXTRACT_JS
+    assert "import(" in _CHAPTER_LIST_API_EXTRACT_JS
+    assert ".chapters(" in _CHAPTER_LIST_API_EXTRACT_JS
+    assert "votes" in _CHAPTER_LIST_API_EXTRACT_JS
+    assert "likes" in _CHAPTER_LIST_API_EXTRACT_JS
 
 
 # ─── (6) scanlation group comes from the DOM extractor ────────────────────────
@@ -635,7 +635,7 @@ async def test_scanlation_group_comes_from_dom_row(
     # No chapter-indexes mock: the source must NOT call it. respx would raise
     # AllMockedAssertionError on an unmocked call, which is the assertion.
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    solver.stage_browser_paginated(
+    solver.stage_browser_fetch(
         series_url,
         [
             {
@@ -687,7 +687,7 @@ async def test_dom_row_likes_become_release_votes(
         )
     )
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    solver.stage_browser_paginated(
+    solver.stage_browser_fetch(
         series_url,
         [
             {
@@ -737,7 +737,7 @@ async def test_missing_dom_group_yields_null_scanlation_group(
         )
     )
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    solver.stage_browser_paginated(
+    solver.stage_browser_fetch(
         series_url,
         [{"id": _CHAPTER_ID, "chapter": "1", "lang": "en", "groups": []}],
     )
@@ -768,12 +768,10 @@ async def test_comix_search_walks_full_list_finds_low_chapter(
     now present and findable.
 
     The series is staged with a ~3-page-worth full list (30 chapters) where
-    chapter ``5`` sits deep in the list. The fake records the call on
-    ``paginated_fetch_calls`` ONLY (the series URL is NOT staged on the one-shot
-    ``fetch_via_browser`` registry), so if ``_series_chapters`` regressed to the
-    one-shot primitive this test would fail with an unmocked-call assertion.
-    A ``type=chapter`` search for chapter 5 (the 260606-2ff filter) must return
-    exactly that chapter — proving it survived the full enumeration."""
+    chapter ``5`` sits deep in the list. The fake returns the FULL merged list the
+    in-page ``chapters()`` loader enumerates (spike 019). A ``type=chapter`` search
+    for chapter 5 (the 260606-2ff filter) must return exactly that chapter —
+    proving it survived the full enumeration."""
     respx.get(f"{_COMIX}/api/v1/manga").mock(
         return_value=httpx.Response(
             200,
@@ -794,7 +792,7 @@ async def test_comix_search_walks_full_list_finds_low_chapter(
     )
     # 30 chapters; chapter 5 lives deep in the list (it would render only on a
     # later pagination page on the live site — the #146 failure mode). The fake
-    # paginated primitive returns the FULL merged list the real primitive walks.
+    # one-shot primitive returns the FULL merged list the in-page loader yields.
     full_list = [
         {
             "id": f"chap-{n}",
@@ -806,7 +804,7 @@ async def test_comix_search_walks_full_list_finds_low_chapter(
     ]
     assert any(c["chapter"] == "5" for c in full_list)
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    solver.stage_browser_paginated(series_url, full_list)
+    solver.stage_browser_fetch(series_url, full_list)
 
     resp = await comix_client.post(
         "/search",
@@ -823,10 +821,12 @@ async def test_comix_search_walks_full_list_finds_low_chapter(
     # release, proving #5 was enumerated from the FULL walked list.
     releases = body["releases"]
     assert [r["chapterNumber"] for r in releases] == [5]
-    # And the enumeration went through the always-walk sequential paginated
-    # primitive (#232) with NO route-rewrite (index 4 = route_limit_rewrite).
-    assert len(solver.paginated_fetch_calls) == 1
-    assert solver.paginated_fetch_calls[0][4] is None
+    # And the enumeration went through the one-shot fetch_via_browser (spike 019),
+    # keyed by the series URL — the retired paginated Next-walk is never used.
+    assert solver.paginated_fetch_calls == []
+    series_calls = [c for c in solver.browser_fetch_calls if "-chapter-" not in c[0]]
+    assert len(series_calls) == 1
+    assert series_calls[0][0] == series_url
 
 
 # ─── (debug comix-page-walker-100-cap) a >100-chapter series honors req.limit ──
@@ -884,7 +884,7 @@ async def test_comix_search_returns_more_than_100_when_limit_is_higher(
         for n in range(150, 0, -1)
     ]
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    solver.stage_browser_paginated(series_url, full_list)
+    solver.stage_browser_fetch(series_url, full_list)
 
     resp = await comix_client.post(
         "/search",
@@ -903,11 +903,12 @@ async def test_comix_search_returns_more_than_100_when_limit_is_higher(
         f"expected 150 releases for a 150-chapter series at limit=150, "
         f"got {len(releases)} (warnings={body.get('warnings')})"
     )
-    # The sequential paginated primitive walks the natural ``limit=20`` pages with
-    # NO route-rewrite (#232; index 4 = route_limit_rewrite) — the result window is
-    # decoupled from the per-page fetch size, which stays the SPA's own limit.
-    assert len(solver.paginated_fetch_calls) == 1
-    assert solver.paginated_fetch_calls[0][4] is None
+    # The in-page chapters() loader (spike 019) rides the one-shot fetch_via_browser
+    # — the per-series result window is decoupled from the upstream page size, and
+    # the retired paginated Next-walk is never used.
+    assert solver.paginated_fetch_calls == []
+    series_calls = [c for c in solver.browser_fetch_calls if "-chapter-" not in c[0]]
+    assert len(series_calls) == 1
 
 
 @respx.mock
@@ -942,7 +943,7 @@ async def test_comix_search_default_limit_still_truncates_at_route(
         for n in range(150, 0, -1)
     ]
     series_url = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    solver.stage_browser_paginated(series_url, full_list)
+    solver.stage_browser_fetch(series_url, full_list)
 
     resp = await comix_client.post(
         "/search",

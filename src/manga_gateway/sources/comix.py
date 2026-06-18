@@ -971,93 +971,151 @@ _CHAPTER_PAGES_WAIT_FOR = ".rpage-page[data-page]"
 # the context so the imgs populate; 2 attempts total (1 retry).
 _MANIFEST_COLD_RACE_ATTEMPTS = 2
 
-# JS extractor that returns the rendered chapter list off the series page DOM.
-# Selects ``<a>`` elements whose href matches the recon-pinned chapter URL
-# pattern ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and emits a
-# ``{id, chapter, lang, groups, publishedAtRelative}`` shape per chapter —
-# match-compatible with the encrypted-API ``_to_release`` consumer. Lang
-# defaults to "en" (Comix is English-only per live recon) and group is best-
-# effort extracted from a sibling ``.scanlation`` / ``.group`` element when
-# present; absent the live-smoke is allowed to refine the selector. Chapter
-# IDs and numbers are load-bearing — the rest is advisory.
+# JS extractor that enumerates the FULL chapter list via comix's OWN internal API
+# loader (spike 019), replacing the slow browser-DOM "Next-walk". The chapter-list
+# endpoint ``/api/v1/manga/{hid}/chapters`` is gated by a JS-minted ``_=`` request
+# signature (binds page+limit since #232) AND returns an encrypted ``{"e":...}``
+# envelope decrypted only in-page by the VM-obfuscated ``secure-*.js`` — judged
+# un-crackable statically (spikes 010/012/015). Spike 019's bypass: don't crack the
+# VM, call comix's own loader. The API-client ES module (``env-*.js``) wires the
+# request-SIGN + response-DECRYPT interceptors onto its axios instance (``ro(ri)``);
+# ES modules are cached singletons, so ``await import('<env-*.js url>')`` returns the
+# LIVE warm instance and ``<api>.chapters(hid, {limit:100})`` signs limit=100 AND
+# returns DECRYPTED rows (proven live: 100 rows in ~511ms). Dynamic same-origin
+# import is NOT CSP-blocked from page.evaluate (unlike the init scripts Patchright
+# suppresses). limit=100 cuts One Piece from ~236 pages (limit=20 DOM walk) to ~47,
+# each a ~500ms in-page API call fanned out (bounded) in ONE warm tab.
 #
-# Issue #30 (2026-05-30): also extract ``<span class="mchap-row__time">``'s
-# text content per row. The chapter-list DOM does NOT expose a machine-
-# readable absolute timestamp; the only public per-row date is the rendered
-# relative string ("2d ago", "3mos ago", "14h ago"). We capture it raw here
-# and parse it Python-side (:func:`_parse_relative_time`) into an approximate
-# ISO 8601 UTC date-time so the REL-01 ``publishDate`` contract holds.
-_CHAPTER_LIST_EXTRACT_JS = """
-  const rx = /\\/title\\/[A-Za-z0-9_-]+\\/(\\d+)-chapter-([0-9.]+)(?:[/?#]|$)/i;
-  const seen = new Set();
-  const out = [];
-  const anchors = Array.from(document.querySelectorAll('a[href*="-chapter-"]'));
-  for (const a of anchors) {
-    const href = a.getAttribute('href') || '';
-    const m = href.match(rx);
-    if (!m) continue;
-    const id = m[1];
-    if (seen.has(id)) continue;
-    seen.add(id);
-    // Each chapter row is a ``<div class="mchap-row">`` carrying an
-    // ``<a class="mchap-row__group">…<span>{name}</span></a>``. Walk to the
-    // row, find the group anchor, and prefer its inner <span> (the anchor
-    // itself contains an SVG icon whose textContent is empty/whitespace).
-    // A miss is still a valid chapter row (group simply omitted).
-    let group = null;
-    let publishedAtRelative = null;
-    let likes = null;
-    const row = a.closest(
-      '.mchap-row, li, tr, [data-chapter], .chapter, .chapter-item'
-    );
-    if (row) {
-      const g = row.querySelector(
-        'a.mchap-row__group, .scanlation, .group, [data-group], .scanlator'
-      );
-      if (g) {
-        const span = g.querySelector('span');
-        const text = ((span && span.textContent) || g.textContent || '').trim();
-        if (text) group = text;
-      }
-      // Issue #30: ``<span class="mchap-row__time">`` carries the rendered
-      // ``createdAtFormatted`` value (e.g. "14h ago", "2d ago", "3mos ago").
-      // The raw absolute timestamp is NOT exposed in the DOM — only this
-      // relative string. We capture it for Python-side approximation.
-      const t = row.querySelector('.mchap-row__time, time, [data-time]');
-      if (t) {
-        const text = (t.textContent || '').trim();
-        if (text) publishedAtRelative = text;
-      }
-      // REL-03: ``<span class="mchap-row__likes"><svg/>27</span>`` carries the
-      // per-chapter thumbs-up count. textContent is the inline SVG icon noise
-      // followed by the integer (e.g. an abbreviated "1.2K" form). Strip the
-      // non-digit noise and parse the trailing count; a row without the span is
-      // still a valid chapter row (likes simply null).
-      const lk = row.querySelector('.mchap-row__likes, [data-likes]');
-      if (lk) {
-        const raw = (lk.textContent || '').replace(/[^0-9.kKmM]/g, '');
-        const km = raw.match(/^([0-9.]+)([kKmM]?)$/);
-        if (km) {
-          let n = parseFloat(km[1]);
-          if (!isNaN(n)) {
-            const suffix = km[2].toLowerCase();
-            if (suffix === 'k') n *= 1000;
-            else if (suffix === 'm') n *= 1000000;
-            likes = Math.round(n);
-          }
-        }
-      }
+# Emits the SAME ``{id, chapter, lang, groups, publishedAtRelative, likes, volume}``
+# row shape the prior DOM extractor produced, so the ``_to_release`` consumer and the
+# newest-first sort / enum-cache wrapping in ``_fetch_series_chapters_raw`` are
+# unchanged. The env-*.js URL hash and minified export names can rotate per deploy,
+# so both are discovered at RUNTIME (Resource-Timing buffer + export scan), never
+# hardcoded. raw-string literal — the JS regexes use single-backslash escapes.
+_CHAPTER_LIST_API_EXTRACT_JS = r"""
+  // Bounded parallel page-fetch tuning. limit=100 (comix signs the token for any
+  // limit); CONCURRENCY caps simultaneous in-page API calls; MAX_PAGES is a
+  // runaway guard (200*100 = 20k rows — far past comix's longest series).
+  const LIMIT = 100;
+  const CONCURRENCY = 8;
+  const MAX_PAGES = 200;
+
+  // (1) Discover the API-client module (env-*.js) URL at RUNTIME — the hash
+  // changes per deploy, so NEVER hardcode it. It is in the Resource-Timing buffer
+  // because the SPA already loaded it on boot.
+  const envUrl = performance.getEntriesByType('resource')
+    .map(e => e.name)
+    .find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
+  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
+
+  // (2) import() returns the LIVE cached singleton — its axios instance already
+  // has comix's own request-SIGN + response-DECRYPT interceptors wired (ro(ri)),
+  // so chapters() signs the _= token for limit=100 AND decrypts the {"e":...}
+  // envelope for free. Dynamic same-origin import is NOT CSP-blocked here.
+  const mod = await import(envUrl);
+
+  // (3) Find the manga API object (exposes chapters(hid, params)). Prefer the
+  // proven `c` export; fall back to scanning exports (minified names can rotate).
+  const findApi = (m) => {
+    if (!m) return null;
+    if (m.c && typeof m.c.chapters === 'function') return m.c;
+    for (const v of Object.values(m)) {
+      if (v && typeof v === 'object' && typeof v.chapters === 'function') return v;
     }
-    out.push({
-      id: id,
-      chapter: m[2],
-      lang: 'en',
-      groups: group ? [{ name: group }] : [],
-      publishedAtRelative: publishedAtRelative,
-      likes: likes
-    });
+    return null;
+  };
+  const api = findApi(mod) || findApi(mod.default);
+  if (!api) throw new Error('comix: chapters() API not found in env module');
+
+  // (4) Series hid from the path (/title/{hid}-{slug}); hids carry no hyphen.
+  const hm = location.pathname.match(/\/title\/([^/-]+)/);
+  if (!hm) throw new Error('comix: could not read hid from ' + location.pathname);
+  const hid = hm[1];
+
+  const getPage = (p) =>
+    api.chapters(hid, { page: p, limit: LIMIT, order: { number: 'desc' } });
+  const rowsOf = (res) => {
+    if (!res) return [];
+    if (Array.isArray(res)) return res;
+    return res.items || (res.result && res.result.items) || res.data || [];
+  };
+  const num = (o, ks) => {
+    if (!o) return null;
+    for (const k of ks) {
+      const v = o[k];
+      if (v != null && Number.isFinite(+v)) return +v;
+    }
+    return null;
+  };
+
+  const byId = new Map();
+  const add = (rows) => {
+    for (const it of rows) {
+      if (!it || it.id == null || it.number == null) continue;
+      if (byId.has(it.id)) continue;
+      byId.set(it.id, {
+        id: String(it.id),
+        chapter: String(it.number),
+        lang: it.language || 'en',
+        groups: (it.group && it.group.name) ? [{ name: it.group.name }] : [],
+        publishedAtRelative: it.createdAtFormatted || null,
+        likes: (typeof it.votes === 'number') ? it.votes : null,
+        volume: (it.volume != null) ? it.volume : null
+      });
+    }
+  };
+
+  // (5) Page 1 — NO catch: a real connectivity/token/decrypt failure here must
+  // surface (fail-closed; a partial chapter list is never returned).
+  const first = await getPage(1);
+  const firstRows = rowsOf(first);
+  add(firstRows);
+
+  // (6) Determine the last page P from pagination meta when the decrypted
+  // response carries it (Laravel-style: last_page / total). meta may sit at the
+  // top level, under .meta, or under .result(.meta).
+  const meta =
+    (first && (first.meta || (first.result && (first.result.meta || first.result)))) ||
+    first ||
+    {};
+  let lastPage = num(
+    meta, ['lastPage', 'last_page', 'pages', 'totalPages', 'total_pages']);
+  if (lastPage == null) {
+    const total = num(meta, ['total', 'totalCount', 'total_count', 'count']);
+    if (total != null) lastPage = Math.max(1, Math.ceil(total / LIMIT));
   }
-  return out;
+
+  if (lastPage != null) {
+    // Exact, fail-closed: fan pages 2..P out in bounded chunks (no overshoot, no
+    // error masking — a thrown page rejects Promise.all and fails the whole read).
+    const P = Math.min(lastPage, MAX_PAGES);
+    for (let start = 2; start <= P; start += CONCURRENCY) {
+      const batch = [];
+      for (let p = start; p < start + CONCURRENCY && p <= P; p++) batch.push(p);
+      const fetched = await Promise.all(batch.map(p => getPage(p).then(rowsOf)));
+      for (const rows of fetched) add(rows);
+    }
+  } else if (firstRows.length >= LIMIT) {
+    // Degraded fallback (no pagination meta): wave-probe pages 2.. until a page
+    // returns < LIMIT rows. Tolerate per-page rejection past the end (overshoot)
+    // by treating it as an empty page, so a healthy long series still completes.
+    let next = 2;
+    let done = false;
+    while (!done && next <= MAX_PAGES) {
+      const batch = [];
+      for (let p = next; p < next + CONCURRENCY && p <= MAX_PAGES; p++) batch.push(p);
+      const fetched = await Promise.all(
+        batch.map(p => getPage(p).then(rowsOf).catch(() => []))
+      );
+      for (const rows of fetched) {
+        add(rows);
+        if (rows.length < LIMIT) done = true;
+      }
+      next += CONCURRENCY;
+    }
+  }
+
+  return Array.from(byId.values());
 """
 
 # CSS selector ``solver.fetch_via_browser`` waits for before reading the series
@@ -1072,22 +1130,6 @@ _CHAPTER_LIST_EXTRACT_JS = """
 _CHAPTER_LIST_WAIT_FOR = (
     "() => document.querySelectorAll('a.mchap-row__primary').length > 0"
 )
-
-# CSS selector for the chapter-list "Next page" pagination control. The
-# SEQUENTIAL enumeration (#232) JS-clicks this button page-by-page; each click is
-# a NATURAL SPA navigation that mints a FRESH valid ``_=`` token for the next
-# ``/api/v1/manga/{hid}/chapters?page=N&limit=20&…`` request (token-compatible).
-#
-# #232 — comix made the chapter-list ``_=`` token a SIGNATURE bound to the EXACT
-# query string, so the #222 PARALLEL primitive
-# (``fetch_via_browser_parallel_pages``), which PINS each page by REWRITING the
-# SPA's own token-signed request URL (limit-bump + ``?page=N``) via
-# ``page.route()``, invalidates the signature → 403 → 0 rows. Walking the natural
-# Next control at the SPA's own ``limit=20`` (NO route-rewrite) is the
-# token-compatible path. ``_LAST_PAGE_SELECTOR`` (the parallel path's
-# P-discovery jump) is retired from comix; the framework primitive + its unit
-# tests stay intact for other sources.
-_NEXT_PAGE_SELECTOR = 'button[aria-label*="Next"]'
 
 
 def _title_to_slug(title: str) -> str:
@@ -1797,32 +1839,27 @@ class ComixSource(Source):
         DOM reads we ALSO need off-Protocol browser primitives (D-41), same
         instance, distinct from the request-clearance use:
 
-        * ``fetch_via_browser_paginated`` — the always-walk SEQUENTIAL
-          chapter-list enumeration in :meth:`_series_chapters` (#232 reverted
-          #222's parallel fan-out: the signed ``_=`` token is incompatible with
-          the parallel primitive's URL-rewrite — see ``_NEXT_PAGE_SELECTOR``);
-        * ``fetch_via_browser`` — the one-shot chapter-pages manifest read in
-          :meth:`fetch_manifest`; and
+        * ``fetch_via_browser`` — the one-shot primitive used for BOTH the
+          chapter-list enumeration (:meth:`_fetch_series_chapters_raw`, which runs
+          comix's own internal ``chapters(hid, {limit:100})`` loader in the warm
+          tab — spike 019) AND the chapter-pages manifest read
+          (:meth:`fetch_manifest`); and
         * ``fetch_via_browser_typed`` — the real-keyboard typed search that mints
           the ``_=`` request token (``need_typed=True``, :meth:`_search_series`;
           debug ``comix-search-api-403``).
 
         Raises ``SourceError`` when the solver is missing OR lacks a REQUIRED
-        primitive (a wiring bug, not a runtime condition). (The PARALLEL
-        ``fetch_via_browser_parallel_pages`` is no longer required — #232 moved
-        the chapter-list path back to the sequential Next-walk; the framework
-        primitive itself stays for other sources.)
+        primitive (a wiring bug, not a runtime condition). (Comix no longer needs
+        ``fetch_via_browser_paginated`` — spike 019 replaced the DOM Next-walk with
+        the in-page API loader on the one-shot ``fetch_via_browser`` — nor the
+        PARALLEL ``fetch_via_browser_parallel_pages``; both framework primitives
+        stay for other sources.)
         """
         solver = getattr(ctx, "_solver", None)
-        if (
-            solver is None
-            or not hasattr(solver, "fetch_via_browser")
-            or not hasattr(solver, "fetch_via_browser_paginated")
-        ):
+        if solver is None or not hasattr(solver, "fetch_via_browser"):
             raise SourceError(
                 "source_unavailable",
-                "comix browser-fetch requires a solver with fetch_via_browser "
-                "and fetch_via_browser_paginated",
+                "comix browser-fetch requires a solver with fetch_via_browser",
             )
         if need_typed and not hasattr(solver, "fetch_via_browser_typed"):
             raise SourceError(
@@ -1937,63 +1974,62 @@ class ComixSource(Source):
         series_slug: str,
         ctx: SourceContext,
     ) -> list[dict[str, Any]]:
-        """The RAW, newest-first, FULLY-WALKED chapter list off the warm series
-        page (no filter, no slice).
+        """The RAW, newest-first, COMPLETE chapter list off the warm series page
+        (no filter, no slice).
 
-        This is the EXPENSIVE unit (a 7-18s browser navigation that ALWAYS walks
-        the FULL paginated chapter list, #146) and so the unit the Layer-2
+        This is the EXPENSIVE unit (one warm-tab browser navigation that ALWAYS
+        enumerates the FULL chapter list, #146) and so the unit the Layer-2
         enumeration cache stores: it navigates ``{base_url}/title/{hid}-{slug}`` in
-        the warm Patchright browser, waits for the chapter-list anchors to hydrate,
-        walks every pagination page, normalizes the rows to the dict shape
-        ``_to_release`` consumes, and sorts newest-first by chapter number. It
-        applies NEITHER the ``chapter_matches`` floor filter NOR the offset/limit
-        slice — those live one level up (``_series_chapters`` for the
-        ``fetch_manifest`` path; ``search()`` for the cached search path) so the
-        cached enumeration is the complete, unfiltered list (CACHE-02). Because the
-        walk is COMPLETE, ``search()`` marks the cached ``Enumeration`` exhausted.
+        the warm Patchright browser, waits for the chapter-list anchors to hydrate
+        (so the SPA's API module is loaded + interceptors warm), runs comix's OWN
+        internal ``chapters(hid, {limit:100})`` loader in-page to enumerate every
+        chapter, normalizes the rows to the dict shape ``_to_release`` consumes, and
+        sorts newest-first by chapter number. It applies NEITHER the
+        ``chapter_matches`` floor filter NOR the offset/limit slice — those live one
+        level up (``_series_chapters`` for the ``fetch_manifest`` path; ``search()``
+        for the cached search path) so the cached enumeration is the complete,
+        unfiltered list (CACHE-02). Because the enumeration is COMPLETE, ``search()``
+        marks the cached ``Enumeration`` exhausted.
 
-        #146 / #222: ALWAYS enumerate the FULL paginated chapter list, not just the
-        ~20 rows on first paint. The series page renders only the newest chapter's
-        group-uploads initially, so a low/old chapter (e.g. #5) lives on a later
-        pagination page and was never enumerated by the old one-shot read. The
-        parallel-pagination primitive (a) discovers the page count P via the
-        ``button[aria-label*="Last"]`` jump + the SPA's ``?page=N`` URL sync — NOT
-        the windowed numbered buttons, which under-report P on long series and
-        silently DROP chapters (spike 014's load-bearing correctness step) — then
-        (b) fans pages 1..P out CONCURRENTLY, each pinned by a ``page.route()``
-        ``page``+``limit`` rewrite, bounded by the EXISTING
-        ``_browser_lock``/``fetch_concurrency`` semaphore, and merges deduped by
-        ``id`` newest-first. A fan-out page that fails or yields no rows FAILS CLOSED
-        (raises) — a partial list is never returned. All comix-side literals — the
-        ``/chapters`` URL substring, the ``100`` target limit, the
-        ``button[aria-label*="Last"]`` selector, the ``page`` param name — live
-        HERE, never in the framework.
+        #146 / spike 019: ALWAYS enumerate the FULL chapter list, not just the ~20
+        rows on first paint. The prior approaches walked the rendered DOM page-by-
+        page (the ``limit=20`` "Next" control — #232) which was correct but slow
+        (One Piece ~236 pages, ~20-30s, blew the 30s budget on the longest series).
+        Spike 019 replaced it: the chapter-list endpoint's ``_=`` request signature
+        (binds page+limit) and encrypted ``{"e":...}`` response are un-crackable
+        statically, so rather than crack them we call comix's OWN axios loader. The
+        API-client ES module (``env-*.js``, discovered at runtime — the hash rotates
+        per deploy) is a cached singleton whose request-SIGN + response-DECRYPT
+        interceptors are already wired; ``await import()``-ing it and calling
+        ``<api>.chapters(hid, {page, limit:100, order})`` signs limit=100 AND returns
+        DECRYPTED rows. The extract (``_CHAPTER_LIST_API_EXTRACT_JS``) fans the pages
+        out (bounded ``Promise.all``) in ONE warm tab and merges deduped by ``id``.
+        limit=100 cuts One Piece to ~47 pages, each a ~500ms in-page API call. A page
+        fetch that throws FAILS CLOSED (rejects ``Promise.all`` → the extract throws →
+        ``SourceError`` below) — a partial list is never returned. All comix-side
+        literals (the ``/env-*.js`` discovery, the ``chapters()`` call, ``limit=100``)
+        live in the extract JS, never in the framework.
 
-        PERF / CONTENTION NOTE (accepted trade-off, spike 014 note 5): the parallel
-        fan-out now consumes UP TO ``fetch_concurrency`` browser slots concurrently
-        (vs 1 for the old sequential Next-walk), shared across the whole solver —
-        bounded (no second semaphore) and FAR less wall-time (spike 014: ~8.7s →
-        ~1.5-2.5s, byte-identical 386-id result). Bounded by the 30s primitive
-        timeout (≤ the framework's 30s per-source fan-out timeout,
-        ``framework/fanout.py::_DEFAULT_TIMEOUT``); the per-source aiolimiter still
-        bounds outer cadence. A failed fetch surfaces as
+        PERF (spike 019, live): the in-page API fan-out replaces the per-page DOM
+        Next-walk — One Piece drops from ~236 sequential limit=20 pages (timeout) to
+        ~47 limit=100 in-page API calls fanned out in one tab. Bounded by the 30s
+        ``fetch_via_browser`` timeout (≤ the framework's 30s per-source fan-out
+        timeout, ``framework/fanout.py::_DEFAULT_TIMEOUT``); the per-source aiolimiter
+        still bounds outer cadence. A failed fetch surfaces as
         ``SourceError("source_unavailable")`` → per-source warning (WR-06).
         """
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
         try:
-            raw = await solver.fetch_via_browser_paginated(
+            raw = await solver.fetch_via_browser(
                 series_url,
-                extract=_CHAPTER_LIST_EXTRACT_JS,
+                # Run comix's own internal ``chapters(hid, {limit:100})`` loader in
+                # the warm cleared tab (spike 019) — signs the ``_=`` token for
+                # limit=100 AND decrypts the response in-page, no VM crack.
+                extract=_CHAPTER_LIST_API_EXTRACT_JS,
+                # Wait for the chapter-list anchors so the SPA has booted and the
+                # API ES module is loaded with its interceptors wired before import.
                 wait_for=_CHAPTER_LIST_WAIT_FOR,
-                next_selector=_NEXT_PAGE_SELECTOR,
-                # #232: NO ``route_limit_rewrite``. Bumping the SPA's natural
-                # ``limit=20``→``100`` rewrites its token-signed ``/chapters`` URL
-                # and invalidates the ``_=`` signature → 403 → 0 rows. Walk the
-                # natural ``limit=20`` Next control; each click mints a fresh valid
-                # token. Slower than the #222 parallel fan-out (sequential vs
-                # concurrent pages) but reliably token-compatible — the explicit
-                # reliability-over-speed trade in #232.
                 timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as typed source failure
@@ -2002,8 +2038,8 @@ class ComixSource(Source):
             ) from exc
         if not isinstance(raw, list):
             raise SourceError("source_unavailable", "malformed chapter list")
-        # Normalize to the dict shape ``_to_release`` already consumes (the
-        # encrypted-API path produced the same shape, so the consumer is
+        # Normalize to the dict shape ``_to_release`` already consumes (the extract
+        # emits the same shape the prior DOM extractor did, so the consumer is
         # source-agnostic). Sort newest-first by chapter number when parseable.
         chapters: list[dict[str, Any]] = [c for c in raw if isinstance(c, dict)]
         chapters.sort(
@@ -2021,19 +2057,18 @@ class ComixSource(Source):
         ctx: SourceContext,
         req: SearchRequest | None = None,
     ) -> list[dict[str, Any]]:
-        """Browser-DOM read of the FULL paginated series chapter list (#146).
+        """Browser-tab read of the FULL series chapter list (#146 / spike 019).
 
-        Navigates ``{base_url}/title/{hid}-{slug}`` in the warm Patchright
-        browser and ALWAYS enumerates the FULL paginated chapter list via
-        ``solver.fetch_via_browser_parallel_pages`` (#222 parallel fan-out) —
-        reading ``[{id, chapter, lang, groups, publishedAtRelative}, …]`` off every
-        pagination page, not just the ~20 rows on first paint. Before #146 this
-        was a one-shot read of the first render (mostly the newest chapter's
-        group-uploads), so a low/old chapter that only appears on a later
-        pagination page was never enumerated. The numeric chapter id (URL
-        leading segment) and chapter number (URL trailing segment after
-        ``-chapter-``) are load-bearing — group/lang/date are best-effort
-        extracted and the live smoke pins selector refinements.
+        Delegates to :meth:`_fetch_series_chapters_raw`, which navigates
+        ``{base_url}/title/{hid}-{slug}`` in the warm Patchright browser and ALWAYS
+        enumerates the FULL chapter list by running comix's OWN internal
+        ``chapters(hid, {limit:100})`` loader in-page (spike 019) — yielding
+        ``[{id, chapter, lang, groups, publishedAtRelative, likes, volume}, …]`` for
+        every chapter, not just the ~20 rows on first paint. Before #146 this was a
+        one-shot read of the first render (mostly the newest chapter's group-
+        uploads), so a low/old chapter only enumerable deeper in the list was missed.
+        The chapter id and chapter number are load-bearing — group/lang/date/likes
+        are best-effort.
 
         We sort newest-first by chapter number and slice the
         ``offset..offset+limit`` window AFTER the full enumeration so the
@@ -2041,16 +2076,15 @@ class ComixSource(Source):
         list). A failed browser fetch surfaces as
         ``SourceError("source_unavailable")`` → per-source warning (WR-06).
 
-        Scanlation-group extraction: each chapter row is a
-        ``<div class="mchap-row">`` carrying an ``<a class="mchap-row__group">
-        …<span>{group_name}</span></a>``. The DOM extractor reads the name
-        directly off that anchor; a row that omits the anchor simply yields
-        an empty ``groups`` list (``scanlationGroup`` stays ``null``).
+        Scanlation-group extraction: each API chapter row carries a
+        ``group: {id, name}`` object; the extract maps it to ``groups: [{name}]``
+        and ``_to_release`` reads the name (``scanlationGroup`` stays ``null`` when
+        the chapter has no group).
 
-        Publish-date extraction (Issue #30): each chapter row carries
-        ``<span class="mchap-row__time">`` whose text is the rendered relative
-        time ("14h ago", "3mos ago"). The absolute timestamp is NOT in the
-        DOM. The JS extractor captures the relative text and ``_to_release``
+        Publish-date extraction (Issue #30): each API row carries
+        ``createdAtFormatted`` (the rendered relative time, e.g. "14h ago",
+        "3mos ago"); the absolute timestamp is NOT exposed. The extract maps it to
+        ``publishedAtRelative`` and ``_to_release``
         funnels it through :func:`_parse_relative_time` to approximate the
         REL-01 ISO 8601 ``publishDate``.
         """

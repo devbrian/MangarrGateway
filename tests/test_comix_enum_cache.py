@@ -48,12 +48,13 @@ class _CountingComixSolver:
 
     ``fetch_calls`` is the cross-search witness the headline assertion reads: a
     Layer-2 cache HIT must never reach the browser, so the delta across the second
-    search is exactly 0. The search path enumerates the FULL chapter list
-    SEQUENTIALLY (#232 reverted #222) via ``fetch_via_browser_paginated`` — that is
-    the method the source actually calls now (``_fetch_series_chapters_raw``), so it
-    increments ``fetch_calls``. ``fetch_via_browser`` (the one-shot chapter-pages
-    read) is present so ``_solver_from_ctx`` (which requires BOTH primitives)
-    accepts the fake; it is unused on the search path.
+    search is exactly 0. The search path enumerates the FULL chapter list by running
+    comix's OWN internal ``chapters(hid, {limit:100})`` loader on the one-shot
+    ``fetch_via_browser`` (spike 019) — that is the method the source actually calls
+    now (``_fetch_series_chapters_raw``), so it increments ``fetch_calls``. The
+    retired ``fetch_via_browser_paginated`` is kept on the fake (sharing the same
+    ``browser_results`` registry + counter) only for back-compat; the source no
+    longer calls it and ``_solver_from_ctx`` no longer requires it.
     """
 
     def __init__(self) -> None:

@@ -264,9 +264,11 @@ class _FakeSolver:
     """Records the ``chapter_url`` passed to ``fetch_via_browser`` so the test
     can assert the deferred branch resolved the sentinel before navigating.
 
-    Also backs the #232 always-walk SEQUENTIAL paginated primitive: tests that
+    Also backs the chapter-list enumeration (spike 019: comix's own internal
+    ``chapters()`` loader on the one-shot ``fetch_via_browser``): tests that
     exercise the REAL deferred path (no ``_series_chapters`` monkeypatch) stage the
-    full series chapter list on ``paginated_results`` keyed by the series URL."""
+    full series chapter list keyed by the series URL; ``fetch_via_browser`` serves
+    it for the series URL and the chapter-page image URLs for chapter URLs."""
 
     def __init__(self, urls: list[str] | None = None) -> None:
         self.last_url: str | None = None
@@ -286,9 +288,16 @@ class _FakeSolver:
         *,
         extract: str,
         wait_for: Any,
-        timeout: float,  # noqa: ASYNC109 — mirrors the real solver signature
-    ) -> list[str]:
+        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
+    ) -> list[str] | list[dict[str, Any]]:
+        _ = (extract, wait_for, timeout)
         self.last_url = url
+        # The chapter-list enumeration (spike 019) rides the one-shot primitive,
+        # keyed by the series URL; serve the staged full list for it. Chapter-page
+        # manifest reads (chapter URLs) return the image-URL list.
+        if url in self.paginated_results:
+            self.paginated_fetch_calls.append(url)
+            return self.paginated_results[url]
         return self._urls
 
     async def fetch_via_browser_paginated(
@@ -475,7 +484,9 @@ async def test_fetch_manifest_deferred_resolves_against_full_walked_list() -> No
 
     urls = await source.fetch_manifest(composite, _ctx_for_fetch(solver))
     assert urls  # the fake returns a non-empty allowed-CDN list
-    # The always-walk primitive was the enumeration path (not the one-shot read).
+    # The chapter-list enumeration (spike 019) was served for the series URL via
+    # the one-shot fetch_via_browser (recorded here), feeding the full list to
+    # _resolve_deferred.
     assert solver.paginated_fetch_calls == [series_url]
     # Chapter 5's numeric id (9938805) was resolved from the deep row and used to
     # build the chapter URL — NOT the DEFERRED sentinel.

@@ -660,9 +660,9 @@ class _ManifestSequenceSolver:
 
     Backs the Issue #171 cold-race test: stage e.g. ``[[], [url]]`` and assert
     ``fetch_manifest`` re-navigates once and resolves the warm second capture.
-    ``fetch_via_browser_paginated`` exists only so ``_solver_from_ctx``'s
-    hasattr guard passes — the resolved (non-DEFERRED) composite never walks the
-    series.
+    ``fetch_via_browser_paginated`` is retired on the comix path (spike 019) and
+    kept here only for back-compat — the resolved (non-DEFERRED) composite never
+    walks the series, and ``_solver_from_ctx`` no longer requires it.
     """
 
     def __init__(self, results: list[object]) -> None:
