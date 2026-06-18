@@ -195,6 +195,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     android_keys: frozenset[str] = frozenset(
         key for key, engine in engine_by_source.items() if engine == "android"
     )
+    # On-demand keys (debug pooltimeout-recurrence): cloudflare sources whose CF
+    # managed challenge is INTERMITTENT (``cloudflare_challenge_optional=True``,
+    # mangaball). Both solver legs SKIP these in ``warm()`` (no eager startup solve of
+    # an absent challenge → no wasted redroid loop, no D-33 force-disable), and
+    # ``_warm_solver`` never disables them — they solve on-demand when a request hits a
+    # live challenge.
+    on_demand_keys: frozenset[str] = frozenset(
+        key
+        for key, cls in cf_sources.items()
+        if getattr(cls, "cloudflare_challenge_optional", False)
+    )
     # Per-source health map (D-38): one breaker per cloudflare-gated source.
     # JobManager + the search route read this by reference (deps.get_source_health).
     source_health: dict[str, SourceHealth] = {
@@ -278,6 +289,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Phase 10: the Patchright leg owns ONLY the patchright sources (comix); the
         # android sources are warmed/solved by the AndroidSolver leg below.
         "cloudflare_keys": patchright_keys,
+        # warm() skips on-demand sources (intermittent challenge); patchright-side
+        # intersection is empty today but threaded for correctness/symmetry.
+        "on_demand_keys": on_demand_keys & patchright_keys,
         # #153: bounded eager-warm retry so a cold-deploy launch flake is absorbed
         # before a source is force_disabled (and so advertised down in /caps for 12h).
         "warm_attempts": settings.cloudflare_warm_attempts,
@@ -336,6 +350,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         base_url=settings.android_solver_url,
         api_key=settings.android_solver_api_key,
         challenge_urls=android_challenge_urls,
+        # warm() skips on-demand android sources (mangaball) — they solve on-demand,
+        # never eager (debug pooltimeout-recurrence).
+        on_demand_keys=on_demand_keys & android_keys,
         timeout_s=settings.android_solver_timeout_s,
         # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
         # the CloudflareSolver (no second build_proxy call, no new setting). The
@@ -369,6 +386,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "disabled (D-33)",
                 exc_info=True,
             )
+        # On-demand sources are never disabled for a warm failure: warm() already
+        # skips them, but the catastrophic-raise fallback above sets failed=ALL cf
+        # keys, so filter them out here too (debug pooltimeout-recurrence).
+        failed = [key for key in failed if key not in on_demand_keys]
         for key in failed:
             source_health[key].force_disabled = True
         if failed:

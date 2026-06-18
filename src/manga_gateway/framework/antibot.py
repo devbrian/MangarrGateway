@@ -457,6 +457,12 @@ class CloudflareSolver:
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         challenge_urls: dict[str, str] | None = None,
         cloudflare_keys: Iterable[str] = (),
+        # On-demand keys (``cloudflare_challenge_optional=True``) — ``warm()`` skips
+        # them so an intermittent-challenge source is never eager-solved/force-disabled
+        # at startup; it solves on-demand when a request hits a live challenge (debug
+        # pooltimeout-recurrence). No patchright source sets this today; threaded for
+        # symmetry with AndroidSolver via the SolverRouter.
+        on_demand_keys: Iterable[str] = (),
         engine: AntibotEngine = "patchright",
         log_browser_events: bool = False,
         proxy: dict[str, str] | None = None,
@@ -483,6 +489,7 @@ class CloudflareSolver:
         self._challenge_url = challenge_url
         self._challenge_urls = dict(challenge_urls or {})
         self._cloudflare_keys = frozenset(cloudflare_keys)
+        self._on_demand_keys = frozenset(on_demand_keys)
         self._engine: AntibotEngine = engine
         # #153: eager-warm retry budget. ``warm()`` retries each source up to
         # ``warm_attempts`` times (linear backoff ``warm_retry_seconds * attempt``)
@@ -606,6 +613,10 @@ class CloudflareSolver:
         self._lifecycle.start_recycle_watchdog()
         failed: list[str] = []
         for key in self._cloudflare_keys:
+            if key in self._on_demand_keys:
+                # On-demand source: never eager-warm — solves only on a live challenge
+                # (debug pooltimeout-recurrence).
+                continue
             if not await self._warm_one(key, sleep=sleep):
                 failed.append(key)
         return failed

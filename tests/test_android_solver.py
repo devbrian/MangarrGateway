@@ -170,6 +170,25 @@ async def test_non_force_reuses_held_clearance() -> None:
     assert route.call_count == 1
 
 
+@respx.mock
+@pytest.mark.asyncio
+async def test_warm_skips_on_demand_keys() -> None:
+    """On-demand keys are NEVER eager-warmed (debug pooltimeout-recurrence): warm()
+    skips them, so the sidecar is not hit for an absent challenge and the key is NOT
+    reported failed (→ never force-disabled). The non-on-demand key still warms."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(on_demand_keys=frozenset({"mangadot"}))
+    try:
+        failed = await solver.warm()
+    finally:
+        await solver.aclose()
+    # mangadot skipped → not failed; kagane warmed once.
+    assert "mangadot" not in failed
+    assert route.call_count == 1  # only kagane hit the sidecar
+    body = json.loads(route.calls.last.request.content)
+    assert body["challenge_url"] == _CHALLENGE_URLS["kagane"]
+
+
 def test_solve_if_missing_is_declared_keyword() -> None:
     """On-demand peek (debug pooltimeout-recurrence): ``solve_if_missing`` must be a
     real keyword param so context.py / SolverRouter ``inspect.signature`` detection
