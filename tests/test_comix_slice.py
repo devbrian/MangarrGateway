@@ -503,62 +503,30 @@ async def test_comix_fetch_manifest_routes_through_browser(
     fetched_url, extract_body, wait_for = chapter_calls[0]
     expected = f"{_COMIX}/title/{_SERIES_ID}-cipher-tales/{_CHAPTER_ID}-chapter-1"
     assert fetched_url == expected
-    # The extractor filters by the /{seg}/{token}/{NN}.{ext} CDN pattern,
-    # where {seg} is a WILDCARDED short path segment (Comix rotates it:
-    # /si/ historically, /i3/ live 2026-06-02 — debug comix-malformed-
-    # manifest). The pattern is embedded as a JS regex literal, so the JS
-    # source sees the segment class ``/\/[a-z0-9]{2,4}\//`` and the token
-    # shape ``[A-Za-z0-9_-]{16,}``.
-    assert "[a-z0-9]{2,4}" in extract_body
-    assert "[A-Za-z0-9_-]{16,}" in extract_body
-    # Regression guard: the OLD pinned regex SEGMENT (the escaped JS-regex
-    # literal ``\/si\/``) must not return. Match the escaped form — NOT the
-    # plain substring ``/si`` — so a docstring/comment mentioning the historical
-    # ``/si/`` path can never false-fail this (CodeRabbit PR #92).
-    assert "\\/si\\/" not in extract_body
-    # NN-order sort over the page-number-keyed Map, gaps preserved (Comix's
-    # reader scaffolds .rpage-page[data-page=N] divs; the extractor keys
-    # captured/synthesized URLs by the data-page integer and sorts ascending).
-    assert "rpage-page" in extract_body
-    assert "sort" in extract_body
-    # Issue #45 (2026-05-31): the extractor's Step-2 walk scrolls the inner
-    # Swiper scroll container to its midpoint then its end in two batched
-    # passes (head+tail) for a cheap real-image capture. The ancestor walk
-    # that finds the inner Swiper container reads
-    # ``getComputedStyle(el).overflowY`` and ``el.scrollHeight`` — both
-    # substrings MUST appear so a future rewrite that loses the two-scroll
-    # capture is caught here, not only by the live perf test.
-    assert "scrollHeight" in extract_body
-    assert "overflowY" in extract_body
-    # debug comix-manifest-60s-timeout (2026-06-03): Comix's single-page reader
-    # keeps only ~3 imgs DOM-resident, so the manifest is completed by SYNTHESIS
-    # — for every scaffold page not captured, substitute its zero-padded
-    # filename number into a captured img's /{NN}.{ext} tail (``padStart`` over
-    # the data-page count). This replaced the old O(pages) per-missing-page
-    # ``scrollIntoView`` walk that blew the 60s budget on long chapters; assert
-    # the synthesis marker is present AND the dropped slow-path marker is gone,
-    # so a regression to the per-page walk is caught here.
-    assert "padStart" in extract_body
-    # The per-page walk is gone: no scrollIntoView CALL remains (the strategy
-    # comment may still name it, so match the invocation form, not the word).
+    # Spike 019 (debug comix-cdn-scheme-rotation): the chapter-pages read runs
+    # comix's OWN internal ``chapters/{id}`` API loader in-page instead of scraping
+    # the lazy reader DOM. It discovers the env-*.js module at runtime, imports it,
+    # finds the axios instance, reads the chapter id from the path, and GETs
+    # ``/chapters/{id}`` → decrypted ``pages.items[].url``. Assert the load-bearing
+    # API-read markers are present (so a regression back to DOM scraping is caught
+    # offline, not only by the live nightly).
+    assert "import(" in extract_body
+    assert "/chapters/" in extract_body
+    assert ".get(" in extract_body
+    assert "pages" in extract_body
+    assert "items" in extract_body
+    # The chapter numeric id is read from the URL path /{id}-chapter-{number}.
+    assert "-chapter-" in extract_body
+    # The retired lazy-DOM scrape markers must be gone (no scrollIntoView walk, no
+    # filename-number synthesis, no scaffold-counter heuristic) — comix's per-page
+    # opaque-token CDN URLs broke all three (debug comix-cdn-scheme-rotation).
     assert ".scrollIntoView(" not in extract_body
-    # debug comix-scaffold-partial-capture (2026-06-15): Step 1 now reads the
-    # chapter's TRUE length from the reader's authoritative per-page counter
-    # ``.rpage-page__counter`` ("{n} / {TOTAL}") and waits until the scaffold has
-    # materialized that many divs, instead of the old count-unchanged-for-3-ticks
-    # stabilization that could snapshot a PARTIAL scaffold (silently-short
-    # manifest, the #32 class). Step 4 also synthesizes up to that authoritative
-    # total (``authTotal``) as a backstop. Assert both markers are present so a
-    # regression that drops the authoritative read is caught offline, not only by
-    # the live nightly. The old 3-tick literal must be gone (now a 5-tick fallback
-    # for the no-counter variant).
-    assert "rpage-page__counter" in extract_body
-    assert "authTotal" in extract_body
-    assert "stable >= 3" not in extract_body
-    # Issue #20: wait_for is now None — the extractor's own Step-1 polls for
-    # the scaffold from inside ``page.evaluate``. A Python-side wait_for_selector
-    # would double-wait the same condition and add ~1 s of pure overhead.
-    assert wait_for is None
+    assert "padStart" not in extract_body
+    assert "authTotal" not in extract_body
+    # wait_for is the reader scaffold selector: it guarantees the SPA's API module
+    # is loaded + interceptors wired before the extract import()s it (the extract
+    # reads the API, not the rendered <img>s).
+    assert wait_for == ".rpage-page[data-page]"
 
     # The series-page chapter-list enumeration now runs comix's OWN internal
     # ``chapters(hid, {limit:100})`` loader in the warm tab (spike 019), so it

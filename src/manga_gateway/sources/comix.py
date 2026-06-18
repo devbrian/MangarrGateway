@@ -82,33 +82,19 @@ first live-smoke run and fixed in branch ``fix/comix-publishdate-recent``:
   time. ``supports_recent`` is now ``True`` and ``recent()`` synthesizes
   real Releases; see the deferred-resolver helpers near ``_CID_SEP``.
 
-Issue #32 (2026-05-31): the parallel ``scrollIntoView`` extractor introduced
-by issue #20 was structurally broken: a synchronous burst of ``scrollIntoView``
-calls leaves the viewport at the LAST element's position only — intermediate
-pages never enter view, so the per-div IntersectionObserver never fires and
-the lazy ``<img>`` never loads. The per-div Promise.all watchers then time
-out polling for an ``<img src>`` the observer was never triggered on. Only
-head pages (above the fold) + the final 1-2 pages (where the scroll lands)
-were captured. This was a silent data-loss bug in the production download
-path, not just a drift-test bug: every Comix CBZ shipped for a chapter
-longer than ~4 pages was missing middle pages. The fix walks pages
-SEQUENTIALLY again, scroll → small await → poll for the page's img with
-a tight per-page budget, accepting an O(pages) wall-clock term in exchange
-for correctness. The Step-1 scaffold wait was originally hardened to a
-count-unchanged-for-3-ticks (300ms) stabilization — superseded below.
-
-Issue (debug comix-scaffold-partial-capture, 2026-06-15): that 3-tick (300ms)
-Step-1 stabilization could still declare a still-building incremental scaffold
-"stable" at a PARTIAL count (a >300ms mid-build pause fooled it), so Step-4
-synthesized a truncated 1..N manifest → a SILENTLY-short CBZ (the #32 class on
-the scaffold-readiness axis — proven by the drift fixture's page count varying
-12→15→17→84 for an invariant 84-page chapter). FIX: read the chapter's TRUE
-length from the reader's own per-page counter ``<span class="rpage-page__counter">
-{n} / {TOTAL}</span>`` (live-probe-verified authoritative N) and wait until the
-scaffold has materialized that many divs, falling back to a hardened 5-tick
-stabilization only when no counter is rendered. Step-4 also synthesizes up to
-that authoritative total as a backstop so the manifest can never be SHORTER than
-the reader's declared page count. See ``_CHAPTER_PAGES_EXTRACT_JS`` Step 1 / 4.
+Spike 019 (debug comix-cdn-scheme-rotation, 2026-06): the chapter-list AND
+chapter-pages reads both switched from scraping the rendered DOM to running
+comix's OWN internal API loaders in the warm tab. The series enumeration calls
+``chapters(hid, {limit:100})`` (``_CHAPTER_LIST_API_EXTRACT_JS``) and the
+manifest calls ``/chapters/{id}`` (``_CHAPTER_PAGES_API_EXTRACT_JS``) via the
+env module's axios instance, whose ``ro(ri)`` interceptors sign the ``_=`` token
+AND decrypt the ``{"e":...}`` envelope. This replaced a long line of lazy-reader-
+DOM heuristics (issue #20 scrollIntoView, #32 silent truncation, the
+scaffold-counter wait of comix-scaffold-partial-capture, and the Step-4 filename
+synthesis) which finally became untenable when comix rotated the image-CDN URL
+scheme to a per-page opaque token with NO filename — breaking both the capture
+regex and synthesis at once. The internal API returns the full decrypted page
+list regardless of the CDN URL shape, so it is robust to the next rotation.
 """
 
 from __future__ import annotations
@@ -530,7 +516,14 @@ def _resolve_deferred(
 # ``^…$`` (no path traversal), image extensions only.
 _COMIX_CDN_HOST_RE = re.compile(r"^[a-z0-9-]+\.wowpic\d+\.store$", re.IGNORECASE)
 _COMIX_CDN_PATH_RE = re.compile(
-    r"^/[a-z0-9]{2,4}/[A-Za-z0-9_-]{16,}/\d+\.(webp|jpg|jpeg|png)$", re.IGNORECASE
+    # Two observed shapes: the historical ``/{seg}/{token}/{NN}.{ext}`` and the
+    # 2026-06 scheme ``/{seg}/{per-page-token}`` (NO filename / extension — each
+    # page is one opaque token; debug comix-cdn-scheme-rotation). The trailing
+    # ``/{NN}.{ext}`` is therefore OPTIONAL. The security anchors are unchanged:
+    # the ``*.wowpic{N}.store`` host pin, the {16,}-char token shape, HTTPS-only,
+    # anchored ``^…$`` (no traversal), and image-only extension WHEN one is present.
+    r"^/[a-z0-9]{2,4}/[A-Za-z0-9_-]{16,}(?:/\d+\.(?:webp|jpg|jpeg|png))?$",
+    re.IGNORECASE,
 )
 
 
@@ -639,328 +632,83 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
     return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# JS extractor that returns the rendered chapter-page image URLs in NN order.
-# Matches the live-recon-observed pattern ``/{seg}/{token}/{NN}.{ext}`` (``{seg}``
-# is a rotating short path segment — ``si``/``i3``/…, wildcarded) and filters
-# out cross-site ad imagery (gravatar, postimg, etc.) so the manifest is the
-# chapter pages ONLY. Numbering may have gaps (01,02,04,05,07,…) — the recon
-# shows real chapter pages with gaps, NOT lazy-load artifacts; we sort by
-# embedded NN so the gaps survive.
+# JS extractor that resolves a chapter's ordered page-image URLs from comix's OWN
+# internal API (spike 019), replacing the lazy-reader-DOM scrape. The chapter
+# reader fetches ``GET /api/v1/chapters/{id}`` and the env module's axios instance
+# (its ``ro(ri)`` interceptors) signs the ``_=`` token + decrypts the ``{"e":...}``
+# envelope, returning the chapter object with ``pages:{baseUrl, items:[{width,
+# height, url}]}`` — EVERY page in order, in ONE call.
 #
-# Issue #32 (2026-05-31): the prior parallel-scrollIntoView strategy (issue
-# #20) was structurally broken. ``scrollIntoView`` is a synchronous viewport
-# mutation; issuing N calls in a tight loop leaves the viewport at the FINAL
-# element's position only — intermediate pages never enter view, so the per-
-# page IntersectionObserver never fires and the lazy ``<img>`` never loads.
-# The per-div Promise.all watchers then timed out polling for an ``<img src>``
-# the observer was never triggered on. Result: only head pages (above the
-# fold) + the final 1-2 pages (where the scroll lands) were captured, every
-# Comix CBZ longer than ~4 pages silently shipped truncated. The original fix
-# walked pages SEQUENTIALLY (scrollIntoView → settle → poll the div's <img>
-# for a CDN-matching src per page) which was correct but cost ~14-15s on a
-# 10-page chapter because each page paid an IntersectionObserver + lazy-load
-# round-trip serially.
-#
-# Issue #45 (2026-05-31): rewrite Step 2 as a two-scroll head+tail walk on
-# the INNER Swiper scroll container. The spike
-# ``.planning/debug/comix-warm-page-no-speedup-spike.md`` empirically showed
-# that setting ``viewport_size = {800, 200000}`` loaded pages 1, 2, 13, AND
-# 14 simultaneously — meaning the inner Swiper container (an ancestor of
-# the ``.rpage-page`` divs with ``overflow:auto|scroll|hidden`` and
-# ``scrollHeight > clientHeight``) is what gates middle pages independently
-# of the window viewport. Two batched scrolls on THAT container — to
-# ``scrollHeight/2`` then ``scrollHeight`` — capture every page image the
-# reader has DOM-resident at the time, cheaply (~1s total). The inner-container
-# detection is dynamic (ancestor walk reading ``getComputedStyle(el).overflowY``
-# + ``scrollHeight``) so a Swiper wrapper-class rotation does not break us; a
-# miss falls back to ``document.scrollingElement``.
-#
-# debug comix-manifest-60s-timeout (2026-06-03): Comix rotated the chapter
-# reader from the long-strip variant (``rpage--long-strip rpage--ttb``) to a
-# single-page paginated one (``rpage--single rpage--ltr``). In single-page mode
-# only ~3 page ``<img>``s are EVER DOM-resident at once, so the old
-# per-missing-page ``scrollIntoView`` fallback (issue #45 Step 2b) force-loaded
-# nothing — it just burned ~1.55s/page polling for an ``<img>`` that never
-# attached. A 51-page chapter thus walked ~74s and blew the 60s
-# ``fetch_via_browser`` ceiling (``page.evaluate timed out after 60.0s``); a
-# 33-page chapter squeaked under 60s but shipped a SILENTLY TRUNCATED 3-of-33
-# CBZ (the issue #32 failure class, re-introduced by the reader rotation).
-#
-# FIX: drop the O(pages) per-missing walk entirely and SYNTHESIZE instead. The
-# full ``data-page`` scaffold (1..N) is always present, and (verified live
-# 2026-06-03) every page of a chapter shares ONE host + ONE token, differing
-# only by the zero-padded filename number. So after the cheap two-scroll
-# capture, derive the URL for every uncaptured scaffold page by substituting its
-# filename number into a captured img's own ``/{NN}.{ext}`` tail (Step 4). This
-# is O(1) in wall-clock, returns the complete 1..N manifest, fixes the
-# truncation, and works for BOTH reader shapes (the same per-page template holds
-# in long-strip too), so it is robust to this and future reader-shape rotations.
-# Real captures always win over synthesized ones (first-sight in ``seen``), so a
-# future per-page-token reader degrades to "captured pages correct, gaps filled"
-# rather than silently wrong. The host/extension SSRF anchors are unchanged and
-# every synthesized URL is still validated by ``_is_allowed_image_url`` before
-# fetch.
-#
-# NEVER synthesize from an empty capture: if Step 2/3 matched zero CDN imgs the
-# page is genuinely broken/gated and we return ``[]`` → fetch_manifest raises
-# ``malformed chapter manifest`` (fast, correct) rather than fabricating URLs.
-#
-# Step-1 scaffold wait (debug comix-scaffold-partial-capture, 2026-06-15): the
-# old count-unchanged-for-3-ticks (300ms) stabilization could snapshot a PARTIAL
-# scaffold (a >300ms mid-build pause fooled it → silently-short manifest). Step 1
-# now reads the chapter's TRUE length from the reader's per-page counter
-# (`.rpage-page__counter` "{n} / {TOTAL}", live-verified authoritative N) and
-# waits until the scaffold has materialized that many divs — falling back to a
-# hardened 5-tick stabilization only when no counter is present. Step 4 also
-# synthesizes up to that authoritative total so the manifest can never be shorter
-# than the reader's declared page count (the engine is all-or-nothing, so
-# complete-or-loud-fail is correct; silently-short is the bug). 8s cap.
-_CHAPTER_PAGES_EXTRACT_JS = """
-  // Comix's chapter reader is a Swiper.js component. Historically a long-strip
-  // (`rpage--long-strip rpage--ttb`); as of 2026-06-03 a single-page paginated
-  // variant (`rpage--single rpage--ltr`) is served, in which only ~3 page
-  // <img>s are DOM-resident at once. Each page is wrapped in a
-  // `<div class="rpage-page" data-page="N">` whose <img> child is LAZY-LOADED.
-  //
-  // Strategy (debug comix-manifest-60s-timeout, 2026-06-03):
-  //   Step 1 — read the TRUE page count N from the reader's authoritative
-  //            `.rpage-page__counter` denominator and wait until the data-page
-  //            scaffold has materialized N divs (hardened 5-tick fallback when
-  //            no counter is rendered). Old 3-tick stabilization could snapshot
-  //            a partial scaffold (debug comix-scaffold-partial-capture).
-  //   Step 2 — find the inner Swiper scroll container by ancestor walk, then
-  //            scrollTo(scrollHeight/2) + scrollTo(scrollHeight) with ~500ms
-  //            settle each; capture every CDN-matching <img> after each scroll
-  //            (first-sight wins via a Map keyed on the data-page integer).
-  //            Cheap (~1s) — gets whatever the reader has DOM-resident.
-  //   Step 3 — final document.querySelectorAll('img') sweep (issue #32 net).
-  //   Step 4 — SYNTHESIZE the URL for every scaffold page not captured by
-  //            substituting its filename number into a captured img's
-  //            /{NN}.{ext} tail (all pages share one host+token, verified live
-  //            2026-06-03). Replaces the old O(pages) per-missing-page
-  //            scrollIntoView walk that blew the 60s budget in single-page mode.
-  //   Step 5 — sort the Map entries by page number ascending and return URLs.
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  // Path segment (`si`/`i3`/…) is wildcarded — Comix rotates it; live
-  // 2026-06-02: https://jloo.wowpic5.store/i3/<token>/01.webp. The host pin +
-  // token/filename shape (and the _COMIX_CDN_PATH_RE allowlist) carry the trust.
-  const rx = /\\/[a-z0-9]{2,4}\\/([A-Za-z0-9_-]{16,})\\/(\\d+)\\.(webp|jpg|jpeg|png)$/i;
+# Why this replaced the DOM scrape (debug comix-cdn-scheme-rotation, 2026-06):
+# comix changed the page-image CDN URL scheme from ``/{seg}/{token}/{NN}.{ext}``
+# to ``/{seg}/{per-page-token}`` (no filename, no extension — each page a distinct
+# opaque token). That broke BOTH the old extractor's ``/{NN}.{ext}`` capture regex
+# (zero matches → "malformed chapter manifest") AND its Step-4 synthesis (you can
+# no longer derive page N's URL by substituting a filename number — there is no
+# filename). The single-page reader also keeps only ~3 imgs DOM-resident, so
+# scraping every page meant scrolling N times (the #32/comix-manifest-60s-timeout
+# pain). The internal-API read sidesteps all of it: it returns the full decrypted
+# page list regardless of the CDN URL shape, so it is robust to the next rotation.
+# The env-*.js URL hash + the axios instance are discovered at RUNTIME (never
+# hardcoded). The image BYTES are still fetched via httpx (CLAUDE.md), and the
+# per-page byte/tile decryption in ``fetch_image`` is unchanged. raw-string literal.
+_CHAPTER_PAGES_API_EXTRACT_JS = r"""
+  // (1) Discover the API-client module (env-*.js) at RUNTIME — hash rotates per
+  // deploy, so NEVER hardcode it; it is already in the Resource-Timing buffer.
+  const envUrl = performance.getEntriesByType('resource')
+    .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
+  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
 
-  // Step 1: determine the TRUE page count and wait for the scaffold to reach it.
-  //
-  // AUTHORITATIVE SOURCE (debug comix-scaffold-partial-capture, 2026-06-15):
-  // the reader renders the chapter's true length in EVERY page's counter
-  // `<span class="rpage-page__counter">{n} / {TOTAL}</span>` — live-probe-
-  // verified TOTAL=84 on the 84-page chapter, present the instant the scaffold
-  // appears. That denominator is a single scalar from the decrypted page-list
-  // metadata (atomic), NOT a running count of incrementally-appended divs, so
-  // it is IMMUNE to the mid-build race that made the old
-  // count-unchanged-for-3-ticks (300ms) heuristic snapshot a PARTIAL scaffold
-  // count (captured 12/15/17 instead of 84 → silently-truncated CBZ, the #32
-  // failure class on the scaffold-readiness axis). Parse the MAX denominator
-  // (monotonic — survives a transient counter re-render) and exit as soon as
-  // the .rpage-page[data-page] scaffold has materialized that many divs (the
-  // scaffold is built 1..N; verified live). Fall back to a HARDENED
-  // count-stabilization (unchanged for 5 consecutive ticks, up from 3) ONLY
-  // when no counter is rendered (other/future reader variants). 8s cap either
-  // way — in the common case the authoritative break fires in ~1s (faster than
-  // the old quiet-window wait).
-  const readAuthoritativeTotal = () => {
-    let total = 0;
-    for (const el of document.querySelectorAll('.rpage-page__counter')) {
-      const m = (el.textContent || '').match(/\\/\\s*(\\d+)\\s*$/);
-      if (m) { const d = parseInt(m[1], 10); if (d > total) total = d; }
-    }
-    return total;
+  // (2) import() returns the LIVE cached singleton whose axios instance already
+  // has comix's request-SIGN + response-DECRYPT interceptors wired (ro(ri)).
+  const mod = await import(envUrl);
+  const isAxios = (v) => v && (typeof v === 'object' || typeof v === 'function')
+    && typeof v.get === 'function' && v.interceptors && v.interceptors.request;
+  // spike 019: m.x is the axios instance (ri); fall back to scanning exports
+  // (minified export names can rotate per deploy).
+  const findAxios = (m) => {
+    if (!m) return null;
+    if (isAxios(m.x)) return m.x;
+    for (const v of Object.values(m)) if (isAxios(v)) return v;
+    return null;
   };
-  let authTotal = 0;
-  let stable = 0;
-  let lastCount = -1;
-  for (let i = 0; i < 80; i++) {
-    const count = document.querySelectorAll('.rpage-page[data-page]').length;
-    authTotal = Math.max(authTotal, readAuthoritativeTotal());
-    if (authTotal > 0) {
-      // Authoritative path: stop once the scaffold holds every declared page.
-      // Append-only scaffold ⇒ count never regresses below a value we passed.
-      if (count >= authTotal) break;
-    } else if (count > 0 && count === lastCount) {
-      // Fallback path (no counter): require a LONGER quiet window than the old
-      // 3-tick (300ms) heuristic so a brief mid-build pause is less likely to
-      // be mistaken for "scaffold done".
-      stable += 1;
-      if (stable >= 5) break;
-    } else {
-      stable = 0;
-      lastCount = count;
-    }
-    await sleep(100);
+  const ax = findAxios(mod) || findAxios(mod.default);
+  if (!ax) throw new Error('comix: axios instance not found in env module');
+
+  // (3) Chapter numeric id from the path: /title/{hid}-{slug}/{id}-chapter-{number}.
+  const idm = location.pathname.match(/\/(\d+)-chapter-/);
+  if (!idm) throw new Error('comix: no chapter id in ' + location.pathname);
+
+  // (4) GET /chapters/{id} (axios baseURL is /api/v1) -> the decrypted chapter
+  // with pages:{baseUrl, items:[{url}]}. A thrown request fails closed (the extract
+  // throws → fetch_manifest raises → SourceError), never a partial manifest.
+  const res = await ax.get('/chapters/' + idm[1]);
+  const data = (res && res.data !== undefined) ? res.data : res;
+  const pages = data && data.pages;
+  const items = (pages && Array.isArray(pages.items)) ? pages.items
+    : (Array.isArray(data && data.images) ? data.images
+      : (Array.isArray(pages) ? pages : []));
+  const baseUrl = (pages && typeof pages.baseUrl === 'string') ? pages.baseUrl : '';
+
+  // (5) Ordered absolute URLs. Items may be strings or {url|src}; a relative url
+  // is prefixed with baseUrl. SSRF + extension are re-checked Python-side
+  // (_is_allowed_image_url) before any byte fetch.
+  const urls = [];
+  for (const it of items) {
+    let u = (typeof it === 'string') ? it : (it && (it.url || it.src));
+    if (typeof u !== 'string' || !u) continue;
+    if (baseUrl && !/^https?:\/\//i.test(u)) u = baseUrl + u;
+    urls.push(u);
   }
-
-  const pageDivs = Array.from(document.querySelectorAll('.rpage-page[data-page]'))
-    .sort((a, b) => {
-      const an = parseInt(a.getAttribute('data-page') || '0', 10);
-      const bn = parseInt(b.getAttribute('data-page') || '0', 10);
-      return an - bn;
-    });
-
-  const seen = new Map();
-  const captureAll = () => {
-    // Sweep every .rpage-page div's <img> children, recording the first
-    // CDN-matching src per data-page. First-sight wins so a subsequent
-    // Swiper eviction never loses a URL we already saw.
-    for (const div of pageDivs) {
-      const n = parseInt(div.getAttribute('data-page') || '0', 10);
-      if (seen.has(n)) continue;
-      for (const img of div.querySelectorAll('img')) {
-        const src = img.currentSrc || img.src || '';
-        const m = src.match(rx);
-        if (m) {
-          seen.set(n, src);
-          break;
-        }
-      }
-    }
-  };
-
-  // Step 2: identify the inner Swiper scroll container and do TWO batched
-  // scrolls (midpoint then end). The spike's tall-viewport finding (pages
-  // 1, 2, 13, 14 loaded but 3-12 stayed lazy) is the empirical evidence
-  // that this container — NOT the window — is what gates middle pages.
-  //
-  // Ancestor walk: starting from the first .rpage-page div, climb parents
-  // and test each for overflowY in {auto, scroll, hidden} AND
-  // scrollHeight > clientHeight (so we pick the element that ACTUALLY
-  // gates scrolling, not a decorative overflow:hidden wrapper). The CSS
-  // class of the container is NOT pinned — bundle rotations may change
-  // it; the dynamic check protects us. Fall back to
-  // document.scrollingElement on miss (degraded path; Step 2b picks up
-  // the slack).
-  let container = null;
-  if (pageDivs.length > 0) {
-    let el = pageDivs[0].parentElement;
-    while (el && el !== document.body) {
-      const style = getComputedStyle(el);
-      const overflowY = style.overflowY;
-      const scrolls =
-        overflowY === 'auto' ||
-        overflowY === 'scroll' ||
-        overflowY === 'hidden';
-      if (scrolls && el.scrollHeight > el.clientHeight) {
-        container = el;
-        break;
-      }
-      el = el.parentElement;
-    }
-  }
-  if (!container) {
-    container = document.scrollingElement || document.documentElement;
-  }
-
-  // Two batched scrolls: midpoint then end. 500ms settle after each is
-  // the empirically-grounded budget from the spike — enough for the
-  // IntersectionObserver callback to fire AND for the lazy <img>'s src
-  // to propagate. Capture after each scroll so a Swiper eviction
-  // between the two passes can't lose a page we already saw.
-  container.scrollTo({ top: container.scrollHeight / 2, behavior: 'instant' });
-  await sleep(500);
-  captureAll();
-  container.scrollTo({ top: container.scrollHeight, behavior: 'instant' });
-  await sleep(500);
-  captureAll();
-
-  // Step 3 (safety net): sweep the whole document for any CDN-matching <img>
-  // the per-div capture missed (reader-shape variants where the canonical
-  // `data-page` wrapper is absent but images still match the CDN pattern, OR a
-  // page whose <img> only attached AFTER we scrolled past it). This is the
-  // issue #32 silent-truncation safety net — DO NOT remove.
-  // Key by the nearest .rpage-page[data-page] ancestor — the SAME key space
-  // Step 2's captureAll uses — so a captured page is never double-recorded
-  // under both its data-page (Step 2) and its filename number (here); that
-  // would defeat Step 4's data-page→filename `offset` correction on a
-  // 0-/1-indexed reader. Only orphan imgs with no scaffold wrapper (the
-  // degenerate variant this net targets, where pageDivs is empty and Step 4
-  // is skipped) fall back to the filename number.
-  for (const img of document.querySelectorAll('img')) {
-    const src = img.currentSrc || img.src || '';
-    const m = src.match(rx);
-    if (m) {
-      const wrapper = img.closest('.rpage-page[data-page]');
-      const n = wrapper
-        ? parseInt(wrapper.getAttribute('data-page') || '0', 10)
-        : parseInt(m[2], 10);
-      if (!seen.has(n)) seen.set(n, src);
-    }
-  }
-
-  // Step 4: synthesize the URL for every scaffold page we did NOT capture.
-  // Comix's single-page reader keeps only ~3 imgs DOM-resident, so `seen` is
-  // short even on a healthy chapter — but the full data-page scaffold (1..N) is
-  // present and every page shares ONE host + ONE token, differing only by the
-  // zero-padded filename number (verified live 2026-06-03, debug
-  // comix-manifest-60s-timeout). Derive each missing page's URL by substituting
-  // its filename number into a captured src's /{NN}.{ext} tail — O(1), no
-  // per-page lazy-load round-trip. NEVER synthesize from an empty capture
-  // (seen.size === 0) — return [] so fetch_manifest raises
-  // "malformed chapter manifest" rather than fabricating URLs for a broken page.
-  if (seen.size > 0 && pageDivs.length > 0) {
-    // Lowest-data-page captured sample → template + data-page→filename offset
-    // + zero-pad width. Offset is normally 0 (data-page 1 → "01"); deriving it
-    // tolerates a 0-/1-indexed mismatch without guessing.
-    const sampleEntry = Array.from(seen.entries()).sort((a, b) => a[0] - b[0])[0];
-    const sampleN = sampleEntry[0];
-    const sampleSrc = sampleEntry[1];
-    const sm = sampleSrc.match(rx);
-    if (sm) {
-      const sampleFile = parseInt(sm[2], 10);
-      const width = sm[2].length;
-      const ext = sm[3];
-      const offset = sampleFile - sampleN;
-      // Target page numbers = the scaffold's data-page numbers UNION 1..authTotal.
-      // The scaffold is the primary source (it carries the real 0-/1-indexed +
-      // gappy numbering); authTotal (the authoritative .rpage-page__counter
-      // denominator, debug comix-scaffold-partial-capture) is the BACKSTOP that
-      // guarantees the manifest is never SHORTER than the reader's declared page
-      // count even if the scaffold under-materialized at the 8s cap. The engine
-      // is all-or-nothing (jobs/engine.py) — a manifest that is COMPLETE (or a
-      // loud fetch fail on a non-existent page) is correct; a silently-short one
-      // is the #32 bug. NEVER synthesize from an empty capture (guarded above).
-      const targets = new Set();
-      for (const div of pageDivs) {
-        const n = parseInt(div.getAttribute('data-page') || '0', 10);
-        if (n) targets.add(n);
-      }
-      for (let n = 1; n <= authTotal; n++) targets.add(n);
-      for (const n of targets) {
-        if (seen.has(n)) continue;
-        const fileNum = n + offset;
-        if (fileNum < 0) continue;
-        const padded = String(fileNum).padStart(width, '0');
-        // Substitute into the sample's own src so host/seg/token (and any
-        // future query suffix) carry over verbatim; only the NN filename moves.
-        const synth = sampleSrc.replace(
-          /\\/\\d+\\.(webp|jpg|jpeg|png)$/i,
-          '/' + padded + '.' + ext
-        );
-        seen.set(n, synth);
-      }
-    }
-  }
-
-  // Step 5: page-number-ascending order, gaps preserved.
-  return Array.from(seen.entries())
-    .sort((a, b) => a[0] - b[0])
-    .map(e => e[1]);
+  return urls;
 """
 
-# CSS selector ``solver.fetch_via_browser`` waits for before reading the DOM.
-# The chapter reader scaffolds `<div class="rpage-page" data-page="N">` for
-# every page in the chapter once the encrypted page-list arrives and decrypts;
-# images inside are lazy-loaded later via IntersectionObserver. Waiting for
-# the first scaffold div (not the first image) ensures the extract starts as
-# soon as the reader knows the chapter length — the scaffold count IS N, which
-# Step 4 of _CHAPTER_PAGES_EXTRACT_JS uses to synthesize the full 1..N manifest
-# from a captured page-image template (the single-page reader only ever keeps
-# ~3 imgs DOM-resident, so we no longer try to lazy-load every page).
+# CSS selector ``solver.fetch_via_browser`` waits for before the chapter-pages
+# extract runs. The reader scaffolds `<div class="rpage-page" data-page="N">`
+# once it has fetched + decrypted the page list — which means the SPA's API ES
+# module is loaded and its axios interceptors are wired, exactly what
+# ``_CHAPTER_PAGES_API_EXTRACT_JS`` needs before it ``import()``s the module and
+# calls ``/chapters/{id}`` itself (we read the API, not the rendered <img>s).
 _CHAPTER_PAGES_WAIT_FOR = ".rpage-page[data-page]"
 
 # Issue #171: how many times fetch_manifest navigates the chapter page before
@@ -1521,22 +1269,24 @@ class ComixSource(Source):
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
         """Resolve a chapter id → ordered page-image URLs, INTERNALLY (PKG-01/R6).
 
-        Option A (Plan 04-04, 2026-05-30): drive the chapter HTML page in the
-        warm Patchright browser and read the rendered image-tag URLs off the DOM.
-        The page's own JS does token-mint + encrypted-API call + decrypt + image
-        rendering — we just read the result. Bypasses the encrypted
-        ``/api/v1/chapters/{id}`` endpoint entirely because its ``_=`` request
-        token is minted by the same VM-obfuscated ``secure-*.js`` that does
-        decryption, and we cannot reliably mint it statically.
+        Spike 019 (2026-06): navigate the chapter page in the warm Patchright
+        browser, then run comix's OWN internal ``chapters/{id}`` API loader in-page
+        (``_CHAPTER_PAGES_API_EXTRACT_JS``) to get the decrypted page list. The env
+        module's axios instance (``ro(ri)``) signs the ``_=`` token + decrypts the
+        ``{"e":...}`` envelope, returning ``pages.items[].url`` — every page in one
+        call. This replaced the prior lazy-reader-DOM scrape, which broke when comix
+        rotated its image-CDN URL scheme from ``/{seg}/{token}/{NN}.{ext}`` to
+        ``/{seg}/{per-page-token}`` (no filename → the capture regex matched nothing
+        AND filename-substitution synthesis became impossible; debug
+        comix-cdn-scheme-rotation). The API read is robust to that rotation — it
+        returns whatever URL comix serves.
 
         Composite-id contract: ``chapter_id`` is the
         ``"{numeric_id}|{hid}|{slug}|{number}"`` composite the search step
         encoded into the handle's ``ResolutionRecord.chapter_id``. We decode
         here, construct the live chapter URL, and call
-        :meth:`solver.fetch_via_browser` with a JS extractor that returns the
-        rendered ``/{seg}/{token}/{NN}.{ext}`` image URLs in NN order (``{seg}``
-        is a rotating short path segment — ``si``/``i3``). A malformed
-        composite or an empty page list raises
+        :meth:`solver.fetch_via_browser` with the internal-API extractor. A
+        malformed composite or an empty page list raises
         ``SourceError("source_unavailable")`` so it surfaces as a contract
         warning, never a raw KeyError (WR-06). The manifest is consumed only by
         the gateway's own engine — never returned to a caller (R6).
@@ -1574,34 +1324,30 @@ class ComixSource(Source):
         chapter_url = (
             f"{self.base_url}/title/{hid}-{slug}/{numeric_id}-chapter-{number}"
         )
-        # Issue #171: a cold browser can race the page's lazy <img> load and yield
-        # an EMPTY capture. Retry only that signature once (a warm re-nav lets the
-        # imgs populate); a genuinely broken page returns [] again and falls through
-        # to the malformed-manifest raise, while a populated-but-invalid manifest is
-        # a real fault that does NOT consume the retry.
+        # Issue #171: a cold browser can race the page's readiness and yield an
+        # EMPTY page list. Retry only that signature once (a warm re-nav lets the
+        # SPA module load + interceptors wire); a genuinely empty chapter returns
+        # [] again and falls through to the malformed-manifest raise, while a
+        # populated-but-invalid manifest is a real fault that does NOT retry.
         urls: Any = None
         for attempt in range(_MANIFEST_COLD_RACE_ATTEMPTS):
             try:
                 urls = await solver.fetch_via_browser(
                     chapter_url,
-                    extract=_CHAPTER_PAGES_EXTRACT_JS,
-                    # Issue #20: pass wait_for=None and let the JS extractor's
-                    # own Step-1 scaffold wait do the readiness check. A Python-
-                    # side wait_for_selector AND a JS-side scaffold poll would
-                    # double-wait the same condition; the JS poll runs inside
-                    # page.evaluate which Playwright is happy to schedule
-                    # immediately after goto commits.
-                    wait_for=None,
-                    # debug comix-manifest-60s-timeout (2026-06-03): the extractor
-                    # no longer walks pages serially — it does a cheap two-scroll
-                    # capture (~1s) then SYNTHESIZES the full 1..N manifest from a
-                    # captured page-image template, so resolve is now O(1) in pages
-                    # (a couple seconds regardless of chapter length). The old
-                    # O(pages) scrollIntoView walk burned ~1.55s/page and blew this
-                    # ceiling on long chapters in the single-page reader. The 60s
-                    # ceiling stays as a generous safety margin for the scaffold
-                    # wait + Cloudflare/first-paint tail; the per-source rate
-                    # limiter bounds outer cadence.
+                    # spike 019: call comix's OWN internal ``chapters/{id}`` loader
+                    # in-page — returns the decrypted ``pages.items[].url`` list,
+                    # robust to the image-CDN URL-scheme rotation that broke the old
+                    # lazy-DOM scrape (debug comix-cdn-scheme-rotation).
+                    extract=_CHAPTER_PAGES_API_EXTRACT_JS,
+                    # Wait for the reader scaffold so the SPA has fetched+decrypted
+                    # the page list — which guarantees the API ES module is loaded
+                    # and its axios interceptors are wired before the extract
+                    # ``import()``s it and calls ``/chapters/{id}`` itself.
+                    wait_for=_CHAPTER_PAGES_WAIT_FOR,
+                    # The in-page API call is a couple of decrypted requests, not an
+                    # O(pages) DOM walk; 60s stays as a generous margin for the
+                    # scaffold wait + Cloudflare/first-paint tail. The per-source
+                    # rate limiter bounds outer cadence.
                     timeout=60.0,
                 )
             except Exception as exc:  # noqa: BLE001 — surface as a typed source failure

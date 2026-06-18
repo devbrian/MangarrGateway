@@ -40,6 +40,12 @@ _ACCEPT_CASES: list[tuple[str, str]] = [
         f"https://jloo.wowpic9.store/zz/{_TOKEN}/07.png",
         "future-rotation-proof: an unseen 2-char segment is accepted",
     ),
+    (
+        "https://j24n.wowpic2.store/i5/"
+        "bEqPbYfoOT0GmxnkQkqfoA5s5q0FZuKi3R0VvpLI6y4AjS5FIHyEz7PI11FmpSw",
+        "2026-06 scheme: /{seg}/{per-page-token} with NO filename/extension "
+        "(debug comix-cdn-scheme-rotation)",
+    ),
 ]
 
 _REJECT_CASES: list[tuple[str, str]] = [
