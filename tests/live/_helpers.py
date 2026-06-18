@@ -38,8 +38,42 @@ from schemathesis.specs.openapi.checks import response_schema_conformance
 
 from manga_gateway.app import create_app
 from manga_gateway.config import Settings
+from manga_gateway.framework.registry import SourceRegistry
+from manga_gateway.sources import register_builtin_sources
 
 from .profiles._base import LiveSmokeProfile
+
+
+def _on_demand_keys() -> frozenset[str]:
+    """Source keys whose Cloudflare challenge is INTERMITTENT (on-demand).
+
+    Mirrors ``app.py``'s lifespan (``on_demand_keys`` = sources with
+    ``cloudflare_challenge_optional=True``). An on-demand source is NEVER
+    eager-warmed: in production its requests go out bare and force a solve ONLY
+    on a live challenge (D-35 reconcile in ``context._request_response``).
+
+    ``live_client_for`` MUST do the same (#276). Eager-``get_clearance``-ing an
+    intermittent source diverges from prod and is the live-test defect PR #277
+    left unfixed: the per-test eager warm runs under a 60s ceiling while the home
+    android sidecar's solve budget is 120s (``SOLVER_SOLVE_TIMEOUT_S``), so a real
+    solve can never fit — and when the challenge is OFF the WebView finds no
+    Turnstile OOPIF and stalls. Either way the eager warm times out. Skipping it
+    for on-demand keys lets the test mirror prod: bare request, solve only on a
+    live 403 within the per-test ``download_timeout_s`` budget.
+
+    Built from a FRESH ``SourceRegistry`` (mirrors conftest's ``REGISTERED_KEYS``
+    pattern) so this is side-effect-free against any process-level registry.
+    """
+    reg = SourceRegistry()
+    register_builtin_sources(reg)
+    return frozenset(
+        key
+        for key, cls in reg.items()
+        if getattr(cls, "cloudflare_challenge_optional", False)
+    )
+
+
+_ON_DEMAND_KEYS = _on_demand_keys()
 
 # Contract of record (D-07) — same path tests/test_contract.py:53 reads.
 _CONTRACT_PATH = Path(__file__).resolve().parents[2] / "manga-gateway.openapi.yaml"
@@ -178,7 +212,7 @@ async def live_client_for(
     app = create_app(settings)
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        if profile.needs_solver_warm:
+        if profile.needs_solver_warm and profile.source_key not in _ON_DEMAND_KEYS:
             # #196 cross-source-contamination fix: warm ONLY the source under
             # test, NOT the whole solver. ``solver.warm()`` eager-solves EVERY
             # cloudflare-gated key sequentially (comix THEN kagane THEN ...),
@@ -191,6 +225,13 @@ async def live_client_for(
             # warmed it returns the cached ``Clearance`` instantly; otherwise it
             # solves just that one host. One failing CF source can no longer
             # contaminate another's smoke bucket.
+            #
+            # #276: an ON-DEMAND source (``_ON_DEMAND_KEYS``, e.g. mangaball) is
+            # deliberately NOT eager-warmed here — it mirrors prod by going out
+            # bare and forcing a solve only on a live challenge inside the request
+            # (D-35), under the per-test ``download_timeout_s`` budget. Eager-
+            # warming it instead times out: the 60s ceiling below is under the home
+            # sidecar's 120s solve budget, and an absent challenge yields no OOPIF.
             await asyncio.wait_for(
                 app.state.solver.get_clearance(profile.source_key), timeout=60.0
             )
