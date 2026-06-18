@@ -242,6 +242,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # the first request triggers a bootstrap GET). For a non-cloudflare csrf source the
     # solver returns None → the bootstrap GET stays a bare httpx request (unchanged).
     async def _bootstrap_clearance(source_key: str) -> Clearance | None:
+        # On-demand source (debug pooltimeout-recurrence): the csrf-bootstrap GET must
+        # NOT eagerly solve — that is the same eager-clearance trap as the request
+        # path. Peek held clearance only; the bootstrap GET then goes out without
+        # cf_clearance (mangaball returns 200 when its challenge is off) and the
+        # csrf-bootstrap's own force_refresh / the data path's challenge reconcile
+        # escalate to a real solve only if a live challenge actually appears.
+        if source_key in on_demand_keys:
+            return await solver.get_clearance(source_key, solve_if_missing=False)
         return await solver.get_clearance(source_key)
 
     session_prep = CsrfBootstrap(
@@ -584,7 +592,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # task per cloudflare-gated source so they recover independently.
     async def _probe_source(source_key: str) -> bool:
         try:
-            clearance = await solver.get_clearance(source_key, force_resolve=True)
+            if source_key in on_demand_keys:
+                # On-demand source (debug pooltimeout-recurrence): never force-solve a
+                # recovery probe — that would loop the solver on an absent challenge.
+                # Peek held clearance only; its breaker clears on the next successful
+                # data call (record_success) via the on-demand challenge path instead.
+                clearance = await solver.get_clearance(
+                    source_key, solve_if_missing=False
+                )
+            else:
+                clearance = await solver.get_clearance(source_key, force_resolve=True)
         except Exception:  # noqa: BLE001 — a failed re-probe just keeps it down
             return False
         return clearance is not None

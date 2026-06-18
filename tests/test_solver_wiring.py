@@ -86,6 +86,39 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
         }
 
 
+async def test_on_demand_source_wired_into_warm_skip_and_bootstrap_peek() -> None:
+    """On-demand clearance wiring (debug pooltimeout-recurrence): mangaball
+    (``cloudflare_challenge_optional=True``) must be (a) in the Android leg's
+    ``on_demand_keys`` so ``warm()`` skips it, and (b) routed through the csrf-bootstrap
+    clearance provider with ``solve_if_missing=False`` so the bootstrap GET never
+    eagerly solves an absent challenge. An eager source (comix) keeps the eager path.
+    """
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        # (a) warm-skip wiring: mangaball is on-demand on the Android leg; the
+        # Patchright leg has no on-demand source.
+        assert "mangaball" in solver._android._on_demand_keys
+        assert solver._patchright._on_demand_keys == frozenset()
+
+        # (b) bootstrap provider peeks for an on-demand source, stays eager otherwise.
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def _spy(source_key: str, **kwargs: object) -> None:
+            calls.append((source_key, kwargs))
+            return None
+
+        solver.get_clearance = _spy  # type: ignore[method-assign]
+        provider = app.state.session_prep._get_clearance
+        await provider("mangaball")
+        await provider("comix")
+
+    by_key = dict(calls)
+    assert by_key["mangaball"] == {"solve_if_missing": False}  # peek, no eager solve
+    assert by_key["comix"] == {}  # eager (no solve_if_missing forwarded)
+
+
 async def test_mangadex_resolves_no_clearance_with_real_solver() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
