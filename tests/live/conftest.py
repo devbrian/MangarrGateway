@@ -530,6 +530,18 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
         for key, cls in android_sources.items()
         if (url := getattr(cls, "cloudflare_challenge_url", None))
     }
+    # On-demand keys (debug pooltimeout-recurrence): MUST mirror app.py's lifespan,
+    # which passes ``on_demand_keys=on_demand_keys & android_keys`` so ``warm()`` SKIPS
+    # an intermittent-challenge source (mangaball). Without this the session-shared
+    # AndroidSolver eager-warms mangaball against the contended home sidecar → 504 →
+    # D-33 force-disable → every mangaball live test fails (sticky #261), even though
+    # production (which DOES pass on_demand_keys) skips it correctly. This is exactly
+    # the "silent drift breaks the live android leg" hazard this hand-mirror warns of.
+    on_demand_keys = frozenset(
+        key
+        for key, cls in android_sources.items()
+        if getattr(cls, "cloudflare_challenge_optional", False)
+    )
     # PROXY-01 / Req 7: mirror the lifespan's proxy wiring so the session-shared
     # AndroidSolver's /solve egress matches the per-test httpx-fetch egress (one
     # IP — cf_clearance is IP-bound). app.py passes ``proxy=playwright_proxy``
@@ -539,6 +551,7 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
         "base_url": settings.android_solver_url,
         "api_key": settings.android_solver_api_key,
         "challenge_urls": android_challenge_urls,
+        "on_demand_keys": on_demand_keys,
         "timeout_s": settings.android_solver_timeout_s,
         "proxy": playwright_proxy,
     }

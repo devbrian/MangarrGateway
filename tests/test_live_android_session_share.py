@@ -49,21 +49,38 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
     """The kwargs are exactly the fields app.py passes to ``AndroidSolver(...)``.
 
     app.py builds ``AndroidSolver(base_url=..., api_key=..., challenge_urls=...,
-    timeout_s=..., proxy=playwright_proxy)`` — ``proxy`` passed UNCONDITIONALLY
-    (None when unconfigured). The mirror must carry the same five keys so the
-    shared instance is constructed identically to production.
+    on_demand_keys=..., timeout_s=..., proxy=playwright_proxy)`` — ``proxy`` passed
+    UNCONDITIONALLY (None when unconfigured). The mirror must carry the same keys so
+    the shared instance is constructed identically to production.
     """
     kwargs = _build_session_android_solver_kwargs()
     assert set(kwargs) == {
         "base_url",
         "api_key",
         "challenge_urls",
+        "on_demand_keys",
         "timeout_s",
         "proxy",
     }
     # The kwargs construct a real AndroidSolver offline (no network until /solve).
     solver = AndroidSolver(**kwargs)
     assert isinstance(solver, AndroidSolver)
+
+
+def test_on_demand_keys_mirror_app_so_warm_skips_mangaball() -> None:
+    """DRIFT GUARD (debug pooltimeout-recurrence): the session-shared AndroidSolver
+    MUST carry ``on_demand_keys`` exactly like app.py, or its ``warm()`` eager-solves
+    mangaball against the contended home sidecar → 504 → D-33 force-disable → every
+    mangaball live test fails (sticky #261) while production skips it correctly.
+
+    mangaball declares ``cloudflare_challenge_optional=True``, so it MUST be in the
+    mirror's ``on_demand_keys`` — and must never leak a non-on-demand android source
+    (mangadot/kagane) into the skip set.
+    """
+    on_demand = _build_session_android_solver_kwargs()["on_demand_keys"]
+    assert "mangaball" in on_demand
+    assert "mangadot" not in on_demand
+    assert "kagane" not in on_demand
 
 
 def test_app_module_androidsolver_is_the_monkeypatch_target() -> None:
