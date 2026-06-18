@@ -114,24 +114,49 @@ class HttpxTransport:
         self._client = httpx.AsyncClient(**client_kwargs)
 
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        # Wrap the buffered call in a TOTAL wall-clock deadline
-        # (_TOTAL_REQUEST_DEADLINE) so a tarpitting upstream cannot defeat httpx's
-        # PER-CHUNK ``read`` timeout and pin a pooled connection forever (debug
-        # all-sources-pooltimeout). On expiry ``asyncio.timeout`` cancels the
-        # in-flight request; httpx closes the response on the resulting cancellation,
-        # returning the connection to the shared pool. The deadline is surfaced as
-        # ``httpx.ReadTimeout`` (a ``TransportError``) so the context's existing
-        # ``_is_retryable`` / tenacity policy treats it like any other timeout —
-        # retried with backoff, then terminal → source cooldown. An EXTERNAL
-        # cancellation (job timeout, shutdown) is NOT from this scope, so
-        # ``asyncio.timeout`` re-raises ``CancelledError`` unchanged and it propagates.
+        # Wrap the call in a TOTAL wall-clock deadline (_TOTAL_REQUEST_DEADLINE) so a
+        # tarpitting upstream cannot defeat httpx's PER-CHUNK ``read`` timeout and pin
+        # a pooled connection forever (debug all-sources-pooltimeout). The deadline is
+        # surfaced as ``httpx.ReadTimeout`` (a ``TransportError``) so the context's
+        # existing ``_is_retryable`` / tenacity policy treats it like any other
+        # timeout — retried with backoff, then terminal → source cooldown.
+        #
+        # CONNECTION-LEAK FIX (debug pooltimeout-recurrence, 2026-06-18): use the
+        # explicit STREAMING send (``send(stream=True)`` + ``aread()`` + a guaranteed
+        # ``aclose()`` in ``finally``) instead of the buffered ``client.request()``.
+        # The buffered helper provides NO guarantee that the pooled connection is
+        # released when the in-flight coroutine is CANCELLED by an OUTER scope — and
+        # that is exactly the live failure mode: the search fan-out's per-source
+        # ``asyncio.timeout(30s)`` fires BEFORE this inner 60s deadline (and the job
+        # engine's per-page TaskGroup cancels in-flight siblings), re-raising
+        # ``CancelledError`` straight through ``client.request`` mid-response. httpcore
+        # 1.0.9 then loses track of the connection: the OS socket stays ESTABLISHED
+        # (idle, no keepalive timer) and — critically — its LOGICAL pool slot is never
+        # returned. Enough leaked slots exhaust ``max_connections`` and every new
+        # acquisition blocks for ``pool=10s`` → ``PoolTimeout``. Observed live: 503
+        # idle no-timer ESTABLISHED sockets (445 to 4 CF hosts) against a 100 keepalive
+        # cap. The 60s deadline (df08b38) didn't help — it only converts ITS OWN
+        # TimeoutError, not an external CancelledError; the ceiling bump (9c01865) only
+        # delayed exhaustion. Streaming with ``finally: await response.aclose()``
+        # releases the connection on EVERY exit path (success, error, AND cancellation),
+        # which closes the leak at the single choke point.
+        request = self._client.build_request(method, url, **kwargs)
         try:
             async with asyncio.timeout(_TOTAL_REQUEST_DEADLINE):
-                return await self._client.request(method, url, **kwargs)
+                response = await self._client.send(request, stream=True)
+                try:
+                    await response.aread()
+                finally:
+                    # Release the connection back to the pool on EVERY exit — success,
+                    # error, OR cancellation. This is the leak fix: without it a
+                    # cancellation between ``send`` and the implicit close leaves the
+                    # connection checked out forever (the live PoolTimeout cause).
+                    await response.aclose()
+                return response
         except TimeoutError as exc:
             raise httpx.ReadTimeout(
                 f"total request deadline ({_TOTAL_REQUEST_DEADLINE}s) exceeded",
-                request=httpx.Request(method, url),
+                request=request,
             ) from exc
 
     async def aclose(self) -> None:
