@@ -549,6 +549,21 @@ class MangaBallSource(Source):
     # this engine, so MangaBall is the first android + csrf-bootstrap UNION source. CI
     # has no redroid sidecar, so the nightly disables mangaball (with kagane/mangadot).
     solver_engine = "android"
+    # On-demand clearance (debug pooltimeout-recurrence, 2026-06-18): MangaBall's
+    # site-wide managed challenge is INTERMITTENT — it was off pre-2026-06-15, switched
+    # ON 06-15 (the escalation above), and was OFF again by 06-18 (direct probe: GET /
+    # returns 200 + the real csrf-token page, NO ``cf-mitigated`` header). With eager
+    # clearance, every request blocked on the android-solver for a cf_clearance it could
+    # never mint while no challenge was firing (the WebView found no
+    # ``challenges.cloudflare.com`` OOPIF → solve timed out → every download
+    # ReadTimeout-failed). This flag makes the cf half LAZY: attach held clearance if
+    # the sidecar already has one, but do NOT block on a fresh solve up front — let the
+    # request go out and only force a real solve when a response is an actual challenge
+    # (``is_cf_challenge`` → the D-35 reconcile in context._request_response). So
+    # MangaBall now self-heals whether or not the challenge is live, and the antibot
+    # config never needs flipping back and forth. ``antibot``/``solver_engine``/
+    # ``session_prep`` stay as-is — only the SOLVE is deferred.
+    cloudflare_challenge_optional = True
     # NEW class-attr (Plan 01, D-06): the framework maps this onto the shared
     # CsrfBootstrap provider (Plan 02). ``post_json`` injects the harvested
     # X-CSRF-Token + PHPSESSID on every /api/v1 form POST.

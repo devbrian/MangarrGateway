@@ -36,6 +36,8 @@ import httpx
 from .antibot import Clearance
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from pydantic import SecretStr
 
 _log = logging.getLogger("manga_gateway")
@@ -70,12 +72,21 @@ class AndroidSolver:
         # arrives already built by ``build_proxy`` (the sole SecretStr unpacker,
         # T-odg-01) — it is threaded through verbatim and NEVER logged (T-11-02).
         proxy: dict[str, str] | None = None,
+        # On-demand (challenge-triggered) keys — sources with
+        # ``cloudflare_challenge_optional=True``. ``warm()`` SKIPS these: their CF
+        # challenge is intermittent, so an eager startup solve would loop on an absent
+        # challenge, waste the single redroid device, and (failing) force-disable the
+        # source for the 12h /caps window (debug pooltimeout-recurrence). They still
+        # solve on-demand via ``get_clearance(force_resolve=True)`` when a request
+        # actually hits a challenge.
+        on_demand_keys: Iterable[str] = (),
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
         self._base_url = base_url.rstrip("/") if base_url else None
         self._api_key = api_key
         self._challenge_urls = dict(challenge_urls)
+        self._on_demand_keys = frozenset(on_demand_keys)
         self._timeout_s = timeout_s
         self._proxy = proxy
         self._client = client
@@ -85,7 +96,11 @@ class AndroidSolver:
         self._held: dict[str, Clearance] = {}
 
     async def get_clearance(
-        self, source_key: str, *, force_resolve: bool = False
+        self,
+        source_key: str,
+        *,
+        force_resolve: bool = False,
+        solve_if_missing: bool = True,
     ) -> Clearance | None:
         """Return clearance for ``source_key`` (``None`` for non-android keys).
 
@@ -95,6 +110,14 @@ class AndroidSolver:
         FRESH sidecar solve (D-35, the 403 self-heal). ``force_resolve`` is a declared
         keyword so context.py's ``_call_solver`` ``inspect.signature`` detection passes
         it through (D-41).
+
+        ``solve_if_missing=False`` (the on-demand peek, debug pooltimeout-recurrence):
+        serve the held clearance if present but return ``None`` instead of running a
+        BLOCKING sidecar solve when none is held — the caller (a
+        ``cloudflare_challenge_optional`` source) will let the request go out without
+        clearance and only force a real solve if the response is an actual challenge.
+        This is what stops an intermittent-challenge source from hanging on the sidecar
+        for a clearance the site is not currently demanding.
         """
         if source_key not in self._challenge_urls:
             return None  # MangaDex et al. — no android clearance needed
@@ -108,6 +131,9 @@ class AndroidSolver:
             held = self._held.get(source_key)
             if held is not None:
                 return held
+            if not solve_if_missing:
+                # On-demand peek with nothing held — do NOT block on a sidecar solve.
+                return None
         clearance = await self._solve(source_key)
         self._held[source_key] = clearance
         return clearance
@@ -125,6 +151,10 @@ class AndroidSolver:
         """
         failed: list[str] = []
         for key in self._challenge_urls:
+            if key in self._on_demand_keys:
+                # On-demand source: never eager-warm — it solves only when a live
+                # challenge is detected (debug pooltimeout-recurrence).
+                continue
             try:
                 await self.get_clearance(key)
             except Exception as exc:  # noqa: BLE001 — isolate per-key warm failures

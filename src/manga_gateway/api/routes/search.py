@@ -177,6 +177,9 @@ async def search(
             handle_store=handle_store,
             solver=solver,
             antibot=src.antibot,
+            cloudflare_challenge_optional=getattr(
+                src, "cloudflare_challenge_optional", False
+            ),
             decrypt_scheme=src.decrypt_scheme,
             decrypt_config=dict(src_decrypt_config) if src_decrypt_config else None,
             source_health=health_map.get(src.key),

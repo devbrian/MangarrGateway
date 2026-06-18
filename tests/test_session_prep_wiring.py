@@ -53,6 +53,7 @@ _SALIENT_KEYS = frozenset(
         "handle_store",
         "solver",
         "antibot",
+        "cloudflare_challenge_optional",
         "decrypt_scheme",
         "decrypt_config",
         "source_health",

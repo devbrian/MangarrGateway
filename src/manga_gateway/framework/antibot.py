@@ -457,6 +457,12 @@ class CloudflareSolver:
         challenge_url: str = _DEFAULT_CHALLENGE_URL,
         challenge_urls: dict[str, str] | None = None,
         cloudflare_keys: Iterable[str] = (),
+        # On-demand keys (``cloudflare_challenge_optional=True``) — ``warm()`` skips
+        # them so an intermittent-challenge source is never eager-solved/force-disabled
+        # at startup; it solves on-demand when a request hits a live challenge (debug
+        # pooltimeout-recurrence). No patchright source sets this today; threaded for
+        # symmetry with AndroidSolver via the SolverRouter.
+        on_demand_keys: Iterable[str] = (),
         engine: AntibotEngine = "patchright",
         log_browser_events: bool = False,
         proxy: dict[str, str] | None = None,
@@ -483,6 +489,7 @@ class CloudflareSolver:
         self._challenge_url = challenge_url
         self._challenge_urls = dict(challenge_urls or {})
         self._cloudflare_keys = frozenset(cloudflare_keys)
+        self._on_demand_keys = frozenset(on_demand_keys)
         self._engine: AntibotEngine = engine
         # #153: eager-warm retry budget. ``warm()`` retries each source up to
         # ``warm_attempts`` times (linear backoff ``warm_retry_seconds * attempt``)
@@ -549,15 +556,31 @@ class CloudflareSolver:
         return self._engine
 
     async def get_clearance(
-        self, source_key: str, *, force_resolve: bool = False
+        self,
+        source_key: str,
+        *,
+        force_resolve: bool = False,
+        solve_if_missing: bool = True,
     ) -> Clearance | None:
         """Return clearance for ``source_key`` (``None`` for non-cloudflare keys).
 
         ``force_resolve`` (internal, D-35) skips the held clearance and runs a fresh
-        solve. It is NOT part of the ``AntiBotSolver`` Protocol (D-41).
+        solve. ``solve_if_missing=False`` is the on-demand peek (debug
+        pooltimeout-recurrence). Both are internal kwargs, NOT part of the
+        ``AntiBotSolver`` Protocol (D-41).
+
+        Unlike the AndroidSolver, this desktop solver keeps NO in-memory held cache —
+        cf_clearance persists in the browser ``cloudflare-userdata`` dir and every
+        solve re-navigates (short-circuiting on the on-disk cookie). There is therefore
+        nothing to return cheaply for a peek, so ``solve_if_missing=False`` on a
+        non-force call returns ``None`` and defers to the challenge-triggered
+        force-resolve. (No patchright source sets ``cloudflare_challenge_optional``
+        today; this keeps the seam correct for the router's signature pass-through.)
         """
         if source_key not in self._cloudflare_keys:
             return None  # MangaDex et al. — no clearance needed
+        if not force_resolve and not solve_if_missing:
+            return None
         return await self._lifecycle.solve(source_key, force=force_resolve)
 
     async def warm(
@@ -590,6 +613,10 @@ class CloudflareSolver:
         self._lifecycle.start_recycle_watchdog()
         failed: list[str] = []
         for key in self._cloudflare_keys:
+            if key in self._on_demand_keys:
+                # On-demand source: never eager-warm — solves only on a live challenge
+                # (debug pooltimeout-recurrence).
+                continue
             if not await self._warm_one(key, sleep=sleep):
                 failed.append(key)
         return failed

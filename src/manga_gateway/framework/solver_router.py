@@ -130,20 +130,30 @@ class SolverRouter:
         return self._android if engine == _ANDROID_ENGINE else self._patchright
 
     async def get_clearance(
-        self, source_key: str, *, force_resolve: bool = False
+        self,
+        source_key: str,
+        *,
+        force_resolve: bool = False,
+        solve_if_missing: bool = True,
     ) -> Clearance | None:
         """Dispatch to the mapped backend's ``get_clearance`` (D-41 pass-through).
 
-        ``force_resolve`` (the D-35 403 self-heal) is forwarded ONLY when the chosen
-        backend declares it as a keyword — mirroring context.py's ``_call_solver``
-        ``inspect.signature`` detection so the public ``AntiBotSolver`` seam stays
-        unchurned (D-41).
+        ``force_resolve`` (the D-35 403 self-heal) and ``solve_if_missing`` (the
+        on-demand peek — ``False`` serves only already-held clearance) are forwarded
+        ONLY when the chosen backend declares them as keywords — mirroring context.py's
+        ``_call_solver`` ``inspect.signature`` detection so the public ``AntiBotSolver``
+        seam stays unchurned (D-41). ``solve_if_missing=True`` (the default) is never
+        forwarded, so eager dispatch is byte-for-byte unchanged.
         """
         backend = self._backend_for(source_key)
         get = backend.get_clearance
-        if force_resolve and "force_resolve" in inspect.signature(get).parameters:
-            return await get(source_key, force_resolve=True)  # type: ignore[call-arg]
-        return await get(source_key)
+        params = inspect.signature(get).parameters
+        kwargs: dict[str, Any] = {}
+        if force_resolve and "force_resolve" in params:
+            kwargs["force_resolve"] = True
+        if not solve_if_missing and "solve_if_missing" in params:
+            kwargs["solve_if_missing"] = False
+        return await get(source_key, **kwargs)
 
     # ── off-Protocol browser primitives (D-41) — pass-through for comix ──────────
     # Delegate to the PATCHRIGHT backend, never android: comix is the only caller

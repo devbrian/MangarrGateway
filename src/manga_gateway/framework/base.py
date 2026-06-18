@@ -60,6 +60,20 @@ class Source(ABC):
     # ``{source_key: solver_engine}`` map from this attr — the ONLY per-source code a
     # new android source needs (a one-line override), no framework edit.
     solver_engine: str = "patchright"
+    # On-demand (challenge-triggered) clearance. ``False`` (default) = the historic
+    # EAGER path: a ``cloudflare*`` source mints/serves cf_clearance on EVERY request
+    # (comix/kagane/mangadot — byte-for-byte unchanged). ``True`` = a source whose
+    # Cloudflare managed challenge is INTERMITTENT (it flips on/off site-side): the
+    # framework attaches CACHED clearance if the solver already holds one but does NOT
+    # block on a fresh solve up front — it lets the request go out and only solves when
+    # the response is an actual challenge (``is_cf_challenge`` → the existing D-35
+    # force-resolve reconcile). This makes a source self-heal whether or not the
+    # challenge is currently active, so the antibot config never has to be flipped back
+    # and forth (debug ``pooltimeout-recurrence`` → mangaball dropped its 2026-06-15
+    # challenge; eager clearance then routed every request through the android-solver
+    # for a clearance it could never mint, hanging every download). Keep ``antibot``,
+    # ``solver_engine``, and any ``session_prep`` as-is — this only defers the SOLVE.
+    cloudflare_challenge_optional: bool = False
     # D-01: the httpx session-prep style the framework resolves into a SessionPrep
     # provider (framework/session_prep.py). ``None`` = no bootstrap (MangaDex/Comix
     # byte-for-byte unchanged); ``"csrf-bootstrap"`` = GET an HTML page, harvest the

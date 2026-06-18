@@ -172,6 +172,66 @@ async def test_non_force_reuses_held_clearance() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_warm_skips_on_demand_keys() -> None:
+    """On-demand keys are NEVER eager-warmed (debug pooltimeout-recurrence): warm()
+    skips them, so the sidecar is not hit for an absent challenge and the key is NOT
+    reported failed (→ never force-disabled). The non-on-demand key still warms."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(on_demand_keys=frozenset({"mangadot"}))
+    try:
+        failed = await solver.warm()
+    finally:
+        await solver.aclose()
+    # mangadot skipped → not failed; kagane warmed once.
+    assert "mangadot" not in failed
+    assert route.call_count == 1  # only kagane hit the sidecar
+    body = json.loads(route.calls.last.request.content)
+    assert body["challenge_url"] == _CHALLENGE_URLS["kagane"]
+
+
+def test_solve_if_missing_is_declared_keyword() -> None:
+    """On-demand peek (debug pooltimeout-recurrence): ``solve_if_missing`` must be a
+    real keyword param so context.py / SolverRouter ``inspect.signature`` detection
+    forwards it (D-41)."""
+    params = inspect.signature(_solver().get_clearance).parameters
+    assert "solve_if_missing" in params
+    assert params["solve_if_missing"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_if_missing_false_peeks_without_solving() -> None:
+    """On-demand peek with NOTHING held → ``None`` and NO sidecar solve. This is what
+    stops an intermittent-challenge source from blocking on a clearance the site is
+    not currently demanding (debug pooltimeout-recurrence)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    try:
+        result = await solver.get_clearance("mangadot", solve_if_missing=False)
+    finally:
+        await solver.aclose()
+    assert result is None
+    assert not route.called  # peeked the empty cache — never touched the sidecar
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_if_missing_false_serves_held_clearance() -> None:
+    """On-demand peek WITH a held clearance → serve it (no re-solve). The first real
+    solve (or a D-35 force-resolve) populates ``_held``; subsequent peeks reuse it."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    try:
+        seeded = await solver.get_clearance("mangadot")  # one real solve seeds _held
+        peeked = await solver.get_clearance("mangadot", solve_if_missing=False)
+    finally:
+        await solver.aclose()
+    assert peeked is seeded  # served the held value
+    assert route.call_count == 1  # the peek added NO sidecar call
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_force_resolve_reposts_and_replaces_held() -> None:
     route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
     solver = _solver()
