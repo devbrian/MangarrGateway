@@ -145,17 +145,49 @@ async def test_internal_handler_maps_unhandled_to_500() -> None:
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected_no_traversal"),
+    "raw",
     [
-        ("../../etc/passwd", True),
-        ("..\\..\\windows\\system32", True),
-        ("Chainsaw Man Ch. 152", True),
-        ("....", True),
+        "../../etc/passwd",
+        "..\\..\\windows\\system32",
+        "Chainsaw Man Ch. 152",
+        "....",  # pure-dots run
+        "/etc/passwd",  # absolute POSIX path
+        "C:\\Windows\\System32",  # absolute Windows path
+        "..",  # bare parent ref
+        ".",  # bare current-dir ref
+        "  ..trailing.. ",  # leading/trailing dots + spaces
+        "\x00\x01\x02bad",  # NUL + control chars
+        "foo/../bar",  # embedded traversal mid-string
     ],
 )
-def test_sanitize_rejects_traversal(raw: str, expected_no_traversal: bool) -> None:
+def test_sanitize_rejects_traversal(raw: str) -> None:
+    """SEC-02 / D-08 / T-01-06: every value reduces to ONE safe component — no
+    separator, no usable ``..``, no control chars, never empty."""
     out = sanitize_filename(raw)
     assert "/" not in out
     assert "\\" not in out
     assert ".." not in out
-    assert out  # never empty
+    assert not any(ord(c) < 0x20 for c in out)  # no control/NUL chars survive
+    assert out  # never empty (fallback applied if it would be)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Bug A2: separators are NEUTRALIZED in place, not used to drop segments.
+        ("AC/DC", "AC_DC"),
+        ("/a/nonymous]", "_a_nonymous]"),
+        ("Scan/Group", "Scan_Group"),
+        # Legal characters (brackets, spaces, dashes) are preserved unchanged.
+        ("[Anonymous]", "[Anonymous]"),
+        ("Solo Leveling - Ch. 1 [Team]", "Solo Leveling - Ch. 1 [Team]"),
+    ],
+)
+def test_sanitize_neutralizes_separators_preserving_data(
+    raw: str, expected: str
+) -> None:
+    """Bug A2 (output-path-group-slash-filenotfound): a value with directory
+    separators keeps ALL its segments with the separators substituted to ``_`` —
+    the old ``split('/')[-1]`` silently dropped everything before the last
+    separator (``AC/DC`` → ``DC``)."""
+    assert sanitize_filename(raw) == expected

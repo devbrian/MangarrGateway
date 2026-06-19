@@ -130,7 +130,7 @@ def test_write_cbz_is_zip_stored_zero_padded_reading_order(tmp_path: Path) -> No
     pages = [(f"page-{i}.jpg", f"img{i}".encode()) for i in range(1, 11)]  # 10 pages
     final = tmp_path / "out.cbz"
 
-    package.write_cbz(pages, final)
+    package.write_cbz(pages, final, job_id="j_test")
 
     with zipfile.ZipFile(final) as zf:
         names = zf.namelist()
@@ -146,7 +146,7 @@ def test_write_cbz_entries_have_exact_original_bytes(tmp_path: Path) -> None:
     pages = [("a.png", _png_bytes("red")), ("b.png", _png_bytes("green"))]
     final = tmp_path / "out.cbz"
 
-    package.write_cbz(pages, final)
+    package.write_cbz(pages, final, job_id="j_test")
 
     with zipfile.ZipFile(final) as zf:
         # 2 pages → width max(2, 1) == 2 → zero-padded 01/02.
@@ -158,7 +158,7 @@ def test_write_cbz_preserves_original_extension(tmp_path: Path) -> None:
     pages = [("first.png", b"a"), ("second.jpeg", b"b"), ("third", b"c")]
     final = tmp_path / "out.cbz"
 
-    package.write_cbz(pages, final)
+    package.write_cbz(pages, final, job_id="j_test")
 
     with zipfile.ZipFile(final) as zf:
         names = zf.namelist()
@@ -172,7 +172,7 @@ def test_write_cbz_contains_no_comicinfo_or_xml(tmp_path: Path) -> None:
     pages = [("a.jpg", b"a"), ("b.jpg", b"b")]
     final = tmp_path / "out.cbz"
 
-    package.write_cbz(pages, final)
+    package.write_cbz(pages, final, job_id="j_test")
 
     with zipfile.ZipFile(final) as zf:
         names = [n.lower() for n in zf.namelist()]
@@ -189,7 +189,7 @@ def test_write_cbz_atomic_on_mid_write_failure(tmp_path: Path) -> None:
     # object() is not bytes-like → zipfile.writestr raises mid-write (TypeError),
     # exercising the BaseException cleanup branch (D-26) without a blind assert.
     with pytest.raises(TypeError):
-        package.write_cbz(pages, final)  # type: ignore[arg-type]
+        package.write_cbz(pages, final, job_id="j_test")  # type: ignore[arg-type]
 
     assert not final.exists()
     leftovers = [p for p in tmp_path.iterdir() if p.name != final.name]
@@ -337,3 +337,140 @@ def test_compute_output_path_malicious_title_cannot_escape_root() -> None:
     assert path.parent.name.startswith("manga-")
     # The folder component carries no path separator.
     assert "/" not in path.parent.name and "\\" not in path.parent.name
+
+
+# ──────────── compute_output_path: falsy/non-positive manga_id (Bug A1) ──────────
+
+
+@pytest.mark.parametrize("manga_id", [0, -1, -42])
+def test_compute_output_path_nonpositive_mangaid_buckets_under_title(
+    manga_id: int,
+) -> None:
+    """Bug A1: ``manga_id <= 0`` (notably the ``0`` placeholder) is NOT a real id —
+    it must NOT mint a ``manga-0`` (or ``manga--1``) folder. It falls through to the
+    per-series title bucket exactly like ``None`` and STILL gets the #9 hash."""
+    path = package.compute_output_path(
+        "/data/manga",
+        manga_id,
+        "Chapter 1",
+        manga_title="Some Series",
+        fallback_discriminator="uuid-aaa",
+    )
+    assert path.parent == Path("/data/manga/manga-Some Series")
+    assert f"manga-{manga_id}" not in {p for p in path.parts}
+    # #9 collision hash applied on the id-less path (regression: 0 used to skip it).
+    assert path.stem.startswith("Chapter 1-")
+
+
+@pytest.mark.parametrize("manga_id", [0, -1])
+def test_compute_output_path_nonpositive_mangaid_unusable_title_unknown(
+    manga_id: int,
+) -> None:
+    """Bug A1: ``manga_id <= 0`` with no usable title falls to ``manga-unknown/``
+    (tier 3) and STILL applies the #9 collision hash — never ``manga-0``."""
+    path = package.compute_output_path(
+        "/data/manga", manga_id, "Chapter 1", fallback_discriminator="uuid-aaa"
+    )
+    assert path.parent == Path("/data/manga/manga-unknown")
+    assert path.stem.startswith("Chapter 1-")
+
+
+@pytest.mark.parametrize("manga_id", [0, -5])
+def test_compute_output_path_nonpositive_mangaid_two_series_no_collision(
+    manga_id: int,
+) -> None:
+    """Bug A1 amplifies Bug B (over-concentration): with the OLD code every
+    ``manga_id=0`` grab landed in ``manga-0/`` with a bare (hashless) filename, so
+    two series sharing a chapter title collided. Now distinct discriminators yield
+    distinct paths even at ``manga_id=0``."""
+    a = package.compute_output_path(
+        "/data/manga", manga_id, "Chapter 1", fallback_discriminator="series-a"
+    )
+    b = package.compute_output_path(
+        "/data/manga", manga_id, "Chapter 1", fallback_discriminator="series-b"
+    )
+    assert a != b
+
+
+def test_compute_output_path_positive_mangaid_unchanged() -> None:
+    """Bug A1 regression: a POSITIVE ``manga_id`` keeps the exact legacy layout —
+    ``manga-{id}`` folder, NO #9 hash, ``manga_title`` ignored."""
+    path = package.compute_output_path(
+        "/data/manga",
+        178,
+        "Chapter 1",
+        manga_title="Solo Leveling",
+        fallback_discriminator="uuid-aaa",
+    )
+    assert path == Path("/data/manga/manga-178/Chapter 1.cbz")
+
+
+# ───────────────── compute_output_path: separator neutralization (Bug A2) ────────
+
+
+def test_compute_output_path_title_separators_neutralized_not_dropped() -> None:
+    """Bug A2: a title with separators NEUTRALIZES them (``_``) instead of dropping
+    the leading segments. ``/a/nonymous]`` must NOT become ``nonymous]``."""
+    path = package.compute_output_path("/data/manga", 7, "/a/nonymous]")
+    assert path == Path("/data/manga/manga-7/_a_nonymous].cbz")
+    # Reproduce the EXACT reported scenario (manga_id=0 placeholder + slashed group),
+    # asserting the old malformed ``/data/manga/manga-0/nonymous].cbz`` is gone.
+    repro = package.compute_output_path(
+        "/data/manga", 0, "/a/nonymous]", manga_title="Some Series"
+    )
+    assert repro.parent == Path("/data/manga/manga-Some Series")
+    assert repro.stem.startswith("_a_nonymous]")
+    assert "manga-0" not in {p for p in repro.parts}
+
+
+# ───────────────── staging_temp_glob: per-job scoping (Bug B) ────────────────────
+
+
+@pytest.mark.parametrize(
+    ("output_format", "expected_suffix"),
+    [("cbz", ".cbz.tmp"), ("cbt", ".cbt.tmp"), ("folder", ".folder.tmp")],
+)
+def test_staging_temp_glob_is_job_scoped(
+    output_format: str, expected_suffix: str
+) -> None:
+    """Bug B: the cleanup glob is pinned to the OWNING job_id + format suffix so it
+    can never match a sibling job's temp."""
+    pattern = package.staging_temp_glob("j_abc", output_format=output_format)
+    assert pattern == f"j-j_abc-*{expected_suffix}"
+    # Wildcard only between the per-job prefix and the format suffix → never a bare
+    # ``*.cbz.tmp`` that would sweep siblings.
+    assert not pattern.startswith("*")
+
+
+def test_staging_temp_glob_unknown_format_defaults_cbz() -> None:
+    assert package.staging_temp_glob("j_x", output_format="weird").endswith(".cbz.tmp")
+
+
+def test_write_cbz_staging_temp_is_job_scoped(tmp_path: Path) -> None:
+    """Bug B: the in-flight ``write_cbz`` staging temp is named with the owning
+    job_id, so a per-job glob matches it while a different job's glob does NOT."""
+    final = tmp_path / "out.cbz"
+    captured: list[str] = []
+    real_replace = package.os.replace
+
+    def _spy(src: str, dst: object) -> None:
+        # Snapshot the staging-temp name the moment before atomic publish.
+        captured.extend(p.name for p in tmp_path.glob("*.cbz.tmp"))
+        real_replace(src, dst)  # type: ignore[arg-type]
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(package.os, "replace", _spy)
+    try:
+        package.write_cbz([("a.jpg", b"x")], final, job_id="j_OWNER")
+    finally:
+        monkey.undo()
+
+    assert len(captured) == 1
+    temp_name = captured[0]
+    assert Path(tmp_path, temp_name).match(
+        package.staging_temp_glob("j_OWNER", output_format="cbz")
+    )
+    # A different job's per-job glob must NOT match this temp.
+    assert not Path(tmp_path, temp_name).match(
+        package.staging_temp_glob("j_OTHER", output_format="cbz")
+    )

@@ -29,6 +29,7 @@ import contextlib
 import logging
 import os
 import secrets
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,6 +39,7 @@ import aiosqlite
 from ..models.download import DownloadJob
 from .engine import JobEngine
 from .model import Job, JobStatus
+from .package import staging_temp_glob
 
 _log = logging.getLogger("manga_gateway.jobs.manager")
 
@@ -311,27 +313,38 @@ class JobManager:
 
     @staticmethod
     def _unlink_job_files(job: Job) -> None:
-        """Blocking: unlink the job's OWN output + sibling staging temp (T-03-12).
+        """Blocking: unlink ONLY this job's OWN output + its OWN staging temp.
 
-        Only paths the GATEWAY produced are touched: the stored ``output_path`` (set
-        by the engine at completion) and any leftover ``*.cbz.tmp``/``*.cbt.tmp``
-        staging temp in that same directory. No client-supplied path is ever unlinked.
-        Offload via ``asyncio.to_thread`` (Pitfall 2). Missing files are ignored.
+        Only paths the GATEWAY produced for THIS job are touched: the stored
+        ``output_path`` (set by the engine at completion) and any leftover staging
+        temp this job itself created — matched by the per-job ``staging_temp_glob``
+        (``j-{job_id}-*.{fmt}.tmp``), NEVER a blanket ``*.cbz.tmp`` sibling sweep.
+
+        The old sibling glob deleted EVERY ``*.cbz.tmp``/``*.cbt.tmp`` in the
+        directory, so removing one finished job (``DELETE ?deleteData=true``) wiped
+        a CONCURRENT job's in-flight staging temp and that job's ``os.replace`` then
+        raised ``FileNotFoundError(2)`` (bug output-path-group-slash-filenotfound,
+        Bug B). Scoping the glob to ``job_id`` removes that cross-job race. No
+        client-supplied path is ever unlinked (T-03-12). Offload via
+        ``asyncio.to_thread`` (Pitfall 2). Missing files are ignored.
         """
         if job.output_path is None:
             return
         out = Path(job.output_path)
         with contextlib.suppress(OSError):
             out.unlink(missing_ok=True)
-        # Sweep any sibling staging temp left mid-archive for this job's directory.
+        # Remove ONLY this job's own staging temp (matched by job_id), never a
+        # sibling's in-flight temp. The startup orphan sweep (app.py _STAGING_GLOBS,
+        # startup-only) still catches any temp orphaned by a crash.
         parent = out.parent
         if parent.is_dir():
-            for temp in parent.glob("*.cbz.tmp"):
+            pattern = staging_temp_glob(job.job_id, output_format=job.output_format)
+            for temp in parent.glob(pattern):
                 with contextlib.suppress(OSError):
-                    temp.unlink(missing_ok=True)
-            for temp in parent.glob("*.cbt.tmp"):
-                with contextlib.suppress(OSError):
-                    temp.unlink(missing_ok=True)
+                    if temp.is_dir():  # folder-format staging dir (j-...-.folder.tmp)
+                        shutil.rmtree(temp, ignore_errors=True)
+                    else:
+                        temp.unlink(missing_ok=True)
 
     # ─────────────────────────── lifecycle ───────────────────────────
 
