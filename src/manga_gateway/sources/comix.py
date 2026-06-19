@@ -679,10 +679,34 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""
   const idm = location.pathname.match(/\/(\d+)-chapter-/);
   if (!idm) throw new Error('comix: no chapter id in ' + location.pathname);
 
+  // Timeout-only retry: comix's OWN axios instance bakes in a 15s timeout we
+  // can't set. An intermittently-slow comix backend (>15s) throws AxiosError
+  // 'timeout of 15000ms exceeded' (e.code === 'ECONNABORTED') — a transient
+  // flake, so retry it with a small backoff. ANY OTHER error (sign/decrypt/
+  // connectivity) MUST still fail-closed immediately; do NOT broaden the catch.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const MAX_RETRIES = 2;
+  const RETRY_BACKOFF_MS = [500, 1000];
+  const isTimeout = (e) =>
+    !!e && (e.code === 'ECONNABORTED' || /timeout/i.test(String(e.message || e)));
+  const withTimeoutRetry = async (fn) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn();
+      } catch (e) {
+        if (attempt < MAX_RETRIES && isTimeout(e)) {
+          await sleep(RETRY_BACKOFF_MS[attempt] || 1000);
+          continue;
+        }
+        throw e;
+      }
+    }
+  };
+
   // (4) GET /chapters/{id} (axios baseURL is /api/v1) -> the decrypted chapter
   // with pages:{baseUrl, items:[{url}]}. A thrown request fails closed (the extract
   // throws → fetch_manifest raises → SourceError), never a partial manifest.
-  const res = await ax.get('/chapters/' + idm[1]);
+  const res = await withTimeoutRetry(() => ax.get('/chapters/' + idm[1]));
   const data = (res && res.data !== undefined) ? res.data : res;
   const pages = data && data.pages;
   const items = (pages && Array.isArray(pages.items)) ? pages.items
@@ -780,8 +804,35 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""
   if (!hm) throw new Error('comix: could not read hid from ' + location.pathname);
   const hid = hm[1];
 
+  // Timeout-only retry: comix's OWN axios instance bakes in a 15s timeout we
+  // can't set. When comix's backend is intermittently slow (>15s for one page)
+  // the call throws AxiosError 'timeout of 15000ms exceeded' (e.code ===
+  // 'ECONNABORTED'). That is a transient flake — retry it with a small backoff.
+  // ANY OTHER error (token/sign failure, decrypt failure, connectivity) MUST
+  // still fail-closed immediately (no error masking — a partial chapter list is
+  // never returned). Do NOT broaden this catch beyond the axios-timeout class.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const MAX_RETRIES = 2;
+  const RETRY_BACKOFF_MS = [500, 1000];
+  const isTimeout = (e) =>
+    !!e && (e.code === 'ECONNABORTED' || /timeout/i.test(String(e.message || e)));
+  const withTimeoutRetry = async (fn) => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await fn();
+      } catch (e) {
+        if (attempt < MAX_RETRIES && isTimeout(e)) {
+          await sleep(RETRY_BACKOFF_MS[attempt] || 1000);
+          continue;
+        }
+        throw e;
+      }
+    }
+  };
+
   const getPage = (p) =>
-    api.chapters(hid, { page: p, limit: LIMIT, order: { number: 'desc' } });
+    withTimeoutRetry(() =>
+      api.chapters(hid, { page: p, limit: LIMIT, order: { number: 'desc' } }));
   const rowsOf = (res) => {
     if (!res) return [];
     if (Array.isArray(res)) return res;
