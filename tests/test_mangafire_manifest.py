@@ -251,13 +251,21 @@ async def test_fetch_manifest_integrity_mismatch_not_retried(_no_sleep: None) ->
 
 
 def test_image_list_extract_js_wraps_refetch_in_retry() -> None:
+    """The in-page AJAX re-fetch retries on a transient throw and falls through to
+    CONTINUE the outer poll loop instead of aborting (mangafire-manifest-contention)."""
     js = _IMAGE_LIST_EXTRACT_JS
     # The in-page re-fetch has its own bounded attempt loop with a try/catch guard.
     assert "for (let attempt = 0; attempt < 3; attempt++)" in js
     assert "try {" in js
     assert "} catch (e) {" in js
-    # On a throw we keep trying (do NOT break/return out of the whole extract).
-    assert "break" not in js
+    # Narrow the "no abort" check to the inner re-fetch retry block: on a thrown/empty
+    # re-fetch it must fall through (CONTINUE the outer poll), never break/return out.
+    # A whole-string check would spuriously fail on an unrelated future break (CR #285).
+    start = js.index("for (let attempt = 0; attempt < 3; attempt++)")
+    end = js.index("// re-fetch threw or stayed empty", start)
+    inner_retry_block = js[start:end]
+    assert "break" not in inner_retry_block
+    assert "return []" not in inner_retry_block
 
 
 @pytest.mark.asyncio
