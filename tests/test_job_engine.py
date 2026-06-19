@@ -108,6 +108,9 @@ class _StubSource:
 
     key = "stub"
     rate_limit_per_minute = 6000
+    # Mirrors the Source base default: a 403 opts INTO the engine's stale-baseUrl
+    # re-resolve recovery. A test sets this False to assert the opt-out fail-fast path.
+    reresolve_manifest_on_403 = True
 
     def __init__(
         self,
@@ -119,7 +122,11 @@ class _StubSource:
         # For the stale-baseUrl test: a list of manifests returned in sequence on
         # successive fetch_manifest calls.
         manifest_sequence: list[list[str]] | None = None,
+        # Opt out of the 403→re-resolve recovery (mangafire-class sources).
+        reresolve_manifest_on_403: bool | None = None,
     ) -> None:
+        if reresolve_manifest_on_403 is not None:
+            self.reresolve_manifest_on_403 = reresolve_manifest_on_403
         self._manifest = manifest
         self._manifest_sequence = manifest_sequence
         self._manifest_calls = 0
@@ -419,6 +426,40 @@ async def test_run_fails_when_reresolve_budget_exceeded(tmp_path: Path) -> None:
         await engine.run(job)
 
         assert job.status == JobStatus.FAILED
+        assert not _has_cbz_under(tmp_path / "out")
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_reresolve_when_source_opts_out(tmp_path: Path) -> None:
+    """A source with ``reresolve_manifest_on_403 = False`` (mangafire-class) must NOT
+    re-resolve on an image 403 — the original SourceError propagates (fail fast,
+    correctly classified), the manifest is fetched exactly once, and the failure
+    message is the ORIGINAL error, not the misleading stale-manifest wording.
+    Debug ``mangafire-stale-manifest-reresolve-budget``."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        urls = ["http://node/data/h/p1.png", "http://node/data/h/p2.png"]
+        src = _StubSource(
+            manifest=urls,
+            image_map={urls[0]: _png_bytes()},
+            image_errors={
+                urls[1]: SourceError("source_unavailable", "upstream 403", status=403)
+            },
+            reresolve_manifest_on_403=False,
+        )
+        engine = _engine_for(src, store, output_root=str(tmp_path / "out"))
+        job = _make_job()
+        await store.insert(job)
+
+        await engine.run(job)
+
+        assert job.status == JobStatus.FAILED
+        # No re-resolve: manifest fetched exactly once (vs >=2 for the opt-in path).
+        assert src._manifest_calls == 1
+        # The failure carries the ORIGINAL 403 wording, not "stale manifest …".
+        assert "stale manifest" not in (job.message or "")
         assert not _has_cbz_under(tmp_path / "out")
     finally:
         await store.close()
