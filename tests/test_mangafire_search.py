@@ -150,7 +150,7 @@ async def test_search_types_keyword_captures_vrf_and_mints_releases() -> None:
     assert _GUID_RE.match(rel.guid), rel.guid
     assert rel.chapter_number == Decimal("346.2")
     assert rel.download_handle and ":" not in rel.download_handle
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     assert record.chapter_id == "/read/blue-lockk.kw9j9/en/chapter-346.2"
 

@@ -166,7 +166,7 @@ async def test_search_mints_composite_handle_and_guid() -> None:
     assert rel.guid == "atsumaru:sVC2A:ch-1184:gGfRS"
     assert rel.download_handle
     assert ":" not in rel.download_handle  # opaque, not a structured composite
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     # The COMPOSITE chapter_id carries both ids (read/chapter needs both).
     assert record.chapter_id == "sVC2A:gGfRS"
@@ -255,7 +255,7 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     assert len(releases) == 3
     assert len(ctx.handle_store._cache) == 3  # noqa: SLF001 — store-size assertion
     for rel in releases:
-        assert ctx.handle_store.resolve(rel.download_handle) is not None
+        assert await ctx.handle_store.resolve(rel.download_handle) is not None
 
 
 @pytest.mark.asyncio

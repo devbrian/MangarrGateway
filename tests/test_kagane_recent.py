@@ -94,7 +94,7 @@ async def test_recent_mints_direct_release_from_latest_chapter() -> None:
     assert rel.guid == "kagane:s1:ch-138:lb1"
     assert rel.chapter_number == Decimal("138")
     assert rel.publish_date == "2026-06-09T01:54:55.063310+00:00"
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     assert record.chapter_id == "lb1"  # bare book_id
     assert rel.ids == {"kaganeSeriesId": "s1", "kaganeBookId": "lb1"}

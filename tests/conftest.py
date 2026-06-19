@@ -136,6 +136,7 @@ def app(tmp_path: Path) -> FastAPI:
         Settings(
             api_key=TEST_API_KEY,
             metrics_db_path=str(tmp_path / "metrics.db"),
+            handle_db_path=str(tmp_path / "handles.db"),
             log_dir=str(tmp_path / "logs"),
         )
     )

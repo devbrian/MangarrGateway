@@ -278,7 +278,7 @@ async def test_search_mints_fully_specific_guid_and_opaque_handle() -> None:
     assert rel.download_handle
     assert ":" not in rel.download_handle  # not a structured composite
     # The handle resolves to a record whose chapter_id == the translation id.
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     assert record.chapter_id == tx_id
     assert record.source_key == "mangaball"
@@ -464,7 +464,7 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     assert len(ctx.handle_store._cache) == 3  # noqa: SLF001 — store-size assertion
     # Every returned release's handle resolves (no eviction of survivors).
     for rel in releases:
-        assert ctx.handle_store.resolve(rel.download_handle) is not None
+        assert await ctx.handle_store.resolve(rel.download_handle) is not None
 
 
 # --- alt-title prune wiring (#139, GAP 2) ------------------------------------

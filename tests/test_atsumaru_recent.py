@@ -104,7 +104,7 @@ async def test_recent_mints_newest_chapter_per_title() -> None:
     assert by_title["One Piece"].guid == "atsumaru:m1:ch-1184:op2"  # newest, not op1
     assert by_title["Naruto"].guid == "atsumaru:m2:ch-700:nr1"
     # Composite chapter_id on the minted record.
-    record = ctx.handle_store.resolve(by_title["One Piece"].download_handle)
+    record = await ctx.handle_store.resolve(by_title["One Piece"].download_handle)
     assert record is not None
     assert record.chapter_id == "m1:op2"
     assert by_title["One Piece"].publish_date.endswith("+00:00")

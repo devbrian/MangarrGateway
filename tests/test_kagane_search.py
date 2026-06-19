@@ -173,7 +173,7 @@ async def test_search_mints_book_id_handle_and_guid() -> None:
     assert _GUID_RE.match(rel.guid), rel.guid
     assert rel.guid == "kagane:s1:ch-200:b1"
     assert rel.download_handle and ":" not in rel.download_handle
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     assert record.chapter_id == "b1"  # bare book_id (no composite)
     assert record.source_key == "kagane"
@@ -239,7 +239,7 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     assert len(releases) == 3
     assert len(ctx.handle_store._cache) == 3  # noqa: SLF001
     for rel in releases:
-        assert ctx.handle_store.resolve(rel.download_handle) is not None
+        assert await ctx.handle_store.resolve(rel.download_handle) is not None
 
 
 @pytest.mark.asyncio

@@ -544,6 +544,7 @@ async def test_create_app_boots_when_metrics_db_unwritable(tmp_path: Path) -> No
             log_dir=str(tmp_path / "logs"),
             output_root=str(tmp_path / "out"),
             db_path=str(tmp_path / "jobs.db"),
+            handle_db_path=str(tmp_path / "handles.db"),
         )
     )
     async with app.router.lifespan_context(app):

@@ -105,18 +105,18 @@ def _record() -> ResolutionRecord:
     )
 
 
-def test_store_mint_then_resolve_roundtrips() -> None:
+async def test_store_mint_then_resolve_roundtrips() -> None:
     store = HandleStore()
     record = _record()
     handle = store.mint(record)
     assert isinstance(handle, str)
     assert handle  # non-empty opaque token
-    assert store.resolve(handle) == record
+    assert await store.resolve(handle) == record
 
 
-def test_store_resolve_unknown_returns_none() -> None:
+async def test_store_resolve_unknown_returns_none() -> None:
     store = HandleStore()
-    assert store.resolve("nonexistent") is None
+    assert await store.resolve("nonexistent") is None
 
 
 def test_store_mints_are_opaque_and_distinct() -> None:
@@ -889,7 +889,7 @@ async def test_search_minted_handle_resolves_in_store(
     assert resp.status_code == 200
     handle = resp.json()["releases"][0]["downloadHandle"]
     store = app.state.handle_store
-    record = store.resolve(handle)
+    record = await store.resolve(handle)
     assert record is not None
     # chapter_id is a UUID and there is no baseUrl (HDL-01).
     uuid.UUID(record.chapter_id)

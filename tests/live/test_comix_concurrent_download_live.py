@@ -98,6 +98,7 @@ async def test_two_comix_downloads_run_concurrently(tmp_path: Path) -> None:
         api_key=_TEST_API_KEY,
         output_root=str(output_root),
         db_path=str(tmp_path / "jobs.db"),
+        handle_db_path=str(tmp_path / "handles.db"),
         cloudflare_headless=_headless(),
         # Widen the caps so both comix jobs are admitted concurrently (the
         # default per-source cap of 1 would serialize them — this test is about

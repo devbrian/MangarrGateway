@@ -208,6 +208,7 @@ async def live_client_for(
         api_key=_TEST_API_KEY,
         output_root=str(tmp_path / "out"),
         db_path=str(tmp_path / "jobs.db"),
+        handle_db_path=str(tmp_path / "handles.db"),
     )
     app = create_app(settings)
     transport = httpx.ASGITransport(app=app)

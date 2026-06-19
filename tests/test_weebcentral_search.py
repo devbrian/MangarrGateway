@@ -203,7 +203,7 @@ async def test_search_mints_bare_handle_and_guid() -> None:
     assert rel.guid == f"weebcentral:{_SERIES}:ch-1184:{_chapter_id(1)}"
     assert rel.download_handle
     assert ":" not in rel.download_handle  # opaque, not a structured composite
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     # The BARE chapter ULID — the manifest endpoint needs only it (NOT a composite).
     assert record.chapter_id == _chapter_id(1)
@@ -254,7 +254,7 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     assert len(releases) == 3
     assert len(ctx.handle_store._cache) == 3  # noqa: SLF001 — store-size assertion
     for rel in releases:
-        assert ctx.handle_store.resolve(rel.download_handle) is not None
+        assert await ctx.handle_store.resolve(rel.download_handle) is not None
 
 
 @pytest.mark.asyncio
