@@ -35,8 +35,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _log = logging.getLogger("manga_gateway")
 
 _KEY_BYTES = 32  # secrets.token_urlsafe(32) -> >= 43 url-safe chars
-# The 60-min downloadHandle TTL — the enum-cache TTL ceiling (D-09/CACHE-05).
-_HANDLE_TTL_CEILING_SECONDS = 3600
+# Default downloadHandle TTL — was a hard-coded 3600s (60 min) which was the
+# CONFIRMED cause of the "release no longer resolvable" production failures
+# (debug session release-no-longer-resolvable): Mangarr's automated
+# library-sync replays grabs for releases whose handle minted >60 min earlier
+# had already aged out of the in-memory TTLCache (~60% bad_handle misses in
+# active windows). Raised to 6h (21600s) so the window comfortably covers
+# Mangarr's grab-replay latency; still ENFORCED so handles age out (SEC posture
+# / D-15 — never keep-forever). Operator-overridable via GATEWAY_HANDLE_TTL_SECONDS.
+_DEFAULT_HANDLE_TTL_SECONDS = 21600
 
 
 class Settings(BaseSettings):
@@ -327,6 +334,27 @@ class Settings(BaseSettings):
     # Rides the existing load_settings model_fields TOML->kwargs merge — no extra
     # wiring needed.
     handle_maxsize: int = Field(default=200_000, ge=1)
+    # HDL-02: the downloadHandle TTL in seconds. An env-overridable ops knob
+    # (D-11, same host/port treatment — NOT the api_key exclusion):
+    # GATEWAY_HANDLE_TTL_SECONDS, default 21600 (6h). Replaces the prior hard-coded
+    # 3600s (60 min) that was the CONFIRMED cause of the "release no longer
+    # resolvable" production failures — Mangarr's library-sync replays grabs long
+    # after the 60-min window, so the handle was already gone (debug session
+    # release-no-longer-resolvable). The TTL is STILL enforced (handles age out —
+    # SEC posture / D-15, never keep-forever); it just spans Mangarr's grab-replay
+    # latency now. ge=1800: MUST stay >= the 30-min Mangarr interactive-search
+    # floor AND >= the enum-cache TTL ceiling default (1800), so a cached
+    # enumeration can never out-live the handle it serves (D-09/CACHE-05, enforced
+    # by `_enum_cache_ttl_within_handle_ttl` which now anchors to THIS value).
+    handle_ttl_seconds: int = Field(default=_DEFAULT_HANDLE_TTL_SECONDS, ge=1800)
+    # HDL-02 / D-16 REVERSAL: path to the aiosqlite handle store so minted handles
+    # SURVIVE a restart (the in-memory TTLCache is wiped on restart, which combined
+    # with the long TTL above would silently re-introduce bad_handle misses after a
+    # redeploy). Mirrors db_path/metrics_db_path: an env-overridable ops knob
+    # (GATEWAY_HANDLE_DB_PATH); the Dockerfile points it at the /state volume so it
+    # persists across container recreation. Persisting also lets the on-disk store
+    # hold far more than a 6h in-memory burst without blowing the 200k cap.
+    handle_db_path: str = "handles.db"
 
     @field_validator("metrics_cors_origins")
     @classmethod
@@ -423,23 +451,28 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _enum_cache_ttl_within_handle_ttl(self) -> Settings:
-        """Fail fast when the enum-cache TTL exceeds the 60-min handle TTL (D-09).
+        """Fail fast when the enum-cache TTL exceeds the handle TTL (D-09).
 
         A cached enumeration mints a fresh ``downloadHandle`` on every serve
-        (CACHE-03), but the handle store's own TTL is 3600s. If the enumeration
-        TTL were allowed above that ceiling the cache could keep serving a series
-        whose handles can no longer be resolved downstream (CACHE-05). Reject the
+        (CACHE-03), but a handle only lives ``handle_ttl_seconds``. If the
+        enumeration TTL were allowed above that ceiling the cache could keep
+        serving a series whose handles can no longer be resolved downstream
+        (CACHE-05). The ceiling is now ANCHORED to the configured
+        ``handle_ttl_seconds`` (debug session release-no-longer-resolvable) rather
+        than a hard-coded 3600 — raising the handle TTL must not retroactively
+        clamp the enum cache, and lowering it must still be respected. Reject the
         misconfiguration at construction — mirroring ``_reject_camoufox_parallel``
         — so it surfaces loudly at startup instead of silently mis-behaving.
         """
-        if self.enum_cache_ttl_seconds > _HANDLE_TTL_CEILING_SECONDS:
+        if self.enum_cache_ttl_seconds > self.handle_ttl_seconds:
             raise ValueError(
                 "enum_cache_ttl_seconds="
                 f"{self.enum_cache_ttl_seconds} exceeds the "
-                f"{_HANDLE_TTL_CEILING_SECONDS}s (60-min) downloadHandle TTL "
-                "ceiling (D-09/CACHE-05): a cached enumeration must not out-live "
-                "the handle it serves. Fix via env: set "
-                "GATEWAY_ENUM_CACHE_TTL_SECONDS to a value ≤ 3600."
+                f"{self.handle_ttl_seconds}s downloadHandle TTL ceiling "
+                "(handle_ttl_seconds, D-09/CACHE-05): a cached enumeration must "
+                "not out-live the handle it serves. Fix via env: set "
+                "GATEWAY_ENUM_CACHE_TTL_SECONDS <= GATEWAY_HANDLE_TTL_SECONDS "
+                f"(currently {self.handle_ttl_seconds})."
             )
         return self
 

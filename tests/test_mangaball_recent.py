@@ -283,7 +283,7 @@ async def test_recent_mints_direct_release_with_real_translation_id() -> None:
     assert rel.guid == f"mangaball:{title_id}:ch-30.1:vi:{tx_id}"
     assert rel.chapter_number == Decimal("30.1")
     # The handle resolves to a record whose chapter_id is the bare translation_id.
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     assert record.chapter_id == tx_id
     assert "DEFERRED" not in record.chapter_id

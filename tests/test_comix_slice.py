@@ -170,6 +170,7 @@ def comix_app(tmp_path: Path) -> FastAPI:
         Settings(
             api_key=TEST_API_KEY,
             db_path=str(tmp_path / "jobs.db"),
+            handle_db_path=str(tmp_path / "handles.db"),
             output_root=str(tmp_path / "out"),
         )
     )

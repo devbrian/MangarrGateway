@@ -235,6 +235,7 @@ async def test_comix_warm_download_under_perf_budget(tmp_path: Path) -> None:
         api_key=_TEST_API_KEY,
         output_root=str(output_root),
         db_path=str(tmp_path / "jobs.db"),
+        handle_db_path=str(tmp_path / "handles.db"),
         cloudflare_headless=_headless(),
     )
     app = create_app(settings)

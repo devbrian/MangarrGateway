@@ -190,6 +190,7 @@ async def _make_app(tmp_path: Path, *, max_per_source: int, fetch_concurrency: i
     settings = Settings(
         api_key=_TEST_API_KEY,
         db_path=str(tmp_path / "jobs.db"),
+        handle_db_path=str(tmp_path / "handles.db"),
         output_root=str(tmp_path / "out"),
         max_concurrent_chapters=4,
         max_concurrent_per_source=max_per_source,

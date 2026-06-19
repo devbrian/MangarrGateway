@@ -256,13 +256,67 @@ def test_enum_cache_defaults() -> None:
 
 
 def test_enum_cache_ttl_ceiling_rejects_above_handle_ttl() -> None:
-    """D-09/CACHE-05: a TTL above the 60-min (3600s) handle TTL fails fast."""
-    # 3600 (the ceiling) is allowed...
-    at_ceiling = Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=3600)
-    assert at_ceiling.enum_cache_ttl_seconds == 3600
-    # ...but one second over the ceiling is rejected at construction.
-    with pytest.raises(ValidationError, match="3600"):
-        Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=3601)
+    """D-09/CACHE-05: the enum-cache TTL ceiling is ANCHORED to handle_ttl_seconds.
+
+    The ceiling is no longer the hard-coded 3600 — it follows the configured handle
+    TTL (release-no-longer-resolvable). With the default 21600s handle TTL, a value
+    that used to be rejected (3601) is now accepted; only a value above the ACTUAL
+    handle TTL fails fast.
+    """
+    # 21600 (the default handle TTL ceiling) is allowed...
+    at_ceiling = Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=21600)
+    assert at_ceiling.enum_cache_ttl_seconds == 21600
+    # ...3601 — previously rejected against the 3600 ceiling — is now FINE.
+    raised = Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=3601)
+    assert raised.enum_cache_ttl_seconds == 3601
+    # ...but one second over the configured handle TTL is rejected at construction.
+    with pytest.raises(ValidationError, match="21600"):
+        Settings(api_key=_DUMMY_KEY, enum_cache_ttl_seconds=21601)
+
+
+def test_enum_cache_ttl_ceiling_tracks_lowered_handle_ttl() -> None:
+    """A LOWERED handle TTL re-anchors the ceiling downward (not a fixed 3600)."""
+    ok = Settings(
+        api_key=_DUMMY_KEY, handle_ttl_seconds=1800, enum_cache_ttl_seconds=1800
+    )
+    assert ok.enum_cache_ttl_seconds == 1800
+    with pytest.raises(ValidationError, match="1800"):
+        Settings(
+            api_key=_DUMMY_KEY, handle_ttl_seconds=1800, enum_cache_ttl_seconds=1801
+        )
+
+
+def test_handle_ttl_default_is_six_hours() -> None:
+    """HDL-02: default raised from 3600 → 21600 (6h), the confirmed fix for the
+    'release no longer resolvable' production misses."""
+    settings = Settings(api_key=_DUMMY_KEY)
+    assert settings.handle_ttl_seconds == 21600
+
+
+def test_handle_ttl_rejects_below_floor() -> None:
+    """HDL-02: ge=1800 — the TTL must stay >= the 30-min Mangarr floor."""
+    with pytest.raises(ValidationError):
+        Settings(api_key=_DUMMY_KEY, handle_ttl_seconds=1799)
+
+
+def test_env_overrides_handle_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-11: GATEWAY_HANDLE_TTL_SECONDS env var overrides the default."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'api_key = "{_DUMMY_KEY}"\n', encoding="utf-8")
+
+    monkeypatch.setenv("GATEWAY_HANDLE_TTL_SECONDS", "43200")
+
+    settings = load_settings(cfg)
+
+    assert settings.handle_ttl_seconds == 43200
+
+
+def test_handle_db_path_default() -> None:
+    """D-16 reversal: the handle store now has a SQLite path knob (relative default)."""
+    settings = Settings(api_key=_DUMMY_KEY)
+    assert settings.handle_db_path == "handles.db"
 
 
 def test_enum_cache_maxsize_rejects_non_positive() -> None:

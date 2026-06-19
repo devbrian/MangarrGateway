@@ -732,7 +732,7 @@ async def test_recent_returns_releases_with_deferred_guids_and_composites() -> N
     # Resolution record carries the deferred composite — matches what the
     # search-path's fetch_manifest deferred branch (Task 2) will decode.
     for rel in releases:
-        record = ctx.handle_store.resolve(rel.download_handle)  # type: ignore[attr-defined]
+        record = await ctx.handle_store.resolve(rel.download_handle)  # type: ignore[attr-defined]
         assert record is not None
         assert record.chapter_id.startswith("DEFERRED|")
         # Composite roundtrips through the existing parser unchanged.

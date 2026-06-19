@@ -103,7 +103,7 @@ async def test_recent_mints_direct_releases_from_feed() -> None:
     # RFC3339 publishDate normalized to an aware ``…+00:00`` string.
     assert rel.publish_date == "2026-06-08T23:52:15.380000+00:00"
     # DIRECT mint: the handle resolves to the BARE chapter ULID (not :DEFERRED).
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     assert record.chapter_id == "01KTMTDD8MWBD0CTR8QKGNB5JM"
     assert ":" not in rel.download_handle

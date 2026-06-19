@@ -196,7 +196,7 @@ async def test_repeat_same_series_chapter_search_zero_upstream_calls() -> None:
     # Fresh handle per serve (CACHE-03/05) — every served release resolves.
     assert all(r.download_handle for r in second)
     for rel in second:
-        assert ctx.handle_store.resolve(rel.download_handle) is not None
+        assert await ctx.handle_store.resolve(rel.download_handle) is not None
 
 
 # ─────────────────── kill-switch restores the pre-Phase-9 calls ────────────────────

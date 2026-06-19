@@ -57,6 +57,7 @@ def dl_app(tmp_path: Path) -> FastAPI:
         Settings(
             api_key=TEST_API_KEY,
             db_path=str(tmp_path / "jobs.db"),
+            handle_db_path=str(tmp_path / "handles.db"),
             output_root=str(tmp_path / "out"),
         )
     )
@@ -277,7 +278,7 @@ async def test_resubmit_live_handle_returns_same_job(dl_app: FastAPI) -> None:
     async with dl_app.router.lifespan_context(dl_app):
         manager = dl_app.state.job_manager
         handle = _mint_handle(dl_app)
-        record = dl_app.state.handle_store.resolve(handle)
+        record = await dl_app.state.handle_store.resolve(handle)
         req = SubmitRequest(releaseHandle=handle, sourceKey="mangadex", mangaId=42)
         # Hold the global semaphore so the first job stays queued/live for the
         # second submit — exercising the live-handle path (not the file path).
@@ -537,6 +538,7 @@ async def test_startup_sweeps_orphan_staging_temp(tmp_path: Path) -> None:
         Settings(
             api_key=TEST_API_KEY,
             db_path=str(tmp_path / "jobs.db"),
+            handle_db_path=str(tmp_path / "handles.db"),
             output_root=str(out_root),
         )
     )

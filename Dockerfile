@@ -114,6 +114,7 @@ RUN useradd --create-home --uid 10001 app \
 ENV GATEWAY_HOST=0.0.0.0 \
     GATEWAY_CONFIG=/state/config.toml \
     GATEWAY_DB_PATH=/state/gateway.db \
+    GATEWAY_HANDLE_DB_PATH=/state/handles.db \
     GATEWAY_CLOUDFLARE_USER_DATA_DIR=/state/cloudflare-userdata \
     GATEWAY_OUTPUT_ROOT=/data/manga \
     GATEWAY_CLOUDFLARE_HEADLESS=false

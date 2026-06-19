@@ -221,7 +221,7 @@ async def test_search_mints_specific_guid_and_direct_chapter_id() -> None:
     # mangadot-resolve-404) — DIRECT, no :DEFERRED. The guid + ids above stay BARE
     # ("388872"); only the handle's resolve unit carries the packed source so
     # fetch_manifest can route to /api/uploads vs /api/chapters.
-    record = ctx.handle_store.resolve(rel.download_handle)
+    record = await ctx.handle_store.resolve(rel.download_handle)
     assert record is not None
     assert record.chapter_id == "388872|user"
     assert MangadotSource._parse_resolve_id(record.chapter_id) == ("388872", "user")
@@ -343,7 +343,7 @@ async def test_search_mints_handles_only_for_returned_releases() -> None:
     assert len(releases) == 3
     assert len(ctx.handle_store._cache) == 3  # noqa: SLF001 — store-size assertion
     for rel in releases:
-        assert ctx.handle_store.resolve(rel.download_handle) is not None
+        assert await ctx.handle_store.resolve(rel.download_handle) is not None
 
 
 @pytest.mark.asyncio

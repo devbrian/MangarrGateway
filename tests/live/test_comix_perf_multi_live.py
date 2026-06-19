@@ -269,6 +269,7 @@ async def test_comix_multi_chapter_sequential_download(tmp_path: Path) -> None:
         api_key=_TEST_API_KEY,
         output_root=str(output_root),
         db_path=str(tmp_path / "jobs.db"),
+        handle_db_path=str(tmp_path / "handles.db"),
         cloudflare_headless=_headless(),
     )
     app = create_app(settings)

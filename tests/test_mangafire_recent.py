@@ -107,7 +107,7 @@ async def test_recent_mints_direct_newest_chapter_per_title() -> None:
         assert _GUID_RE.match(rel.guid), rel.guid
         assert rel.download_handle
         assert ":" not in rel.download_handle  # opaque, not a structured composite
-        record = ctx.handle_store.resolve(rel.download_handle)
+        record = await ctx.handle_store.resolve(rel.download_handle)
         assert record is not None
         # The chapter_id is the read href (the resolve unit, D-09).
         assert record.chapter_id.startswith("/read/")

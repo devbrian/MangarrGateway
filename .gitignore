@@ -23,9 +23,11 @@ config.toml
 # committed template is .env.example; a real .env must NEVER be committed.
 .env
 
-# SQLite job store (runtime persistence — PLAT-03) + WAL/SHM sidecars.
-# Scoped to the runtime DB only so unrelated *.db fixtures aren't ignored (CR).
+# SQLite job store + downloadHandle store (runtime persistence — PLAT-03 / D-16
+# reversal) + WAL/SHM sidecars. Scoped to the runtime DBs only so unrelated *.db
+# fixtures aren't ignored (CR).
 gateway.db*
+handles.db*
 
 # Patchright persistent-context dir holding cf_clearance (D-34) — runtime artifact,
 # never committed (T-04-03). The committed D-44 decrypt fixtures stay tracked.

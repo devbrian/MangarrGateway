@@ -84,8 +84,9 @@ services:
         required: false
     volumes:
       # App data (config.toml + the auto-generated API key, gateway.db,
-      # cf_clearance, the metrics snapshot DB `metrics.db`, and the JSON-lines
-      # logs under `logs/gateway.jsonl`). Defaults to the named `gateway-state`
+      # the SQLite downloadHandle store `handles.db` (restart-survival, D-16
+      # reversal), cf_clearance, the metrics snapshot DB `metrics.db`, and the
+      # JSON-lines logs under `logs/gateway.jsonl`). Defaults to `gateway-state`
       # volume; set MANGARR_STATE_DIR=/opt/mangarrgateway (in .env) to bind a host dir.
       - ${MANGARR_STATE_DIR:-gateway-state}:/state
       # CBZ downloads/output. Defaults to the named `gateway-output` volume; set

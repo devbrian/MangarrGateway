@@ -56,6 +56,7 @@ def tel_app(tmp_path: Path) -> FastAPI:
             log_dir=str(tmp_path / "logs"),
             output_root=str(tmp_path / "out"),
             db_path=str(tmp_path / "jobs.db"),
+            handle_db_path=str(tmp_path / "handles.db"),
         )
     )
 
