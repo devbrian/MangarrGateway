@@ -28,6 +28,13 @@ def test_mangafire_class_declares_cloudflare_antibot() -> None:
     assert MangaFireSource.id_types == []  # title-search fallback (SRCH-07)
 
 
+def test_mangafire_serializes_downloads_to_one_job() -> None:
+    """Download jobs are serialized (max_concurrent_jobs == 1) so concurrent reader
+    navs can't starve each other's manifest capture (debug
+    mangafire-manifest-contention). Search/recent use the separate fan-out semaphore."""
+    assert MangaFireSource.max_concurrent_jobs == 1
+
+
 def test_mangafire_is_registered_in_the_builtin_registry() -> None:
     from manga_gateway.framework.registry import SourceRegistry
     from manga_gateway.sources import register_builtin_sources
