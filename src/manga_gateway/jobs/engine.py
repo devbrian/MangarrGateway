@@ -457,7 +457,16 @@ class JobEngine:
             # Branch on the structured ``status`` attribute (WR-07) — not substring
             # presence of "403" in the rendered message, which misclassifies any
             # error whose message happens to contain those digits.
-            if any(
+            #
+            # The re-resolve recovery is a MangaDex at-home assumption (a 403 means a
+            # genuinely fresh baseUrl will clear it). A source whose 403 is NOT
+            # baseUrl-bound opts out via ``reresolve_manifest_on_403 = False`` (debug
+            # ``mangafire-stale-manifest-reresolve-budget``: a CDN-zone WAF deny where
+            # re-resolve re-lands on the SAME blocked zone). For an opted-out source a
+            # 403 propagates as the original SourceError — fail fast, correctly
+            # classified, no wasted re-navs and no misleading "stale manifest" wording.
+            reresolve_on_403 = getattr(source, "reresolve_manifest_on_403", True)
+            if reresolve_on_403 and any(
                 isinstance(e, SourceError) and e.status == 403 for e in eg.exceptions
             ):
                 raise _StaleManifest from None

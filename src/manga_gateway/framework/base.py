@@ -83,6 +83,19 @@ class Source(ABC):
     session_prep: str | None = None
     supports_search: bool = True
     supports_recent: bool = True
+    # Engine recovery opt-in: treat a mid-fetch image-host 403 as a stale-baseUrl
+    # signal and re-resolve the manifest (Pitfall 4, ``engine._fetch_all_pages``).
+    # ``True`` (default) = the historic MangaDex at-home rotation behavior: a 403
+    # re-navigates the source for a genuinely FRESH baseUrl that clears the block.
+    # A source whose 403 is NOT baseUrl-bound — where re-resolving lands on the SAME
+    # blocked origin so re-resolve is provably useless — sets this ``False`` so a 403
+    # propagates as the original (correctly classified) SourceError and the job fails
+    # fast instead of burning ``_MAX_MANIFEST_RERESOLVES`` wasted re-navs and the
+    # misleading "stale manifest re-resolve budget exceeded" wording (debug
+    # ``mangafire-stale-manifest-reresolve-budget``: a Cloudflare WAF deny of the
+    # gateway egress IP on some MangaFire CDN zones — mangafire opts out and instead
+    # self-heals via its own per-page zone-retry in ``fetch_image``).
+    reresolve_manifest_on_403: bool = True
     # D-30 / WR-02 per-source override: max concurrent download JOBS for THIS source.
     # ``None`` = use the global ``settings.max_concurrent_per_source`` default. A source
     # the rate-limit probe shows tolerates parallel chapter downloads sets this
