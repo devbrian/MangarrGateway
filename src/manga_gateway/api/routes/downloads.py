@@ -140,7 +140,7 @@ async def submit_download(
         body=req.model_dump(by_alias=True),
     )
 
-    record = handle_store.resolve(req.release_handle)
+    record = await handle_store.resolve(req.release_handle)
     if record is None:
         # Expired/unknown handle → SubmitResponse{jobId:null} at 400 (HDL-02), NOT the
         # {error:{code,message}} envelope (RESEARCH Anti-Patterns).

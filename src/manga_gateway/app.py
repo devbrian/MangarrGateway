@@ -38,7 +38,7 @@ from .framework.session import SessionManager
 from .framework.session_prep import CsrfBootstrap
 from .framework.solver_router import SolverRouter
 from .framework.transport import HttpxTransport
-from .handles.store import HandleStore
+from .handles.store import open_handle_store
 from .jobs.manager import JobManager
 from .jobs.store import open_store
 from .logging_config import configure_logging
@@ -411,9 +411,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (app.state.ratelimiter is created earlier, before CsrfBootstrap, so the
     # bootstrap GET shares the per-source limiter — see above.)
     app.state.caps_cache = TTLCache(maxsize=1, ttl=_CAPS_TTL_SECONDS)  # PLAT-04
-    app.state.handle_store = HandleStore(
-        maxsize=settings.handle_maxsize
-    )  # opaque downloadHandle store (HDL-01/02)
+    # Opaque downloadHandle store (HDL-01/02). D-16 REVERSAL (debug session
+    # release-no-longer-resolvable): now SQLite-backed so handles survive a restart,
+    # with a configurable TTL (default 6h, GATEWAY_HANDLE_TTL_SECONDS) that covers
+    # Mangarr's grab-replay latency — the prior in-memory-only 60-min TTL was the
+    # confirmed cause of the production "release no longer resolvable" misses.
+    app.state.handle_store = await open_handle_store(
+        settings.handle_db_path,
+        ttl=settings.handle_ttl_seconds,
+        maxsize=settings.handle_maxsize,
+    )
     # CACHE-01: ONE process-wide enumeration cache for the whole lifespan (R1), built
     # from settings exactly like RateLimiter()/HandleStore() above. The per-source TTL
     # override map (D-09) is harvested from the registry the SAME way cf_sources /
@@ -431,6 +438,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ttl=settings.enum_cache_ttl_seconds,
         enabled=settings.enum_cache_enabled,
         ttl_overrides=enum_cache_ttl_overrides,
+        # CACHE-05: clamp every cached entry to the configured handle TTL so a cached
+        # enumeration never out-lives the downloadHandle it would mint — anchored to
+        # the live handle_ttl_seconds, not the legacy hard-coded 3600 (debug session
+        # release-no-longer-resolvable, so a raised handle TTL is not silently clamped).
+        max_ttl=settings.handle_ttl_seconds,
     )
     # 260606-lyb Change 2: ONE process-wide per-source failure cooldown for the whole
     # lifespan (R1), mirroring the enum_cache construction. The search/recent routes
@@ -659,6 +671,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             await job_manager.cancel_all()
         await store.close()  # release the job-store connection
+        # Drain pending handle persists + release the handle-store connection (D-16
+        # reversal). Guarded so a teardown error here cannot skip the transport close.
+        with suppress(Exception):
+            await app.state.handle_store.close()
         await transport.aclose()  # release the search/recent client
         await download_transport.aclose()  # release the download client (split pool)
         # Metrics teardown LAST (independent of solver/job/transport): a FINAL

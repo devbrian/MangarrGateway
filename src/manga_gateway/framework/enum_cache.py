@@ -47,9 +47,15 @@ from ..metrics.collector import get_collector
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-_DEFAULT_TTL = 1800  # 30 min — ≤ the 60-min handle TTL (D-09, blueprint R5)
+_DEFAULT_TTL = 1800  # 30 min — ≤ the handle TTL (D-09, blueprint R5)
 _DEFAULT_MAXSIZE = 512  # D-07 memory bound
-_MAX_TTL = 3600  # hard ceiling = the 60-min handle TTL (D-09)
+# Default hard ceiling for any cached entry's TTL = the LEGACY 60-min handle TTL
+# (D-09). This is now INJECTABLE (``max_ttl``) and the lifespan passes the
+# configured ``handle_ttl_seconds`` so a deliberately-raised handle TTL is not
+# silently clamped back to 60 min (debug session release-no-longer-resolvable).
+# The 3600 default is retained only as the safe fallback for callers that do not
+# pass a ceiling (tests / direct construction).
+_MAX_TTL = 3600
 
 # IN-01: distinct absence sentinel. ``self._cache.get(key)`` defaults to ``None``,
 # but ``None`` is a value a future ``fetch_fn`` could legitimately return — under an
@@ -120,26 +126,28 @@ class SingleFlightCache[V]:
         maxsize: int = _DEFAULT_MAXSIZE,
         enabled: bool = True,
         ttl_overrides: dict[str, int] | None = None,
+        max_ttl: int = _MAX_TTL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._default_ttl = ttl
         self._enabled = enabled
         self._ttl_overrides = ttl_overrides or {}
+        self._max_ttl = max_ttl
         self._cache: TLRUCache[CacheKey, V] = TLRUCache(
             maxsize=maxsize, ttu=self._ttu, timer=clock
         )
         self._inflight: dict[CacheKey, asyncio.Future[V]] = {}
 
     def _ttu(self, key: CacheKey, value: V, now: float) -> float:
-        """Per-entry expiry: ``now + min(override_or_default_ttl, _MAX_TTL)``.
+        """Per-entry expiry: ``now + min(override_or_default_ttl, self._max_ttl)``.
 
         The per-source override is keyed on ``key[0]`` (the ``source_key``); absent
-        → the default ttl. Every TTL is clamped to ``_MAX_TTL`` so no entry outlives
-        the 60-min handle TTL (D-09).
+        → the default ttl. Every TTL is clamped to ``self._max_ttl`` (the configured
+        handle TTL, D-09) so no entry outlives the handle it serves.
         """
         source_key = key[0]
         ttl = self._ttl_overrides.get(source_key, self._default_ttl)
-        return now + min(ttl, _MAX_TTL)
+        return now + min(ttl, self._max_ttl)
 
     async def get_or_fetch(
         self, key: CacheKey, fetch_fn: Callable[[], Awaitable[V]]
@@ -248,6 +256,7 @@ class EnumerationCache:
         maxsize: int = _DEFAULT_MAXSIZE,
         enabled: bool = True,
         ttl_overrides: dict[str, int] | None = None,
+        max_ttl: int = _MAX_TTL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._enabled = enabled
@@ -256,6 +265,7 @@ class EnumerationCache:
             maxsize=maxsize,
             enabled=enabled,
             ttl_overrides=ttl_overrides,
+            max_ttl=max_ttl,
             clock=clock,
         )
         self._resolve: SingleFlightCache[Any] = SingleFlightCache(
@@ -263,6 +273,7 @@ class EnumerationCache:
             maxsize=maxsize,
             enabled=enabled,
             ttl_overrides=ttl_overrides,
+            max_ttl=max_ttl,
             clock=clock,
         )
 
