@@ -570,6 +570,45 @@ def test_chapter_list_api_extract_js_maps_votes_to_likes() -> None:
     assert "likes" in _CHAPTER_LIST_API_EXTRACT_JS
 
 
+def test_chapter_list_api_extract_js_retries_only_axios_timeouts() -> None:
+    """The chapter-list extractor wraps its per-page ``api.chapters()`` calls in a
+    timeout-ONLY retry guard. Comix's own axios instance bakes in a 15s timeout we
+    can't set; an intermittently-slow comix backend throws ``AxiosError: timeout of
+    15000ms exceeded`` (``e.code === 'ECONNABORTED'``) on a cold (uncached) page
+    fetch → ``BrowserFetchError`` → the fail-closed read returns 0 releases
+    (``source_unavailable: timed out``, issue #281). The fix retries that transient
+    class with a small backoff while keeping every OTHER error fail-closed. This
+    asserts the guard exists so a future edit can't silently drop it."""
+    from manga_gateway.sources.comix import _CHAPTER_LIST_API_EXTRACT_JS as js
+
+    # The bounded retry helper + its timeout-only detection must be present.
+    assert "withTimeoutRetry" in js
+    assert "ECONNABORTED" in js
+    assert "/timeout/i" in js
+    # The per-page call must route THROUGH the retry helper (not call api directly).
+    assert "withTimeoutRetry(() =>" in js
+    # Bounded: it must not retry forever.
+    assert "MAX_RETRIES" in js
+    # Fail-closed for non-timeout errors: the catch still re-throws.
+    assert "throw e" in js
+
+
+def test_chapter_pages_api_extract_js_retries_only_axios_timeouts() -> None:
+    """Parity with the chapter-list extractor: the chapter-PAGES (manifest/download)
+    extractor calls the SAME in-page axios instance (``ax.get('/chapters/' + id)``),
+    so it is subject to the identical 15s comix timeout. It wraps that call in the
+    same timeout-only retry guard for download robustness, keeping fail-closed
+    semantics for every non-timeout error."""
+    from manga_gateway.sources.comix import _CHAPTER_PAGES_API_EXTRACT_JS as js
+
+    assert "withTimeoutRetry" in js
+    assert "ECONNABORTED" in js
+    assert "/timeout/i" in js
+    assert "withTimeoutRetry(() => ax.get(" in js
+    assert "MAX_RETRIES" in js
+    assert "throw e" in js
+
+
 # ─── (6) scanlation group comes from the DOM extractor ────────────────────────
 
 
