@@ -547,3 +547,99 @@ async def test_startup_sweeps_orphan_staging_temp(tmp_path: Path) -> None:
 
     assert not orphan.exists()  # orphan staging temp swept
     assert completed.exists()  # completed output untouched
+
+
+# ───────── Bug B: _unlink_job_files is per-job (no cross-job temp deletion) ───────
+
+
+def _bug_b_job(job_id: str, output_path: str, *, output_format: str = "cbz") -> object:
+    """Minimal :class:`Job` for the ``_unlink_job_files`` focused unit test."""
+    from manga_gateway.jobs.model import Job, JobStatus  # noqa: PLC0415
+
+    now = "2026-06-18T00:00:00+00:00"
+    return Job(
+        job_id=job_id,
+        release_handle="h_" + job_id,
+        source_key="comix",
+        title="Chapter 1",
+        status=JobStatus.COMPLETED,
+        manga_id=None,
+        output_format=output_format,
+        chapter_id="c1",
+        language="en",
+        total_pages=1,
+        downloaded_pages=1,
+        total_bytes=1,
+        remaining_bytes=0,
+        output_path=output_path,
+        message=None,
+        created_at=now,
+        updated_at=now,
+        completed_at=now,
+    )
+
+
+def test_unlink_job_files_only_removes_own_temp_not_concurrent_job(
+    tmp_path: Path,
+) -> None:
+    """Bug B (output-path-group-slash-filenotfound): removing job B with
+    ``delete_data=True`` must NOT delete a CONCURRENT job A's in-flight staging temp
+    sharing the same directory. The old blanket ``*.cbz.tmp`` glob deleted it and A's
+    ``os.replace`` then raised ``FileNotFoundError(2)``."""
+    from manga_gateway.jobs.manager import JobManager  # noqa: PLC0415
+    from manga_gateway.jobs.package import staging_temp_glob  # noqa: PLC0415
+
+    shared = tmp_path / "manga-unknown"
+    shared.mkdir(parents=True)
+
+    # Job A's LIVE in-flight staging temp (mid-archive) — uses A's per-job prefix.
+    a_glob = staging_temp_glob("j_AAA", output_format="cbz").replace("*", "deadbeef")
+    a_temp = shared / a_glob
+    a_temp.write_bytes(b"job-a-in-flight")
+
+    # Job B is finished; its OWN output + its OWN (already-published) temp leftover.
+    b_out = shared / "Chapter 1-bbb.cbz"
+    b_out.write_bytes(b"job-b-done")
+    b_glob = staging_temp_glob("j_BBB", output_format="cbz").replace("*", "cafef00d")
+    b_temp = shared / b_glob
+    b_temp.write_bytes(b"job-b-leftover")
+
+    # Remove job B with delete_data → only B's own files go.
+    JobManager._unlink_job_files(_bug_b_job("j_BBB", str(b_out)))  # type: ignore[arg-type]
+
+    assert not b_out.exists()  # B's output removed
+    assert not b_temp.exists()  # B's OWN staging temp removed
+    assert a_temp.exists()  # A's in-flight temp UNTOUCHED → A still publishes
+
+
+def test_unlink_job_files_removes_own_folder_staging_dir(tmp_path: Path) -> None:
+    """Bug B: a folder-format job's OWN ``*.folder.tmp`` staging DIR is removed
+    (recursively) by its own cleanup, but a sibling job's is left alone. Also covers
+    the folder-format FINAL output_path (a directory): ``Path.unlink`` would raise
+    IsADirectoryError (suppressed) and leak it — it MUST be rmtree'd (CR #280)."""
+    from manga_gateway.jobs.manager import JobManager  # noqa: PLC0415
+    from manga_gateway.jobs.package import staging_temp_glob  # noqa: PLC0415
+
+    shared = tmp_path / "manga-unknown"
+    shared.mkdir(parents=True)
+    own = shared / staging_temp_glob("j_OWN", output_format="folder").replace(
+        "*", "1234"
+    )
+    own.mkdir()
+    (own / "01.jpg").write_bytes(b"x")
+    sibling = shared / staging_temp_glob("j_SIB", output_format="folder").replace(
+        "*", "5678"
+    )
+    sibling.mkdir()
+    (sibling / "01.jpg").write_bytes(b"y")
+    out = shared / "Chapter 1"
+    out.mkdir()
+    (out / "01.jpg").write_bytes(b"z")
+
+    JobManager._unlink_job_files(  # type: ignore[arg-type]
+        _bug_b_job("j_OWN", str(out), output_format="folder")
+    )
+
+    assert not out.exists()  # folder-format final output dir removed (not leaked)
+    assert not own.exists()  # own staging dir removed recursively
+    assert sibling.exists()  # sibling's staging dir untouched

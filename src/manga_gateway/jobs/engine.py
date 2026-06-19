@@ -328,7 +328,9 @@ class JobEngine:
         # emit here, never inside package.py). Strictly additive + failure-isolated.
         _pkg_start = time.perf_counter()
         try:
-            await asyncio.to_thread(writer, pages, final_path)
+            # Bug B: thread the owning job_id so the staging temp is named per-job
+            # and a concurrent DELETE ?deleteData=true can't glob-delete it.
+            await asyncio.to_thread(writer, pages, final_path, job_id=job.job_id)
         except Exception as exc:
             _emit_package(
                 job.source_key,
