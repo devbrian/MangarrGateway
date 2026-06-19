@@ -614,7 +614,9 @@ def test_unlink_job_files_only_removes_own_temp_not_concurrent_job(
 
 def test_unlink_job_files_removes_own_folder_staging_dir(tmp_path: Path) -> None:
     """Bug B: a folder-format job's OWN ``*.folder.tmp`` staging DIR is removed
-    (recursively) by its own cleanup, but a sibling job's is left alone."""
+    (recursively) by its own cleanup, but a sibling job's is left alone. Also covers
+    the folder-format FINAL output_path (a directory): ``Path.unlink`` would raise
+    IsADirectoryError (suppressed) and leak it — it MUST be rmtree'd (CR #280)."""
     from manga_gateway.jobs.manager import JobManager  # noqa: PLC0415
     from manga_gateway.jobs.package import staging_temp_glob  # noqa: PLC0415
 
@@ -632,10 +634,12 @@ def test_unlink_job_files_removes_own_folder_staging_dir(tmp_path: Path) -> None
     (sibling / "01.jpg").write_bytes(b"y")
     out = shared / "Chapter 1"
     out.mkdir()
+    (out / "01.jpg").write_bytes(b"z")
 
     JobManager._unlink_job_files(  # type: ignore[arg-type]
         _bug_b_job("j_OWN", str(out), output_format="folder")
     )
 
+    assert not out.exists()  # folder-format final output dir removed (not leaked)
     assert not own.exists()  # own staging dir removed recursively
     assert sibling.exists()  # sibling's staging dir untouched

@@ -332,7 +332,13 @@ class JobManager:
             return
         out = Path(job.output_path)
         with contextlib.suppress(OSError):
-            out.unlink(missing_ok=True)
+            # A ``folder``-format output_path is a DIRECTORY, not a file —
+            # ``Path.unlink`` would raise IsADirectoryError (an OSError, silently
+            # suppressed) and leak the directory. rmtree it; cbz/cbt are files.
+            if out.is_dir():
+                shutil.rmtree(out, ignore_errors=True)
+            else:
+                out.unlink(missing_ok=True)
         # Remove ONLY this job's own staging temp (matched by job_id), never a
         # sibling's in-flight temp. The startup orphan sweep (app.py _STAGING_GLOBS,
         # startup-only) still catches any temp orphaned by a crash.
