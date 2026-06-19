@@ -24,6 +24,7 @@ import pytest
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.mangafire import (
     _IMAGE_LIST_EXTRACT_JS,
+    _MANIFEST_EMPTY_RETRIES,
     _PREFERRED_ZONE_ATTR,
     MangaFireSource,
     _rewrite_zone,
@@ -133,6 +134,138 @@ async def test_fetch_manifest_integrity_guard_passes_on_match() -> None:
     ctx = _FakeCtx(_FakeSolver(capture), expected_pages=2)
     urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
     assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_2"]
+
+
+# ─────────────── bounded retry on empty/malformed capture (contention) ────────────
+# Under concurrent browser navs the in-page manifest capture intermittently returns
+# empty (reader AJAX never fired / in-page re-fetch threw); it self-heals on retry, so
+# fetch_manifest re-navigates up to _MANIFEST_EMPTY_RETRIES extra times before raising
+# "malformed mangafire chapter manifest" (debug mangafire-manifest-contention).
+
+
+class _SeqSolver:
+    """Returns/raises a different result per ``fetch_via_browser`` call.
+
+    ``results`` is consumed in order; each item is either a capture list to RETURN or
+    an ``Exception`` to RAISE (mirroring the observed ``page.evaluate failed``
+    mid-extract). The last item is reused once the sequence is exhausted, so a
+    steady-state can be pinned without listing every attempt.
+    """
+
+    def __init__(self, results: list[Any]) -> None:
+        self._results = results
+        self.calls: list[dict[str, Any]] = []
+
+    async def fetch_via_browser(
+        self,
+        url: str,
+        *,
+        extract: str,
+        wait_for: str | None = None,
+        timeout: float = 30.0,  # noqa: ASYNC109 — op-budget kwarg mirror
+    ) -> Any:
+        self.calls.append(
+            {"url": url, "extract": extract, "wait_for": wait_for, "timeout": timeout}
+        )
+        idx = min(len(self.calls) - 1, len(self._results) - 1)
+        result = self._results[idx]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+@pytest.fixture
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the manifest-retry backoff a no-op so tests never actually sleep."""
+
+    async def _instant(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("manga_gateway.sources.mangafire.asyncio.sleep", _instant)
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_retries_empty_then_succeeds(_no_sleep: None) -> None:
+    """An empty capture on the first try is re-navigated; the retry's list succeeds."""
+    valid = [[f"{_CDN}/0.jpg", 0], [f"{_CDN}/1.jpg", 3]]
+    solver = _SeqSolver([[], valid])  # 1st call empty → 2nd call valid
+    ctx = _FakeCtx(solver)
+    urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_3"]
+    assert len(solver.calls) == 2  # one retry was spent
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_retries_on_evaluate_raise_then_succeeds(
+    _no_sleep: None,
+) -> None:
+    """A thrown extract (``page.evaluate failed``) on the first try is also retried."""
+    valid = [[f"{_CDN}/0.jpg", 0]]
+    solver = _SeqSolver([RuntimeError("page.evaluate failed"), valid])
+    ctx = _FakeCtx(solver)
+    urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    assert urls == [f"{_CDN}/0.jpg"]
+    assert len(solver.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_empty_all_attempts_raises(_no_sleep: None) -> None:
+    """Empty on EVERY attempt → the original malformed-manifest error, after retries."""
+    solver = _SeqSolver([[]])  # always empty
+    ctx = _FakeCtx(solver)
+    with pytest.raises(SourceError, match="malformed mangafire chapter manifest"):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    # initial attempt + the bounded extra retries were all spent.
+    assert len(solver.calls) == _MANIFEST_EMPTY_RETRIES + 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_raise_all_attempts_surfaces_typed_error(
+    _no_sleep: None,
+) -> None:
+    """A persistent extract throw surfaces the typed browser-manifest-fetch error."""
+    solver = _SeqSolver([RuntimeError("page.evaluate failed")])
+    ctx = _FakeCtx(solver)
+    with pytest.raises(SourceError, match="browser manifest fetch failed"):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    assert len(solver.calls) == _MANIFEST_EMPTY_RETRIES + 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_integrity_mismatch_not_retried(_no_sleep: None) -> None:
+    """A NON-empty capture that fails the expected_pages guard is a real data problem —
+    it raises immediately and is NEVER re-navigated (only empty/malformed retries)."""
+    capture = [[f"{_CDN}/0.jpg", 0], [f"{_CDN}/1.jpg", 0]]
+    solver = _SeqSolver([capture])
+    ctx = _FakeCtx(solver, expected_pages=3)
+    with pytest.raises(SourceError, match="integrity"):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    assert len(solver.calls) == 1  # no retry on a genuine integrity mismatch
+
+
+# ───────────── extract-JS hardening (in-page re-fetch retry + continue) ───────────
+# The in-page extract must (1) wrap the re-fetch in its OWN retry so a transient throw
+# doesn't abort, and (2) CONTINUE the outer poll loop on a thrown/empty re-fetch rather
+# than break/abort — pinned so a future edit can't silently drop the contention guard
+# (debug mangafire-manifest-contention).
+
+
+def test_image_list_extract_js_wraps_refetch_in_retry() -> None:
+    """The in-page AJAX re-fetch retries on a transient throw and falls through to
+    CONTINUE the outer poll loop instead of aborting (mangafire-manifest-contention)."""
+    js = _IMAGE_LIST_EXTRACT_JS
+    # The in-page re-fetch has its own bounded attempt loop with a try/catch guard.
+    assert "for (let attempt = 0; attempt < 3; attempt++)" in js
+    assert "try {" in js
+    assert "} catch (e) {" in js
+    # Narrow the "no abort" check to the inner re-fetch retry block: on a thrown/empty
+    # re-fetch it must fall through (CONTINUE the outer poll), never break/return out.
+    # A whole-string check would spuriously fail on an unrelated future break (CR #285).
+    start = js.index("for (let attempt = 0; attempt < 3; attempt++)")
+    end = js.index("// re-fetch threw or stayed empty", start)
+    inner_retry_block = js[start:end]
+    assert "break" not in inner_retry_block
+    assert "return []" not in inner_retry_block
 
 
 @pytest.mark.asyncio

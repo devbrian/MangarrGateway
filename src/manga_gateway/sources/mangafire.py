@@ -121,6 +121,17 @@ _DEFAULT_LANGUAGE = "en"
 # The keyword <input> the typed primitive drives (D-13).
 _SEARCH_INPUT_SELECTOR = ".search-inner input[name=keyword]"
 
+# ── fetch_manifest contention retry (debug mangafire-manifest-contention) ──────
+# Under concurrent browser navs the in-page manifest capture intermittently yields
+# an EMPTY/malformed list (reader AJAX never fires in the poll window, or the in-page
+# re-fetch throws). It self-heals on retry (live: isolated 8/8 OK). fetch_manifest
+# therefore re-navigates & re-extracts up to this many EXTRA times on an empty/
+# malformed capture, with the backoff below, before raising. An integrity mismatch on
+# a NON-empty capture is a real data problem and is NOT retried.
+_MANIFEST_EMPTY_RETRIES = 2
+# Backoff (seconds) before each extra attempt; index 0 = before the 1st retry, etc.
+_MANIFEST_RETRY_BACKOFF: tuple[float, ...] = (1.0, 2.0)
+
 # ── browser `extract` bodies (bare `return`; the framework wraps `async () => {…}`,
 # mirroring comix `_CHAPTER_PAGES_EXTRACT_JS`). ─────────────────────────────────
 
@@ -128,6 +139,14 @@ _SEARCH_INPUT_SELECTOR = ".search-inner input[name=keyword]"
 # the reader's auto-fired `/ajax/read/chapter/` AJAX, re-`fetch()` it in-page with
 # the XHR header, and return [url, offset] per image (index 0 = URL, index 2 =
 # offset; offset==0 ⇒ not scrambled). ≤60×500ms.
+#
+# Contention hardening (debug mangafire-manifest-contention, 2026-06-19): under
+# concurrent reader navs the in-page re-`fetch()` of the AJAX URL can transiently
+# THROW or come back empty (observed images=-2). The re-fetch is therefore wrapped
+# in its own small bounded retry, and on a thrown/empty re-fetch we CONTINUE the
+# outer poll loop (keep waiting / retry next tick) instead of aborting the whole
+# extract — the ~30s overall budget (≤60×500ms) is preserved. Contract unchanged:
+# still returns [[url, offset], …] or [].
 _IMAGE_LIST_EXTRACT_JS = """
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   for (let i = 0; i < 60; i++) {
@@ -136,12 +155,20 @@ _IMAGE_LIST_EXTRACT_JS = """
       .map((e) => e.name)
       .find((u) => u.includes('/ajax/read/chapter/'));
     if (hit) {
-      const r = await fetch(hit, {
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
-      });
-      const j = await r.json();
-      const imgs = (j && j.result && j.result.images) || [];
-      if (imgs.length) return imgs.map((it) => [it[0], it[2] || 0]);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const r = await fetch(hit, {
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          });
+          const j = await r.json();
+          const imgs = (j && j.result && j.result.images) || [];
+          if (imgs.length) return imgs.map((it) => [it[0], it[2] || 0]);
+        } catch (e) {
+          // transient in-page re-fetch failure under contention — keep trying.
+        }
+        await sleep(200);
+      }
+      // re-fetch threw or stayed empty: fall through and CONTINUE polling.
     }
     await sleep(500);
   }
@@ -429,14 +456,19 @@ class MangaFireSource(Source):
     #     browser-nav path — skipped, "manifest not captured"); the Plan 04 live nightly
     #     confirms it end-to-end.
     rate_limit_per_minute = 60
-    # D-30 per-source override — tuned for the UNLIMITED get_bytes image-fetch path that
-    # rides a download job (recent/search/filter HTML use the separate per-source
-    # _CHAPTERS_FANOUT_CONCURRENCY semaphore, not this knob). The image CDN sustained
-    # concurrency 32 + 960/min cleanly, so images are NOT the bottleneck; the binding
-    # constraint on concurrent JOBS is each job's one browser CF-nav manifest (comix-
-    # class, unmeasurable above). 3 mirrors the comix/mangadot/atsumaru precedent and is
-    # clamped by the job manager to the global max_concurrent_chapters (8).
-    max_concurrent_jobs = 3
+    # D-30 per-source override — bounds concurrent download JOBS only (recent/search/
+    # filter HTML use the separate per-source _CHAPTERS_FANOUT_CONCURRENCY semaphore,
+    # not this knob). Each job's binding cost is its one browser reader-nav manifest
+    # extract (comix-class). Serialized to 1 (was 3) by the
+    # mangafire-manifest-contention investigation (2026-06-19): concurrent mangafire
+    # reader navs starve each other's in-page `/ajax/read/chapter/` capture,
+    # intermittently yielding an empty manifest → "malformed mangafire chapter
+    # manifest" (live repro: 8/8 isolated OK, 10/10 FAIL at concurrency 5). 1 removes
+    # mangafire-vs-mangafire manifest contention WITHOUT touching the shared solver
+    # `cloudflare_fetch_concurrency`. Tradeoff: mangafire download throughput is one
+    # chapter at a time; search/recent are unaffected, and the bounded retry + hardened
+    # extract above cover residual cross-source contention.
+    max_concurrent_jobs = 1
     # D-05: interior pages answer cold over httpx, but declare cloudflare anyway so the
     # framework keeps a warm browser + clearance for the manifest path and degrades
     # gracefully on a datacenter host that trips a managed challenge.
@@ -684,6 +716,14 @@ class MangaFireSource(Source):
         non-allowlisted URL raises ``source_unavailable`` pre-fetch — SEC-01), and the
         scramble offset rides as a ``#scr_{offset}`` fragment when ``offset>0`` (D-10).
         The extracted count is guarded against ``ctx.expected_pages`` when known.
+
+        Bounded retry (debug mangafire-manifest-contention, 2026-06-19): an empty/
+        malformed capture under browser contention self-heals, so on that result we
+        re-navigate & re-extract up to ``_MANIFEST_EMPTY_RETRIES`` extra times with
+        ``_MANIFEST_RETRY_BACKOFF`` before raising "malformed mangafire chapter
+        manifest". The SSRF allowlist, offset parsing, and ``expected_pages`` integrity
+        check run on the FINAL successful capture only — an integrity mismatch is a real
+        data problem and is NOT retried.
         """
         if not chapter_id.startswith("/read/"):
             raise SourceError(
@@ -692,21 +732,7 @@ class MangaFireSource(Source):
             )
         solver = self._solver_from_ctx(ctx)
         read_url = urljoin(self.base_url + "/", chapter_id.lstrip("/"))
-        try:
-            captured = await solver.fetch_via_browser(
-                read_url,
-                extract=_IMAGE_LIST_EXTRACT_JS,
-                wait_for=None,
-                timeout=60.0,
-            )
-        except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
-            raise SourceError(
-                "source_unavailable", f"browser manifest fetch failed: {exc}"
-            ) from exc
-        if not isinstance(captured, list) or not captured:
-            raise SourceError(
-                "source_unavailable", "malformed mangafire chapter manifest"
-            )
+        captured = await self._capture_image_list(solver, read_url)
         urls: list[str] = []
         for entry in captured:
             if not isinstance(entry, (list, tuple)) or not entry:
@@ -734,6 +760,45 @@ class MangaFireSource(Source):
                 f"chapter declares {ctx.expected_pages} pages",
             )
         return urls
+
+    async def _capture_image_list(self, solver: Any, read_url: str) -> list[Any]:
+        """Navigate the read page + run the capture extract, retrying empty captures.
+
+        Returns the raw ``[[url, offset], …]`` list from ``_IMAGE_LIST_EXTRACT_JS``.
+        Under browser contention the capture intermittently comes back empty/malformed
+        (the reader AJAX never fired, or the in-page re-fetch threw — debug
+        ``mangafire-manifest-contention``); that self-heals, so on an empty/malformed
+        capture (or a ``fetch_via_browser`` raise) we re-navigate up to
+        ``_MANIFEST_EMPTY_RETRIES`` extra times with ``_MANIFEST_RETRY_BACKOFF`` before
+        raising. A non-empty capture is returned as-is — its SSRF/offset/integrity
+        validation (incl. the ``expected_pages`` mismatch, a real data problem that is
+        NOT retried) happens in the caller.
+        """
+        last_exc: Exception | None = None
+        total_attempts = _MANIFEST_EMPTY_RETRIES + 1
+        for attempt in range(total_attempts):
+            if attempt > 0:
+                backoff_idx = min(attempt - 1, len(_MANIFEST_RETRY_BACKOFF) - 1)
+                await asyncio.sleep(_MANIFEST_RETRY_BACKOFF[backoff_idx])
+            try:
+                captured = await solver.fetch_via_browser(
+                    read_url,
+                    extract=_IMAGE_LIST_EXTRACT_JS,
+                    wait_for=None,
+                    timeout=60.0,
+                )
+            except Exception as exc:  # noqa: BLE001 — retried then surfaced typed
+                last_exc = exc
+                continue
+            if isinstance(captured, list) and captured:
+                return captured
+            # empty/malformed capture — retry (contention self-heals); no exc to chain.
+            last_exc = None
+        if last_exc is not None:
+            raise SourceError(
+                "source_unavailable", f"browser manifest fetch failed: {last_exc}"
+            ) from last_exc
+        raise SourceError("source_unavailable", "malformed mangafire chapter manifest")
 
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's bytes + geometric descramble (PKG-02, D-11/D-12).
