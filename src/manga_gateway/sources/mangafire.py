@@ -76,6 +76,28 @@ _MANGAFIRE_IMG_PATH_RE = re.compile(
 _MANGAFIRE_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECASE)
 _MANGAFIRE_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
 
+# ── adaptive CDN zone-retry (debug mangafire-stale-manifest-reresolve-budget) ───
+# MangaFire serves a chapter's pages from ONE of a small rotating set of CDN zones,
+# each host shaped ``{prefix}.mfcdn{N}.xyz`` (prefix ∈ nw8/l1n/k99/m3z/o48; N ∈ the
+# set below). Cloudflare's WAF on SOME zones hard-blocks (403) the gateway's egress
+# IP while OTHERS allow it; the block is egress-IP-dependent, so we do NOT pin a
+# single "good" zone — on a per-page 403 we retry the IDENTICAL signed path with the
+# host's ``mfcdnN`` rewritten to each OTHER known zone until one returns bytes (the
+# live cross-test proved the exact signed path returns 200 on an un-blocked zone),
+# then remember the winning zone for the rest of the job. Extend this tuple if
+# MangaFire adds a zone — no other code change needed.
+_MANGAFIRE_CDN_ZONES: tuple[int, ...] = (1, 2, 3)
+# Matches the ``mfcdnN`` label inside a MangaFire image host (``o48.mfcdn1.xyz``) so
+# the zone digit can be rewritten while leaving the subdomain prefix + ``.xyz`` TLD
+# (and the whole path/signature) byte-for-byte intact.
+_MANGAFIRE_ZONE_RE = re.compile(r"\.mfcdn(\d+)\.", re.IGNORECASE)
+# Per-job sidecar attr stashed on the SourceContext holding the CDN zone that last
+# answered 200 for THIS job, so subsequent pages try it FIRST and never re-probe the
+# blocked zone every page. The context is per-job (engine._build_context), so this
+# never cross-contaminates concurrent jobs — unlike source-instance state (the source
+# object is a shared registry singleton).
+_PREFERRED_ZONE_ATTR = "_mangafire_preferred_cdn_zone"
+
 # ── geometric descramble constants (D-12, Keiyoushi ImageInterceptor.kt) ────────
 PIECE_SIZE = 200
 MIN_SPLIT_COUNT = 5
@@ -176,6 +198,38 @@ def _is_allowed_image_url(url: str) -> bool:
         and bool(_MANGAFIRE_HOST_RE.match(host))
         and bool(_MANGAFIRE_IMG_PATH_RE.match(norm_path))
     )
+
+
+def _zone_of(url: str) -> int | None:
+    """The ``mfcdnN`` CDN zone number of ``url``'s host (``None`` if not a zoned host).
+
+    Reads the ``.mfcdn{N}.`` label out of the host (``o48.mfcdn1.xyz`` → ``1``). A URL
+    whose host carries no ``mfcdn`` label (a non-MangaFire-CDN host) returns ``None`` so
+    the zone-retry path can no-op safely on it.
+    """
+    host = (urlparse(url).hostname or "").lower()
+    m = _MANGAFIRE_ZONE_RE.search(host)
+    return int(m.group(1)) if m else None
+
+
+def _rewrite_zone(url: str, zone: int) -> str:
+    """Return ``url`` with its host's ``mfcdnN`` zone label rewritten to zone ``zone``.
+
+    Only the zone digit changes — the subdomain prefix, the ``.xyz`` TLD, and the
+    entire path + query + signature stay byte-for-byte identical (the live cross-test
+    proved the exact signed path returns 200 on an un-blocked zone). A URL with no
+    ``mfcdn`` label is returned unchanged. Operates on the netloc only so a path segment
+    that happened to contain ``mfcdnN`` could never be rewritten.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    new_host = _MANGAFIRE_ZONE_RE.sub(f".mfcdn{zone}.", host, count=1)
+    if new_host == host:
+        return url
+    netloc = new_host
+    if parsed.port is not None:
+        netloc = f"{new_host}:{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
 
 
 def _descramble_image(content: bytes, offset: int) -> bytes:
@@ -394,6 +448,17 @@ class MangaFireSource(Source):
     session_prep = None
     supports_search = True
     supports_recent = True
+    # Opt OUT of the engine's 403→stale-baseUrl re-resolve recovery (debug
+    # ``mangafire-stale-manifest-reresolve-budget``). A MangaFire image 403 is a
+    # Cloudflare WAF deny of the gateway's egress IP on a particular CDN zone
+    # (``mfcdnN``), NOT a stale/expired baseUrl: re-resolving re-navigates the reader
+    # and lands the SAME pages on the SAME blocked zone, so the engine's re-resolve is
+    # provably useless and only burns 2 wasted browser navs before failing with the
+    # misleading "stale manifest re-resolve budget exceeded". This source instead
+    # self-heals INSIDE ``fetch_image`` by retrying the identical signed path across
+    # the OTHER CDN zones; a 403 only escapes ``fetch_image`` when ALL zones are
+    # blocked, where re-resolve cannot help anyway — so failing fast is correct.
+    reresolve_manifest_on_403 = False
 
     def __init__(self) -> None:
         super().__init__()
@@ -674,18 +739,87 @@ class MangaFireSource(Source):
         """Fetch one page image's bytes + geometric descramble (PKG-02, D-11/D-12).
 
         Strips the ``#scr_{offset}`` fragment, fetches the CLEAN URL via
-        ``ctx.get_bytes`` (NEVER the browser — CLAUDE.md), and when ``offset>0``
+        ``ctx.get_bytes`` (NEVER the browser — CLAUDE.md) with adaptive CDN zone-retry
+        (see :meth:`_get_bytes_zone_retry` / debug
+        ``mangafire-stale-manifest-reresolve-budget``), and when ``offset>0``
         descrambles in Pillow offloaded via ``asyncio.to_thread`` (ruff ASYNC). An
-        ``offset==0`` page is returned unchanged.
+        ``offset==0`` page is returned unchanged. The descramble always runs on the
+        bytes from WHICHEVER zone answered, so a zone switch never bypasses the offset
+        un-shuffle.
         """
         clean, frag = urldefrag(url)
         offset = 0
         if frag.startswith("scr_"):
             offset = self._parse_int(frag[4:]) or 0
-        content = await ctx.get_bytes(clean)
+        content = await self._get_bytes_zone_retry(clean, ctx)
         if offset > 0:
             return await asyncio.to_thread(_descramble_image, content, offset)
         return content
+
+    async def _get_bytes_zone_retry(self, clean_url: str, ctx: SourceContext) -> bytes:
+        """``ctx.get_bytes`` the clean URL, retrying across CDN zones on a 403.
+
+        MangaFire's per-page 403 is a Cloudflare WAF deny of the gateway's egress IP on
+        a particular ``mfcdnN`` CDN zone, not a stale/expired signed URL (debug
+        ``mangafire-stale-manifest-reresolve-budget``). The IDENTICAL signed path
+        returns 200 on an un-blocked zone, so on a 403 we re-fetch the same path with
+        the host's zone label rewritten to each OTHER known zone
+        (:data:`_MANGAFIRE_CDN_ZONES`) until one answers; the winning zone is remembered
+        on the per-job context (:data:`_PREFERRED_ZONE_ATTR`) so the rest of this job
+        tries it FIRST and never re-probes the blocked zone every page.
+
+        Every rewritten URL is re-validated through :func:`_is_allowed_image_url` (SSRF,
+        SEC-01) before it is fetched — a rewrite that somehow failed the allowlist is
+        skipped, never fetched blindly. A non-403 ``SourceError`` (a genuine page loss)
+        propagates unchanged. When EVERY zone 403s the request raises a clear terminal
+        ``source_unavailable`` naming the blocked host — NOT the old stale-manifest
+        wording (the engine also opts mangafire out of its re-resolve recovery).
+        """
+        # Build the zone-attempt order: the job's remembered-good zone first (if any),
+        # then the current URL's zone, then every other known zone — de-duplicated,
+        # order-preserving. A URL with no ``mfcdn`` label (current_zone is None) just
+        # gets a single plain fetch with no rewrite.
+        current_zone = _zone_of(clean_url)
+        if current_zone is None:
+            return await ctx.get_bytes(clean_url)
+
+        preferred = getattr(ctx, _PREFERRED_ZONE_ATTR, None)
+        order: list[int] = []
+        for z in (preferred, current_zone, *_MANGAFIRE_CDN_ZONES):
+            if isinstance(z, int) and z not in order:
+                order.append(z)
+
+        last_403: SourceError | None = None
+        attempted: list[str] = []
+        for zone in order:
+            candidate = (
+                clean_url if zone == current_zone else _rewrite_zone(clean_url, zone)
+            )
+            # SEC-01: never fetch a rewritten URL that fails the SSRF allowlist (it
+            # will pass — same shape — but assert it defensively).
+            if not _is_allowed_image_url(candidate):
+                continue
+            attempted.append(f"mfcdn{zone}")
+            try:
+                content = await ctx.get_bytes(candidate)
+            except SourceError as exc:
+                if exc.status == 403:
+                    last_403 = exc
+                    continue
+                raise
+            # Remember the zone that answered for the rest of this job. The context is
+            # per-job (engine._build_context) so this never crosses jobs; the source
+            # object is a shared singleton and must NOT hold this state.
+            setattr(ctx, _PREFERRED_ZONE_ATTR, zone)
+            return content
+
+        host = (urlparse(clean_url).hostname or "").lower()
+        raise SourceError(
+            "source_unavailable",
+            f"all mangafire CDN zones blocked (403): {host} "
+            f"(tried {', '.join(attempted) or 'none'})",
+            status=403,
+        ) from last_403
 
     # ─────────────────────────── helpers ──────────────────────────────────────
 
