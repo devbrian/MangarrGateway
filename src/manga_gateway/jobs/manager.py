@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from ..config import Settings
     from ..framework.antibot import AntiBotSolver
     from ..framework.health import SourceHealth
+    from ..framework.proxy_pool import ProxyPool
     from ..framework.ratelimit import RateLimiter
     from ..framework.registry import SourceRegistry
     from ..framework.session import SessionManager
@@ -118,6 +119,7 @@ class JobManager:
         solver: AntiBotSolver | None = None,
         source_health: dict[str, SourceHealth] | None = None,
         session_prep: SessionPrep | None = None,
+        image_proxy_pool: ProxyPool | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -136,6 +138,7 @@ class JobManager:
             solver=solver,
             source_health=source_health,
             session_prep=session_prep,
+            image_proxy_pool=image_proxy_pool,
         )
 
     # ─────────────────────────── submit ───────────────────────────

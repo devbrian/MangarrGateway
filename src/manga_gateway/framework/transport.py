@@ -70,6 +70,13 @@ _TOTAL_REQUEST_DEADLINE = 60.0
 # runs with the locked dependency set (falls back to HTTP/1.1 transparently).
 _HTTP2 = importlib.util.find_spec("h2") is not None
 
+# Sentinel distinguishing "caller passed no proxy_override" (derive from settings, the
+# byte-for-byte-unchanged default) from "caller explicitly passed None" — both differ
+# from passing a concrete proxy. A bare ``None`` default could not express the
+# image-proxy-pool path (260620-4im), which constructs one transport PER residential
+# proxy via an explicit ``proxy_override``.
+_NO_PROXY_OVERRIDE = object()
+
 
 @runtime_checkable
 class Transport(Protocol):
@@ -92,14 +99,30 @@ class HttpxTransport:
     session intact. The proxy is derived from the SAME ``build_proxy`` helper
     the lifespan feeds the browser launch closures, so both legs egress through
     one IP (cf_clearance is IP-bound).
+
+    PER-PROXY-POOL OVERRIDE (260620-4im): ``proxy_override`` lets the framework
+    image-proxy pool build ONE transport per residential proxy — httpx binds the
+    proxy at client construction, so a distinct client per proxy is required. When
+    ``proxy_override`` is the ``_NO_PROXY_OVERRIDE`` sentinel (the default, every
+    existing caller), the proxy is derived from ``build_proxy(settings)`` exactly as
+    today; otherwise the supplied override is used verbatim (a ``None`` override still
+    omits ``proxy=``).
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        proxy_override: httpx.Proxy | str | None = _NO_PROXY_OVERRIDE,  # type: ignore[assignment]
+    ) -> None:
         self._settings = settings
         # One shared client. Non-spoofed UA + per-host limits live HERE (SRC-04/SRC-05);
         # HTTP/2 when ``h2`` is available. The httpx proxy is the second element of
-        # the shared build_proxy helper's pair (the browser dict is the first).
-        _, httpx_proxy = build_proxy(settings)
+        # the shared build_proxy helper's pair (the browser dict is the first) UNLESS
+        # an explicit per-proxy override was supplied (the image-proxy pool path).
+        if proxy_override is _NO_PROXY_OVERRIDE:
+            _, httpx_proxy = build_proxy(settings)
+        else:
+            httpx_proxy = proxy_override
         # Build kwargs conditionally: pass ``proxy=`` ONLY when configured so the
         # no-proxy client construction is byte-for-byte unchanged (the #65
         # regression contract). httpx 0.28.x uses ``proxy=`` (singular).

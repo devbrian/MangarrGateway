@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     from ..config import Settings
     from ..framework.antibot import AntiBotSolver
     from ..framework.health import SourceHealth
+    from ..framework.proxy_pool import ProxyPool
     from ..framework.ratelimit import RateLimiter
     from ..framework.registry import SourceRegistry
     from ..framework.session import SessionManager
@@ -220,6 +221,7 @@ class JobEngine:
         solver: AntiBotSolver | None = None,
         source_health: dict[str, SourceHealth] | None = None,
         session_prep: SessionPrep | None = None,
+        image_proxy_pool: ProxyPool | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -227,6 +229,11 @@ class JobEngine:
         self._ratelimiter = ratelimiter
         self._handle_store = handle_store
         self._settings = settings
+        # 260620-4im: the reusable residential proxy pool (None unless configured).
+        # Threaded into the per-job download context (``_build_context``) so an opted-in
+        # source's ``fetch_image`` byte fetches route through it; unconfigured/non-opted
+        # sources are byte-for-byte unchanged.
+        self._image_proxy_pool = image_proxy_pool
         # Phase-4 anti-bot seams (defaulted so app.py without the Plan-04 wiring
         # still constructs; a cloudflare* download injects clearance + decrypts).
         self._solver = solver
