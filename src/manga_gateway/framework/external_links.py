@@ -37,7 +37,12 @@ if TYPE_CHECKING:
 _AL = re.compile(r"/manga/(\d+)")  # anilist / myAnimeList numeric, .../manga/{digits}
 _MU = re.compile(r"/series/([0-9a-z]+)")  # mangaUpdates base36, .../series/{base36}
 _MD = re.compile(r"/title/([0-9a-f-]{36})")  # mangaDex uuid, .../title/{uuid}
-_MB = re.compile(r"mangabaka\.org/(\d+)")  # mangaBaka numeric, mangabaka.org/{digits}
+# mangaBaka numeric, mangabaka.org/{digits}. The negative lookbehind anchors the
+# domain so a hostile look-alike host whose name merely ENDS in ``mangabaka.org``
+# (``notmangabaka.org/123``, ``attackermangabaka.org/123``) cannot false-match — the
+# char preceding ``mangabaka`` must be a host/scheme separator, not another label char
+# (WR-04 / R2 defensive posture).
+_MB = re.compile(r"(?<![a-z0-9-])mangabaka\.org/(\d+)")
 _BW = re.compile(r"series/(\d+)")  # bookwalker numeric, MangaDex "series/N[/list]"
 _KEN = re.compile(r"/series/([^/?#]+)")  # kenmei slug, .../series/{slug}
 

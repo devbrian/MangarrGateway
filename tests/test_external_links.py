@@ -221,6 +221,16 @@ def test_normalize_bookwalker_extracts_numeric_from_path() -> None:
     assert result.model_dump(by_alias=True) == {"bookwalker": "441768"}
 
 
+def test_normalize_mangabaka_anchored_rejects_lookalike_host() -> None:
+    # WR-04: a look-alike host whose name merely ends in ``mangabaka.org`` must NOT
+    # have an id extracted; the real domain still works.
+    assert normalize({"mb": "https://notmangabaka.org/123"}, "comix") is None
+    assert normalize({"mb": "https://attackermangabaka.org/123"}, "comix") is None
+    result = normalize({"mb": "https://mangabaka.org/222572/"}, "comix")
+    assert result is not None
+    assert result.model_dump(by_alias=True) == {"mangaBaka": "222572"}
+
+
 # ───────────────────────── wrapper: resolve_external_links (D-03) ───────────────────
 
 
