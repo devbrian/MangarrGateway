@@ -40,12 +40,24 @@ def _chapters_url(manga_id: str) -> str:
     return f"{_BASE}/api/manga/{manga_id}/chapters/list"
 
 
+def _detail_url(manga_id: str) -> str:
+    return f"{_BASE}/api/manga/{manga_id}"
+
+
 class _FakeCtxForSearch:
     """``SourceContext`` stand-in: routes ``get_json`` vs ``get_json_array`` by URL.
 
     ``GET /api/search`` returns the title-only object envelope; ``GET
     /api/manga/{id}/chapters/list`` returns the bare chapter array keyed by the
-    manga id parsed out of the URL. Calls are recorded for assertions.
+    manga id parsed out of the URL; ``GET /api/manga/{id}`` (the detail object)
+    returns the staged tracker body for the Phase-13 external-links fetch. Calls
+    are recorded for assertions.
+
+    ``details`` maps a manga id to either a detail body dict (returned by
+    ``get_json``) or an ``Exception`` instance (raised, to exercise the
+    best-effort path). ``resolve_external_links`` MIRRORS the real framework
+    wrapper — it runs ``await parse_fn()`` inside ``try/except Exception: None``
+    so the swallow-all best-effort contract is exercised entirely offline.
     """
 
     def __init__(
@@ -53,12 +65,27 @@ class _FakeCtxForSearch:
         *,
         manga_list: list[dict[str, Any]],
         listings: dict[str, list[dict[str, Any]]],
+        details: dict[str, Any] | None = None,
     ) -> None:
         self.handle_store = HandleStore()
         self._manga_list = manga_list
         self._listings = listings
+        self._details = details or {}
         self.json_calls: list[tuple[str, dict[str, Any]]] = []
         self.array_calls: list[str] = []
+        self.detail_calls: list[str] = []
+        # 13-02 seam: per-request scratch stash (unused by mangadot's detail-GET
+        # path, present for parity with the real SourceContext).
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        # Mirror SourceContext.resolve_external_links' best-effort swallow-all
+        # (the real wrapper also bounds it with asyncio.timeout(5s) + caches
+        # resolve-once; here a single pass-through with swallow suffices offline).
+        try:
+            return await parse_fn()
+        except Exception:
+            return None
 
     # Enum-cache seam (09-06): mirror the real SourceContext's default-None
     # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
@@ -91,6 +118,18 @@ class _FakeCtxForSearch:
                 "manga_list": self._manga_list,
                 "pagination": {"current_page": 1, "total_pages": 1},
             }
+        # Detail object GET /api/manga/{id} (NO /chapters/list suffix) — the
+        # Phase-13 external-links fetch.
+        m = re.match(rf"{re.escape(_BASE)}/api/manga/([^/]+)$", url)
+        if m:
+            manga_id = m.group(1)
+            self.detail_calls.append(manga_id)
+            staged = self._details.get(manga_id)
+            if isinstance(staged, Exception):
+                raise staged
+            if staged is None:
+                raise AssertionError(f"no staged detail body for id: {manga_id}")
+            return staged
         raise AssertionError(f"unexpected get_json url: {url}")
 
     async def get_json_array(self, url: str, **params: Any) -> list[Any]:
@@ -105,8 +144,11 @@ def _ctx(
     *,
     manga_list: list[dict[str, Any]],
     listings: dict[str, list[dict[str, Any]]] | None = None,
+    details: dict[str, Any] | None = None,
 ) -> Any:
-    return _FakeCtxForSearch(manga_list=manga_list, listings=listings or {})
+    return _FakeCtxForSearch(
+        manga_list=manga_list, listings=listings or {}, details=details
+    )
 
 
 def _manga(*, manga_id: str, title: str = "Murim Psychopath") -> dict[str, Any]:
@@ -151,17 +193,21 @@ async def test_search_calls_search_then_one_array_per_candidate() -> None:
     ctx = _ctx(
         manga_list=[_manga(manga_id="20277")],
         listings={"20277": [_row(chapter_id="388872")]},
+        details={"20277": _detail()},
     )
     await MangadotSource().search(
         SearchRequest(type="manga", query="murim psychopath"), ctx
     )
 
-    assert len(ctx.json_calls) == 1
+    # Two get_json calls: the search envelope + the Phase-13 detail object (the
+    # external-links GET). One array call: the chapters/list enumeration.
+    assert len(ctx.json_calls) == 2
     url0, params0 = ctx.json_calls[0]
     assert url0 == _SEARCH
     assert params0["search"] == "murim psychopath"
     assert params0["sortBy"] == "relevance"
     assert params0["page"] == 1
+    assert ctx.json_calls[1] == (_detail_url("20277"), {})
     assert ctx.array_calls == [_chapters_url("20277")]
 
 
@@ -356,6 +402,96 @@ async def test_search_empty_results_returns_no_releases() -> None:
     # Only the search call fired — no candidate to enumerate.
     assert len(ctx.json_calls) == 1
     assert ctx.array_calls == []
+
+
+def _detail(
+    *,
+    anilist_id: Any = 105398,
+    mal_id: Any = 121496,
+    mangaupdates_id: Any = "6z1uqw7",
+    mangabaka_id: Any = 3397,
+    kitsu_id: Any = 54114,
+    mangadex_id: Any = None,
+) -> dict[str, Any]:
+    """The flat ``GET /api/manga/{id}`` detail body (RESEARCH frozen table)."""
+    return {
+        "id": 118,
+        "title": "Solo Leveling",
+        "anilist_id": anilist_id,
+        "mal_id": mal_id,
+        "mangaupdates_id": mangaupdates_id,
+        "mangabaka_id": mangabaka_id,
+        "kitsu_id": kitsu_id,
+        "mangadex_id": mangadex_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_external_links_canonical_and_stamped_once_per_series() -> None:
+    """One detail GET per series → every release carries the identical 5-key dict.
+
+    ``mangadex_id`` is ``null`` upstream and dropped (R3); the numeric fields are
+    stringified (R2). The detail GET fires AT MOST ONCE for the series even though
+    the listing yields multiple releases, and all releases share the IDENTICAL
+    object (R4).
+    """
+    ctx = _ctx(
+        manga_list=[_manga(manga_id="118", title="Solo Leveling")],
+        listings={
+            "118": [
+                _row(chapter_id="a", chapter_number=2, language="en"),
+                _row(chapter_id="b", chapter_number=1, language="en"),
+            ]
+        },
+        details={"118": _detail()},
+    )
+    releases = await MangadotSource().search(
+        SearchRequest(type="manga", query="solo leveling"), ctx
+    )
+
+    assert len(releases) == 2
+    # At most one detail GET per series.
+    assert ctx.detail_calls == ["118"]
+    links = releases[0].external_links
+    assert links is not None
+    assert links.model_dump(by_alias=True, exclude_none=True) == {
+        "anilist": "105398",
+        "myAnimeList": "121496",
+        "mangaUpdates": "6z1uqw7",
+        "mangaBaka": "3397",
+        "kitsu": "54114",
+    }
+    # Identical object stamped onto every release (R4).
+    assert all(rel.external_links is links for rel in releases)
+
+
+@pytest.mark.asyncio
+async def test_external_links_detail_url_built_from_internal_series_id() -> None:
+    """The detail URL is ``/api/manga/{gateway-internal id}`` — never client input."""
+    ctx = _ctx(
+        manga_list=[_manga(manga_id="118")],
+        listings={"118": [_row(chapter_id="a")]},
+        details={"118": _detail()},
+    )
+    await MangadotSource().search(SearchRequest(type="manga", query="x"), ctx)
+    # The detail object GET hit /api/manga/118 (the search candidate's own id).
+    assert (_detail_url("118"), {}) in ctx.json_calls
+
+
+@pytest.mark.asyncio
+async def test_external_links_best_effort_failure_leaves_chapters_intact() -> None:
+    """A raising detail GET still returns chapters with ``external_links is None``."""
+    ctx = _ctx(
+        manga_list=[_manga(manga_id="118")],
+        listings={"118": [_row(chapter_id="a"), _row(chapter_id="b")]},
+        details={"118": RuntimeError("upstream 503")},
+    )
+    releases = await MangadotSource().search(
+        SearchRequest(type="manga", query="x"), ctx
+    )
+    assert len(releases) == 2
+    assert all(rel.external_links is None for rel in releases)
+    assert ctx.detail_calls == ["118"]  # attempted once, swallowed by the wrapper
 
 
 @pytest.mark.asyncio

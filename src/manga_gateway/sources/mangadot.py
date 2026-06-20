@@ -101,13 +101,14 @@ from urllib.parse import urlparse
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
+from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
-    from ..models.search import SearchRequest
+    from ..models.search import ExternalLinks, SearchRequest
 
 # search() deep-enumerates this many manga candidates (mangaball GAP-1 lock —
 # search is TITLE-ONLY, so each candidate is a full chapters/list fan-out). Like
@@ -341,9 +342,23 @@ class MangadotSource(Source):
             # newest-first sort + [:limit] + GAP-2 mint-after-slice all stay; it
             # simply consumes ``enum.items`` (the cached raw rows) instead of the
             # raw fetch result.
-            return self._chapters_to_releases(
+            releases = self._chapters_to_releases(
                 enum.items, manga_id, manga_title, wanted_langs, limit, ctx, req
             )
+
+            # Phase-13 (R4/R6/D-02): resolve the series' tracker links ONCE via the
+            # framework wrapper (which owns the resolve-once cache + 5s timeout +
+            # swallow-all-to-None best-effort, D-03), then stamp the single resolved
+            # object onto every release of the series (identical-object, R4). The
+            # detail URL inside ``fetch_external_links`` is built from ``manga_id``
+            # (this source's OWN search candidate id), never client input (SSRF-safe).
+            async def _parse_links(mid: str = manga_id) -> ExternalLinks | None:
+                return await self.fetch_external_links(mid, ctx)
+
+            links = await ctx.resolve_external_links(manga_id, _parse_links)
+            for rel in releases:
+                rel.external_links = links
+            return releases
 
         # Pre-filter candidates lacking a usable ``id`` BEFORE dispatching tasks — a
         # candidate with no ``id`` must not produce a task (preserves the old skip).
@@ -370,6 +385,27 @@ class MangadotSource(Source):
         for chunk in results:
             releases.extend(chunk)
         return releases
+
+    async def fetch_external_links(
+        self, series_id: str, ctx: SourceContext
+    ) -> ExternalLinks | None:
+        """One best-effort detail GET → canonical tracker links (D-02/R6).
+
+        Issues a SINGLE ``GET /api/manga/{series_id}`` (the flat detail object,
+        distinct from the ``/chapters/list`` enumeration) through the framework
+        transport + the source's CF-cleared android-solver session — no new anti-bot
+        plumbing — and routes the flat tracker fields (``anilist_id``, ``mal_id``,
+        ``mangaupdates_id``, ``mangabaka_id``, ``kitsu_id``, ``mangadex_id``) through
+        the shared normalizer (numeric fields stringified, ``null`` fields dropped).
+
+        ``series_id`` is a gateway-internal id (this source's OWN search candidate),
+        so the URL is never a Mangarr-supplied value (SSRF-safe, T-13-01). NO
+        try/except/timeout here — the framework wrapper (``resolve_external_links``)
+        owns resolve-once + the 5s timeout + swallow-all-to-``None`` (D-03), so a
+        raising/slow detail GET leaves the chapter releases intact (R6).
+        """
+        body = await ctx.get_json(f"{self.base_url}/api/manga/{series_id}")
+        return normalize(body, "mangadot")
 
     def _chapters_to_releases(
         self,
