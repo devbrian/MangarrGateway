@@ -1297,6 +1297,20 @@ class ComixSource(Source):
             series_title = str(item.get("title") or "Unknown")
             language = "en"
             composite = _make_deferred_composite(str(hid), slug, ch_str)
+            # Phase-13 (WR-01): the tokenized ``/api/v1/manga`` feed carries the SAME
+            # per-item ``links`` tracker dict that ``search`` stashes — so the recent
+            # path can populate ``externalLinks`` with ZERO added HTTP by routing it
+            # through the identical parse-only normalize seam. Stash the raw dict, then
+            # resolve ONCE per series via the framework (cache/timeout/swallow owner);
+            # each recent item is a distinct series so this is one resolve per row.
+            links_raw = item.get("links")
+            if isinstance(links_raw, dict) and links_raw:
+                ctx.external_links_raw[str(hid)] = links_raw
+
+            async def _parse_links(_hid: str = str(hid)) -> ExternalLinks | None:
+                return await self.fetch_external_links(_hid, ctx)
+
+            ext_links = await ctx.resolve_external_links(str(hid), _parse_links)
             title = self._build_title(
                 series_title, ch_str, volume=None, language=language, group=None
             )
@@ -1337,6 +1351,7 @@ class ComixSource(Source):
                     # /api/v1/manga series-list item carries no per-chapter
                     # likes (likes live only on the chapter-list DOM row).
                     ids={"comixSeriesId": str(hid)},
+                    external_links=ext_links,
                 )
             )
         return releases
