@@ -152,10 +152,17 @@ def _pool(n: int, *, clock: _FakeClock, cooldown: float = 300.0) -> ProxyPool:
     )
 
 
-def test_acquire_excludes_identities() -> None:
+def test_acquire_excludes_selection_keys() -> None:
     clock = _FakeClock()
-    pool = _pool(3, clock=clock)
-    exclude = {f"{_FAKE_HOST}:8000", f"{_FAKE_HOST}:8001"}
+    proxies = [PooledProxy(host=_FAKE_HOST, port=8000 + i) for i in range(3)]
+    pool = ProxyPool(
+        proxies,
+        settings=_settings(),
+        cooldown_seconds=300.0,
+        rng=random.Random(0),
+        clock=clock,
+    )
+    exclude = {proxies[0].selection_key, proxies[1].selection_key}
     got = pool.acquire(exclude=exclude)
     assert got is not None
     assert got.identity == f"{_FAKE_HOST}:8002"
@@ -163,9 +170,51 @@ def test_acquire_excludes_identities() -> None:
 
 def test_acquire_returns_none_when_all_excluded() -> None:
     clock = _FakeClock()
-    pool = _pool(2, clock=clock)
-    exclude = {f"{_FAKE_HOST}:8000", f"{_FAKE_HOST}:8001"}
+    proxies = [PooledProxy(host=_FAKE_HOST, port=8000 + i) for i in range(2)]
+    pool = ProxyPool(
+        proxies,
+        settings=_settings(),
+        cooldown_seconds=300.0,
+        rng=random.Random(0),
+        clock=clock,
+    )
+    exclude = {p.selection_key for p in proxies}
     assert pool.acquire(exclude=exclude) is None
+
+
+def test_selection_key_distinguishes_same_host_port_different_creds() -> None:
+    """Sticky-session proxies share host:port but differ by username — cooldown and the
+    transport cache must NOT collide them (CodeRabbit, credential-distinct key)."""
+    clock = _FakeClock()
+    a = PooledProxy(
+        host=_FAKE_HOST, port=7777, username="session-a", password=SecretStr(_FAKE_PASS)
+    )
+    b = PooledProxy(
+        host=_FAKE_HOST, port=7777, username="session-b", password=SecretStr(_FAKE_PASS)
+    )
+    assert a.identity == b.identity  # same host:port (would collide on identity)
+    assert a.selection_key != b.selection_key  # but distinct bookkeeping keys
+    transports: list[_FakeTransport] = []
+
+    def _factory(*args: Any, **kwargs: Any) -> _FakeTransport:
+        t = _FakeTransport(*args, **kwargs)
+        transports.append(t)
+        return t
+
+    pool = ProxyPool(
+        [a, b],
+        settings=_settings(),
+        cooldown_seconds=300.0,
+        transport_factory=_factory,
+        rng=random.Random(0),
+        clock=clock,
+    )
+    # Distinct per-credential transports (not one shared by host:port).
+    assert pool.transport_for(a) is not pool.transport_for(b)
+    assert len(transports) == 2
+    # Cooling down ``a`` must NOT sideline ``b`` (same host:port, different creds).
+    pool.mark_failed(a)
+    assert pool.acquire(exclude=set()) is b
 
 
 def test_mark_failed_cools_down_then_reappears_after_deadline() -> None:

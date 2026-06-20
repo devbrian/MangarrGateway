@@ -67,6 +67,20 @@ class PooledProxy:
         """Credential-free ``host:port`` identity — the only value ever logged."""
         return f"{self.host}:{self.port}"
 
+    @property
+    def selection_key(self) -> str:
+        """Internal bookkeeping key — credential-distinct, NEVER logged.
+
+        Cooldown / transport-cache / exclusion state is keyed by this, NOT by
+        :attr:`identity`. Residential providers often expose ONE gateway ``host:port``
+        with the rotating session encoded in the *username* (sticky-session proxies), so
+        two pool entries can share ``host:port`` yet be distinct egress paths. Keying
+        state off ``host:port`` alone would collide them — cooling down or caching the
+        transport for the wrong credential. Including the username disambiguates them.
+        ``identity`` stays ``host:port`` for safe logging; this value is never emitted.
+        """
+        return f"{self.host}:{self.port}:{self.username or ''}"
+
     def httpx_proxy(self) -> httpx.Proxy | str:
         """The httpx ``proxy=`` value for this endpoint (mirrors ``build_proxy``).
 
@@ -102,10 +116,12 @@ class ProxyPool:
         self._transport_factory = transport_factory
         self._rng = rng if rng is not None else _DEFAULT_RNG
         self._clock = clock
-        # identity -> monotonic cooldown deadline (lazily popped once expired).
+        # selection_key -> monotonic cooldown deadline (lazily popped once expired).
+        # Keyed by the credential-distinct ``selection_key`` (NOT ``identity``) so two
+        # sticky-session entries sharing a ``host:port`` cool down independently.
         self._cooldowns: dict[str, float] = {}
-        # identity -> ONE cached per-proxy transport (httpx binds the proxy at client
-        # construction, so a distinct client per proxy is required).
+        # selection_key -> ONE cached per-proxy transport (httpx binds the proxy at
+        # client construction, so a distinct client per proxy/credential is required).
         self._transports: dict[str, Transport] = {}
 
     @classmethod
@@ -161,28 +177,31 @@ class ProxyPool:
         """Total proxies loaded into the pool (the startup-log count)."""
         return len(self._proxies)
 
-    def _on_cooldown(self, identity: str) -> bool:
-        """True iff ``identity`` is on a LIVE cooldown; lazily pops an expired one."""
-        deadline = self._cooldowns.get(identity)
+    def _on_cooldown(self, key: str) -> bool:
+        """True iff ``key`` (a selection_key) is on a LIVE cooldown; pops an expired."""
+        deadline = self._cooldowns.get(key)
         if deadline is None:
             return False
         if self._clock() >= deadline:
-            del self._cooldowns[identity]
+            del self._cooldowns[key]
             return False
         return True
 
     def acquire(self, exclude: set[str] | None = None) -> PooledProxy | None:
         """A random proxy not on cooldown and not in ``exclude``, or ``None``.
 
-        Cooldown is NOT bypassed as a last resort — when every proxy is either on a
-        live cooldown or excluded, this returns ``None`` and the orchestrator surfaces
-        a clear terminal failure rather than re-using a known-bad proxy (T-4im-03).
+        ``exclude`` holds ``selection_key`` values (the credential-distinct bookkeeping
+        key — see :attr:`PooledProxy.selection_key`), matching ``_cooldowns``. Cooldown
+        is NOT bypassed as a last resort — when every proxy is either on a live cooldown
+        or excluded, this returns ``None`` and the orchestrator surfaces a clear
+        terminal failure rather than re-using a known-bad proxy (T-4im-03).
         """
         excluded = exclude or set()
         available = [
             proxy
             for proxy in self._proxies
-            if proxy.identity not in excluded and not self._on_cooldown(proxy.identity)
+            if proxy.selection_key not in excluded
+            and not self._on_cooldown(proxy.selection_key)
         ]
         if not available:
             return None
@@ -190,7 +209,7 @@ class ProxyPool:
 
     def mark_failed(self, proxy: PooledProxy) -> None:
         """Cool ``proxy`` down for ``cooldown_seconds`` from now (identity-only log)."""
-        self._cooldowns[proxy.identity] = self._clock() + self._cooldown_seconds
+        self._cooldowns[proxy.selection_key] = self._clock() + self._cooldown_seconds
         _log.info(
             "image proxy %s cooled down for %.0fs after a failed fetch",
             proxy.identity,  # host:port only — NEVER creds (T-4im-01)
@@ -198,13 +217,13 @@ class ProxyPool:
         )
 
     def transport_for(self, proxy: PooledProxy) -> Transport:
-        """The cached per-proxy transport, lazily built once per identity."""
-        transport = self._transports.get(proxy.identity)
+        """The cached per-proxy transport, lazily built once per ``selection_key``."""
+        transport = self._transports.get(proxy.selection_key)
         if transport is None:
             transport = self._transport_factory(
                 self._settings, proxy_override=proxy.httpx_proxy()
             )
-            self._transports[proxy.identity] = transport
+            self._transports[proxy.selection_key] = transport
         return transport
 
     async def aclose(self) -> None:

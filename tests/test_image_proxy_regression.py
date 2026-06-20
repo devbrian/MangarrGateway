@@ -25,7 +25,7 @@ import respx
 from pydantic import SecretStr
 
 from manga_gateway.config import Settings
-from manga_gateway.framework.context import SourceContext
+from manga_gateway.framework.context import _ACTIVE_IMAGE_PROXY, SourceContext
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.framework.proxy_pool import PooledProxy, ProxyPool
 from manga_gateway.framework.ratelimit import RateLimiter
@@ -85,7 +85,7 @@ async def test_pool_unset_download_egresses_direct() -> None:
     out = await ctx.fetch_image_via_pool(_fetch)
     assert out == _IMG
     assert calls == 1  # transparent passthrough — fetch ran exactly once
-    assert ctx._active_proxy is None  # no proxy machinery touched
+    assert _ACTIVE_IMAGE_PROXY.get() is None  # no proxy machinery touched
     # The DIRECT download pool received the request; the search pool did not.
     assert download.calls == [_CDN_URL]
     assert search.calls == []

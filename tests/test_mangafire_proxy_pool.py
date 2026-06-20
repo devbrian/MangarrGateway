@@ -51,17 +51,17 @@ class _FakePool:
     def acquire(self, exclude: set[str] | None = None) -> PooledProxy | None:
         excl = (exclude or set()) | self._cooled
         for proxy in self._proxies:
-            if proxy.identity not in excl:
-                self.acquired.append(proxy.identity)
+            if proxy.selection_key not in excl:
+                self.acquired.append(proxy.selection_key)
                 return proxy
         return None
 
     def mark_failed(self, proxy: PooledProxy) -> None:
-        self.failed.append(proxy.identity)
-        self._cooled.add(proxy.identity)
+        self.failed.append(proxy.selection_key)
+        self._cooled.add(proxy.selection_key)
 
     def transport_for(self, proxy: PooledProxy) -> _RecordingTransport:
-        return self.transports[proxy.identity]
+        return self.transports[proxy.selection_key]
 
 
 def _resp(status: int, url: str, content: bytes = b"") -> httpx.Response:
@@ -97,7 +97,7 @@ async def test_clean_proxy_first_zone_no_rewrite() -> None:
     proxies = [PooledProxy(host=_HOST, port=8000)]
     pool = _FakePool(proxies)
     transport = _RecordingTransport([_resp(200, f"{_CDN}/0.jpg", _IMG)])
-    pool.transports[proxies[0].identity] = transport
+    pool.transports[proxies[0].selection_key] = transport
     ctx = _ctx(pool)
     source = MangaFireSource()
     url = f"{_CDN}/0.jpg"  # offset 0 (no #scr_ fragment) → no descramble
@@ -107,7 +107,7 @@ async def test_clean_proxy_first_zone_no_rewrite() -> None:
     # The first zone answered on the sticky proxy; no zone rewrite happened.
     assert transport.calls == [url]
     assert pool.failed == []
-    assert pool.acquired == [proxies[0].identity]
+    assert pool.acquired == [proxies[0].selection_key]
 
 
 async def test_proxy_403_all_zones_rotates_to_clean_proxy() -> None:
@@ -117,8 +117,8 @@ async def test_proxy_403_all_zones_rotates_to_clean_proxy() -> None:
     bad = _RecordingTransport([_resp(403, _CDN) for _ in range(3)])
     # Proxy 1 serves the first zone cleanly.
     good = _RecordingTransport([_resp(200, f"{_CDN}/0.jpg", _IMG)])
-    pool.transports[proxies[0].identity] = bad
-    pool.transports[proxies[1].identity] = good
+    pool.transports[proxies[0].selection_key] = bad
+    pool.transports[proxies[1].selection_key] = good
     ctx = _ctx(pool)
     source = MangaFireSource()
     url = f"{_CDN}/0.jpg"
@@ -127,16 +127,16 @@ async def test_proxy_403_all_zones_rotates_to_clean_proxy() -> None:
     assert out == _IMG
     # Proxy 0 tried all 3 zones, all 403 → whole zone-retry failed → marked + rotated.
     assert len(bad.calls) == 3
-    assert pool.failed == [proxies[0].identity]
+    assert pool.failed == [proxies[0].selection_key]
     # A DIFFERENT (clean) proxy served the retried fetch and is now sticky.
     assert ctx._sticky_proxy is not None
-    assert ctx._sticky_proxy.identity == proxies[1].identity
+    assert ctx._sticky_proxy.selection_key == proxies[1].selection_key
 
 
 async def test_all_proxies_403_raises_terminal() -> None:
     proxies = [PooledProxy(host=_HOST, port=8000)]
     pool = _FakePool(proxies)
-    pool.transports[proxies[0].identity] = _RecordingTransport(
+    pool.transports[proxies[0].selection_key] = _RecordingTransport(
         [_resp(403, _CDN) for _ in range(3)]
     )
     ctx = _ctx(pool)
@@ -149,4 +149,4 @@ async def test_all_proxies_403_raises_terminal() -> None:
         assert exc.status == 403  # the source's own terminal all-zones-blocked error
     else:  # pragma: no cover - must raise
         raise AssertionError("expected SourceError")
-    assert pool.failed == [proxies[0].identity]
+    assert pool.failed == [proxies[0].selection_key]

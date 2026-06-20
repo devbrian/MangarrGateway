@@ -33,6 +33,7 @@ import inspect
 import json
 import logging
 import time
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx
@@ -43,6 +44,20 @@ from .decrypt import decrypt
 from .errors import SourceError
 
 _log = logging.getLogger("manga_gateway")
+
+# 260620-4im: the in-flight image proxy is TASK-LOCAL, not a shared ``ctx`` field.
+# One ``SourceContext`` is shared by up to ``image_fetch_concurrency`` concurrent
+# page tasks (the engine runs ``_one`` under an ``asyncio.TaskGroup``), so a plain
+# ``self._active_proxy`` would let parallel ``fetch_image_via_pool`` calls clobber
+# each other — a page could egress through a sibling's proxy, or through the DIRECT
+# (banned) transport after a sibling's ``finally`` cleared it. A ``ContextVar`` is
+# copied per task at ``create_task`` time, so each page's set/reset stays isolated
+# to its own await chain (incl. the inner ``_send_emitting`` read). Module-level
+# (NOT per instance) so frequent job contexts don't leak ContextVars.
+# ``_sticky_proxy`` stays a plain ``ctx`` field — per-JOB shared state, by design.
+_ACTIVE_IMAGE_PROXY: ContextVar[PooledProxy | None] = ContextVar(
+    "active_image_proxy", default=None
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -239,11 +254,11 @@ class SourceContext:
         self._proxy_pool = proxy_pool
         self._image_via_proxy_pool = image_via_proxy_pool
         self._image_proxy_max_attempts = image_proxy_max_attempts
-        # The job's sticky proxy (reused across pages) + the proxy currently in flight
-        # (set ONLY while a proxied ``fetch_image`` runs so ``_send_emitting`` routes
-        # the inner ``ctx.get_bytes`` through it; cleared in a ``finally``).
+        # The job's sticky proxy (reused across pages) — per-job shared state, correct
+        # to live on the (per-job) ctx. The proxy currently IN FLIGHT is NOT here: it is
+        # the module-level ``_ACTIVE_IMAGE_PROXY`` ContextVar so concurrent page tasks
+        # sharing this ctx don't clobber each other's routing (see the note above).
         self._sticky_proxy: PooledProxy | None = None
-        self._active_proxy: PooledProxy | None = None
 
     @property
     def handle_store(self) -> HandleStore:
@@ -837,17 +852,17 @@ class SourceContext:
         last_exc: BaseException | None = None
         for _ in range(self._image_proxy_max_attempts):
             # Reuse the sticky proxy unless it was already tried-and-failed THIS page.
-            if (
-                self._sticky_proxy is not None
-                and self._sticky_proxy.identity not in tried
-            ):
-                proxy: PooledProxy | None = self._sticky_proxy
+            sticky = self._sticky_proxy
+            if sticky is not None and sticky.selection_key not in tried:
+                proxy: PooledProxy | None = sticky
             else:
                 proxy = self._proxy_pool.acquire(exclude=tried)
             if proxy is None:
                 break  # every proxy excluded / on cooldown → terminal below
-            tried.add(proxy.identity)
-            self._active_proxy = proxy
+            tried.add(proxy.selection_key)
+            # Set the in-flight proxy task-locally so concurrent page tasks sharing
+            # this ctx route independently; ``reset`` in ``finally`` restores it.
+            token = _ACTIVE_IMAGE_PROXY.set(proxy)
             try:
                 result = await fetch()
             except (SourceError, httpx.HTTPError) as exc:
@@ -855,7 +870,7 @@ class SourceContext:
                 self._proxy_pool.mark_failed(proxy)
                 if (
                     self._sticky_proxy is not None
-                    and self._sticky_proxy.identity == proxy.identity
+                    and self._sticky_proxy.selection_key == proxy.selection_key
                 ):
                     self._sticky_proxy = None  # drop a now-bad sticky
                 _log.info(
@@ -864,8 +879,7 @@ class SourceContext:
                 )
                 continue
             finally:
-                # Always clear so a later non-proxied request never mis-routes.
-                self._active_proxy = None
+                _ACTIVE_IMAGE_PROXY.reset(token)
             self._sticky_proxy = proxy  # first success becomes the new sticky
             _log.debug("image proxy %s served the fetch", proxy.identity)
             return result
@@ -1118,15 +1132,17 @@ class SourceContext:
         """
         start = time.perf_counter()
         # Transport pick (three-way). 260620-4im: while a proxied ``fetch_image`` is in
-        # flight (``_active_proxy`` set), every inner ``ctx.get_bytes`` — including the
-        # source's own per-page zone-retries — egresses through the SAME residential
-        # proxy (proxy OUTER, source-logic INNER). Otherwise route to the download pool
-        # on the download path, else the search pool (debug
+        # flight (the task-local ``_ACTIVE_IMAGE_PROXY`` is set), every inner
+        # ``ctx.get_bytes`` — including the source's own per-page zone-retries —
+        # egresses through the SAME proxy (proxy OUTER, source-logic INNER). The read
+        # is task-local so concurrent page fetches never cross-route. Otherwise route to
+        # the download pool on the download path, else the search pool (debug
         # pool-starves-search-cooldown). All share ONE identity (clearance rides
         # per-request headers), so this only picks which connection pool/egress.
-        if self._active_proxy is not None:
+        active_proxy = _ACTIVE_IMAGE_PROXY.get()
+        if active_proxy is not None:
             assert self._proxy_pool is not None  # set iff a proxy is active
-            transport = self._proxy_pool.transport_for(self._active_proxy)
+            transport = self._proxy_pool.transport_for(active_proxy)
         elif self._use_download_transport:
             transport = self._session.download_transport
         else:
