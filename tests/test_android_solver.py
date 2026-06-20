@@ -10,6 +10,7 @@ boot-disabled warm contract when the sidecar URL is unconfigured.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import time
@@ -336,6 +337,137 @@ async def test_warm_eager_solves_each_android_key() -> None:
     finally:
         await solver.aclose()
     assert isinstance(held, Clearance)
+
+
+# ── #296: per-source-key single-flight coalescing around _solve ───────────────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_concurrent_force_resolve_coalesces_to_one_sidecar_call() -> None:
+    """#296: N concurrent ``force_resolve`` for ONE key fire EXACTLY one sidecar
+    /solve and every caller receives the SAME ``Clearance`` object — the same-key
+    herd is one device hit, not N (the sidecar serializes them, so N un-coalesced
+    solves would cost ~N×~11s for one mint)."""
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _gated(request: httpx.Request) -> httpx.Response:
+        # Hold the single shared solve open until every caller has attached to it,
+        # so the coalescing is exercised deterministically (the de-dup is structural
+        # — the in-flight task is registered before the first await — but the gate
+        # hardens the assertion against any scheduling surprise).
+        entered.set()
+        await gate.wait()
+        return _solve_response()
+
+    route = respx.post(f"{_SIDECAR}/solve").mock(side_effect=_gated)
+    solver = _solver()
+    try:
+        tasks = [
+            asyncio.create_task(solver.get_clearance("mangadot", force_resolve=True))
+            for _ in range(5)
+        ]
+        await entered.wait()  # the one shared solve has started; all callers attached
+        gate.set()
+        results = await asyncio.gather(*tasks)
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1  # one device hit for the whole herd
+    first = results[0]
+    assert isinstance(first, Clearance)
+    assert all(r is first for r in results)  # one shared Clearance object fans out
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_coalesced_failed_solve_propagates_and_leaves_no_hold() -> None:
+    """WR-05 under coalescing: a 504 on the shared solve propagates to EVERY
+    ``force_resolve`` awaiter (each raises ``httpx.HTTPStatusError``), the sidecar is
+    hit ONCE, and no held entry survives for the key (the next non-force call
+    re-solves rather than re-serving a known-bad token)."""
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _gated(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await gate.wait()
+        return httpx.Response(504)
+
+    route = respx.post(f"{_SIDECAR}/solve").mock(side_effect=_gated)
+    solver = _solver()
+    try:
+        tasks = [
+            asyncio.create_task(solver.get_clearance("mangadot", force_resolve=True))
+            for _ in range(5)
+        ]
+        await entered.wait()
+        gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1  # one shared (failed) solve for the herd
+    assert all(isinstance(r, httpx.HTTPStatusError) for r in results)
+    assert "mangadot" not in solver._held  # WR-05: nothing held after a failed solve
+    assert "mangadot" not in solver._expires_at
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_and_reactive_force_resolve_coalesce() -> None:
+    """A proactive refresh tick (a held key inside the lead window) and a concurrent
+    reactive ``force_resolve`` for the SAME key share ONE sidecar /solve — both funnel
+    through the per-key single-flight task."""
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _gated(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await gate.wait()
+        return _solve_response(token="fresh-token", expires=time.time() + 99999)
+
+    route = respx.post(f"{_SIDECAR}/solve").mock(side_effect=_gated)
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "stale-token"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() + 30.0  # inside lead → expiring
+    try:
+        # Refresh first so it enters the shared solve before the reactive caller pops
+        # the held entry; the reactive force_resolve then attaches to the SAME task.
+        refresh = asyncio.create_task(solver._refresh_tick())
+        reactive = asyncio.create_task(
+            solver.get_clearance("mangadot", force_resolve=True)
+        )
+        await entered.wait()
+        gate.set()
+        await asyncio.gather(refresh, reactive)
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1  # refresh + reactive coalesced onto one /solve
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_different_keys_do_not_block_each_other() -> None:
+    """#296 isolation: concurrent ``force_resolve`` for two DIFFERENT keys solve
+    independently — one /solve per key (the single-flight registry is keyed by
+    source, with no global lock, so one key's herd never blocks another)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=lambda request: _solve_response()
+    )
+    solver = _solver()
+    try:
+        a, b = await asyncio.gather(
+            solver.get_clearance("mangadot", force_resolve=True),
+            solver.get_clearance("kagane", force_resolve=True),
+        )
+    finally:
+        await solver.aclose()
+    assert route.call_count == 2  # one per key — different keys are independent
+    assert isinstance(a, Clearance)
+    assert isinstance(b, Clearance)
 
 
 # ── #1: the android solve is now a labeled metric event (the gap-mystery fix) ──
