@@ -86,6 +86,8 @@ class _FakeCtx:
         self._details = details or {}
         self.get_bytes_calls: list[str] = []
         self.detail_calls: list[str] = []
+        # CR #289: records the ``limited`` flag passed for each detail GET.
+        self.detail_limited: list[bool] = []
         self.candidates_enumerated: int | None = None
         # 13-02 seam: per-request scratch stash (unused by mangafire's detail-GET
         # path, present for parity with the real SourceContext).
@@ -114,13 +116,14 @@ class _FakeCtx:
     async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await fetch_fn()
 
-    async def get_bytes(self, url: str) -> bytes:
+    async def get_bytes(self, url: str, *, limited: bool = False) -> bytes:
         self.get_bytes_calls.append(url)
         # Detail page GET /manga/{token} (no query) — the Phase-13 external-links GET.
         m = re.search(r"/manga/([^/?]+)$", url)
         if m:
             token = m.group(1)
             self.detail_calls.append(token)
+            self.detail_limited.append(limited)
             staged = self._details.get(token)
             if isinstance(staged, Exception):
                 raise staged
@@ -319,6 +322,8 @@ async def test_external_links_syncdata_canonical_and_stamped_once() -> None:
     assert all(rel.external_links is links for rel in releases)
     # The detail URL was built from the gateway-internal manga_token (card href).
     assert "https://mangafire.to/manga/berserkk.m2vv" in ctx.get_bytes_calls
+    # CR #289: the metadata detail GET is rate-limited (shares the per-minute budget).
+    assert ctx.detail_limited == [True]
 
 
 @pytest.mark.asyncio

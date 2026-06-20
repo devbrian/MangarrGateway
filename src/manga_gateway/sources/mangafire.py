@@ -684,7 +684,10 @@ class MangaFireSource(Source):
         timeout + swallow-all-to-``None`` (D-03); a raising/slow GET or an
         absent/malformed ``syncData`` leaves the chapter releases intact (R6).
         """
-        html = await ctx.get_bytes(f"{self.base_url}/manga/{series_id}")
+        # CR #289: rate-limit this metadata detail GET (limited=True) so it shares the
+        # per-source per-minute budget (consistent with the weebcentral WR-03 fix) —
+        # the default ``limited=False`` byte path would bypass the source limiter.
+        html = await ctx.get_bytes(f"{self.base_url}/manga/{series_id}", limited=True)
         sync_data = await asyncio.to_thread(_parse_sync_data, html)
         return normalize(sync_data, "mangafire")
 
