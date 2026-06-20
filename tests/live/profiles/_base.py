@@ -41,6 +41,27 @@ class LiveSmokeProfile:
     max_releases_to_try: int = 3
     min_releases_returned: int = 1
     expected_release_pattern: dict[str, str] = field(default_factory=dict)
+    # External tracker links live-smoke (Phase 13, D-08 / R7). OPTIONAL: a
+    # canonical-key → EXACT bare tracker ID/slug map (e.g.
+    # ``{"anilist": "105398", "myAnimeList": "121496"}``) for the canary title
+    # this profile's ``default_query`` resolves to. ``test_external_links_smoke``
+    # SKIPS a source whose map is empty (the default) and otherwise asserts at
+    # least one returned release's ``externalLinks`` is a SUPERSET of this map —
+    # proving the source emits the correct CANONICAL tracker IDs end-to-end
+    # against the real site. Values are bare IDs only (never URLs); the no-``http``
+    # invariant is exercised implicitly. D-08 accepts the brittleness of exact-ID
+    # pins as an early-warning signal: a site correcting/drifting an ID surfaces as
+    # a nightly failure and is repinned.
+    expected_external_links: dict[str, str] = field(default_factory=dict)
+    # Decoupled external-links canary (Phase 13, USER DECISION 2026-06-19).
+    # OPTIONAL: when set, ``test_external_links_smoke`` searches THIS query
+    # instead of ``default_query`` to verify the pinned ``expected_external_links``
+    # superset — used for sources whose ``default_query`` title (tuned for the
+    # DOWNLOAD smoke) legitimately exposes NO tracker links live (mangadex,
+    # mangadot). ``None`` (the default) falls back to ``default_query``. ONLY the
+    # external-links smoke honors this field; every other live test stays on
+    # ``default_query``, so the download-smoke path is unaffected.
+    expected_external_links_query: str | None = None
     fixture_drift_paths: list[Path] = field(default_factory=list)
     perf_budget_s: float | None = None
     # Alt-title live smoke (#139). OPTIONAL: populate ONLY for sources where a

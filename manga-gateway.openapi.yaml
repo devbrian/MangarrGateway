@@ -285,6 +285,7 @@ components:
         votes:           { type: integer, nullable: true, description: "Per-release thumbs-up / popularity count where the source exposes one (e.g. Comix chapter likes, MangaBall views). null when the source has no vote concept." }
         sizeBytes:       { type: integer, default: 0 }
         ids:             { type: object, additionalProperties: true, nullable: true, description: "Cross-reference source ids (e.g. mangadexChapterId/mangadexMangaId). First-class structured data; populated when known." }
+        externalLinks:   { type: object, additionalProperties: { type: string }, nullable: true, description: "Series-level cross-reference tracker IDs (bare ID/slug strings, never URLs). The schema stays an open string->string map (Mangarr treats it as opaque), but the implementation only ever emits one of these 10 canonical keys: anilist, myAnimeList, mangaUpdates, mangaBaka, kitsu, animePlanet, bookwalker, ann, kenmei, mangaDex. Tightening to named properties + additionalProperties:false is a future contract change requiring Mangarr coordination (IN-05)." }
 
     SubmitRequest:
       type: object

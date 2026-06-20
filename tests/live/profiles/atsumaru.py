@@ -73,6 +73,22 @@ LIVE_SMOKE = LiveSmokeProfile(
     max_releases_to_try=3,
     min_releases_returned=1,
     expected_release_pattern={"sourceKey": "atsumaru", "id_field": "manga_id"},
+    # External tracker links (Phase 13, D-08 / R7). REPINNED to the live
+    # ``default_query="one piece"`` title (USER DECISION, 2026-06-19): atsumaru's
+    # ``mangaPage.*`` fields expose the richest canonical set of the six sources.
+    # Captured live 2026-06-19 — the One Piece release (anilist 30013) returns all
+    # eight canonical keys. (The prior Solo Leveling pins were for a DIFFERENT
+    # title than default_query and could never pass — dropped.)
+    expected_external_links={
+        "anilist": "30013",
+        "myAnimeList": "13",
+        "mangaUpdates": "pb8uwds",
+        "mangaBaka": "377",
+        "kitsu": "38",
+        "animePlanet": "one-piece",
+        "ann": "1223",
+        "kenmei": "one-piece",
+    },
     fixture_drift_paths=[],
     perf_budget_s=None,
 )

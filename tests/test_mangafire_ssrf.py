@@ -18,9 +18,12 @@ from manga_gateway.sources.mangafire import _is_allowed_image_url
 @pytest.mark.parametrize(
     "url",
     [
-        # Well-formed varying-host /mf/ image URL (the happy path).
+        # Well-formed mfcdn{N} CDN-zone /mf/ image URL (the happy path); the host
+        # prefix varies per content (nw8/l1n/k99/m3z/o48) but the mfcdnN.xyz family is
+        # fixed (WR-02).
         "https://o48.mfcdn1.xyz/mf/abcdef0123/h/p.jpg",
-        "https://another-cdn99.example.net/mf/deadbeef/h/01.webp",
+        "https://nw8.mfcdn2.xyz/mf/deadbeef/h/01.webp",
+        "https://l1n.mfcdn3.xyz/mf/deadbeef/h/01.jpg",
         "https://o48.mfcdn1.xyz/mf/abcdef0123/h/p.png",
         "https://o48.mfcdn1.xyz/mf/abcdef0123/h/p.jpeg",
         # Belt-and-suspenders: a benign #scr_{offset} fragment is stripped first,
@@ -35,6 +38,12 @@ def test_allows_wellformed_mf_image_urls(url: str) -> None:
 @pytest.mark.parametrize(
     "url",
     [
+        # Public but non-mfcdn host: a syntactically valid hostname that is NOT a
+        # MangaFire CDN zone is now rejected (WR-02 — was previously accepted).
+        "https://another-cdn99.example.net/mf/deadbeef/h/01.webp",
+        "https://evil.com/mf/x/p.jpg",
+        "https://mangafire.to/mf/x/p.jpg",  # main site host is not an image CDN zone
+        "https://o48.mfcdn1.xyz.evil.com/mf/x/p.jpg",  # suffix-smuggle look-alike
         # Internal / metadata hosts (SSRF target).
         "https://metadata.google.internal/mf/x/p.jpg",
         "https://foo.local/mf/x/p.jpg",

@@ -227,6 +227,17 @@ class _FakeCtxForSearch:
         self._listings = listings
         self.array_calls: list[str] = []
         self.candidates_enumerated: int | None = None
+        # 13-02 external-links seam (mangadot's search now resolves links).
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        # Best-effort swallow-all mirror — the detail GET is unstaged here, so the
+        # parse raises and this returns None (external links irrelevant to the
+        # prune-count assertions; only ``array_calls`` is counted).
+        try:
+            return await parse_fn()
+        except Exception:
+            return None
 
     # Enum-cache seam (09-06): mirror the real SourceContext's default-None
     # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
@@ -399,6 +410,8 @@ class _FakeMangaDexCtx:
         self._search_data = search_data
         self.feed_calls: list[str] = []
         self.candidates_enumerated: int | None = None
+        # 13-02 external-links seam: per-request scratch stash + pass-through wrapper.
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
 
     # Enum-cache seam (09-04): mirror the real SourceContext's default-None
     # pass-through — bare ``await fetch_fn()``, no caching — so these fan-out-count
@@ -420,6 +433,9 @@ class _FakeMangaDexCtx:
 
     async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await fetch_fn()
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        return await parse_fn()
 
     def cache_replace(self, key: tuple[Any, ...], enum: Any) -> None:
         return None

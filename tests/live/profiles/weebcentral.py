@@ -90,6 +90,17 @@ LIVE_SMOKE = LiveSmokeProfile(
     max_releases_to_try=3,
     min_releases_returned=1,
     expected_release_pattern={"sourceKey": "weebcentral", "id_field": "series_id"},
+    # External tracker links (Phase 13, D-08 / R7). REPINNED to the live
+    # ``default_query="one piece"`` title (USER DECISION, 2026-06-19): WeebCentral's
+    # Track section exposes only AniList + MangaUpdates as full URLs (normalized to
+    # bare ids); ``Official Source`` is dropped (no canonical map entry, R3).
+    # Captured live 2026-06-19 — the One Piece release returns these two keys
+    # consistently. (The prior Solo Leveling pins were for a DIFFERENT title than
+    # default_query and could never pass — dropped.)
+    expected_external_links={
+        "anilist": "30013",
+        "mangaUpdates": "pb8uwds",
+    },
     fixture_drift_paths=[],
     perf_budget_s=None,
 )

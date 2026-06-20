@@ -78,13 +78,14 @@ from urllib.parse import urljoin, urlparse
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
+from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
-    from ..models.search import SearchRequest
+    from ..models.search import ExternalLinks, SearchRequest
 
 # Typesense search params (live frontend defaults, 2026-06-08). The keyword rides
 # ``q``; the rest mirror the site's own XHR so server-side relevance matches what a
@@ -286,15 +287,23 @@ class AtsumaruSource(Source):
             # a cache HIT acquires neither the fan-out slot nor a rate-limit token.
             async def _enum_fn() -> Enumeration:
                 async with sem:
-                    # allChapters (load-bearing) + the scanlator name map fetched
-                    # concurrently; the group resolve is BEST-EFFORT (helper swallows
-                    # its own errors → {}), so it never fails the enumeration.
-                    listing, group_names = await asyncio.gather(
+                    # allChapters (load-bearing) + the manga.page metadata fetched
+                    # concurrently; the page resolve is BEST-EFFORT (helper swallows
+                    # its own errors → ({}, {})), so it never fails the enumeration.
+                    # The page body carries BOTH the scanlator map AND the tracker-link
+                    # fields, so links ride this existing fetch — zero added HTTP (R5).
+                    listing, page_meta = await asyncio.gather(
                         ctx.get_json(
                             f"{self.base_url}/api/manga/allChapters", mangaId=manga_id
                         ),
-                        self._fetch_scanlator_names(manga_id, ctx),
+                        self._fetch_page_meta(manga_id, ctx),
                     )
+                group_names, links_raw = page_meta
+                # Stash the raw tracker links for the zero-HTTP fetch_external_links
+                # hook to read back (only when present; happens on an enum MISS — a
+                # repeat search serves links from the resolve-cache HIT, Pitfall 7).
+                if links_raw:
+                    ctx.external_links_raw[manga_id] = links_raw
                 chapters = listing.get("chapters")
                 rows = chapters if isinstance(chapters, list) else []
                 _attach_group_names(rows, group_names)
@@ -315,9 +324,20 @@ class AtsumaruSource(Source):
             enum = await ctx.cached_enumerate(
                 ctx.cached_enumerate_key(manga_id, []), _enum_fn
             )
-            return self._chapters_to_releases(
+            releases = self._chapters_to_releases(
                 enum.items, manga_id, manga_title, per_candidate_limit, ctx, req
             )
+
+            # Phase-13 (R4/R5): resolve the series' tracker links ONCE (the framework
+            # owns the cache/timeout/swallow) from the stashed mangaPage fields, then
+            # stamp the single resolved object onto every release of the series.
+            async def _parse_links() -> ExternalLinks | None:
+                return await self.fetch_external_links(manga_id, ctx)
+
+            links = await ctx.resolve_external_links(manga_id, _parse_links)
+            for rel in releases:
+                rel.external_links = links
+            return releases
 
         tasks: list[Coroutine[Any, Any, list[Release]]] = []
         for doc in candidates:
@@ -371,6 +391,10 @@ class AtsumaruSource(Source):
 
     # ─────────────────────────────── recent ──────────────────────────────────
 
+    # Phase-13 (CR #289): recent() DOES populate Release.externalLinks. The per-title
+    # ``manga.page`` body fetched below for the newest chapter + scanlator map ALSO
+    # carries the series' 8 tracker-link fields (the SAME body the search path lifts
+    # links off), so externalLinks ride that existing fetch — zero added HTTP.
     async def recent(
         self,
         *,
@@ -439,7 +463,24 @@ class AtsumaruSource(Source):
             newest["_group"] = group_names.get(
                 str(newest.get("scanlationMangaId") or "")
             )
-            return self._to_release(manga_id, manga_title, newest, ctx)
+            rel = self._to_release(manga_id, manga_title, newest, ctx)
+            if rel is None:
+                return None
+            # Phase-13 (CR #289): the SAME ``manga.page`` body fetched above carries the
+            # series' tracker-link fields — populate externalLinks with ZERO added HTTP,
+            # mirroring the search path. Stash the raw links, resolve once via the
+            # framework seam (resolve-once cache + timeout + swallow-all), stamp it on.
+            links_raw = _mangapage_links(page)
+            if links_raw:
+                ctx.external_links_raw[manga_id] = links_raw
+
+            async def _parse_links() -> ExternalLinks | None:
+                return await self.fetch_external_links(manga_id, ctx)
+
+            rel.external_links = await ctx.resolve_external_links(
+                manga_id, _parse_links
+            )
+            return rel
 
         tasks: list[Coroutine[Any, Any, Release | None]] = []
         for title in titles[:bound]:
@@ -578,28 +619,49 @@ class AtsumaruSource(Source):
             ids={"atsumaruMangaId": manga_id, "atsumaruChapterId": chapter_id},
         )
 
-    async def _fetch_scanlator_names(
+    async def _fetch_page_meta(
         self, manga_id: str, ctx: SourceContext
-    ) -> dict[str, str]:
-        """Best-effort ``scanlationMangaId → group name`` map for a manga (REL-03).
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Best-effort ``(scanlator-name map, raw tracker links)`` from ``manga.page``.
 
-        The ``allChapters`` rows carry only an opaque ``scanlationMangaId``; the human
-        group NAME lives in ``GET /api/manga/page?id=`` → ``mangaPage.scanlators``
-        (``[{id, name}]``). Returns ``{id: name}``, or ``{}`` on ANY missing/malformed
-        shape OR a fetch error (``SourceError`` swallowed) — the scanlation group is an
-        advisory field (D-19), so a flaky/absent ``manga.page`` must degrade to "no
-        group", never fail the load-bearing ``allChapters`` enumeration.
+        ONE ``GET /api/manga/page?id=`` carries BOTH the ``scanlators`` map (REL-03 —
+        ``[{id, name}]``, resolved from the chapter rows' opaque ``scanlationMangaId``)
+        AND the series' 8 tracker-link fields (Pitfall 5) on the SAME ``mangaPage``
+        body. Both are advisory (D-19/D-03): ANY missing/malformed shape OR a fetch
+        error degrades to ``({}, {})`` so a flaky/absent ``manga.page`` never fails the
+        load-bearing ``allChapters`` enumeration. ANY exception is swallowed (CR #289 —
+        ``ctx.get_json`` reraises raw httpx transport/5xx errors after retries; only a
+        permanent 4xx + parse become ``SourceError``, so a final timeout/5xx must NOT
+        fail the search candidate); ``asyncio.CancelledError`` still propagates. The
+        links are returned VERBATIM (raw upstream keys) — the framework normalizer owns
+        the canonical mapping + the kenmei URL->slug rule.
         """
         try:
             body = await ctx.get_json(f"{self.base_url}/api/manga/page", id=manga_id)
-        except SourceError:
-            return {}
+        except Exception:  # noqa: BLE001 — advisory metadata must not fail search
+            return {}, {}
         # Defence-in-depth: ``get_json`` already raises SourceError on a non-object
         # body (caught above), but guard explicitly so the never-fail-enumeration
         # contract holds without relying on the transport's internals (CodeRabbit #185).
         if not isinstance(body, dict):
-            return {}
-        return _scanlator_names(body.get("mangaPage"))
+            return {}, {}
+        page = body.get("mangaPage")
+        return _scanlator_names(page), _mangapage_links(page)
+
+    async def fetch_external_links(
+        self, series_id: str, ctx: SourceContext
+    ) -> ExternalLinks | None:
+        """Parse the stashed ``mangaPage`` tracker fields → canonical links (D-01/R5).
+
+        PARSING ONLY (zero added HTTP): reads the raw link dict stashed during
+        enumeration on ``ctx.external_links_raw`` (lifted off the same ``mangaPage``
+        body the scanlator map came from, Pitfall 5) and routes it through the shared
+        normalizer — ``None`` when the series carried no tracker fields. The framework
+        owns the resolve-once cache + best-effort timeout/swallow.
+        """
+        # IN-03: ``normalize`` short-circuits a falsy ``raw`` (cache miss → ``None``)
+        # to ``None`` itself, so the ``or {}`` guard is unnecessary — pass through.
+        return normalize(ctx.external_links_raw.get(series_id), "atsumaru")
 
     @classmethod
     def _language_wanted(cls, languages: list[str] | None) -> bool:
@@ -644,13 +706,42 @@ class AtsumaruSource(Source):
             return None
 
 
+# The 8 tracker-link fields Atsumaru carries on the ``mangaPage`` body (13-RESEARCH
+# frozen table, Pitfall 5). All bare values except ``kenmeiUrl`` (a full URL); the
+# framework normalizer owns the canonical mapping + the kenmei URL->slug extraction.
+_ATSUMARU_LINK_KEYS = (
+    "anilistId",
+    "malId",
+    "mangaUpdatesId",
+    "mangaBakaId",
+    "kitsuId",
+    "apId",
+    "annId",
+    "kenmeiUrl",
+)
+
+
+def _mangapage_links(page: Any) -> dict[str, Any]:
+    """Lift the raw tracker-link fields off a ``mangaPage`` object (Pitfall 5).
+
+    Returns the subset of :data:`_ATSUMARU_LINK_KEYS` present (truthy) on the page —
+    the RAW upstream keys/values, fed verbatim to ``framework.external_links.normalize``
+    (the single owner of the canonical mapping + the kenmei URL->slug rule). ``{}`` for
+    a non-dict page or one carrying no tracker fields. Read off the SAME body the
+    scanlator map came from — zero added HTTP.
+    """
+    if not isinstance(page, dict):
+        return {}
+    return {key: page[key] for key in _ATSUMARU_LINK_KEYS if page.get(key)}
+
+
 def _scanlator_names(page: Any) -> dict[str, str]:
     """Parse a ``mangaPage`` object's ``scanlators`` → ``{id: name}`` (REL-03).
 
     Best-effort: returns ``{}`` for any non-dict ``page`` / missing-or-malformed
     ``scanlators`` so the advisory group never breaks the caller. Shared by the
-    search path (``_fetch_scanlator_names`` GETs ``manga.page`` for the map) and the
-    recent path (which already holds the ``manga.page`` body and needs both the
+    search path (``_fetch_page_meta`` GETs ``manga.page`` for the map + tracker links)
+    and the recent path (which already holds the ``manga.page`` body and needs both the
     newest chapter and the map from it).
     """
     scanlators = page.get("scanlators") if isinstance(page, dict) else None

@@ -53,6 +53,18 @@ LIVE_SMOKE = LiveSmokeProfile(
     # D-46 — Comix releases carry hid as the canonical series identifier;
     # the release pattern doc-flags the field for the smoke modules.
     expected_release_pattern={"sourceKey": "comix", "id_field": "hid"},
+    # External tracker links (Phase 13, D-08 / R7). PINNED from a live
+    # 2026-06-19 capture of ``default_query="Forgotten Field"`` (USER DECISION,
+    # repin-to-default_query): a headed Patchright run cleared comix's
+    # ``cloudflare+encrypted`` challenge and the canary release returned these
+    # four canonical keys consistently. ``mangaDex`` is the UUID form (non-null
+    # here, RESEARCH A3). Bare IDs only — no URLs (T-13-03).
+    expected_external_links={
+        "anilist": "211558",
+        "mangaUpdates": "iq7tcsv",
+        "mangaBaka": "586650",
+        "mangaDex": "fb716acf-4257-4613-bf30-32d7c32dc199",
+    },
     fixture_drift_paths=[
         _FIXTURE_DIR / "chapter_9001596_pages.json",
         _FIXTURE_DIR / "search_the_forgotten_field.json",

@@ -14,6 +14,7 @@ handles.
 
 from __future__ import annotations
 
+import json
 import re
 from decimal import Decimal
 from typing import Any
@@ -72,6 +73,7 @@ class _FakeCtx:
         solver: Any,
         filter_html: bytes,
         chapter_lists: dict[str, str],
+        details: dict[str, Any] | None = None,
     ) -> None:
         from manga_gateway.handles.store import HandleStore
 
@@ -79,8 +81,24 @@ class _FakeCtx:
         self._solver = solver
         self._filter_html = filter_html
         self._chapter_lists = chapter_lists
+        # Phase-13: detail pages keyed by manga_token → HTML (bytes/str) returned by
+        # get_bytes, or an Exception instance (raised, to exercise best-effort).
+        self._details = details or {}
         self.get_bytes_calls: list[str] = []
+        self.detail_calls: list[str] = []
+        # CR #289: records the ``limited`` flag passed for each detail GET.
+        self.detail_limited: list[bool] = []
         self.candidates_enumerated: int | None = None
+        # 13-02 seam: per-request scratch stash (unused by mangafire's detail-GET
+        # path, present for parity with the real SourceContext).
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        # Mirror SourceContext.resolve_external_links' best-effort swallow-all.
+        try:
+            return await parse_fn()
+        except Exception:
+            return None
 
     def cached_resolve_key(
         self, normalized_query: str, languages: list[str], *, extra: object = None
@@ -98,8 +116,20 @@ class _FakeCtx:
     async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await fetch_fn()
 
-    async def get_bytes(self, url: str) -> bytes:
+    async def get_bytes(self, url: str, *, limited: bool = False) -> bytes:
         self.get_bytes_calls.append(url)
+        # Detail page GET /manga/{token} (no query) — the Phase-13 external-links GET.
+        m = re.search(r"/manga/([^/?]+)$", url)
+        if m:
+            token = m.group(1)
+            self.detail_calls.append(token)
+            self.detail_limited.append(limited)
+            staged = self._details.get(token)
+            if isinstance(staged, Exception):
+                raise staged
+            if staged is None:
+                raise AssertionError(f"no staged detail page for token: {token}")
+            return staged if isinstance(staged, bytes) else staged.encode("utf-8")
         return self._filter_html
 
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
@@ -112,11 +142,13 @@ def _ctx(
     solver: Any,
     cards: list[tuple[str, str]],
     chapter_lists: dict[str, str],
+    details: dict[str, Any] | None = None,
 ) -> _FakeCtx:
     return _FakeCtx(
         solver=solver,
         filter_html=_cards_html(cards),
         chapter_lists=chapter_lists,
+        details=details,
     )
 
 
@@ -227,3 +259,113 @@ async def test_search_chapter_type_filters_to_floor_family() -> None:
         SearchRequest(type="chapter", query="blue lock", chapter=3.0), ctx
     )
     assert {r.chapter_number for r in releases} == {Decimal("3")}
+
+
+def _detail_html(
+    *,
+    anilist_id: str | None = "30002",
+    mal_id: str | None = "2",
+    extra: dict[str, Any] | None = None,
+    sync_data: bool = True,
+) -> str:
+    """A MangaFire detail page with (or without) a ``<script id="syncData">``.
+
+    The syncData JSON carries ``anilist_id``+``mal_id`` plus MangaFire-internal keys
+    (``manga_id``/``page``) the normalizer DROPS. ``sync_data=False`` renders a page
+    with NO syncData script (the absent-script best-effort path).
+    """
+    if not sync_data:
+        return "<html><body><h1>MangaFire</h1></body></html>"
+    payload: dict[str, Any] = {"manga_id": "123", "page": "x"}
+    if anilist_id is not None:
+        payload["anilist_id"] = anilist_id
+    if mal_id is not None:
+        payload["mal_id"] = mal_id
+    if extra:
+        payload.update(extra)
+    body = json.dumps(payload)
+    return f'<html><body><script id="syncData">{body}</script></body></html>'
+
+
+@pytest.mark.asyncio
+async def test_external_links_syncdata_canonical_and_stamped_once() -> None:
+    """One detail GET per series → every release carries ``{anilist, myAnimeList}``.
+
+    MangaFire-internal keys (``manga_id``/``page``) are dropped (R3). The detail GET
+    fires AT MOST ONCE for the series even with multiple releases, and all releases
+    share the IDENTICAL object (R4).
+    """
+    chapters = [
+        {"number": str(n), "href": f"/read/berserkk.m2vv/en/chapter-{n}"}
+        for n in (2, 1)
+    ]
+    ctx = _ctx(
+        solver=_FakeTypedSolver(),
+        cards=[("/manga/berserkk.m2vv", "Berserk")],
+        chapter_lists={"m2vv": _chapter_list_html(chapters)},
+        details={"berserkk.m2vv": _detail_html(anilist_id="30002", mal_id="2")},
+    )
+    releases = await MangaFireSource().search(
+        SearchRequest(type="manga", query="berserk"), ctx
+    )
+
+    assert len(releases) == 2
+    # At most one detail GET per series, keyed on the manga_token.
+    assert ctx.detail_calls == ["berserkk.m2vv"]
+    links = releases[0].external_links
+    assert links is not None
+    assert links.model_dump(by_alias=True, exclude_none=True) == {
+        "anilist": "30002",
+        "myAnimeList": "2",
+    }
+    # Identical object stamped onto every release (R4).
+    assert all(rel.external_links is links for rel in releases)
+    # The detail URL was built from the gateway-internal manga_token (card href).
+    assert "https://mangafire.to/manga/berserkk.m2vv" in ctx.get_bytes_calls
+    # CR #289: the metadata detail GET is rate-limited (shares the per-minute budget).
+    assert ctx.detail_limited == [True]
+
+
+@pytest.mark.asyncio
+async def test_external_links_absent_syncdata_leaves_chapters_intact() -> None:
+    """A detail page with NO syncData script → ``external_links is None`` (R6)."""
+    ctx = _ctx(
+        solver=_FakeTypedSolver(),
+        cards=[("/manga/berserkk.m2vv", "Berserk")],
+        chapter_lists={
+            "m2vv": _chapter_list_html(
+                [{"number": "1", "href": "/read/berserkk.m2vv/en/chapter-1"}]
+            )
+        },
+        details={"berserkk.m2vv": _detail_html(sync_data=False)},
+    )
+    releases = await MangaFireSource().search(
+        SearchRequest(type="manga", query="berserk"), ctx
+    )
+    assert len(releases) == 1
+    assert releases[0].external_links is None
+    assert ctx.detail_calls == ["berserkk.m2vv"]
+
+
+@pytest.mark.asyncio
+async def test_external_links_best_effort_failure_leaves_chapters_intact() -> None:
+    """A raising detail GET still returns chapters with ``external_links is None``."""
+    ctx = _ctx(
+        solver=_FakeTypedSolver(),
+        cards=[("/manga/berserkk.m2vv", "Berserk")],
+        chapter_lists={
+            "m2vv": _chapter_list_html(
+                [
+                    {"number": "2", "href": "/read/berserkk.m2vv/en/chapter-2"},
+                    {"number": "1", "href": "/read/berserkk.m2vv/en/chapter-1"},
+                ]
+            )
+        },
+        details={"berserkk.m2vv": RuntimeError("upstream 403")},
+    )
+    releases = await MangaFireSource().search(
+        SearchRequest(type="manga", query="berserk"), ctx
+    )
+    assert len(releases) == 2
+    assert all(rel.external_links is None for rel in releases)
+    assert ctx.detail_calls == ["berserkk.m2vv"]

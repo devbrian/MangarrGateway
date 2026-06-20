@@ -555,6 +555,15 @@ class _FakeCtxForRecent:
         self._payload = payload
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._solver = _RecentFakeSolver()
+        # Phase-13 (WR-01): per-request scratch stash + best-effort resolve seam.
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        # Mirror SourceContext.resolve_external_links' best-effort swallow-all.
+        try:
+            return await parse_fn()
+        except Exception:
+            return None
 
     async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
         self.calls.append((url, params))
@@ -745,6 +754,55 @@ async def test_recent_returns_releases_with_deferred_guids_and_composites() -> N
         # The chapter_number on the record (Decimal) round-trips with ch_str.
         assert record.chapter_number is not None
         assert format(record.chapter_number.normalize(), "f") == number
+
+
+@pytest.mark.asyncio
+async def test_recent_populates_external_links_from_item_links() -> None:
+    """WR-01: the tokenized ``/api/v1/manga`` feed item carries the SAME ``links``
+    tracker dict ``search`` stashes; ``recent()`` must wire it through the parse-only
+    normalize seam (ZERO added HTTP) so recent Releases carry ``externalLinks``.
+
+    * An item WITH ``links`` → Release.external_links carries the canonical bare IDs
+      (URLs reduced to IDs, R2; storefront keys dropped, R3).
+    * An item WITHOUT ``links`` → Release.external_links is ``None``.
+    * No extra outbound call is made (still exactly one get_json_plain).
+    """
+    item_with = _viable_item(
+        hid="bbbb1",
+        slug_url="/title/bbbb1-with-links",
+        title="With Links",
+        latest_chapter="5",
+    )
+    item_with["links"] = {
+        "al": "https://anilist.co/manga/189223/",
+        "mu": "https://www.mangaupdates.com/series/nx0v0fc/",
+        "amz": "https://www.amazon.com/dp/x",  # storefront -> DROP (R3)
+    }
+    item_without = _viable_item(
+        hid="bbbb2",
+        slug_url="/title/bbbb2-no-links",
+        title="No Links",
+        latest_chapter="7",
+    )
+    payload = {"status": "ok", "result": {"items": [item_with, item_without]}}
+    source = ComixSource()
+    ctx = _ctx_for_recent(payload)
+    releases = await source.recent(languages=None, limit=20, since=None, ctx=ctx)
+
+    assert len(releases) == 2
+    # Still exactly one outbound plaintext call — links rode the SAME feed (no HTTP).
+    assert len(ctx.calls) == 1  # type: ignore[attr-defined]
+    by_hid = {rel.ids["comixSeriesId"]: rel for rel in releases}
+
+    links = by_hid["bbbb1"].external_links
+    assert links is not None
+    dumped = links.model_dump(by_alias=True, exclude_none=True)
+    assert dumped == {"anilist": "189223", "mangaUpdates": "nx0v0fc"}
+    # No emitted value contains a URL (R2); storefront key dropped (R3).
+    assert all("http" not in v for v in dumped.values())
+
+    # The link-less item carries no externalLinks.
+    assert by_hid["bbbb2"].external_links is None
 
 
 # Need this import after the test definition above to avoid a forward

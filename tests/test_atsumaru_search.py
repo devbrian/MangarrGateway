@@ -19,10 +19,12 @@ allChapters) and records calls for assertions.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 
 from manga_gateway.framework.errors import SourceError
@@ -47,13 +49,20 @@ class _FakeCtxForSearch:
         hits: list[dict[str, Any]],
         listings: dict[str, list[dict[str, Any]]],
         scanlators: dict[str, list[dict[str, str]]] | None = None,
+        links: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.handle_store = HandleStore()
         self._hits = hits
         self._listings = listings
         self._scanlators = scanlators or {}
+        # Per-manga raw tracker-link fields to merge onto the mangaPage body (the same
+        # body that already carries the scanlators map — Pitfall 5, zero added HTTP).
+        self._links = links or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.candidates_enumerated: int | None = None
+        # 13-02 external-links seam: per-request scratch stash + a pass-through wrapper
+        # (the real wrapper's resolve-once cache + timeout/swallow are tested in 13-02).
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
 
     def cached_resolve_key(
         self, normalized_query: str, languages: list[str], *, extra: object = None
@@ -71,6 +80,9 @@ class _FakeCtxForSearch:
     async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await fetch_fn()
 
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        return await parse_fn()
+
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         self.calls.append((url, params))
         if url == _SEARCH:
@@ -80,11 +92,13 @@ class _FakeCtxForSearch:
             return {"chapters": self._listings.get(manga_id, [])}
         if url == _MANGAPAGE:
             manga_id = str(params.get("id"))
-            return {
-                "mangaPage": {
-                    "scanlators": self._scanlators.get(manga_id, _DEFAULT_SCANLATORS)
-                }
+            # The mangaPage body carries BOTH the scanlators map AND the tracker-link
+            # fields on the same object (links merged in alongside scanlators).
+            page: dict[str, Any] = {
+                "scanlators": self._scanlators.get(manga_id, _DEFAULT_SCANLATORS)
             }
+            page.update(self._links.get(manga_id, {}))
+            return {"mangaPage": page}
         raise AssertionError(f"unexpected get_json url: {url}")
 
 
@@ -93,8 +107,11 @@ def _ctx(
     hits: list[dict[str, Any]],
     listings: dict[str, list[dict[str, Any]]] | None = None,
     scanlators: dict[str, list[dict[str, str]]] | None = None,
+    links: dict[str, dict[str, Any]] | None = None,
 ) -> Any:
-    return _FakeCtxForSearch(hits=hits, listings=listings or {}, scanlators=scanlators)
+    return _FakeCtxForSearch(
+        hits=hits, listings=listings or {}, scanlators=scanlators, links=links
+    )
 
 
 def _hit(
@@ -290,7 +307,7 @@ async def test_search_empty_hits_returns_no_releases() -> None:
 
 
 class _PageCtx:
-    """Minimal ctx for _fetch_scanlator_names: get_json returns canned/raises."""
+    """Minimal ctx for _fetch_page_meta: get_json returns canned/raises."""
 
     def __init__(self, behavior: Any) -> None:
         self._behavior = behavior
@@ -298,13 +315,15 @@ class _PageCtx:
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         if self._behavior == "raise":
             raise SourceError("source_unavailable", "boom")
+        if isinstance(self._behavior, BaseException):
+            raise self._behavior
         return self._behavior
 
 
 @pytest.mark.asyncio
-async def test_fetch_scanlator_names_happy_and_best_effort() -> None:
+async def test_fetch_page_meta_happy_and_best_effort() -> None:
     src = AtsumaruSource()
-    ok = await src._fetch_scanlator_names(
+    names, links = await src._fetch_page_meta(
         "m",
         _PageCtx(  # type: ignore[arg-type]
             {
@@ -312,15 +331,22 @@ async def test_fetch_scanlator_names_happy_and_best_effort() -> None:
                     "scanlators": [
                         {"id": "a", "name": "Alpha"},
                         {"id": "b", "name": "Asura"},
-                    ]
+                    ],
+                    "anilistId": "105398",
+                    "kenmeiUrl": "https://www.kenmei.co/series/solo-leveling",
                 }
             }
         ),
     )
-    assert ok == {"a": "Alpha", "b": "Asura"}
-    # A fetch error is swallowed → {} (group is advisory, never fails enumeration).
-    assert await src._fetch_scanlator_names("m", _PageCtx("raise")) == {}  # type: ignore[arg-type]
-    # Malformed shapes all degrade to {} — incl. a non-dict body (CodeRabbit #185).
+    assert names == {"a": "Alpha", "b": "Asura"}
+    # The raw tracker fields are lifted off the SAME mangaPage body, verbatim.
+    assert links == {
+        "anilistId": "105398",
+        "kenmeiUrl": "https://www.kenmei.co/series/solo-leveling",
+    }
+    # A fetch error is swallowed → ({}, {}) (both advisory, never fail enumeration).
+    assert await src._fetch_page_meta("m", _PageCtx("raise")) == ({}, {})  # type: ignore[arg-type]
+    # Malformed shapes all degrade to ({}, {}) — incl. non-dict body (CodeRabbit #185).
     for bad in (
         {},
         {"mangaPage": {}},
@@ -329,7 +355,125 @@ async def test_fetch_scanlator_names_happy_and_best_effort() -> None:
         [{"id": "a", "name": "X"}],  # non-dict (list) body
         "oops",  # non-dict (str) body
     ):
-        assert await src._fetch_scanlator_names("m", _PageCtx(bad)) == {}  # type: ignore[arg-type]
+        assert await src._fetch_page_meta("m", _PageCtx(bad)) == ({}, {})  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_meta_swallows_non_source_error() -> None:
+    """CR #289: ``ctx.get_json`` reraises raw httpx transport/5xx errors after
+    retries (only permanent 4xx + parse become ``SourceError``), so a final
+    timeout/5xx must NOT fail the search candidate — ``_fetch_page_meta`` swallows
+    ANY exception to ``({}, {})``."""
+    src = AtsumaruSource()
+    request = httpx.Request("GET", "https://atsu.moe/api/manga/page")
+    non_source_errors: list[Exception] = [
+        httpx.ReadTimeout("timed out", request=request),
+        httpx.HTTPStatusError(
+            "502",
+            request=request,
+            response=httpx.Response(502, request=request),
+        ),
+        httpx.ConnectError("refused", request=request),
+    ]
+    for err in non_source_errors:
+        assert await src._fetch_page_meta("m", _PageCtx(err)) == ({}, {})  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_meta_propagates_cancellation() -> None:
+    """CR #289: ``except Exception`` must NOT swallow ``asyncio.CancelledError`` —
+    cooperative cancellation has to propagate out of the advisory fetch."""
+    src = AtsumaruSource()
+    with pytest.raises(asyncio.CancelledError):
+        await src._fetch_page_meta("m", _PageCtx(asyncio.CancelledError()))  # type: ignore[arg-type]
+
+
+# ─────────────────────────── external tracker links (R2/R4/R5) ──────────────────
+# The mangaPage body fetched for the scanlator map ALSO carries the 8 Atsumaru tracker
+# fields (Pitfall 5); the hook parses them with ZERO added HTTP and stamps one
+# ExternalLinks object onto every release of the series.
+
+# Live-shape raw fields (13-RESEARCH frozen table): all bare except kenmeiUrl (a URL).
+_ATSU_RAW_LINKS = {
+    "anilistId": "105398",
+    "malId": "121496",
+    "mangaUpdatesId": "6z1uqw7",
+    "mangaBakaId": "3397",
+    "kitsuId": "54114",
+    "apId": "solo-leveling",
+    "annId": "32926",
+    "kenmeiUrl": "https://www.kenmei.co/series/solo-leveling",
+}
+_ATSU_EXPECTED = {
+    "anilist": "105398",
+    "myAnimeList": "121496",
+    "mangaUpdates": "6z1uqw7",
+    "mangaBaka": "3397",
+    "kitsu": "54114",
+    "animePlanet": "solo-leveling",
+    "ann": "32926",
+    "kenmei": "solo-leveling",  # slug extracted from the full kenmeiUrl (R2)
+}
+
+
+@pytest.mark.asyncio
+async def test_search_emits_external_links_from_mangapage() -> None:
+    ctx = _ctx(
+        hits=[_hit(manga_id="m")],
+        listings={"m": [_chapter(chapter_id="c")]},
+        links={"m": _ATSU_RAW_LINKS},
+    )
+    releases = await AtsumaruSource().search(
+        SearchRequest(type="manga", query="x"), ctx
+    )
+    assert len(releases) == 1
+    links = releases[0].external_links
+    assert links is not None
+    assert links.model_dump() == _ATSU_EXPECTED
+
+
+@pytest.mark.asyncio
+async def test_search_external_links_zero_added_http() -> None:
+    ctx = _ctx(
+        hits=[_hit(manga_id="m")],
+        listings={"m": [_chapter(chapter_id="c")]},
+        links={"m": _ATSU_RAW_LINKS},
+    )
+    await AtsumaruSource().search(SearchRequest(type="manga", query="x"), ctx)
+    # Links ride the existing scanlator-map fetch — exactly ONE /api/manga/page (R5).
+    assert [u for u, _ in ctx.calls].count(_MANGAPAGE) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_external_links_identical_object_across_releases() -> None:
+    chapters = [_chapter(chapter_id=f"c{n}", number=n, index=n) for n in range(1, 4)]
+    ctx = _ctx(
+        hits=[_hit(manga_id="m")],
+        listings={"m": chapters},
+        links={"m": _ATSU_RAW_LINKS},
+    )
+    releases = await AtsumaruSource().search(
+        SearchRequest(type="manga", query="x"), ctx
+    )
+    assert len(releases) == 3
+    first = releases[0].external_links
+    assert first is not None
+    for rel in releases:
+        assert rel.external_links is first  # resolve-once + stamp (R4)
+
+
+@pytest.mark.asyncio
+async def test_search_external_links_none_when_mangapage_has_no_trackers() -> None:
+    # mangaPage carries the scanlators map but NO tracker fields → externalLinks None.
+    ctx = _ctx(
+        hits=[_hit(manga_id="m")],
+        listings={"m": [_chapter(chapter_id="c")]},
+    )
+    releases = await AtsumaruSource().search(
+        SearchRequest(type="manga", query="x"), ctx
+    )
+    assert len(releases) == 1
+    assert releases[0].external_links is None
 
 
 @pytest.mark.asyncio
@@ -341,3 +485,109 @@ async def test_search_non_english_language_filter_returns_empty() -> None:
     )
     assert releases == []
     assert ctx.calls == []  # short-circuits before any network call
+
+
+# ─────────────────────────── recent() external tracker links ────────────────────
+# CR #289: recent()'s per-title ``manga.page`` body (already fetched for the newest
+# chapter + scanlator map) ALSO carries the tracker-link fields — so recent Releases
+# carry externalLinks with ZERO added HTTP, mirroring the search path.
+
+_RECENTLY_UPDATED = "https://atsu.moe/api/infinite/recentlyUpdated"
+
+
+class _FakeCtxForRecent:
+    """``SourceContext`` stand-in for the recent path: routes ``get_json`` by URL
+    (recentlyUpdated vs manga.page) and records calls for assertion."""
+
+    def __init__(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        pages: dict[str, dict[str, Any]],
+    ) -> None:
+        self.handle_store = HandleStore()
+        self._items = items
+        # Per-manga ``mangaPage`` body keyed by manga id (carries chapters +
+        # scanlators + tracker links — the SAME body recent's newest-chapter read uses).
+        self._pages = pages
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        return await parse_fn()
+
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((url, params))
+        if url == _RECENTLY_UPDATED:
+            return {"items": self._items}
+        if url == _MANGAPAGE:
+            manga_id = str(params.get("id"))
+            return {"mangaPage": self._pages.get(manga_id, {})}
+        raise AssertionError(f"unexpected get_json url: {url}")
+
+
+def _recent_page(
+    *, chapter_id: str = "c1", number: Any = 5, links: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    page: dict[str, Any] = {
+        "chapters": [
+            {
+                "id": chapter_id,
+                "scanlationMangaId": "cmgz",
+                "number": number,
+                "index": int(number) if str(number).isdigit() else 0,
+                "pageCount": 13,
+            }
+        ],
+        "scanlators": _DEFAULT_SCANLATORS,
+    }
+    if links:
+        page.update(links)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_recent_emits_external_links_from_mangapage_zero_added_http() -> None:
+    """CR #289: recent() carries canonical externalLinks lifted off the per-title
+    ``manga.page`` body — with NO extra HTTP (exactly one page GET per title)."""
+    ctx = _FakeCtxForRecent(
+        items=[{"id": "m1", "title": "Solo Leveling"}],
+        pages={"m1": _recent_page(links=_ATSU_RAW_LINKS)},
+    )
+    releases = await AtsumaruSource().recent(
+        languages=None,
+        limit=20,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
+    )
+
+    assert len(releases) == 1
+    links = releases[0].external_links
+    assert links is not None
+    assert links.model_dump() == _ATSU_EXPECTED
+    # No emitted value contains a URL (R2).
+    assert all(
+        "http" not in v
+        for v in links.model_dump(by_alias=True, exclude_none=True).values()
+    )
+    # Zero added HTTP: one recentlyUpdated feed + exactly one manga.page per title.
+    urls = [u for u, _ in ctx.calls]
+    assert urls.count(_RECENTLY_UPDATED) == 1
+    assert urls.count(_MANGAPAGE) == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_external_links_none_when_page_has_no_trackers() -> None:
+    """A title whose ``manga.page`` carries no tracker fields → externalLinks None."""
+    ctx = _FakeCtxForRecent(
+        items=[{"id": "m1", "title": "No Links"}],
+        pages={"m1": _recent_page()},
+    )
+    releases = await AtsumaruSource().recent(
+        languages=None,
+        limit=20,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
+    )
+    assert len(releases) == 1
+    assert releases[0].external_links is None
