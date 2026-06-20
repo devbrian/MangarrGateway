@@ -345,6 +345,11 @@ class MangadotSource(Source):
             releases = self._chapters_to_releases(
                 enum.items, manga_id, manga_title, wanted_langs, limit, ctx, req
             )
+            # CR #289: skip the external-links resolve entirely when no release
+            # survived filtering — a non-matching/sparse candidate must not issue a
+            # wasted detail GET (the resolved object would be stamped onto nothing).
+            if not releases:
+                return releases
 
             # Phase-13 (R4/R6/D-02): resolve the series' tracker links ONCE via the
             # framework wrapper (which owns the resolve-once cache + 5s timeout +

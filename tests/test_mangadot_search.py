@@ -509,6 +509,25 @@ async def test_external_links_best_effort_failure_leaves_chapters_intact() -> No
 
 
 @pytest.mark.asyncio
+async def test_external_links_skipped_when_candidate_yields_no_releases() -> None:
+    """CR #289: a candidate whose chapters are all filtered out (here a language
+    filter drops every row) yields ZERO releases — so the external-links resolve is
+    skipped and NO wasted detail GET fires. No ``details`` is staged, so a stray GET
+    would surface (its absence proves the skip — the swallow-all wrapper would hide a
+    raised AssertionError, but ``detail_calls`` records the attempt regardless)."""
+    ctx = _ctx(
+        manga_list=[_manga(manga_id="118", title="Solo Leveling")],
+        listings={"118": [_row(chapter_id="a", language="es")]},
+    )
+    releases = await MangadotSource().search(
+        SearchRequest(type="manga", query="solo leveling", languages=["en"]), ctx
+    )
+    assert releases == []
+    # No detail GET attempted for the empty candidate.
+    assert ctx.detail_calls == []
+
+
+@pytest.mark.asyncio
 async def test_recent_is_noop() -> None:
     ctx = _ctx(manga_list=[])
     out = await MangadotSource().recent(languages=None, limit=50, since=None, ctx=ctx)
