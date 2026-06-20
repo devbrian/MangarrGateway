@@ -427,7 +427,15 @@ class JobEngine:
                 # ``except Exception`` traceback log; this just gives the failure a
                 # specific, diagnosable shape.
                 try:
-                    content = await source.fetch_image(url, ctx)  # type: ignore[attr-defined]
+                    # 260620-4im: wrap the fetch in the proxy-pool orchestration. When
+                    # the pool is inactive (unconfigured OR this source did not opt in)
+                    # ``fetch_image_via_pool`` is a transparent ``await fetch()``, so the
+                    # non-opted/unconfigured path is byte-for-byte unchanged. The
+                    # surrounding try/except stays as-is so a final httpx error from an
+                    # exhausted pool still maps to the page-scoped SourceError.
+                    content = await ctx.fetch_image_via_pool(
+                        lambda: source.fetch_image(url, ctx)  # type: ignore[attr-defined]
+                    )
                 except SourceError:
                     raise
                 except httpx.HTTPError as exc:
@@ -519,6 +527,14 @@ class JobEngine:
             # surface (manifest + image fetches) uses the SEPARATE download pool so
             # a download backlog can never starve the search fan-out's pool.
             use_download_transport=True,
+            # 260620-4im: thread the residential proxy pool + this source's opt-in flag
+            # + the per-page attempt budget. ``image_via_proxy_pool`` is read off the
+            # source class the same way ``antibot``/``reresolve_manifest_on_403`` are; a
+            # non-opted source (flag False) or an unconfigured pool (None) makes
+            # ``fetch_image_via_pool`` a transparent passthrough (DIRECT egress).
+            proxy_pool=self._image_proxy_pool,
+            image_via_proxy_pool=getattr(source, "image_fetch_via_proxy_pool", False),
+            image_proxy_max_attempts=self._settings.image_proxy_max_attempts,
         )
 
     async def _transition(self, job: Job, status: JobStatus) -> None:

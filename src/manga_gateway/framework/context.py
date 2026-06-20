@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from .antibot import AntiBotSolver
     from .enum_cache import CacheKey, Enumeration, EnumerationCache
     from .health import SourceHealth
+    from .proxy_pool import PooledProxy, ProxyPool
     from .ratelimit import RateLimiter
     from .session import SessionManager
     from .session_prep import SessionPrep
@@ -156,6 +157,9 @@ class SourceContext:
         enum_cache: EnumerationCache | None = None,
         retry_attempts: int = 4,
         use_download_transport: bool = False,
+        proxy_pool: ProxyPool | None = None,
+        image_via_proxy_pool: bool = False,
+        image_proxy_max_attempts: int = 3,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -226,6 +230,20 @@ class SourceContext:
         # is threaded in by the POST /search route; the recent + download paths leave
         # it None (recent is never cached, download resolves one handle — CACHE-05).
         self._enum_cache = enum_cache
+        # 260620-4im image proxy pool seam (default-off → every existing caller AND the
+        # search path byte-for-byte unchanged). ``_proxy_pool`` is the shared pool;
+        # ``_image_via_proxy_pool`` is THIS source's opt-in flag (only an opted-in
+        # download ctx routes ``fetch_image`` through the pool). The sticky/active proxy
+        # live HERE because ``ctx`` is per-job (engine._build_context), mirroring the
+        # per-job ``_PREFERRED_ZONE_ATTR`` sidecar — never cross-job shared.
+        self._proxy_pool = proxy_pool
+        self._image_via_proxy_pool = image_via_proxy_pool
+        self._image_proxy_max_attempts = image_proxy_max_attempts
+        # The job's sticky proxy (reused across pages) + the proxy currently in flight
+        # (set ONLY while a proxied ``fetch_image`` runs so ``_send_emitting`` routes the
+        # inner ``ctx.get_bytes`` through it; cleared in a ``finally``).
+        self._sticky_proxy: PooledProxy | None = None
+        self._active_proxy: PooledProxy | None = None
 
     @property
     def handle_store(self) -> HandleStore:
@@ -787,6 +805,76 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
+    async def fetch_image_via_pool(
+        self, fetch: Callable[[], Awaitable[bytes]]
+    ) -> bytes:
+        """Run ``fetch`` through the residential proxy pool (sticky + rotate + cooldown).
+
+        The framework wrapper the engine puts around an opted-in source's
+        ``fetch_image`` (260620-4im). When no pool is wired OR this source did not opt in
+        (``image_fetch_via_proxy_pool``) — and ALWAYS on the search path, which is never
+        given a pool — this is a transparent ``await fetch()``: ``_active_proxy`` is never
+        set, so transport routing stays byte-for-byte today (the regression contract).
+
+        With a pool active it orchestrates, per call: pick the job's sticky proxy (or
+        ``acquire`` a fresh one), set ``_active_proxy`` so every inner ``ctx.get_bytes``
+        (incl. the source's per-page zone-retry) egresses through it, and run ``fetch``.
+        On a fetch failure (``SourceError`` incl. upstream 403, or any ``httpx.HTTPError``
+        — proxy 407 / ConnectTimeout / connect error) the proxy is ``mark_failed``'d and
+        a DIFFERENT proxy is acquired (excluding the ones already tried THIS page), up to
+        ``image_proxy_max_attempts`` total; the first success becomes the new sticky. All
+        attempts failing re-raises the LAST failure unchanged (the terminal image-fetch
+        surface the engine already understands); no proxy available at all raises a clear
+        terminal ``SourceError("source_unavailable", …)`` (T-4im-03). Logs the chosen
+        proxy identity (host:port) only — NEVER creds (T-4im-01).
+        """
+        if self._proxy_pool is None or not self._image_via_proxy_pool:
+            return await fetch()  # regression-safe passthrough (non-opted / search)
+
+        tried: set[str] = set()
+        last_exc: BaseException | None = None
+        for _ in range(self._image_proxy_max_attempts):
+            # Reuse the sticky proxy unless it was already tried-and-failed THIS page.
+            if (
+                self._sticky_proxy is not None
+                and self._sticky_proxy.identity not in tried
+            ):
+                proxy: PooledProxy | None = self._sticky_proxy
+            else:
+                proxy = self._proxy_pool.acquire(exclude=tried)
+            if proxy is None:
+                break  # every proxy excluded / on cooldown → terminal below
+            tried.add(proxy.identity)
+            self._active_proxy = proxy
+            try:
+                result = await fetch()
+            except (SourceError, httpx.HTTPError) as exc:
+                last_exc = exc
+                self._proxy_pool.mark_failed(proxy)
+                if (
+                    self._sticky_proxy is not None
+                    and self._sticky_proxy.identity == proxy.identity
+                ):
+                    self._sticky_proxy = None  # drop a now-bad sticky
+                _log.info(
+                    "image proxy %s failed — rotating to a different proxy",
+                    proxy.identity,
+                )
+                continue
+            finally:
+                # Always clear so a later non-proxied request never mis-routes.
+                self._active_proxy = None
+            self._sticky_proxy = proxy  # first success becomes the new sticky
+            _log.debug("image proxy %s served the fetch", proxy.identity)
+            return result
+
+        if last_exc is not None:
+            raise last_exc  # the terminal image-fetch surface the engine understands
+        raise SourceError(
+            "source_unavailable",
+            "no image proxy available (all proxies on cooldown)",
+        )
+
     async def _request_response(
         self,
         url: str,
@@ -1027,14 +1115,20 @@ class SourceContext:
         5xx to the except branch, this classification is correct + harmless.)
         """
         start = time.perf_counter()
-        # Route to the download pool on the download path, else the search pool
-        # (debug pool-starves-search-cooldown). Both share one identity (clearance
-        # rides per-request headers), so this only picks which connection pool.
-        transport = (
-            self._session.download_transport
-            if self._use_download_transport
-            else self._session.transport
-        )
+        # Transport pick (three-way). 260620-4im: while a proxied ``fetch_image`` is in
+        # flight (``_active_proxy`` set), every inner ``ctx.get_bytes`` — including the
+        # source's own per-page zone-retries — egresses through the SAME residential
+        # proxy (proxy OUTER, source-logic INNER). Otherwise route to the download pool
+        # on the download path, else the search pool (debug
+        # pool-starves-search-cooldown). All share ONE identity (clearance rides
+        # per-request headers), so this only picks which connection pool/egress.
+        if self._active_proxy is not None:
+            assert self._proxy_pool is not None  # set iff a proxy is active
+            transport = self._proxy_pool.transport_for(self._active_proxy)
+        elif self._use_download_transport:
+            transport = self._session.download_transport
+        else:
+            transport = self._session.transport
         try:
             resp = await transport.request(method, url, **kwargs)
         except Exception as exc:

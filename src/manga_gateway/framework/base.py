@@ -96,6 +96,17 @@ class Source(ABC):
     # gateway egress IP on some MangaFire CDN zones — mangafire opts out and instead
     # self-heals via its own per-page zone-retry in ``fetch_image``).
     reresolve_manifest_on_403: bool = True
+    # 260620-4im opt-in: route THIS source's ``fetch_image`` byte fetches through the
+    # framework residential proxy pool (the OUTER, per-job-sticky egress dimension).
+    # ``True`` = an image-CDN source whose direct egress IP is banned by the CDN's WAF
+    # (MangaFire — verified 403 on all ``mfcdnN`` zones) opts in; the framework then
+    # selects a sticky proxy per job, rotates to a different proxy on a fetch failure
+    # (+cooldown), and routes every inner ``ctx.get_bytes`` (incl. the source's own
+    # per-page zone-retry) through that one proxy. The NEXT image-CDN source enables it
+    # with this single one-line flip — zero networking code. ``False`` (default) = every
+    # existing source unchanged / DIRECT egress (search + the CF solve are never given a
+    # pool regardless). Mirrors the ``reresolve_manifest_on_403`` opt-out precedent.
+    image_fetch_via_proxy_pool: bool = False
     # D-30 / WR-02 per-source override: max concurrent download JOBS for THIS source.
     # ``None`` = use the global ``settings.max_concurrent_per_source`` default. A source
     # the rate-limit probe shows tolerates parallel chapter downloads sets this
