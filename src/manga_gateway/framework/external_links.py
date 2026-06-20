@@ -43,7 +43,11 @@ _MD = re.compile(r"/title/([0-9a-f-]{36})")  # mangaDex uuid, .../title/{uuid}
 # char preceding ``mangabaka`` must be a host/scheme separator, not another label char
 # (WR-04 / R2 defensive posture).
 _MB = re.compile(r"(?<![a-z0-9-])mangabaka\.org/(\d+)")
-_BW = re.compile(r"series/(\d+)")  # bookwalker numeric, MangaDex "series/N[/list]"
+# bookwalker numeric, MangaDex "series/N[/list]" (a bare PATH fragment, not a full
+# URL — so the IN-01 domain-anchor suggestion does not apply to this value shape).
+# Anchor ``series/`` to string-start or a ``/`` boundary so a foreign path segment like
+# ``.../aseries/42`` or ``.../webseries/42`` cannot false-match as a Bookwalker id.
+_BW = re.compile(r"(?:^|/)series/(\d+)")
 _KEN = re.compile(r"/series/([^/?#]+)")  # kenmei slug, .../series/{slug}
 
 

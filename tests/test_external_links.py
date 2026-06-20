@@ -221,6 +221,16 @@ def test_normalize_bookwalker_extracts_numeric_from_path() -> None:
     assert result.model_dump(by_alias=True) == {"bookwalker": "441768"}
 
 
+def test_normalize_bookwalker_anchored_rejects_foreign_segment() -> None:
+    # IN-01: ``series/`` must be anchored to start or a ``/`` boundary, so a foreign
+    # path segment ending in ``series`` cannot false-match as a Bookwalker id.
+    assert normalize({"bw": "webseries/42"}, "mangadex") is None
+    # A genuine boundary-prefixed value still extracts.
+    result = normalize({"bw": "x/series/777"}, "mangadex")
+    assert result is not None
+    assert result.model_dump(by_alias=True) == {"bookwalker": "777"}
+
+
 def test_normalize_mangabaka_anchored_rejects_lookalike_host() -> None:
     # WR-04: a look-alike host whose name merely ends in ``mangabaka.org`` must NOT
     # have an id extracted; the real domain still works.
