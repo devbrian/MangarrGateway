@@ -91,7 +91,21 @@ class _CountingCtx:
         self._enum_cache = enum_cache
         self.search_calls = 0
         self.listing_calls = 0
+        self.detail_calls = 0
         self.candidates_enumerated: int | None = None
+        # 13-02 external-links seam (mangadot's search now resolves links).
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        # Best-effort swallow-all mirror — the detail GET below is routed as an
+        # UNCOUNTED upstream route (it is neither the /api/search nor the
+        # /chapters/list call these tests count), so the headline "zero upstream
+        # calls on the repeat search" assertions over search_calls/listing_calls
+        # stay exact.
+        try:
+            return await parse_fn()
+        except Exception:
+            return None
 
     # Enum-cache seam — delegate to the real cache (mirrors SourceContext).
     def cached_resolve_key(
@@ -117,6 +131,12 @@ class _CountingCtx:
 
     # Upstream calls — counted.
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        # The Phase-13 detail object GET /api/manga/{id} (NO /chapters/list suffix)
+        # is the external-links route — tracked separately, NOT counted as a search
+        # call. Empty body → normalize(...) → None (no links staged here).
+        if re.match(rf"{re.escape(_BASE)}/api/manga/[^/]+$", url):
+            self.detail_calls += 1
+            return {}
         self.search_calls += 1
         if url == _SEARCH:
             return {
