@@ -431,7 +431,7 @@ class JobManager:
         task.add_done_callback(self._tasks.discard)
 
     async def _run_guarded(self, job_id: str) -> None:
-        """Acquire the global + per-source semaphores, then drive the engine (D-30).
+        """Acquire the per-source + global semaphores, then drive the engine (D-30).
 
         The per-source semaphore is sized from ``max_concurrent_per_source`` (WR-02)
         — a distinct, intentionally tighter knob than the global
@@ -440,6 +440,13 @@ class JobManager:
         ceiling that keeps one slow source from saturating every global slot. A source
         may RAISE its own ceiling via the ``Source.max_concurrent_jobs`` class attr
         (e.g. mangadot=3, measured safe); the override is clamped to the global bound.
+
+        Acquire order is **per-source first, global second** (#267). Were it reversed,
+        an over-cap source's overflow tasks would grab a global permit and then block
+        on the per-source cap — squatting global slots while idle and starving other
+        sources (head-of-line blocking). Acquiring the per-source permit first means a
+        capped source's extra tasks wait on ``source_sem`` alone, holding no global
+        slot, leaving the global pool free for healthy sources.
         """
         job = self._projection.get(job_id)
         if job is None:  # pragma: no cover - defensive; submit always projects first
@@ -452,7 +459,7 @@ class JobManager:
             job.source_key,
             asyncio.Semaphore(self._per_source_bound(job.source_key)),
         )
-        async with self._global_sem, source_sem:
+        async with source_sem, self._global_sem:
             await self._engine.run(job)
 
     def _per_source_bound(self, source_key: str) -> int:
