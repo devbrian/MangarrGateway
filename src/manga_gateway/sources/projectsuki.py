@@ -480,12 +480,18 @@ class ProjectSukiSource(Source):
     id_types: list[str] = []
     # Single-language (English) aggregator — no per-chapter language metadata exists.
     languages = ["en"]
-    # Conservative start — the orchestrator probe-tunes this (Step 5.5). The limiter is
-    # SHARED across the search + manifest HTML/JSON calls; image bytes are exempt
-    # (``get_bytes`` is ``limited=False``).
-    rate_limit_per_minute = 30
-    # Conservative per-source download-job concurrency (D-30) — probe-tuned later
-    # (Step 5.5); the job manager clamps it to the global max_concurrent_chapters.
+    # Probe-tuned (2026-06-20, scripts/probe_rate_limits.py): two proxied sweeps found
+    # NO hard limit on projectsuki — zero 429/403/CF-challenge/Retry-After and zero
+    # latency degradation on the search path. The rate-ceiling sweep sustained 960/min
+    # cleanly at concurrency 8 — a FLOOR (the true ceiling is higher). 480 is the
+    # conservative ~50%-of-floor suggestion, matching the mangaball/mangadot/atsumaru
+    # precedent (#101). The limiter is SHARED across the search + /callpage manifest
+    # calls; image bytes are exempt (``get_bytes`` is ``limited=False``).
+    rate_limit_per_minute = 480
+    # D-30 per-source override: the parallelism sweep sustained concurrency 32 cleanly
+    # (zero throttling), so chapter downloads parallelize safely. 3 mirrors the
+    # mangaball/mangadot/atsumaru precedent; the job manager clamps it to the global
+    # max_concurrent_chapters. (Governs concurrent download JOBS, not search fan-out.)
     max_concurrent_jobs = 3
     antibot = "none"
     decrypt_scheme = None
