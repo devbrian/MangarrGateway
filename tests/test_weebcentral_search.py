@@ -105,12 +105,28 @@ class _FakeCtxForSearch:
         *,
         search_html: bytes,
         listings: dict[str, bytes],
+        details: dict[str, Any] | None = None,
     ) -> None:
         self.handle_store = HandleStore()
         self._search_html = search_html
         self._listings = listings
+        # Phase-13: series MAIN pages keyed by the slugged token ``{ULID}/{slug}`` →
+        # Track HTML (bytes) returned by get_bytes, or an Exception (raised, to exercise
+        # the best-effort path).
+        self._details = details or {}
         self.calls: list[str] = []
+        self.detail_calls: list[str] = []
         self.candidates_enumerated: int | None = None
+        # 13-02 seam: per-request scratch stash (unused by weebcentral's main-page GET
+        # path, present for parity with the real SourceContext).
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        # Mirror SourceContext.resolve_external_links' best-effort swallow-all.
+        try:
+            return await parse_fn()
+        except Exception:
+            return None
 
     def cached_resolve_key(
         self, normalized_query: str, languages: list[str], *, extra: object = None
@@ -137,6 +153,17 @@ class _FakeCtxForSearch:
         m = re.match(r"^/series/([^/]+)/full-chapter-list$", path)
         if m is not None:
             return self._listings.get(m.group(1), b"<div></div>")
+        # Series MAIN page GET /series/{ULID}/{slug} — the Phase-13 external-links GET.
+        main = re.match(r"^/series/([^/]+)/([^/]+)$", path)
+        if main is not None and main.group(2) != "full-chapter-list":
+            token = f"{main.group(1)}/{main.group(2)}"
+            self.detail_calls.append(token)
+            staged = self._details.get(token)
+            if isinstance(staged, Exception):
+                raise staged
+            if staged is None:
+                raise AssertionError(f"no staged main page for token: {token}")
+            return staged
         raise AssertionError(f"unexpected get_bytes url: {url}")
 
 
@@ -144,11 +171,13 @@ def _ctx(
     *,
     series: list[tuple[str, str]],
     listings: dict[str, list[dict[str, Any]]] | None = None,
+    details: dict[str, Any] | None = None,
 ) -> Any:
     listings = listings or {}
     return _FakeCtxForSearch(
         search_html=_search_html(series),
         listings={sid: _chapter_list_html(chs) for sid, chs in listings.items()},
+        details=details,
     )
 
 
@@ -290,3 +319,133 @@ async def test_search_non_english_language_filter_returns_empty() -> None:
     )
     assert releases == []
     assert ctx.calls == []  # short-circuits before any network call
+
+
+# ───────────────────────── Phase-13 external links (R2/R4/R6) ─────────────────────
+# The series MAIN page (/series/{ULID}/{slug}) Track section carries three labeled
+# anchors as FULL URLs: AniList + MangaUpdates + Official Source. The hook does ONE
+# best-effort main-page GET per series, parses the Track section, drops Official
+# Source, extracts the bare id/slug, and stamps the single object on every release.
+# Solo Leveling live IDs (RESEARCH live-smoke): anilist=105398, mangaUpdates=6z1uqw7.
+
+# The search-href slug is ``title.replace(" ", "-")`` (see _search_html), so "Solo
+# Leveling" → "Solo-Leveling"; the slugged main-page token is ``{ULID}/{slug}``.
+_SOLO_SLUG = "Solo-Leveling"
+_SOLO_TOKEN = f"{_SERIES}/{_SOLO_SLUG}"
+
+
+def _track_html(
+    *,
+    anilist: str | None = "https://anilist.co/manga/105398/Solo-Leveling/",
+    mangaupdates: str | None = (
+        "https://www.mangaupdates.com/series/6z1uqw7/solo-leveling"
+    ),
+    official: str | None = "https://www.tapas.io/series/solo-leveling",
+    track_section: bool = True,
+) -> bytes:
+    """Build a WeebCentral series MAIN page with (or without) a Track section.
+
+    The Track section renders as ``<strong>Track:</strong>`` then one labeled
+    ``<span data-tip="<Label>"><a href="<URL>"></span>`` per tracker (AniList,
+    MangaUpdates, Official Source) — full URLs, mirroring the live markup. A ``None``
+    href drops that label; ``track_section=False`` renders a page with NO Track section
+    (the absent-Track best-effort path).
+    """
+    if not track_section:
+        return b"<html><body><h1>Solo Leveling</h1></body></html>"
+    spans = []
+    for label, href in (
+        ("AniList", anilist),
+        ("MangaUpdates", mangaupdates),
+        ("Official Source", official),
+    ):
+        if href is None:
+            continue
+        spans.append(
+            f'<span class="tooltip" data-tip="{label}">'
+            f'<a href="{href}">{label}</a></span>'
+        )
+    body = "".join(spans)
+    return (
+        f"<html><body><section><strong>Track:</strong>{body}</section></body></html>"
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_external_links_track_canonical_and_stamped_once() -> None:
+    """One main-page GET per series → every release carries ``{anilist, mangaUpdates}``.
+
+    Official Source is dropped (R3), no value is a URL (R2), the GET fires AT MOST ONCE
+    for the series, and all releases share the IDENTICAL object (R4).
+    """
+    chapters = [_chapter(chapter_id=_chapter_id(n), number=n) for n in (2, 1)]
+    ctx = _ctx(
+        series=[(_SERIES, "Solo Leveling")],
+        listings={_SERIES: chapters},
+        details={_SOLO_TOKEN: _track_html()},
+    )
+    releases = await WeebCentralSource().search(
+        SearchRequest(type="manga", query="solo leveling"), ctx
+    )
+    assert len(releases) == 2
+    # At most one main-page GET per series, keyed on the slugged token.
+    assert ctx.detail_calls == [_SOLO_TOKEN]
+    links = releases[0].external_links
+    assert links is not None
+    dumped = links.model_dump(by_alias=True, exclude_none=True)
+    assert dumped == {"anilist": "105398", "mangaUpdates": "6z1uqw7"}
+    # Official Source dropped; no emitted value contains a URL (R2).
+    assert all("http" not in v for v in dumped.values())
+    # Identical object stamped onto every release (R4).
+    assert all(rel.external_links is links for rel in releases)
+    # The main-page URL was built from the gateway-internal id/slug (search href).
+    assert f"{_BASE}/series/{_SOLO_TOKEN}" in ctx.calls
+
+
+@pytest.mark.asyncio
+async def test_external_links_drops_official_source_only() -> None:
+    """A Track section with ONLY Official Source → ``external_links is None`` (R3)."""
+    ctx = _ctx(
+        series=[(_SERIES, "Solo Leveling")],
+        listings={_SERIES: [_chapter(chapter_id=_chapter_id(1))]},
+        details={_SOLO_TOKEN: _track_html(anilist=None, mangaupdates=None)},
+    )
+    releases = await WeebCentralSource().search(
+        SearchRequest(type="manga", query="solo leveling"), ctx
+    )
+    assert len(releases) == 1
+    assert releases[0].external_links is None
+    assert ctx.detail_calls == [_SOLO_TOKEN]
+
+
+@pytest.mark.asyncio
+async def test_external_links_absent_track_leaves_chapters_intact() -> None:
+    """A main page with NO Track section → ``external_links is None`` (R6)."""
+    ctx = _ctx(
+        series=[(_SERIES, "Solo Leveling")],
+        listings={_SERIES: [_chapter(chapter_id=_chapter_id(1))]},
+        details={_SOLO_TOKEN: _track_html(track_section=False)},
+    )
+    releases = await WeebCentralSource().search(
+        SearchRequest(type="manga", query="solo leveling"), ctx
+    )
+    assert len(releases) == 1
+    assert releases[0].external_links is None
+    assert ctx.detail_calls == [_SOLO_TOKEN]
+
+
+@pytest.mark.asyncio
+async def test_external_links_best_effort_failure_leaves_chapters_intact() -> None:
+    """A raising main-page GET still returns chapters, ``external_links is None``."""
+    chapters = [_chapter(chapter_id=_chapter_id(n), number=n) for n in (2, 1)]
+    ctx = _ctx(
+        series=[(_SERIES, "Solo Leveling")],
+        listings={_SERIES: chapters},
+        details={_SOLO_TOKEN: RuntimeError("upstream 403")},
+    )
+    releases = await WeebCentralSource().search(
+        SearchRequest(type="manga", query="solo leveling"), ctx
+    )
+    assert len(releases) == 2
+    assert all(rel.external_links is None for rel in releases)
+    assert ctx.detail_calls == [_SOLO_TOKEN]
