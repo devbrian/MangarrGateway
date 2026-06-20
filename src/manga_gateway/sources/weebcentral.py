@@ -362,7 +362,15 @@ def _parse_track_links(html: bytes) -> dict[str, str]:
     except Exception:
         return {}
     out: dict[str, str] = {}
-    for strong in doc.xpath("//strong[contains(text(), 'Track')]"):
+    # IN-04: match the EXACT ``Track`` section heading (live renders ``Track:``), not a
+    # substring — so ``<strong>Backtrack</strong>`` / ``<strong>Soundtrack</strong>``
+    # elsewhere on the page can never be mistaken for the tracker section. Both the
+    # colon and bare forms are accepted so a live heading-punctuation tweak won't drop
+    # links.
+    track_xpath = (
+        "//strong[normalize-space(text())='Track:' or normalize-space(text())='Track']"
+    )
+    for strong in doc.xpath(track_xpath):
         section = strong.getparent()
         if section is None:
             continue

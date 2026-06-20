@@ -28,7 +28,7 @@ import pytest
 
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.models.search import SearchRequest
-from manga_gateway.sources.weebcentral import WeebCentralSource
+from manga_gateway.sources.weebcentral import WeebCentralSource, _parse_track_links
 
 _GUID_RE = re.compile(r"^weebcentral:[0-9A-Za-z]{26}:ch-[\d.?]+:[0-9A-Za-z]{26}$")
 _BASE = "https://weebcentral.com"
@@ -372,6 +372,32 @@ def _track_html(
     return (
         f"<html><body><section><strong>Track:</strong>{body}</section></body></html>"
     ).encode()
+
+
+def test_parse_track_links_matches_exact_heading() -> None:
+    """IN-04: the real ``Track:`` heading is matched (links collected)."""
+    out = _parse_track_links(_track_html())
+    assert out == {
+        "AniList": "https://anilist.co/manga/105398/Solo-Leveling/",
+        "MangaUpdates": "https://www.mangaupdates.com/series/6z1uqw7/solo-leveling",
+        "Official Source": "https://www.tapas.io/series/solo-leveling",
+    }
+
+
+def test_parse_track_links_ignores_lookalike_heading() -> None:
+    """IN-04: a ``Soundtrack`` / ``Backtrack`` heading is NOT a substring match —
+    its sibling spans must not be collected as tracker links."""
+    html = (
+        b"<html><body>"
+        b"<section><strong>Soundtrack</strong>"
+        b'<span data-tip="AniList"><a href="https://anilist.co/manga/999/">x</a>'
+        b"</span></section>"
+        b"<section><strong>Backtrack</strong>"
+        b'<span data-tip="MangaUpdates"><a href="https://x.example/series/abc">y</a>'
+        b"</span></section>"
+        b"</body></html>"
+    )
+    assert _parse_track_links(html) == {}
 
 
 @pytest.mark.asyncio
