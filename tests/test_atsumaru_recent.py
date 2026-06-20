@@ -45,6 +45,16 @@ class _FakeCtxForRecent:
         self._listings = listings
         self._scanlators = scanlators or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        # Phase-13 (CR #289): per-request scratch stash + best-effort resolve seam,
+        # mirroring the real SourceContext (recent() now populates externalLinks).
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        # Mirror SourceContext.resolve_external_links' best-effort swallow-all.
+        try:
+            return await parse_fn()
+        except Exception:
+            return None
 
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         self.calls.append((url, params))
