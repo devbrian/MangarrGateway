@@ -2,8 +2,8 @@
 
 Asserts MangaFire opts into the framework residential proxy pool (one flag) while a
 non-opted source stays off, then drives ``fetch_image`` through a REAL ``SourceContext``
-built with a fake ``ProxyPool`` (per-identity fake transports) + ``image_via_proxy_pool``
-to prove the composition: (a) a clean proxy serves the first zone with no rewrite;
+built with a fake ``ProxyPool`` (per-identity fake transports) + the opt-in flag to
+prove the composition: (a) a clean proxy serves the first zone with no rewrite;
 (b) a proxy that 403s ALL zones is ``mark_failed``'d and the framework rotates to a
 different clean proxy, whose retried ``fetch_image`` returns bytes. Offline, fake creds.
 """

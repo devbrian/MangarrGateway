@@ -529,11 +529,11 @@ class MangaFireSource(Source):
     # 260620-4im opt-in: route this source's ``fetch_image`` byte fetches through the
     # framework residential proxy pool. MangaFire's image CDN zones IP-ban the gateway's
     # DIRECT egress (verified Cloudflare Error-1020 403 on all ``mfcdnN`` zones); a real
-    # browser does not help — the ban is IP-based, not fingerprint-based — and the signed
-    # image-token paths need no ``cf_clearance``. A clean residential proxy returns
-    # ``200 image/jpeg``. LAYERING (locked): the proxy is the OUTER, per-job-sticky
-    # dimension (framework-owned — one sticky proxy spans the WHOLE ``mfcdnN`` zone-retry
-    # below); the zone-rewrite stays MangaFire-specific and composes as the INNER
+    # browser does not help — the ban is IP-based, not fingerprint-based — and the
+    # signed image-token paths need no ``cf_clearance``. A clean residential proxy
+    # returns ``200 image/jpeg``. LAYERING (locked): the proxy is the OUTER,
+    # per-job-sticky dimension (framework-owned — one sticky proxy spans the WHOLE
+    # ``mfcdnN`` zone-retry below); the zone-rewrite stays MangaFire-specific, INNER
     # dimension (per-page, same proxy). The framework rotates the proxy ONLY when the
     # entire zone-retry fails. ``fetch_image``/``_get_bytes_zone_retry`` need NO code
     # change — the engine now invokes ``fetch_image`` via ``ctx.fetch_image_via_pool``,
@@ -942,8 +942,8 @@ class MangaFireSource(Source):
         ``source_unavailable`` naming the blocked host — NOT the old stale-manifest
         wording (the engine also opts mangafire out of its re-resolve recovery).
 
-        PROXY LAYERING (260620-4im): the zone-retry is the INNER dimension. The framework
-        proxy pool holds ONE sticky proxy for this whole call (the OUTER dimension), so
+        PROXY LAYERING (260620-4im): the zone-retry is the INNER dimension. The
+        framework proxy pool holds ONE sticky proxy for this whole call (OUTER), so
         every ``ctx.get_bytes`` candidate below egresses through the SAME proxy; the
         framework rotates to a DIFFERENT proxy only when this entire zone-retry raises
         (e.g. all zones 403 on the current proxy). One proxy spans the whole zone sweep.

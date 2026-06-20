@@ -429,8 +429,8 @@ class JobEngine:
                 try:
                     # 260620-4im: wrap the fetch in the proxy-pool orchestration. When
                     # the pool is inactive (unconfigured OR this source did not opt in)
-                    # ``fetch_image_via_pool`` is a transparent ``await fetch()``, so the
-                    # non-opted/unconfigured path is byte-for-byte unchanged. The
+                    # ``fetch_image_via_pool`` is a transparent ``await fetch()``, so
+                    # the non-opted/unconfigured path is byte-for-byte unchanged. The
                     # surrounding try/except stays as-is so a final httpx error from an
                     # exhausted pool still maps to the page-scoped SourceError.
                     content = await ctx.fetch_image_via_pool(

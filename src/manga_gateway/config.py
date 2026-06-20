@@ -209,7 +209,7 @@ class Settings(BaseSettings):
     # egresses byte-for-byte exactly as today (the hard regression contract).
     #
     # ``image_proxy_pool_file`` points at an operator-supplied ``host:port:user:pass``
-    # file (gitignored; NEVER committed). It is added to the ``_empty_proxy_field_is_none``
+    # file (gitignored; NEVER committed). It rides the ``_empty_proxy_field_is_none``
     # validator below so CI's unset-secret ``""`` normalizes to None (pool disabled).
     image_proxy_pool_file: str | None = None
     # Cooldown (seconds) a proxy is sidelined after a failed image fetch before

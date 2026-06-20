@@ -240,8 +240,8 @@ class SourceContext:
         self._image_via_proxy_pool = image_via_proxy_pool
         self._image_proxy_max_attempts = image_proxy_max_attempts
         # The job's sticky proxy (reused across pages) + the proxy currently in flight
-        # (set ONLY while a proxied ``fetch_image`` runs so ``_send_emitting`` routes the
-        # inner ``ctx.get_bytes`` through it; cleared in a ``finally``).
+        # (set ONLY while a proxied ``fetch_image`` runs so ``_send_emitting`` routes
+        # the inner ``ctx.get_bytes`` through it; cleared in a ``finally``).
         self._sticky_proxy: PooledProxy | None = None
         self._active_proxy: PooledProxy | None = None
 
@@ -808,25 +808,27 @@ class SourceContext:
     async def fetch_image_via_pool(
         self, fetch: Callable[[], Awaitable[bytes]]
     ) -> bytes:
-        """Run ``fetch`` through the residential proxy pool (sticky + rotate + cooldown).
+        """Run ``fetch`` through the proxy pool (sticky + rotate + cooldown).
 
         The framework wrapper the engine puts around an opted-in source's
-        ``fetch_image`` (260620-4im). When no pool is wired OR this source did not opt in
-        (``image_fetch_via_proxy_pool``) — and ALWAYS on the search path, which is never
-        given a pool — this is a transparent ``await fetch()``: ``_active_proxy`` is never
-        set, so transport routing stays byte-for-byte today (the regression contract).
+        ``fetch_image`` (260620-4im). When no pool is wired OR this source did not opt
+        in (``image_fetch_via_proxy_pool``) — and ALWAYS on the search path, which is
+        never given a pool — this is a transparent ``await fetch()``: ``_active_proxy``
+        is never set, so transport routing stays byte-for-byte today (the regression
+        contract).
 
         With a pool active it orchestrates, per call: pick the job's sticky proxy (or
         ``acquire`` a fresh one), set ``_active_proxy`` so every inner ``ctx.get_bytes``
         (incl. the source's per-page zone-retry) egresses through it, and run ``fetch``.
-        On a fetch failure (``SourceError`` incl. upstream 403, or any ``httpx.HTTPError``
-        — proxy 407 / ConnectTimeout / connect error) the proxy is ``mark_failed``'d and
-        a DIFFERENT proxy is acquired (excluding the ones already tried THIS page), up to
-        ``image_proxy_max_attempts`` total; the first success becomes the new sticky. All
-        attempts failing re-raises the LAST failure unchanged (the terminal image-fetch
-        surface the engine already understands); no proxy available at all raises a clear
-        terminal ``SourceError("source_unavailable", …)`` (T-4im-03). Logs the chosen
-        proxy identity (host:port) only — NEVER creds (T-4im-01).
+        On a fetch failure (``SourceError`` incl. upstream 403, or any
+        ``httpx.HTTPError`` — proxy 407 / ConnectTimeout / connect error) the proxy is
+        ``mark_failed``'d and a DIFFERENT proxy is acquired (excluding the ones already
+        tried THIS page), up to ``image_proxy_max_attempts`` total; the first success
+        becomes the new sticky. All attempts failing re-raises the LAST failure
+        unchanged (the terminal image-fetch surface the engine already understands); no
+        proxy available at all raises a clear terminal
+        ``SourceError("source_unavailable", …)`` (T-4im-03). Logs the chosen proxy
+        identity (host:port) only — NEVER creds (T-4im-01).
         """
         if self._proxy_pool is None or not self._image_via_proxy_pool:
             return await fetch()  # regression-safe passthrough (non-opted / search)

@@ -135,9 +135,7 @@ def test_from_file_missing_returns_none(tmp_path: Path) -> None:
 def test_from_file_zero_valid_returns_none(tmp_path: Path) -> None:
     f = tmp_path / "proxies.txt"
     f.write_text("# only comments\n\nbad-line\n", encoding="utf-8")
-    assert (
-        ProxyPool.from_file(f, settings=_settings(), cooldown_seconds=300.0) is None
-    )
+    assert ProxyPool.from_file(f, settings=_settings(), cooldown_seconds=300.0) is None
 
 
 # ───────────────────────────── acquire / cooldown ─────────────────────────────
@@ -197,7 +195,9 @@ def test_mark_failed_logs_identity_not_creds(caplog: pytest.LogCaptureFixture) -
         clock=clock,
     )
     with caplog.at_level(logging.INFO):
-        pool.mark_failed(PooledProxy(_FAKE_HOST, 8000, _FAKE_USER, SecretStr(_FAKE_PASS)))
+        pool.mark_failed(
+            PooledProxy(_FAKE_HOST, 8000, _FAKE_USER, SecretStr(_FAKE_PASS))
+        )
     for record in caplog.records:
         assert _FAKE_PASS not in record.getMessage()
         assert _FAKE_USER not in record.getMessage()
