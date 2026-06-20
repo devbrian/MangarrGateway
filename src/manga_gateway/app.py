@@ -32,6 +32,7 @@ from .framework.cooldown import SourceFailureCooldown
 from .framework.enum_cache import EnumerationCache
 from .framework.health import SourceHealth
 from .framework.proxy import build_proxy
+from .framework.proxy_pool import ProxyPool
 from .framework.ratelimit import RateLimiter
 from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
@@ -160,6 +161,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     download_transport = HttpxTransport(settings)
     app.state.download_transport = download_transport
     app.state.session = SessionManager(transport, download_transport)  # R1 identity
+    # 260620-4im: reusable residential proxy pool for source image-byte fetches. Built
+    # ONCE (R1) only when ``image_proxy_pool_file`` is set + non-empty AND
+    # ``ProxyPool.from_file`` parses ≥1 proxy; otherwise the pool stays None and the
+    # download path egresses byte-for-byte exactly as today (the regression contract).
+    # Only an opted-in source (``Source.image_fetch_via_proxy_pool``) routes its
+    # ``fetch_image`` byte fetches through it (engine threads it into the download ctx);
+    # search + the read-page CF solve are never given a pool. Log the COUNT only — never
+    # a proxy host/credential (T-4im-01).
+    image_proxy_pool: ProxyPool | None = (
+        ProxyPool.from_file(
+            settings.image_proxy_pool_file,
+            settings=settings,
+            cooldown_seconds=settings.image_proxy_cooldown_seconds,
+        )
+        if settings.image_proxy_pool_file
+        else None
+    )
+    app.state.image_proxy_pool = image_proxy_pool
+    if image_proxy_pool is not None:
+        _log.info(
+            "image proxy pool loaded %d proxies", image_proxy_pool.available_count()
+        )
     # SRC-01: build the registry first so the rest of the lifespan can inspect
     # per-source metadata (antibot level, decrypt scheme) WITHOUT hardcoding any
     # source key by name. Adding the 50+ planned sources is a register call and
@@ -466,6 +489,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         solver=solver,
         source_health=source_health,
         session_prep=session_prep,
+        image_proxy_pool=image_proxy_pool,
     )
     # download-jobs-failed-23: REQUEUE in-flight jobs (not fail them) + project rows
     # (PLAT-03). The re-spawn happens AFTER the staging sweep below.
@@ -680,6 +704,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await app.state.handle_store.close()
         await transport.aclose()  # release the search/recent client
         await download_transport.aclose()  # release the download client (split pool)
+        # 260620-4im: close every cached per-proxy transport (no-op when unconfigured).
+        if image_proxy_pool is not None:
+            with suppress(Exception):
+                await image_proxy_pool.aclose()
         # Metrics teardown LAST (independent of solver/job/transport): a FINAL
         # snapshot so nothing in-memory since the last timer tick is lost
         # (Pitfall 4), then close the snapshot connection. set_collector(None) so a

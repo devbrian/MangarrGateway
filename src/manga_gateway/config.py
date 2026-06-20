@@ -197,6 +197,28 @@ class Settings(BaseSettings):
     # TOML and never commit a real credential. get_secret_value() is unpacked
     # ONLY inside build_proxy.
     cloudflare_proxy_password: SecretStr | None = None
+    # ── Image-fetch residential proxy pool (260620-4im, PROXY-01 extension) ─────
+    # Env-overridable ops knobs (D-11), same treatment as host/port (NOT the api_key
+    # exclusion); they ride the existing load_settings TOML→kwargs merge. ROUTE ONLY
+    # source image-byte fetches (the ``fetch_image`` phase) through a reusable framework
+    # proxy pool; search + the read-page CF solve stay DIRECT (unchanged). A source opts
+    # in with ``Source.image_fetch_via_proxy_pool = True`` (MangaFire first — its
+    # ``mfcdnN`` image-CDN zones IP-ban the gateway's direct egress; a clean residential
+    # proxy returns 200). "Pool enabled" is DERIVED (file set + ``ProxyPool.from_file``
+    # returns non-None) — no separate enabled bool. When unconfigured the download path
+    # egresses byte-for-byte exactly as today (the hard regression contract).
+    #
+    # ``image_proxy_pool_file`` points at an operator-supplied ``host:port:user:pass``
+    # file (gitignored; NEVER committed). It rides the ``_empty_proxy_field_is_none``
+    # validator below so CI's unset-secret ``""`` normalizes to None (pool disabled).
+    image_proxy_pool_file: str | None = None
+    # Cooldown (seconds) a proxy is sidelined after a failed image fetch before
+    # ``acquire`` offers it again. ge=0.0: 0 disables the cooldown (every proxy always
+    # immediately re-eligible).
+    image_proxy_cooldown_seconds: float = Field(default=300.0, ge=0.0)
+    # Per-page proxy attempts: 1 initial + 2 retries-with-a-different-proxy (the locked
+    # spec). ge=1: at least one attempt must be made.
+    image_proxy_max_attempts: int = Field(default=3, ge=1)
     # ── Android-WebView Cloudflare solver sidecar (Phase 10, BOT-02) ───────────
     # Env-overridable ops knobs (D-11), same treatment as the cloudflare_* knobs
     # (NOT the api_key exclusion); they ride the load_settings TOML→kwargs merge.
@@ -394,6 +416,7 @@ class Settings(BaseSettings):
         "cloudflare_proxy_server",
         "cloudflare_proxy_username",
         "cloudflare_proxy_password",
+        "image_proxy_pool_file",
         mode="before",
     )
     @classmethod

@@ -526,6 +526,20 @@ class MangaFireSource(Source):
     # the OTHER CDN zones; a 403 only escapes ``fetch_image`` when ALL zones are
     # blocked, where re-resolve cannot help anyway — so failing fast is correct.
     reresolve_manifest_on_403 = False
+    # 260620-4im opt-in: route this source's ``fetch_image`` byte fetches through the
+    # framework residential proxy pool. MangaFire's image CDN zones IP-ban the gateway's
+    # DIRECT egress (verified Cloudflare Error-1020 403 on all ``mfcdnN`` zones); a real
+    # browser does not help — the ban is IP-based, not fingerprint-based — and the
+    # signed image-token paths need no ``cf_clearance``. A clean residential proxy
+    # returns ``200 image/jpeg``. LAYERING (locked): the proxy is the OUTER,
+    # per-job-sticky dimension (framework-owned — one sticky proxy spans the WHOLE
+    # ``mfcdnN`` zone-retry below); the zone-rewrite stays MangaFire-specific, INNER
+    # dimension (per-page, same proxy). The framework rotates the proxy ONLY when the
+    # entire zone-retry fails. ``fetch_image``/``_get_bytes_zone_retry`` need NO code
+    # change — the engine now invokes ``fetch_image`` via ``ctx.fetch_image_via_pool``,
+    # so every inner ``ctx.get_bytes`` transparently egresses through the active sticky
+    # proxy. Search + the read-page CF solve are never given a pool (unchanged).
+    image_fetch_via_proxy_pool = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -890,6 +904,15 @@ class MangaFireSource(Source):
         ``offset==0`` page is returned unchanged. The descramble always runs on the
         bytes from WHICHEVER zone answered, so a zone switch never bypasses the offset
         un-shuffle.
+
+        PROXY LAYERING (260620-4im): this source opts into the framework residential
+        proxy pool (``image_fetch_via_proxy_pool``). The engine invokes ``fetch_image``
+        via ``ctx.fetch_image_via_pool``, which pins ONE per-job sticky proxy as the
+        OUTER egress dimension for the duration of this call — so every inner
+        ``ctx.get_bytes`` here, including the ``mfcdnN`` zone-retry below, egresses
+        through that SAME proxy. The proxy is the OUTER (per-job-sticky) dimension; the
+        zone-rewrite is INNER (per-page, same proxy). This method needs NO pool-aware
+        code — the routing is transparent at the transport layer.
         """
         clean, frag = urldefrag(url)
         offset = 0
@@ -918,6 +941,12 @@ class MangaFireSource(Source):
         propagates unchanged. When EVERY zone 403s the request raises a clear terminal
         ``source_unavailable`` naming the blocked host — NOT the old stale-manifest
         wording (the engine also opts mangafire out of its re-resolve recovery).
+
+        PROXY LAYERING (260620-4im): the zone-retry is the INNER dimension. The
+        framework proxy pool holds ONE sticky proxy for this whole call (OUTER), so
+        every ``ctx.get_bytes`` candidate below egresses through the SAME proxy; the
+        framework rotates to a DIFFERENT proxy only when this entire zone-retry raises
+        (e.g. all zones 403 on the current proxy). One proxy spans the whole zone sweep.
         """
         # Build the zone-attempt order: the job's remembered-good zone first (if any),
         # then the current URL's zone, then every other known zone — de-duplicated,
