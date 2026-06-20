@@ -113,13 +113,14 @@ from PIL import Image, UnidentifiedImageError
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
+from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
-    from ..models.search import SearchRequest
+    from ..models.search import ExternalLinks, SearchRequest
 
 _log = logging.getLogger("manga_gateway")
 
@@ -1047,7 +1048,9 @@ class ComixSource(Source):
         # call entirely (genuinely zero upstream calls on a HIT). The key normalizes
         # the query the SAME way the relevance scorer does so punctuation/case
         # variants collapse onto one entry.
-        async def _resolve_fn() -> list[tuple[str, str, str, list[str]]]:
+        async def _resolve_fn() -> list[
+            tuple[str, str, str, list[str], dict[str, Any] | None]
+        ]:
             found = await self._search_series(req.query or "", count, ctx)
             # Prune obviously-irrelevant candidates BEFORE the per-candidate browser
             # chapter fan-out (#126) — each wasted candidate is a 7-18s nav (#101).
@@ -1140,12 +1143,12 @@ class ComixSource(Source):
         # nav via the SingleFlightCache (D-04) on top of that Semaphore.
         coros = [
             _enum_for(series_hid, series_slug)
-            for series_hid, series_slug, _series_title, _alt in series
+            for series_hid, series_slug, _series_title, _alt, _links in series
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
 
         releases: list[Release] = []
-        for (series_hid, series_slug, series_title, _alt), result in zip(
+        for (series_hid, series_slug, series_title, _alt, _links), result in zip(
             series, results, strict=True
         ):
             if isinstance(result, BaseException):
@@ -1173,6 +1176,24 @@ class ComixSource(Source):
                     req, self._parse_decimal(c.get("chapter") or c.get("number"))
                 )
             ]
+            # Phase-13 (R2/R4/R5): the series' tracker links rode the SAME cached
+            # Layer-1 candidate tuple (``_links`` = the search payload's
+            # ``result.items[].links``, full tracker URLs — Pitfall 4), so we stash
+            # the raw dict on the per-request scratch map (ZERO added HTTP — no second
+            # ``/api/v1/manga`` call). ``resolve_external_links`` then parses it ONCE
+            # per series (the framework owns the cache/timeout/swallow), and the single
+            # resolved object is stamped onto every release below (identical-object,
+            # R4). The default-arg idiom binds ``series_hid`` to dodge the loop-var
+            # closure bug.
+            if _links is not None:
+                ctx.external_links_raw[series_hid] = _links
+
+            async def _parse_links(_hid: str = series_hid) -> ExternalLinks | None:
+                return await self.fetch_external_links(_hid, ctx)
+
+            links_obj = await ctx.resolve_external_links(series_hid, _parse_links)
+
+            series_releases: list[Release] = []
             for chapter in chapters[req.offset : req.offset + result_window]:
                 # Inject the series-page-known title into the chapter dict so the
                 # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /
@@ -1184,7 +1205,12 @@ class ComixSource(Source):
                     chapter = {**chapter, "seriesTitle": series_title}
                 rel = self._to_release(series_hid, series_slug, chapter, ctx)
                 if rel is not None:
-                    releases.append(rel)
+                    series_releases.append(rel)
+            # Stamp the single resolved ExternalLinks (or None) onto every release of
+            # the series — all N share the identical object (R4).
+            for rel in series_releases:
+                rel.external_links = links_obj
+            releases.extend(series_releases)
         return releases
 
     async def recent(
@@ -1665,14 +1691,34 @@ class ComixSource(Source):
             )
         return solver
 
+    # ─────────────────────────── External tracker links ─────────────────────────
+
+    async def fetch_external_links(
+        self, series_id: str, ctx: SourceContext
+    ) -> ExternalLinks | None:
+        """Parse the stashed candidate ``links`` → canonical bare-ID links (D-02/R5).
+
+        PARSING ONLY (zero added HTTP): reads the raw ``links`` dict stashed during
+        ``search`` on ``ctx.external_links_raw`` (carried verbatim off the Layer-1
+        candidate tuple — the search payload's ``result.items[].links``, full tracker
+        URLs, Pitfall 4) and routes it through the shared normalizer. Comix exposes
+        FULL URLs, so ``normalize`` extracts the bare IDs (R2). Returns ``None`` when
+        the series carried no tracker links. The framework owns the resolve-once cache
+        + best-effort timeout/swallow (``resolve_external_links``).
+        """
+        raw = ctx.external_links_raw.get(series_id)
+        if not raw:
+            return None
+        return normalize(raw, "comix")
+
     # ─────────────────────────── Comix fetch helpers ──────────────────────────
 
     async def _search_series(
         self, query: str, limit: int, ctx: SourceContext
-    ) -> list[tuple[str, str, str, list[str]]]:
-        """Token-gated ``/api/v1/manga`` search → ``(hid, slug, title, alt_titles)``.
+    ) -> list[tuple[str, str, str, list[str], dict[str, Any] | None]]:
+        """Token-gated ``/api/v1/manga`` search → ``(hid, slug, title, alt, links)``.
 
-        Returns ``(hid, slug, title, alt_titles)`` tuples. The 5-char ``hid`` is
+        Returns ``(hid, slug, title, alt_titles, links)`` tuples. The 5-char ``hid`` is
         the canonical series identifier; the ``slug`` is extracted from the
         item's ``url`` field (``/title/{hid}-{slug}`` per live recon); the
         ``title`` is the rendered series title and is threaded through to
@@ -1713,7 +1759,7 @@ class ComixSource(Source):
         # framework decrypt seam out of this path and replays the URL verbatim.
         data = await ctx.get_json_plain(token_url)
         items = self._result_items(data)
-        out: list[tuple[str, str, str, list[str]]] = []
+        out: list[tuple[str, str, str, list[str], dict[str, Any] | None]] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1732,7 +1778,13 @@ class ComixSource(Source):
             alt_titles = [
                 s for s in (item.get("altTitles") or []) if isinstance(s, str)
             ]
-            out.append((str(hid), slug, title, alt_titles))
+            # Phase-13 (Pitfall 4): carry the search payload's ``links`` object
+            # (full tracker URLs: ``al/mal/mu/md/mb``) through the cached candidate
+            # tuple so ``fetch_external_links`` can parse it parse-only with ZERO
+            # added HTTP (R5). Was fetched-then-discarded before this widening.
+            raw_links = item.get("links")
+            links = raw_links if isinstance(raw_links, dict) else None
+            out.append((str(hid), slug, title, alt_titles, links))
         return out
 
     @staticmethod
