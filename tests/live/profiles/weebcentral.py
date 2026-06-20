@@ -90,6 +90,17 @@ LIVE_SMOKE = LiveSmokeProfile(
     max_releases_to_try=3,
     min_releases_returned=1,
     expected_release_pattern={"sourceKey": "weebcentral", "id_field": "series_id"},
+    # External tracker links (Phase 13, D-08 / R7). RESEARCH-frozen canary IDs
+    # for *Solo Leveling*: WeebCentral's Track section exposes only AniList +
+    # MangaUpdates as full URLs (normalized to bare ids); ``Official Source`` is
+    # dropped (no canonical map entry, R3). NOTE: ``default_query`` above is
+    # "one piece" (download-leg canary), NOT Solo Leveling — Task 3 (nightly)
+    # must reconcile: repoint the links-canary or confirm/repin these IDs
+    # against whatever ``default_query`` returns live.
+    expected_external_links={
+        "anilist": "105398",
+        "mangaUpdates": "6z1uqw7",
+    },
     fixture_drift_paths=[],
     perf_budget_s=None,
 )

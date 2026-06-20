@@ -73,6 +73,22 @@ LIVE_SMOKE = LiveSmokeProfile(
     max_releases_to_try=3,
     min_releases_returned=1,
     expected_release_pattern={"sourceKey": "atsumaru", "id_field": "manga_id"},
+    # External tracker links (Phase 13, D-08 / R7). RESEARCH-frozen canary IDs
+    # for *Solo Leveling* (id sVC2A): atsumaru's ``mangaPage.*`` fields expose
+    # the richest canonical set of the six sources. NOTE: ``default_query``
+    # above is "one piece" (download-leg canary), NOT Solo Leveling — Task 3
+    # (nightly) must reconcile: repoint the links-canary or confirm/repin these
+    # IDs against whatever ``default_query`` returns live.
+    expected_external_links={
+        "anilist": "105398",
+        "myAnimeList": "121496",
+        "mangaUpdates": "6z1uqw7",
+        "mangaBaka": "3397",
+        "kitsu": "54114",
+        "animePlanet": "solo-leveling",
+        "ann": "32926",
+        "kenmei": "solo-leveling",
+    },
     fixture_drift_paths=[],
     perf_budget_s=None,
 )

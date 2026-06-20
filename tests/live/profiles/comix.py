@@ -53,6 +53,17 @@ LIVE_SMOKE = LiveSmokeProfile(
     # D-46 — Comix releases carry hid as the canonical series identifier;
     # the release pattern doc-flags the field for the smoke modules.
     expected_release_pattern={"sourceKey": "comix", "id_field": "hid"},
+    # External tracker links (Phase 13, D-08 / R7). SEEDED EMPTY — comix is
+    # frozen at the FIRST GREEN NIGHTLY (RESEARCH §Live-smoke): the keyword-
+    # search XHR is token-gated/headless-blocked offline, so the canary's exact
+    # live ``links`` IDs cannot be captured here. While empty,
+    # ``test_external_links_smoke`` SKIPS comix (not fails). TASK 3 (nightly):
+    # read comix's live ``test_search`` output for ``default_query="Forgotten
+    # Field"`` (hid mr3m0), capture its actual ``externalLinks`` (e.g.
+    # ``al``/``mal``/``mu``/``mb``; ``md`` only if non-null), pin them here, and
+    # re-run the gate + nightly until comix's assertion is GREEN. comix MUST be
+    # pinned NON-EMPTY before the phase closes (R7 = all six).
+    expected_external_links={},
     fixture_drift_paths=[
         _FIXTURE_DIR / "chapter_9001596_pages.json",
         _FIXTURE_DIR / "search_the_forgotten_field.json",
