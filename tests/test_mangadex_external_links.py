@@ -171,7 +171,9 @@ async def test_zero_added_http() -> None:
 
 @pytest.mark.asyncio
 async def test_all_releases_share_identical_object() -> None:
-    chapters = [_chapter(chapter_id=f"c{n}", number=n, links=_RAW_LINKS) for n in (1, 2, 3)]
+    chapters = [
+        _chapter(chapter_id=f"c{n}", number=n, links=_RAW_LINKS) for n in (1, 2, 3)
+    ]
     ctx = _ctx(chapters=chapters)
     releases = await _search(ctx)
     assert len(releases) == 3

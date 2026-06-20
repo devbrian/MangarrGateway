@@ -20,13 +20,14 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
+from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
-    from ..models.search import SearchRequest
+    from ..models.search import ExternalLinks, SearchRequest
 
 # Bound a title search's candidate manga. The count is mode-invariant: interactive
 # no longer widens the fan-out (#162). Exact-match queries already collapse to ~1
@@ -139,6 +140,22 @@ class MangaDexSource(Source):
                 return self._build_enumeration(chapters)
 
             enum = await ctx.cached_enumerate(enum_key, _feed_fn)
+            # Phase-13 (R4/R5): the series' tracker links ride the SAME cached feed —
+            # the ``includes[]=manga`` expansion carries ``attributes.links`` on every
+            # row (Pitfall 3), so we read the first row that has them and stash the raw
+            # dict on the per-request scratch map (ZERO added HTTP — no ``/manga/{id}``
+            # fetch). ``resolve_external_links`` then parses it ONCE per series (the
+            # framework owns the cache/timeout/swallow), and the single resolved object
+            # is stamped onto every release below (identical-object, R4). The
+            # default-arg idiom binds ``manga_id`` to dodge the loop-var closure bug.
+            raw_links = self._extract_raw_links(enum.items)
+            if raw_links is not None:
+                ctx.external_links_raw[manga_id] = raw_links
+
+            async def _parse_links(_mid: str = manga_id) -> ExternalLinks | None:
+                return await self.fetch_external_links(_mid, ctx)
+
+            links = await ctx.resolve_external_links(manga_id, _parse_links)
             # CACHE-02: the chapter_matches floor filter + the req.offset window are
             # applied AFTER the cache (at the enumeration boundary), exactly like comix
             # — never baked into the cache key. Under type=chapter+chapter this keeps
@@ -152,6 +169,10 @@ class MangaDexSource(Source):
                 if (rel := self._to_release(manga_id, chapter, ctx)) is not None
                 and self.chapter_matches(req, rel.chapter_number)
             ]
+            # Stamp the single resolved ExternalLinks (or None) onto every release of
+            # the series — all N share the identical object (R4).
+            for rel in matched:
+                rel.external_links = links
             releases.extend(matched[req.offset :] if req.offset else matched)
         return releases
 
@@ -395,6 +416,45 @@ class MangaDexSource(Source):
             exhausted=True,
             requested_limit=len(chapters),
         )
+
+    # ─────────────────────────── External tracker links ─────────────────────────
+
+    async def fetch_external_links(
+        self, series_id: str, ctx: SourceContext
+    ) -> ExternalLinks | None:
+        """Parse the cached manga-rel ``attributes.links`` → canonical links (D-01/R5).
+
+        PARSING ONLY (zero added HTTP): reads the raw links dict stashed during
+        ``search`` on ``ctx.external_links_raw`` (lifted off the ``includes[]=manga``
+        feed expansion, Pitfall 3) and routes it through the shared normalizer. Returns
+        ``None`` when the series carried no tracker links. The framework owns the
+        resolve-once cache + best-effort timeout/swallow (``resolve_external_links``).
+        """
+        raw = ctx.external_links_raw.get(series_id)
+        if not raw:
+            return None
+        return normalize(raw, "mangadex")
+
+    @classmethod
+    def _extract_raw_links(
+        cls, chapters: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """First manga-rel ``attributes.links`` dict in the cached feed, else ``None``.
+
+        The ``includes[]=manga`` expansion carries ``attributes.links`` identically on
+        every chapter row (Pitfall 3), so the first row with a dict ``links`` is the
+        series' tracker map — read with ZERO added HTTP (it rides the cached feed).
+        """
+        for chapter in chapters:
+            if not isinstance(chapter, dict):
+                continue
+            manga_attrs = cls._relationship_attrs(chapter, "manga")
+            if manga_attrs is None:
+                continue
+            links = manga_attrs.get("links")
+            if isinstance(links, dict):
+                return links
+        return None
 
     # ─────────────────────────── Release normalization ───────────────────────────
 
