@@ -1092,7 +1092,13 @@ class ComixSource(Source):
         # ceiling. Per-series windowing to ``req.limit`` still bounds handle minting
         # (the merged top-``limit`` can never need more than ``limit`` from any one
         # series) without starving a >100-chapter series.
-        result_window = req.limit or _MAX_FEED_LIMIT
+        #
+        # 260620-ki0 (CodeRabbit): clamp non-negative. A negative ``req.limit`` would
+        # otherwise leave ``result_window`` negative and turn the
+        # ``chapters[: offset + result_window]`` bound into a Python negative slice,
+        # minting all-but-last as dropped handles even though the route clamps limit
+        # and returns an empty page. A zero limit windows to 0 (route returns empty).
+        result_window = max(req.limit, 0)
 
         # Layer 2 (CACHE-02/03): cache the UNFILTERED, newest-first raw chapter list
         # per (series_hid, languages). The browser-DOM read is the SINGLE biggest cost

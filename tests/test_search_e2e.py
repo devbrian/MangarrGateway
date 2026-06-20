@@ -575,6 +575,7 @@ def _offset_feed_payload(manga_id: str) -> dict:
         (2, 2, [Decimal("3"), Decimal("2")]),  # non-overlapping window past page 1
         (10, 2, []),  # past-the-end → empty window, 200 (not error/wraparound)
         (-5, 2, [Decimal("5"), Decimal("4")]),  # negative clamped to 0 at the route
+        (0, -1, []),  # negative limit clamped to 0 at the route → empty page
     ],
 )
 async def test_search_applies_offset_to_merged_window(
