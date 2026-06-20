@@ -174,7 +174,7 @@ def normalize(raw: dict[str, Any] | None, source_key: str) -> ExternalLinks | No
         if not value:
             continue
         if re.search(  # hard R2 choke point — a URL must never reach the wire
-            r"(?i)\bhttps?://", value
+            r"(?i)https?://", value
         ):
             continue
         kwargs[canonical_key] = value

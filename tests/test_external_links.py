@@ -213,6 +213,24 @@ def test_normalize_keeps_bare_http_substring_without_scheme() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "xhttp://attacker.example/9",  # word-char prefix, lower-case
+        "xHTTPS://attacker.example/9",  # word-char prefix, upper-case
+        "123http://attacker.example/9",  # digit prefix
+        "prefixhttps://evil.example/9",  # text prefix
+    ],
+)
+def test_normalize_drops_word_char_prefixed_url(hostile: str) -> None:
+    """R2 hardening (CR #289 follow-up): a ``http(s)://`` scheme preceded by a word
+    character (``xhttp://``, ``123http://``) must STILL be dropped. The earlier
+    ``\\bhttps?://`` guard required a word boundary before the scheme and so leaked
+    these; the boundary-free ``https?://`` catches the scheme anywhere in the value.
+    """
+    assert normalize({"anilistId": hostile}, "atsumaru") is None
+
+
 # ─────────────────────────── normalizer: empty / all-dropped ───────────────────────
 
 
