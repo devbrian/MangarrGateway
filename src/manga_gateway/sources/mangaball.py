@@ -703,12 +703,20 @@ class MangaBallSource(Source):
                         f"{sanitized!r} also blocked); no results returned",
                     )
                     return []
-                # Recovered: the sanitized retry succeeded. Log the rate (no response
-                # warning — results WERE returned, so it is not a partial failure).
+                # Recovered: the sanitized retry succeeded. Still surface a soft
+                # warning (D-14 partial success) — the results are for a DEGRADED query
+                # (the trigger token was dropped), so the API response discloses the
+                # fallback rather than passing approximate matches off as an exact-query
+                # result. Rides the success path → warnings[], never the cooldown.
                 _log.info(
                     "mangaball WAF-blocked query %r; sanitized retry %r recovered",
                     original,
                     sanitized,
+                )
+                ctx.warn(
+                    "waf_blocked",
+                    f"mangaball WAF blocked search {original!r}; returned results for "
+                    f"sanitized query {sanitized!r}",
                 )
             titles, _pagination = _items_and_pagination(body)
 

@@ -313,7 +313,9 @@ async def test_recovered_waf_does_not_feed_fanout_cooldown() -> None:
 
     releases, warnings = await fan_out([source], run_one, cooldown=cd)
     assert releases  # the recovered search returned results through fan_out
-    assert warnings == []  # no warning — the source absorbed the waf_blocked
+    # No collect_warnings here → soft ctx.warn warnings are not pulled; what matters
+    # is that fan_out synthesizes NO hard (cooldown-feeding) warning for a recovery.
+    assert warnings == []
     assert cd.in_cooldown("mangaball") is False  # cooldown never fed
 
 
@@ -388,16 +390,17 @@ async def test_sanitized_retry_still_blocked_surfaces_soft_warning() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recovered_waf_emits_no_soft_warning() -> None:
-    # A recovered block returned results → it is NOT a partial failure, so it adds NO
-    # response warning (log-only). Keeps the response clean on the common path.
+async def test_recovered_waf_surfaces_soft_warning() -> None:
+    # A recovered block returned results, but for a DEGRADED (sanitized) query — so it
+    # STILL surfaces a soft warning disclosing the fallback (results are approximate,
+    # not an exact-query match). The warning rides the success path → no cooldown.
     transport = _source_transport(search_responses=[_waf_403(), _titles_200()])
     ctx = _ctx(transport)
     releases = await MangaBallSource().search(
         SearchRequest(type="manga", query="Solo Leveling System"), ctx
     )
     assert releases  # recovered
-    assert _waf_warnings(ctx) == []
+    assert len(_waf_warnings(ctx)) == 1
 
 
 @pytest.mark.asyncio
