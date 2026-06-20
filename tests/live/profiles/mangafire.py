@@ -88,16 +88,16 @@ LIVE_SMOKE = LiveSmokeProfile(
     max_releases_to_try=3,
     min_releases_returned=1,
     expected_release_pattern={"sourceKey": "mangafire", "id_field": "mangafireMangaId"},
-    # External tracker links (Phase 13, D-08 / R7). RESEARCH-frozen canary IDs
-    # for *Berserk* (``berserkk.m2vv``): MangaFire's ``<script id="syncData">``
-    # JSON exposes only AniList + MyAnimeList (``manga_id`` is its OWN internal
-    # id and is dropped, R3). NOTE: ``default_query`` above is "blue lock"
-    # (download-leg canary), NOT Berserk — Task 3 (nightly) must reconcile:
-    # repoint the links-canary or confirm/repin these IDs against whatever
-    # ``default_query`` returns live.
+    # External tracker links (Phase 13, D-08 / R7). REPINNED to the live
+    # ``default_query="blue lock"`` title (USER DECISION, 2026-06-19): MangaFire's
+    # ``<script id="syncData">`` JSON exposes only AniList + MyAnimeList
+    # (``manga_id`` is its OWN internal id and is dropped, R3). Captured live
+    # 2026-06-19 via a headed Patchright CF clear — the Blue Lock release returns
+    # these two keys consistently. (The prior Berserk pins were for a DIFFERENT
+    # title than default_query and could never pass — dropped.)
     expected_external_links={
-        "anilist": "30002",
-        "myAnimeList": "2",
+        "anilist": "106130",
+        "myAnimeList": "114745",
     },
     fixture_drift_paths=[],
     perf_budget_s=None,
