@@ -1213,6 +1213,10 @@ class ComixSource(Source):
             releases.extend(series_releases)
         return releases
 
+    # IN-02: unlike the other five sources, comix recent() DOES populate
+    # Release.externalLinks — the tokenized /api/v1/manga feed carries the same
+    # per-item ``links`` dict search uses, so they ride through with NO added HTTP
+    # (WR-01).
     async def recent(
         self,
         *,

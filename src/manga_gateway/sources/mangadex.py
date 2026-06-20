@@ -176,6 +176,10 @@ class MangaDexSource(Source):
             releases.extend(matched[req.offset :] if req.offset else matched)
         return releases
 
+    # IN-02: recent() intentionally does NOT populate Release.externalLinks. MangaDex's
+    # recent feed does not carry tracker links in the response, so there is no zero-cost
+    # source for them on this path; interactive search() does carry them. See review
+    # finding IN-02 if a future phase needs externalLinks on recent rows.
     async def recent(
         self,
         *,

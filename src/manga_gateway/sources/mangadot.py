@@ -470,6 +470,10 @@ class MangadotSource(Source):
                 releases.append(rel)
         return releases
 
+    # IN-02: recent() intentionally does NOT populate Release.externalLinks. Mangadot is
+    # a DETAIL-FETCH source — populating links would cost one detail GET per distinct
+    # series in the recent feed (not guarded by the resolve-once cache), a deliberate
+    # trade-off; interactive search() carries them. See review finding IN-02.
     async def recent(
         self,
         *,

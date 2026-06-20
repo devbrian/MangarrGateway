@@ -391,6 +391,10 @@ class AtsumaruSource(Source):
 
     # ─────────────────────────────── recent ──────────────────────────────────
 
+    # IN-02: recent() intentionally does NOT populate Release.externalLinks. Atsumaru's
+    # recent feed does not carry tracker links in the response, so there is no zero-cost
+    # source for them on this path; interactive search() does carry them. See review
+    # finding IN-02 if a future phase needs externalLinks on recent rows.
     async def recent(
         self,
         *,
