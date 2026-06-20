@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import posixpath
 import re
 from collections.abc import Coroutine
@@ -56,13 +57,14 @@ from PIL import Image, UnidentifiedImageError
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
+from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
-    from ..models.search import SearchRequest
+    from ..models.search import ExternalLinks, SearchRequest
 
 # ── SSRF allowlist (host-agnostic; copy the mangaball/weebcentral shape, D-10) ──
 # The page-image host is NEVER pinned (it varies per content), so the meaningful
@@ -346,6 +348,30 @@ def _parse_chapter_list(html: str) -> list[dict[str, Any]]:
     return out
 
 
+def _parse_sync_data(html: bytes | str) -> dict[str, Any]:
+    """Parse the detail page's ``<script id="syncData">`` JSON → raw tracker dict.
+
+    The detail page embeds a single ``<script id="syncData">{…}</script>`` whose body
+    is a JSON object carrying ``anilist_id`` + ``mal_id`` (plus internal keys the
+    normalizer drops). Per RESEARCH Pitfall 6 the WHOLE script body is JSON-parsed —
+    NOT regexed per-id — so a shape change surfaces as a parse miss, not silent
+    mis-extraction.
+
+    On ANY miss (no script, empty body, malformed JSON, non-object) this RAISES — the
+    framework best-effort wrapper (``resolve_external_links``) owns the swallow-to-
+    ``None`` so the chapter releases still return (R6). lxml + ``json.loads`` are
+    blocking, so this runs under ``asyncio.to_thread`` (ruff ASYNC, no loop blocking).
+    """
+    doc = lxml.html.fromstring(html)
+    scripts = doc.xpath("//script[@id='syncData']")
+    if not scripts:
+        raise ValueError("no syncData script on detail page")
+    data = json.loads(scripts[0].text_content())
+    if not isinstance(data, dict):
+        raise ValueError("syncData is not a JSON object")
+    return data
+
+
 def _parse_cards(html: bytes | str) -> list[dict[str, Any]]:
     """Parse ``.original.card-lg .unit .inner`` cards → ``[{href,title,thumbnail}]``.
 
@@ -587,7 +613,7 @@ class MangaFireSource(Source):
                 ctx.cached_enumerate_key(slug_id, [lang]),
                 _enum_fn,
             )
-            return self._chapters_to_releases(
+            releases = self._chapters_to_releases(
                 enum.items,
                 manga_token,
                 manga_title,
@@ -596,6 +622,21 @@ class MangaFireSource(Source):
                 ctx,
                 req,
             )
+
+            # Phase-13 (R4/R6/D-02): resolve the series' tracker links ONCE via the
+            # framework wrapper (resolve-once cache + 5s timeout + swallow-all, D-03),
+            # keyed on ``manga_token`` (the stable ``{slug}.{id}`` id that also builds
+            # the detail URL), then stamp the single resolved object onto every release
+            # of the series (identical-object, R4). The detail URL is built from the
+            # gateway-internal ``manga_token`` (this source's OWN card href), never
+            # client input (SSRF-safe, T-13-01).
+            async def _parse_links(t: str = manga_token) -> ExternalLinks | None:
+                return await self.fetch_external_links(t, ctx)
+
+            links = await ctx.resolve_external_links(manga_token, _parse_links)
+            for rel in releases:
+                rel.external_links = links
+            return releases
 
         tasks: list[Coroutine[Any, Any, list[Release]]] = []
         for card in candidates:
@@ -615,6 +656,28 @@ class MangaFireSource(Source):
         for chunk in results:
             releases.extend(chunk)
         return releases
+
+    async def fetch_external_links(
+        self, series_id: str, ctx: SourceContext
+    ) -> ExternalLinks | None:
+        """One best-effort detail GET → ``{anilist, myAnimeList}`` (D-02/R6).
+
+        Issues a SINGLE ``GET /manga/{series_id}`` (the detail HTML page) through the
+        framework transport + the source's anti-bot session, parses the
+        ``<script id="syncData">`` JSON off-loop (``asyncio.to_thread`` — lxml +
+        ``json.loads`` are blocking), and routes it through the shared normalizer,
+        which keeps ONLY ``anilist_id``/``mal_id`` and drops MangaFire's internal keys
+        (``manga_id``/``page``/…).
+
+        ``series_id`` is the gateway-internal ``manga_token`` (this source's OWN search
+        card href), so the URL is never a Mangarr-supplied value (SSRF-safe, T-13-01).
+        NO try/except/timeout here — the framework wrapper owns resolve-once + the 5s
+        timeout + swallow-all-to-``None`` (D-03); a raising/slow GET or an
+        absent/malformed ``syncData`` leaves the chapter releases intact (R6).
+        """
+        html = await ctx.get_bytes(f"{self.base_url}/manga/{series_id}")
+        sync_data = await asyncio.to_thread(_parse_sync_data, html)
+        return normalize(sync_data, "mangafire")
 
     def _chapters_to_releases(
         self,
