@@ -135,6 +135,32 @@ def is_csrf_failure(resp: httpx.Response) -> bool:
     return b"csrf" in body and (b"token" in body or b"validation" in body)
 
 
+def is_waf_block(resp: httpx.Response) -> bool:
+    """True when ``resp`` is a WAF "malicious payload" false-positive block (D-03).
+
+    The query-rewrite sibling of :func:`is_cf_challenge` / :func:`is_csrf_failure`:
+    mangaball.net sits behind a WAF that returns a 403 carrying
+    ``{"error":"Malicious payload detected", … "code":403}`` for ANY search POST whose
+    ``search_input`` contains a SQL-injection-flavoured token (the literal word
+    "System" is the one live-confirmed trigger). The word is extremely common in
+    manhwa titles, so the block is a false positive the source can recover from by
+    stripping the trigger token and retrying — hence a distinct, catchable signal
+    rather than a terminal ``source_unavailable``.
+
+    Cheap and defensive: the status guard fires FIRST (a 200 carrying the marker words
+    or any 5xx is NOT a WAF block), then a literal ``b"Malicious payload"`` substring
+    match against the raw body (no JSON parse — tolerant of body/escaping variations).
+    A plain 403 (no marker) and a CSRF-failure 403 both return False, so they stay on
+    their existing terminal/CSRF-reconcile paths untouched.
+
+    mangaball-scoped: it is the ONLY source that returns the ``Malicious payload``
+    body, so no other source can ever trigger this predicate.
+    """
+    if resp.status_code != 403:
+        return False
+    return b"Malicious payload" in resp.content
+
+
 def _is_retryable(exc: BaseException) -> bool:
     """Retry transport errors and 5xx responses; never permanent 4xx (Pattern 3).
 
@@ -648,8 +674,14 @@ class SourceContext:
                     op="post_json",
                 )
                 result = self._parse_json_object(body)
-            except SourceError:
-                self._feed_failure()
+            except SourceError as exc:
+                # 260620-5yq: a ``waf_blocked`` is a recoverable soft signal the source
+                # absorbs (sanitize-and-retry), so it records NO source-health failure —
+                # every other code feeds health byte-for-byte as before. Always re-raise
+                # so the source still sees the signal (tenacity does not retry a
+                # SourceError, so it surfaces after exactly ONE transport call).
+                if exc.code != "waf_blocked":
+                    self._feed_failure()
                 raise
             self._feed_success()
             return result
@@ -989,6 +1021,19 @@ class SourceContext:
                     resp.status_code,
                 )
         if resp.status_code in _PERMANENT_STATUSES:
+            # D-03 (260620-5yq): a WAF "malicious payload" 403 is a recoverable
+            # false positive the SOURCE owns (strip the trigger token + retry), so
+            # mint a DISTINCT ``waf_blocked`` code BEFORE the generic terminal raise.
+            # This runs AFTER the CF/CSRF reconcile branches above (both False for the
+            # WAF body), so their behaviour is untouched; every other 403/401/404 still
+            # raises the unchanged ``source_unavailable`` (mangaball-scoped — it is the
+            # only source returning the ``Malicious payload`` body).
+            if is_waf_block(resp):
+                raise SourceError(
+                    "waf_blocked",
+                    "upstream WAF block (sanitizable query)",
+                    status=resp.status_code,
+                )
             raise SourceError(
                 "source_unavailable",
                 f"upstream {resp.status_code}",
