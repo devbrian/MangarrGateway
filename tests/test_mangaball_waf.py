@@ -426,3 +426,38 @@ async def test_unrecovered_waf_warning_surfaces_via_fanout_without_cooldown() ->
     assert releases == []
     assert ("mangaball", "waf_blocked") in [(k, c) for k, c, _ in warnings]
     assert cd.in_cooldown("mangaball") is False  # surfaced, but NOT a cooldown failure
+
+
+@pytest.mark.asyncio
+async def test_absorbed_waf_never_feeds_a_preexisting_cooldown_streak() -> None:
+    # Regression for the "no cooldown impact" invariant with PRE-EXISTING state: a WAF
+    # block must never FEED/trip the cooldown, even when a real failure streak is
+    # already building. A WAF 403 is only returned when the server is REACHABLE (it
+    # served the 403), so the absorbed return is a genuine success — it resets the
+    # streak exactly like any legit empty/successful result. (Raising instead would
+    # hit fan_out's except branch → record_failure → FEED the cooldown: the opposite
+    # of intended.)
+    cd = SourceFailureCooldown(base_seconds=30, max_seconds=600, clock=lambda: 0.0)
+    cd.record_failure("mangaball")  # pre-seed streak=1 (still live — #292 opens at 2)
+    assert cd.in_cooldown("mangaball") is False
+
+    source = MangaBallSource()
+    # Unrecovered: both the original and the sanitized retry WAF-block → absorbed [].
+    transport = _source_transport(search_responses=[_waf_403(), _waf_403()])
+    ctx = _ctx(transport)
+
+    async def run_one(src: MangaBallSource) -> list[Any]:
+        return await src.search(
+            SearchRequest(type="manga", query="Solo Leveling System"), ctx
+        )
+
+    releases, _ = await fan_out(
+        [source], run_one, collect_warnings=lambda src: list(ctx.warnings), cooldown=cd
+    )
+    assert releases == []
+    # The WAF block did NOT feed the cooldown — not tripped.
+    assert cd.in_cooldown("mangaball") is False
+    # Intended: the absorbed (successful) return reset the streak, so the next ISOLATED
+    # real failure starts fresh and does NOT trip at "2".
+    cd.record_failure("mangaball")
+    assert cd.in_cooldown("mangaball") is False
