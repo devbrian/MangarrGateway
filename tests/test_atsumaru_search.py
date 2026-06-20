@@ -342,7 +342,7 @@ async def test_fetch_page_meta_happy_and_best_effort() -> None:
     }
     # A fetch error is swallowed → ({}, {}) (both advisory, never fail enumeration).
     assert await src._fetch_page_meta("m", _PageCtx("raise")) == ({}, {})  # type: ignore[arg-type]
-    # Malformed shapes all degrade to ({}, {}) — incl. a non-dict body (CodeRabbit #185).
+    # Malformed shapes all degrade to ({}, {}) — incl. non-dict body (CodeRabbit #185).
     for bad in (
         {},
         {"mangaPage": {}},
