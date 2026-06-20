@@ -170,8 +170,10 @@ def _select_host_clearance(
     for cookie in cookies:
         if cookie.get("name") == _CLEARANCE_COOKIE and _belongs_to_host(cookie, host):
             value = cookie.get("value")
+            # Skip a malformed host match (empty/non-string value) and keep scanning —
+            # a later host-scoped cf_clearance in the same payload may be valid.
             if not isinstance(value, str) or not value:
-                return None
+                continue
             return ClearanceCookie(value=value, expires=_cookie_expires(cookie))
     return None
 
