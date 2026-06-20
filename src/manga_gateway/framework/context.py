@@ -28,11 +28,12 @@ client or any change to the MangaDex path (R1):
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import tenacity
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
 
     from ..handles.store import HandleStore
     from ..models.caps import AntibotLevel
+    from ..models.search import ExternalLinks
     from .antibot import AntiBotSolver
     from .enum_cache import CacheKey, Enumeration, EnumerationCache
     from .health import SourceHealth
@@ -59,6 +61,14 @@ if TYPE_CHECKING:
 
 # Permanent (non-retryable) upstream statuses — STOP, do not retry (Pattern 3).
 _PERMANENT_STATUSES = (401, 403, 404)
+
+# Phase-13 best-effort budget for external-tracker link resolution (D-03). 5.0s
+# comfortably covers a normal detail GET + one short tenacity backoff while leaving
+# ~25s of the 30s per-source fan-out budget for the (load-bearing) chapter
+# enumeration; kept under the tenacity ``max=8`` backoff so a hung link fetch can
+# never become the binding cost. A slow/hung fetch trips ``asyncio.timeout`` and is
+# swallowed to ``None`` (chapters return unaffected, R6).
+_EXTERNAL_LINKS_TIMEOUT_S = 5.0
 
 # limiter-wait metric threshold (Open Question 2): only emit a ``limiter-wait``
 # event when the acquire actually blocked longer than this — a token-bucket
@@ -202,6 +212,14 @@ class SourceContext:
         # and threads it onto the per-source ``source-result`` metric event.
         # ``None`` for sources that do not deep-enumerate.
         self.candidates_enumerated = candidates_enumerated
+        # Phase-13 per-request external-links scratch map (D-01/D-02). A FREE source
+        # (Comix/MangaDex/Atsumaru) stashes the raw per-series tracker-link dict it
+        # already fetched during ``search`` here, keyed by series id, so its
+        # zero-HTTP ``fetch_external_links`` reads it back with no second fetch.
+        # ``ctx`` is per-request (search.py builds a fresh ctx per source), so this
+        # mirrors the per-request public ``expected_pages``/``candidates_enumerated``
+        # attrs above — it is scratch state, never cross-request shared.
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
         # Phase-9 enumeration-cache seam (CACHE-01, default-off → MangaDex/Comix and
         # every non-app unit test stay byte-for-byte unchanged, matching the
         # solver/session_prep default-None seams). ONE process-wide EnumerationCache
@@ -422,6 +440,38 @@ class SourceContext:
         if self._enum_cache is None:
             return await fetch_fn()
         return await self._enum_cache.cached_resolve(key, fetch_fn)
+
+    async def resolve_external_links(
+        self,
+        series_id: str,
+        parse_fn: Callable[[], Awaitable[ExternalLinks | None]],
+    ) -> ExternalLinks | None:
+        """Best-effort, resolve-once-per-``(sourceKey, seriesId)`` tracker links
+        (D-01/D-03).
+
+        The single framework owner of the best-effort contract so sources stay
+        parse-only (SRC-01/02): ``parse_fn`` (the source's ``fetch_external_links``)
+        runs inside an :func:`asyncio.timeout` bound at
+        :data:`_EXTERNAL_LINKS_TIMEOUT_S`, and ALL exceptions — including
+        ``TimeoutError`` — are swallowed to ``None`` so a slow/hung/failing link fetch
+        never fails or stalls the search (chapter releases return unaffected, R6).
+
+        Mirrors :meth:`cached_resolve`: keyed on ``(sourceKey, "extlinks:"+seriesId)``
+        via :meth:`cached_resolve_key`, so a repeat search for the same series is a
+        HIT with no re-parse/no HTTP/no token (R4). With ``enum_cache=None`` (the
+        default seam) ``cached_resolve`` is the bare pass-through, so the wrapper still
+        applies the timeout + swallow even with no cache wired.
+        """
+
+        async def _guarded() -> ExternalLinks | None:
+            try:
+                async with asyncio.timeout(_EXTERNAL_LINKS_TIMEOUT_S):
+                    return await parse_fn()
+            except Exception:  # noqa: BLE001 — best-effort: links are advisory (D-03)
+                return None
+
+        key = self.cached_resolve_key(f"extlinks:{series_id}", [])
+        return cast("ExternalLinks | None", await self.cached_resolve(key, _guarded))
 
     def cache_replace(self, key: CacheKey, enum: Enumeration) -> None:
         """Overwrite the Layer-2 window after a completeness-driven deeper refetch

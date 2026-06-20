@@ -21,7 +21,7 @@ from ..models.caps import AntibotLevel, SourceCap
 if TYPE_CHECKING:
     from decimal import Decimal
 
-    from ..models.search import Release, SearchRequest
+    from ..models.search import ExternalLinks, Release, SearchRequest
     from .context import SourceContext
     from .health import SourceHealth
 
@@ -190,3 +190,24 @@ class Source(ABC):
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's raw bytes through the shared session (PKG-02)."""
         ...
+
+    async def fetch_external_links(
+        self, series_id: str, ctx: SourceContext
+    ) -> ExternalLinks | None:
+        """Resolve series-level external tracker links (D-01) — PARSING ONLY.
+
+        Non-abstract, default-``None`` opt-out hook (Phase 13). A source that exposes
+        cross-reference tracker IDs overrides this to PARSE already-fetched/cached data
+        (FREE: Comix/MangaDex/Atsumaru) or perform ONE series-level detail GET
+        (DETAIL-FETCH: Mangadot/WeebCentral/MangaFire) and return an
+        :class:`~manga_gateway.models.search.ExternalLinks` via
+        ``framework/external_links.normalize``. The source implements ONLY the parse —
+        the framework owns resolve-once-per-``(sourceKey, seriesId)`` caching, the
+        best-effort ``asyncio.timeout`` bound, and the swallow-all-errors-to-``None``
+        contract (D-03), all in :meth:`SourceContext.resolve_external_links`.
+
+        Returning ``None`` (the default) means "no tracker links" — every existing
+        source that does NOT override this (mangaball, kagane) is unaffected: no new
+        abstract method, no required change.
+        """
+        return None
