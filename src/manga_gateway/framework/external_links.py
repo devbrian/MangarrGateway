@@ -173,7 +173,9 @@ def normalize(raw: dict[str, Any] | None, source_key: str) -> ExternalLinks | No
         value = extractor(raw[raw_key])
         if not value:
             continue
-        if "http" in value:  # hard R2 choke point — a URL must never reach the wire
+        if re.search(  # hard R2 choke point — a URL must never reach the wire
+            r"(?i)\bhttps?://", value
+        ):
             continue
         kwargs[canonical_key] = value
     if not kwargs:

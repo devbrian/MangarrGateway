@@ -191,6 +191,28 @@ def test_normalize_never_emits_http(source_key: str) -> None:
         assert "http" not in value, f"{source_key} leaked a URL: {value!r}"
 
 
+def test_normalize_drops_uppercase_url_scheme() -> None:
+    """R2 hardening (CR #289): the choke point is scheme-aware + case-insensitive,
+    so an upper-case ``HTTPS://`` value — which the old bare ``"http" in value``
+    (lower-case substring) guard would have leaked to the wire — is dropped.
+
+    ``anilistId`` uses ``pass_through`` (no URL->ID extraction), so a hostile
+    upper-case URL value reaches the choke point verbatim and MUST be dropped.
+    """
+    assert normalize({"anilistId": "HTTPS://evil.example/123"}, "atsumaru") is None
+
+
+def test_normalize_keeps_bare_http_substring_without_scheme() -> None:
+    """R2 hardening (CR #289): a benign value that merely CONTAINS the substring
+    ``http`` but carries no ``http(s)://`` scheme is NOT a URL and must survive —
+    the old bare-substring guard false-dropped it."""
+    result = normalize({"anilistId": "myhttpmanga"}, "atsumaru")
+    assert result is not None
+    assert result.model_dump(by_alias=True, exclude_none=True) == {
+        "anilist": "myhttpmanga"
+    }
+
+
 # ─────────────────────────── normalizer: empty / all-dropped ───────────────────────
 
 
