@@ -198,6 +198,13 @@ def test_normalize_empty_input_is_none() -> None:
     assert normalize({}, "comix") is None
 
 
+def test_normalize_none_input_is_none() -> None:
+    # IN-03: a None ``raw`` (cache miss) short-circuits to None, never TypeErrors —
+    # so a source can drop its ``or {}`` guard and pass the .get() result straight in.
+    assert normalize(None, "atsumaru") is None
+    assert normalize(None, "comix") is None
+
+
 def test_normalize_all_dropped_is_none() -> None:
     # Only non-mapped storefront keys present -> nothing survives -> None.
     assert normalize({"amz": "x", "raw": "y"}, "mangadex") is None

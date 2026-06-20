@@ -635,7 +635,9 @@ class AtsumaruSource(Source):
         normalizer — ``None`` when the series carried no tracker fields. The framework
         owns the resolve-once cache + best-effort timeout/swallow.
         """
-        return normalize(ctx.external_links_raw.get(series_id) or {}, "atsumaru")
+        # IN-03: ``normalize`` short-circuits a falsy ``raw`` (cache miss → ``None``)
+        # to ``None`` itself, so the ``or {}`` guard is unnecessary — pass through.
+        return normalize(ctx.external_links_raw.get(series_id), "atsumaru")
 
     @classmethod
     def _language_wanted(cls, languages: list[str] | None) -> bool:

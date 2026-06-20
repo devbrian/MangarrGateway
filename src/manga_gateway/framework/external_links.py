@@ -147,7 +147,7 @@ _SOURCE_MAPS: dict[str, dict[str, tuple[str, Callable[[Any], str | None]]]] = {
 }
 
 
-def normalize(raw: dict[str, Any], source_key: str) -> ExternalLinks | None:
+def normalize(raw: dict[str, Any] | None, source_key: str) -> ExternalLinks | None:
     """Map a source's raw tracker dict onto canonical bare-ID ``ExternalLinks``.
 
     Walks ``source_key``'s frozen map: for each raw key present, applies the extractor,
@@ -156,7 +156,13 @@ def normalize(raw: dict[str, Any], source_key: str) -> ExternalLinks | None:
     absent from the map and dropped (R3). Returns an :class:`ExternalLinks` if any
     canonical key survived, else ``None`` (an all-dropped / empty input -> ``None``,
     so the release's ``externalLinks`` is omitted, D-07).
+
+    A falsy ``raw`` (``None`` from a cache miss, or an empty dict) short-circuits to
+    ``None`` — so a source can pass ``ctx.external_links_raw.get(series_id)`` straight
+    through with no ``or {}`` guard (IN-03).
     """
+    if not raw:
+        return None
     source_map = _SOURCE_MAPS.get(source_key)
     if source_map is None:
         return None
