@@ -214,14 +214,17 @@ async def test_paginate_all_walk_spans_multiple_feed_pages() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_offset_is_post_cache_slice_over_cached_feed() -> None:
-    """debug mangadex-search-not-cached: ``req.offset`` is a POST-cache slice over the
-    COMPLETE cached feed — NOT a walk-window discriminator that re-fetches.
+async def test_offset_agnostic_source_feed_still_hits_cache() -> None:
+    """260620-ki0: ``offset`` is a ROUTE concern — the source returns the
+    window-agnostic FULL cached feed regardless of offset, and a different offset still
+    HITs the cache (no re-fetch).
 
     The walk always paginate-all walks the whole feed from offset 0 and caches it
-    keyed on ``(manga_id, languages)`` ONLY. A second search with a different offset
-    therefore HITs the cache (zero new ``/chapter`` calls, mirroring comix/mangaball)
-    and the offset is applied to the cached releases.
+    keyed on ``(manga_id, languages)`` ONLY. Since per-source offset consumption was
+    removed (search.py now applies offset+limit on the merged list), the source returns
+    ALL chapters for any offset; a second search with a different offset therefore HITs
+    both cache layers (zero new ``/manga`` and ``/chapter`` calls, mirroring
+    comix/mangaball) and returns the identical full feed.
     """
     manga_id = str(uuid.uuid4())
     manga_route = respx.get(f"{MANGADEX}/manga").mock(
@@ -246,10 +249,10 @@ async def test_offset_is_post_cache_slice_over_cached_feed() -> None:
             SearchRequest(type="manga", query="Solo Leveling", offset=2), ctx
         )
         # Both layers HIT (same query AND window-agnostic Layer-2 key): NO new upstream
-        # calls. The offset=2 slice drops the first two ascending chapters post-cache.
+        # calls. offset is no longer consumed at the source — it returns the full feed.
         assert manga_route.call_count - manga_after == 0
         assert chapter_route.call_count - chapter_after == 0
-        assert sorted(str(r.chapter_number) for r in page2) == ["3", "4", "5"]
+        assert sorted(str(r.chapter_number) for r in page2) == ["1", "2", "3", "4", "5"]
     finally:
         await transport.aclose()
 

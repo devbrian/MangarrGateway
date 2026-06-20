@@ -227,10 +227,25 @@ async def search(
     # letting a high-volume source (e.g. mangaball/mangadot returning 50-250 hits)
     # silently starve sources after it of releases that exist upstream.
     sort_newest_first(releases)
-    # T-02-04: bound the total releases/handles a single search can mint. A title
-    # search fans across multiple candidate manga, so per-source/per-manga paging
-    # alone does not cap the merged total — truncate to the requested limit.
-    releases = releases[: req.limit]
+    # 260620-ki0: offset+limit are BOTH applied here, on the cross-source merged
+    # newest-first list — the single unified point that makes paging stable. offset
+    # was previously consumed per-source (mangadex sliced its ASCENDING feed before
+    # this re-sort → wrong window; comix sliced its own newest-first list →
+    # per-source-correct but not cross-source-unified). Slicing the merged list
+    # instead means a given (offset, limit) returns the same window regardless of how
+    # many sources or candidate manga contributed.
+    #
+    # T-02-04: limit still bounds the total releases/handles a single search can mint
+    # (a title search fans across multiple candidate manga, so per-source paging alone
+    # does not cap the merged total).
+    #
+    # Both are clamped non-negative at the route (mirroring recent.py:_parse_limit's
+    # defensive coerce — never 400-ing, and never letting Python negative-index slicing
+    # wrap around to return an unintended window). No ge=0 Field constraint is added to
+    # SearchRequest: that would turn negatives into 422s, a contract-observable change.
+    offset = max(req.offset, 0)
+    limit = max(req.limit, 0)
+    releases = releases[offset : offset + limit]
     warnings = [
         SourceWarning(source_key=key, code=code, message=message)
         for key, code, message in warning_tuples
