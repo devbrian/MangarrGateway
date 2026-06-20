@@ -151,6 +151,12 @@ class AndroidSolver:
         # Last-good clearance per source key (the D-35 hold — mirrors the browser
         # solver's persistent-context clearance reuse).
         self._held: dict[str, Clearance] = {}
+        # Per-source-key single-flight registry (#296): the in-flight ``_solve`` task
+        # for a key, so N concurrent callers for that key share ONE device hit instead
+        # of each firing their own against the single serialized redroid (which would
+        # cost ~N×~11s for one mint). Keyed by ``source_key`` with no global lock, so
+        # distinct keys get distinct tasks and one key's herd never blocks another.
+        self._inflight: dict[str, asyncio.Task[tuple[Clearance, float | None]]] = {}
         # Per-source wall-clock epoch expiry of the held clearance (only for keys whose
         # sidecar response carried a real cookie lifetime). Drives the proactive
         # refresh; a key absent here is refreshed only reactively (D-35 403 self-heal).
@@ -202,10 +208,43 @@ class AndroidSolver:
             if not solve_if_missing:
                 # On-demand peek with nothing held — do NOT block on a sidecar solve.
                 return None
-        clearance, expires_at = await self._solve(source_key)
+        clearance, expires_at = await self._coalesced_solve(source_key)
         self._held[source_key] = clearance
         self._record_expiry(source_key, expires_at)
         return clearance
+
+    async def _coalesced_solve(self, source_key: str) -> tuple[Clearance, float | None]:
+        """Single-flight the sidecar ``_solve`` per source key (#296).
+
+        Concurrent ``force_resolve`` / reactive / proactive-refresh callers for the
+        SAME key share ONE in-flight ``_solve`` task against the one redroid device
+        rather than each firing their own — the sidecar serializes them, so an
+        un-coalesced same-key herd would pay ~N×~11s for a single mint. Distinct keys
+        get distinct tasks (the registry is keyed by ``source_key`` with no global
+        lock), so one source's herd never head-of-line-blocks another (#296 isolation).
+
+        The shared task is awaited under :func:`asyncio.shield` so a single abandoned
+        / cancelled awaiter's cancellation cannot tear down the solve for the whole
+        herd — the shared task runs to completion in the background and its result (or
+        exception) fans out to every awaiter. A FAILED solve therefore propagates the
+        same exception to all awaiters and leaves the per-caller post-solve swap
+        un-run, so no clearance is held for that key (WR-05).
+        """
+        task = self._inflight.get(source_key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._solve(source_key))
+            self._inflight[source_key] = task
+
+            def _pop(
+                completed: asyncio.Task[tuple[Clearance, float | None]],
+            ) -> None:
+                # Clear the slot only when it still holds THIS task, so a later
+                # solve's task is never clobbered by an earlier one's callback.
+                if self._inflight.get(source_key) is completed:
+                    del self._inflight[source_key]
+
+            task.add_done_callback(_pop)
+        return await asyncio.shield(task)
 
     def _record_expiry(self, source_key: str, expires_at: float | None) -> None:
         """Track (or clear) the held clearance's epoch expiry for the refresh loop."""
@@ -383,7 +422,7 @@ class AndroidSolver:
             if expiry - now > self._refresh_lead_s:
                 continue
             try:
-                clearance, new_expiry = await self._solve(key)
+                clearance, new_expiry = await self._coalesced_solve(key)
             except Exception:  # noqa: BLE001 — keep the held clearance; D-35 backstops
                 _log.warning(
                     "AndroidSolver proactive refresh failed for source %r; keeping "

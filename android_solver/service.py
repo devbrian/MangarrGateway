@@ -32,6 +32,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import select
 import socket
 import subprocess
 import sys
@@ -79,6 +80,34 @@ _HTTP_TIMEOUT_S = 10.0
 # read timeout so a slow-loris dribble cannot pin a worker thread indefinitely.
 _MAX_BODY_BYTES = 64 * 1024
 _HANDLER_READ_TIMEOUT_S = 15.0
+
+# #275: while a solve is in flight the service waits on the worker future in short
+# polls so a caller-disconnect can be detected and the solve cancelled PROMPTLY
+# instead of grinding the full solve deadline against the single device. 499 is the
+# non-standard "Client Closed Request" status (nginx convention) returned when an
+# abandoned /solve is cancelled mid-flight.
+_DISCONNECT_POLL_S = 0.5
+_CLIENT_CLOSED_REQUEST = 499
+
+
+def _peer_disconnected(sock: socket.socket) -> bool:
+    """True when the HTTP peer has closed its end of ``sock`` (#275).
+
+    A ``select`` with a zero timeout asks "is there anything to read?"; a
+    not-readable socket means the peer is still connected with nothing pending
+    (``False``). A readable socket that ``MSG_PEEK``s an empty result is at EOF — the
+    peer closed the connection (``True``). An ``OSError`` (the socket is already torn
+    down) is likewise treated as disconnected. Used by the handler to wire an
+    abandoned /solve to the pipeline's cooperative cancel.
+    """
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        if not readable:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True
+
 
 # Cross-origin Cloudflare OOPIF readiness poll: the Turnstile iframe renders a
 # few seconds after the page loads, so wait for it before locating the checkbox.
@@ -402,85 +431,102 @@ class AndroidSolvePipeline:
         pid = self._device.pidof()
         _raise_if_cancelled(cancel)
         port = self._device.forward_devtools(pid)
-        _raise_if_cancelled(cancel)
-        ws_url = self._discover_page_ws(port)
-        _raise_if_cancelled(cancel)
-
-        # Bound the whole locate→tap→poll loop by the solve deadline (T-10-11).
-        deadline = time.monotonic() + self._timeout_s
-        ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
+        # #275 req 3: from the moment the adb/CDP forward exists, tear it down in a
+        # finally on EVERY exit — success, failure, timeout, AND cancellation — so no
+        # ESTABLISHED devtools forward leaks across solves.
         try:
-            cdp_call(ws, "Page.enable", command_id=10)
-            cdp_call(ws, "DOM.enable", command_id=11)
-            if expected_egress_ip:
-                # Req 3 / T-11-01: prove the WebView egresses through the verified
-                # proxy IP BEFORE tapping — a silently-bypassed proxy must NOT mint
-                # a wrong-IP clearance. Mismatch/transient echo failure ⇒ no token.
-                observed = self._observe_webview_egress(ws, cancel)
-                if observed != expected_egress_ip:
-                    # WR-02: the egress-verify gate asserts the self-probe IP and
-                    # the WebView IP are byte-equal (T-11-01 — the minted
-                    # cf_clearance MUST bind to the EXACT egress). This REQUIRES a
-                    # STICKY upstream that holds one exit IP across both the
-                    # self-probe CONNECT and the WebView's separate connection. A
-                    # ROTATING residential proxy (exit IP changes per TCP
-                    # connection) will mismatch on nearly every solve, so the
-                    # operator MUST configure a sticky-session upstream. The error
-                    # below names the rotating-proxy cause explicitly so a config
-                    # mismatch is not mistaken for a Cloudflare failure.
-                    raise SolveError(
-                        f"proxied egress IP differed (expected {expected_egress_ip}, "
-                        f"observed {observed}) — is the upstream a rotating/"
-                        f"non-sticky proxy? egress-verify needs a sticky-session "
-                        f"upstream that holds one exit IP across connections"
+            _raise_if_cancelled(cancel)
+            ws_url = self._discover_page_ws(port)
+            _raise_if_cancelled(cancel)
+
+            # Bound the whole locate→tap→poll loop by the solve deadline (T-10-11).
+            deadline = time.monotonic() + self._timeout_s
+            ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
+            try:
+                cdp_call(ws, "Page.enable", command_id=10)
+                cdp_call(ws, "DOM.enable", command_id=11)
+                if expected_egress_ip:
+                    # Req 3 / T-11-01: prove the WebView egresses through the verified
+                    # proxy IP BEFORE tapping — a silently-bypassed proxy must NOT mint
+                    # a wrong-IP clearance. Mismatch/transient echo failure ⇒ no token.
+                    observed = self._observe_webview_egress(ws, cancel)
+                    if observed != expected_egress_ip:
+                        # WR-02: the egress-verify gate asserts the self-probe IP and
+                        # the WebView IP are byte-equal (T-11-01 — the minted
+                        # cf_clearance MUST bind to the EXACT egress). This REQUIRES a
+                        # STICKY upstream that holds one exit IP across both the
+                        # self-probe CONNECT and the WebView's separate connection. A
+                        # ROTATING residential proxy (exit IP changes per TCP
+                        # connection) will mismatch on nearly every solve, so the
+                        # operator MUST configure a sticky-session upstream. The error
+                        # below names the rotating-proxy cause explicitly so a config
+                        # mismatch is not mistaken for a Cloudflare failure.
+                        raise SolveError(
+                            f"proxied egress IP differed "
+                            f"(expected {expected_egress_ip}, observed {observed}) — "
+                            f"is the upstream a rotating/non-sticky proxy? "
+                            f"egress-verify needs a sticky-session upstream that holds "
+                            f"one exit IP across connections"
+                        )
+                    _log.info("verified proxied WebView egress %s", observed)
+                    # The echo read navigated away; return to the challenge under the
+                    # now-verified egress before locating the Turnstile widget.
+                    cdp_call(
+                        ws,
+                        "Page.navigate",
+                        {"url": challenge_url},
+                        command_id=_CHALLENGE_RENAV_CMD_ID,
                     )
-                _log.info("verified proxied WebView egress %s", observed)
-                # The echo read navigated away; return to the challenge under the
-                # now-verified egress before locating the Turnstile widget.
-                cdp_call(
-                    ws,
-                    "Page.navigate",
-                    {"url": challenge_url},
-                    command_id=_CHALLENGE_RENAV_CMD_ID,
+                # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
+                # after load) — the real readiness gate, not the fixed settle above.
+                self._wait_for_cf_frame(ws, cancel)
+                # Page ws, DOM/Page enable, frame readiness, and the viewport scales
+                # are computed ONCE; only locate+tap+poll repeats inside the loop.
+                x_scale, y_scale = self._compute_scales(ws)
+                minted = self._tap_until_cleared(
+                    ws, ws_url, host, x_scale, y_scale, deadline, cancel
                 )
-            # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
-            # after load) — the real readiness gate, not the fixed settle above.
-            self._wait_for_cf_frame(ws, cancel)
-            # Page ws, DOM/Page enable, frame readiness, and the viewport scales
-            # are computed ONCE; only locate+tap+poll repeats inside the loop.
-            x_scale, y_scale = self._compute_scales(ws)
-            minted = self._tap_until_cleared(
-                ws, ws_url, host, x_scale, y_scale, deadline, cancel
+            finally:
+                ws.close()
+            if minted is None:
+                raise SolveError(f"clearance not minted for {host} before deadline")
+            token, expires = minted.value, minted.expires
+
+            # IN-01: use the INJECTED getter (so tests/proxy injection apply), and
+            # guard the fetch — a trivial /json/version hiccup must not discard an
+            # already-minted, ~60s-expensive token (fall back to an empty UA). The
+            # forward is still alive here (its teardown is the outer finally below).
+            try:
+                user_agent = (
+                    webview_user_agent(
+                        f"http://localhost:{port}/json/version",
+                        http_get=self._http_get,
+                    )
+                    or ""
+                )
+            except Exception:  # noqa: BLE001 — a UA hiccup must not discard a minted token
+                _log.warning(
+                    "webview UA fetch failed after token mint; using empty UA",
+                    exc_info=True,
+                )
+                user_agent = ""
+            return SolveResult(
+                cf_clearance=token,
+                user_agent=user_agent,
+                cf_clearance_expires=expires,
+                host=host,
+                egress_ip=expected_egress_ip,
             )
         finally:
-            ws.close()
-        if minted is None:
-            raise SolveError(f"clearance not minted for {host} before deadline")
-        token, expires = minted.value, minted.expires
+            self._remove_forward_quietly(port)
 
-        # IN-01: use the INJECTED getter (so tests/proxy injection apply), and
-        # guard the fetch — a trivial /json/version hiccup must not discard an
-        # already-minted, ~60s-expensive token (fall back to an empty UA).
+    def _remove_forward_quietly(self, port: int) -> None:
+        """Best-effort devtools-forward teardown (#275): logs, never masks the solve
+        outcome — same discipline as ``_clear_proxy_quietly`` / ``_reset_device``."""
         try:
-            user_agent = (
-                webview_user_agent(
-                    f"http://localhost:{port}/json/version", http_get=self._http_get
-                )
-                or ""
-            )
-        except Exception:  # noqa: BLE001 — a UA hiccup must not discard a minted token
-            _log.warning(
-                "webview UA fetch failed after token mint; using empty UA",
-                exc_info=True,
-            )
-            user_agent = ""
-        return SolveResult(
-            cf_clearance=token,
-            user_agent=user_agent,
-            cf_clearance_expires=expires,
-            host=host,
-            egress_ip=expected_egress_ip,
-        )
+            self._device.remove_forward(port)
+        except Exception:  # noqa: BLE001 — teardown must not mask the solve outcome
+            _log.warning("remove_forward failed in teardown", exc_info=True)
 
     def _observe_webview_egress(self, ws: WebSocketLike, cancel: Event | None) -> str:
         """Navigate the WebView to the IP echo and return its observed egress IP.
@@ -774,7 +820,13 @@ class SolverService:
         status = HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE
         return int(status), {"status": "ok" if ok else "unavailable"}
 
-    def solve(self, *, api_key: str | None, body: bytes) -> tuple[int, dict[str, Any]]:
+    def solve(
+        self,
+        *,
+        api_key: str | None,
+        body: bytes,
+        disconnected: Callable[[], bool] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
         if not self._authenticate(api_key):
             # T-10-08: no device action without a valid key.
             return int(HTTPStatus.UNAUTHORIZED), {
@@ -824,7 +876,7 @@ class SolverService:
             return proxy_err
         proxy = payload.get("proxy")
 
-        return self._run_solve(challenge_url, host, proxy)
+        return self._run_solve(challenge_url, host, proxy, disconnected)
 
     @staticmethod
     def _validate_proxy(
@@ -883,7 +935,11 @@ class SolverService:
         return None
 
     def _run_solve(
-        self, challenge_url: str, host: str, proxy: dict[str, Any] | None = None
+        self,
+        challenge_url: str,
+        host: str,
+        proxy: dict[str, Any] | None = None,
+        disconnected: Callable[[], bool] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         cancel = Event()
         # D-07 / Pitfall 6: a proxied solve adds a cross-container CONNECT hop +
@@ -900,40 +956,66 @@ class SolverService:
             if proxy is not None
             else self._config.solve_timeout_s
         )
-        with self._lock:  # serialize: one WebView solve at a time (T-10-11)
+        # #275 req 2 (T-nup-01): NON-blocking acquire. A /solve arriving while one is
+        # already in flight is rejected 503 immediately rather than queuing behind the
+        # single device — an abandoned/bursty caller can never pile a backlog the one
+        # redroid cannot work off. The single WebView solve stays serialized (T-10-11).
+        if not self._lock.acquire(blocking=False):
+            _log.info("solver busy; rejecting concurrent /solve for host %s", host)
+            return int(HTTPStatus.SERVICE_UNAVAILABLE), {"error": "solver busy"}
+        try:
             future = self._executor.submit(
                 self._pipeline.solve, challenge_url, host, cancel, proxy=proxy
             )
-            try:
-                result = future.result(timeout=timeout_s)
-            except FuturesTimeout:
-                _log.warning("solve timed out for host %s", host)
-                # issue #207 / WR-02: the worker can't be force-killed. Signal
-                # cooperative cancellation and drain it within a BOUNDED grace
-                # window (still under the lock) so the orphan resets the device
-                # and exits before the next /solve — no cascading 504s.
-                self._cancel_and_drain(future, cancel, host)
-                return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve timed out"}
-            except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
-                # IN-02: keep the traceback so field solve failures are
-                # diagnosable (still never logs the token — the value isn't here).
-                _log.warning("solve failed for host %s", host, exc_info=True)
-                return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve failed"}
-
-        # Redacted success event ONLY (T-10-10) — never the minted token value.
-        # The verified egress_ip IS loggable (Req 6 / T-10-04).
-        _log.info("solved %s (egress %s)", host, result.egress_ip or "direct")
-        return int(HTTPStatus.OK), {
-            "cf_clearance": result.cf_clearance,
-            "user_agent": result.user_agent,
-            "host": result.host,
-            # Req 6: present on EVERY response — the verified egress on a proxied
-            # solve, "" on the no-proxy path (additive-only; D-08 keys unchanged).
-            "egress_ip": result.egress_ip,
-            # Additive-only: the minted cookie's epoch expiry (or null) so the gateway
-            # re-mints ahead of the Challenge-Passage lapse. Non-sensitive (D-08).
-            "cf_clearance_expires": result.cf_clearance_expires,
-        }
+            # #275 req 1: wait on the worker in short polls (bounded overall by
+            # timeout_s) so an abandoned request is detected and the in-flight solve
+            # cancelled PROMPTLY, instead of grinding the full deadline against the
+            # single device while a CLOSE_WAIT pile-up builds.
+            deadline = time.monotonic() + timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _log.warning("solve timed out for host %s", host)
+                    # issue #207 / WR-02: the worker can't be force-killed. Signal
+                    # cooperative cancellation and drain it within a BOUNDED grace
+                    # window (still under the lock) so the orphan resets the device
+                    # and exits before the next /solve — no cascading 504s.
+                    self._cancel_and_drain(future, cancel, host)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve timed out"}
+                try:
+                    result = future.result(timeout=min(_DISCONNECT_POLL_S, remaining))
+                except FuturesTimeout:
+                    # Still solving — if the caller has since disconnected, cancel the
+                    # orphan now (don't pin the device for the rest of the deadline).
+                    if disconnected is not None and disconnected():
+                        _log.info(
+                            "caller disconnected mid-solve for host %s; cancelling",
+                            host,
+                        )
+                        self._cancel_and_drain(future, cancel, host)
+                        return _CLIENT_CLOSED_REQUEST, {"error": "client disconnected"}
+                    continue
+                except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
+                    # IN-02: keep the traceback so field solve failures are
+                    # diagnosable (still never logs the token — the value isn't here).
+                    _log.warning("solve failed for host %s", host, exc_info=True)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "solve failed"}
+                # Redacted success event ONLY (T-10-10) — never the minted token value.
+                # The verified egress_ip IS loggable (Req 6 / T-10-04).
+                _log.info("solved %s (egress %s)", host, result.egress_ip or "direct")
+                return int(HTTPStatus.OK), {
+                    "cf_clearance": result.cf_clearance,
+                    "user_agent": result.user_agent,
+                    "host": result.host,
+                    # Req 6: present on EVERY response — the verified egress on a
+                    # proxied solve, "" on the no-proxy path (additive; D-08 unchanged).
+                    "egress_ip": result.egress_ip,
+                    # Additive-only: the minted cookie's epoch expiry (or null) so the
+                    # gateway re-mints ahead of the lapse. Non-sensitive (D-08).
+                    "cf_clearance_expires": result.cf_clearance_expires,
+                }
+        finally:
+            self._lock.release()
 
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
         """Signal cancellation and wait (bounded) for the orphan to unwind (#207).
@@ -1041,8 +1123,20 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         body = self.rfile.read(length) if length > 0 else b""
-        status, payload = self.server.service.solve(api_key=api_key, body=body)
-        self._send_json(status, payload)
+        # #275 req 1: let the service detect a mid-solve caller disconnect (peek the
+        # socket for EOF) so an abandoned /solve cancels its device work promptly.
+        status, payload = self.server.service.solve(
+            api_key=api_key,
+            body=body,
+            disconnected=lambda: _peer_disconnected(self.connection),
+        )
+        # #275 cleanup: the client may already be gone (CLOSE_WAIT / BrokenPipe). A
+        # write to a dead peer must not crash the daemon worker thread — swallow it
+        # (OSError covers BrokenPipeError/ConnectionError, its subclasses).
+        try:
+            self._send_json(status, payload)
+        except OSError:
+            _log.info("client gone before /solve response could be sent for host")
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Silence the default access log (keeps request lines — and any header
