@@ -68,6 +68,16 @@ def _req(release_handle: str = "h_abc") -> SubmitRequest:
     )
 
 
+def _req_for(source_key: str, release_handle: str) -> SubmitRequest:
+    """A submit request pinned to ``source_key`` (drives ``job.source_key``)."""
+    return SubmitRequest(
+        releaseHandle=release_handle,
+        sourceKey=source_key,
+        mangaId=42,
+        outputFormat="cbz",
+    )
+
+
 async def _make_manager(
     store: JobStore,
     *,
@@ -282,6 +292,44 @@ async def test_per_source_semaphore_caps_below_global(tmp_path: Path) -> None:
         engine.release_all()
         await mgr.drain()
         assert engine.total_completed == 4
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_capped_source_deep_queue_does_not_starve_other_sources(
+    tmp_path: Path,
+) -> None:
+    """A capped source's deep queue must not squat global slots (#267).
+
+    With global=2 and a source capped at 1, a deep backlog of that source plus a
+    job from a *different* source: the other source must still acquire a global
+    slot and run concurrently. Under the old acquire order (global before
+    per-source) the capped source's overflow tasks grabbed global permits and
+    then blocked on the per-source cap — head-of-line blocking that left the
+    other source's job stuck ``queued``."""
+    store = await open_store(str(tmp_path / "jobs.db"))
+    try:
+        mgr = await _make_manager(store, max_concurrent=2, max_concurrent_per_source=1)
+        engine = _SourceTrackingEngine()
+        mgr._engine = engine  # type: ignore[assignment]
+
+        # 4 jobs of a capped source (per-source=1) — a backlog deeper than global.
+        for i in range(4):
+            await mgr.submit(_record(), _req_for("comix", f"c{i}"))
+        # 1 job of a different, healthy source.
+        await mgr.submit(_record(), _req_for("mangadex", "m0"))
+
+        await asyncio.sleep(0.05)
+
+        # The healthy source must have started despite the capped backlog, and the
+        # engine must reach 2 active across the two sources (>cap of either).
+        assert "mangadex" in engine.started_sources
+        assert engine.peak_concurrent == 2
+
+        engine.release_all()
+        await mgr.drain()
+        assert engine.total_completed == 5
     finally:
         await store.close()
 
@@ -569,6 +617,29 @@ class _CountingEngine:
         self._release.set()
 
     async def run(self, job: Job) -> None:
+        self.currently_running += 1
+        self.peak_concurrent = max(self.peak_concurrent, self.currently_running)
+        await self._release.wait()
+        self.currently_running -= 1
+        self.total_completed += 1
+        job.status = JobStatus.COMPLETED
+
+
+class _SourceTrackingEngine:
+    """Like ``_CountingEngine`` but records which sources actually started (#267)."""
+
+    def __init__(self) -> None:
+        self.started_sources: set[str] = set()
+        self.currently_running = 0
+        self.peak_concurrent = 0
+        self.total_completed = 0
+        self._release = asyncio.Event()
+
+    def release_all(self) -> None:
+        self._release.set()
+
+    async def run(self, job: Job) -> None:
+        self.started_sources.add(job.source_key)
         self.currently_running += 1
         self.peak_concurrent = max(self.peak_concurrent, self.currently_running)
         await self._release.wait()
