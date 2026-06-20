@@ -334,3 +334,92 @@ async def test_trigger_only_query_returns_empty_with_single_post() -> None:
     assert len(_search_posts(transport)) == 1
     # No source-health failure recorded (waf_blocked is not fed; no success either).
     assert health.consecutive_failures == 0
+
+
+# ─────────────── (e) unrecovered WAF blocks are SURFACED (not silent) ──────────
+# A waf_blocked absorbed to [] is invisible to fanout/cooldown, so the source MUST
+# surface it via a soft ``ctx.warn`` (rides the success path → shows in the response
+# ``warnings[]`` WITHOUT feeding the cooldown). Otherwise a silent coverage loss —
+# or a NEW WAF trigger word our denylist misses — looks identical to a real 0-results.
+
+
+def _waf_warnings(ctx: SourceContext) -> list[tuple[str, str]]:
+    return [w for w in ctx.warnings if w[0] == "waf_blocked"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_only_query_surfaces_soft_warning() -> None:
+    transport = _source_transport(search_responses=[_waf_403()])
+    ctx = _ctx(transport)
+    releases = await MangaBallSource().search(
+        SearchRequest(type="manga", query="System"), ctx
+    )
+    assert releases == []
+    # The drop is surfaced as a soft warning, never silently swallowed.
+    assert len(_waf_warnings(ctx)) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_trigger_word_surfaces_soft_warning() -> None:
+    # The query carries NO known trigger token, yet the WAF blocks it → a NEW trigger
+    # word the denylist misses. Sanitize strips nothing (sanitized == original), so
+    # there is a single POST and the block is surfaced (loud log + soft warning).
+    transport = _source_transport(search_responses=[_waf_403()])
+    ctx = _ctx(transport)
+    releases = await MangaBallSource().search(
+        SearchRequest(type="manga", query="Mahouka Koukou"), ctx
+    )
+    assert releases == []
+    assert len(_search_posts(transport)) == 1  # nothing to retry with
+    assert len(_waf_warnings(ctx)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sanitized_retry_still_blocked_surfaces_soft_warning() -> None:
+    # Both the original AND the sanitized retry WAF-block → give up softly, surfaced.
+    transport = _source_transport(search_responses=[_waf_403(), _waf_403()])
+    ctx = _ctx(transport)
+    releases = await MangaBallSource().search(
+        SearchRequest(type="manga", query="Solo Leveling System"), ctx
+    )
+    assert releases == []
+    assert len(_search_posts(transport)) == 2  # original + one sanitized retry
+    assert len(_waf_warnings(ctx)) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovered_waf_emits_no_soft_warning() -> None:
+    # A recovered block returned results → it is NOT a partial failure, so it adds NO
+    # response warning (log-only). Keeps the response clean on the common path.
+    transport = _source_transport(search_responses=[_waf_403(), _titles_200()])
+    ctx = _ctx(transport)
+    releases = await MangaBallSource().search(
+        SearchRequest(type="manga", query="Solo Leveling System"), ctx
+    )
+    assert releases  # recovered
+    assert _waf_warnings(ctx) == []
+
+
+@pytest.mark.asyncio
+async def test_unrecovered_waf_warning_surfaces_via_fanout_without_cooldown() -> None:
+    # End-to-end: an unrecovered WAF block surfaces in the fanout warnings (via
+    # collect_warnings on the SUCCESS path) AND never feeds the cooldown.
+    cd = SourceFailureCooldown(base_seconds=30, max_seconds=600, clock=lambda: 0.0)
+    source = MangaBallSource()
+    transport = _source_transport(search_responses=[_waf_403(), _waf_403()])
+    ctx = _ctx(transport)
+
+    async def run_one(src: MangaBallSource) -> list[Any]:
+        return await src.search(
+            SearchRequest(type="manga", query="Solo Leveling System"), ctx
+        )
+
+    releases, warnings = await fan_out(
+        [source],
+        run_one,
+        collect_warnings=lambda src: list(ctx.warnings),
+        cooldown=cd,
+    )
+    assert releases == []
+    assert ("mangaball", "waf_blocked") in [(k, c) for k, c, _ in warnings]
+    assert cd.in_cooldown("mangaball") is False  # surfaced, but NOT a cooldown failure

@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import posixpath
 import re
 import string
@@ -117,6 +118,8 @@ _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
 # live-confirmed — add tokens here as more false-positives surface (a small frozenset
 # kept trivially extensible; single strip-and-retry is the live-verified approach,
 # NOT progressive multi-word stripping).
+_log = logging.getLogger("manga_gateway")
+
 _WAF_TRIGGER_WORDS = frozenset({"system"})
 
 # Characters stripped off a token's edges when normalizing it to a denylist "core"
@@ -656,14 +659,57 @@ class MangaBallSource(Source):
                     raise
                 sanitized = _sanitize_waf_query(original)
                 if not sanitized or sanitized == original:
-                    # Only trigger words / nothing stripped → soft empty, NO 2nd POST.
+                    # Nothing usable to retry with → soft empty (NO 2nd POST). A
+                    # waf_blocked absorbed to [] is INVISIBLE to fanout/cooldown, so it
+                    # MUST be surfaced here (log + soft warning) or a silent coverage
+                    # loss looks identical to a legitimate 0-results. The soft ``warn``
+                    # rides the SUCCESS path (the source returns normally), so it shows
+                    # in the response ``warnings[]`` WITHOUT feeding the cooldown.
+                    if sanitized == original:
+                        # 403 fired but our denylist matched nothing → a NEW WAF trigger
+                        # word. Loud WARNING so _WAF_TRIGGER_WORDS can be extended.
+                        _log.warning(
+                            "mangaball WAF-blocked query %r but no known trigger token "
+                            "matched — _WAF_TRIGGER_WORDS may need updating",
+                            original,
+                        )
+                    else:
+                        # Query was ONLY trigger words (e.g. "System") → nothing left.
+                        _log.info(
+                            "mangaball WAF-blocked query %r reduced to trigger-words"
+                            "-only → no searchable terms remain",
+                            original,
+                        )
+                    ctx.warn(
+                        "waf_blocked",
+                        f"mangaball WAF blocked search {original!r}; no results",
+                    )
                     return []
                 try:
                     body = await _post_search(sanitized)
                 except SourceError as exc2:
                     if exc2.code != "waf_blocked":
                         raise
-                    return []  # still blocked after the single retry → soft empty
+                    # Sanitized retry STILL blocked → surface (soft) and give up.
+                    _log.warning(
+                        "mangaball WAF still blocked sanitized query %r (from %r) — "
+                        "no results returned",
+                        sanitized,
+                        original,
+                    )
+                    ctx.warn(
+                        "waf_blocked",
+                        f"mangaball WAF blocked search {original!r} (sanitized retry "
+                        f"{sanitized!r} also blocked); no results returned",
+                    )
+                    return []
+                # Recovered: the sanitized retry succeeded. Log the rate (no response
+                # warning — results WERE returned, so it is not a partial failure).
+                _log.info(
+                    "mangaball WAF-blocked query %r; sanitized retry %r recovered",
+                    original,
+                    sanitized,
+                )
             titles, _pagination = _items_and_pagination(body)
 
             dict_titles = [t for t in titles if isinstance(t, dict)]
