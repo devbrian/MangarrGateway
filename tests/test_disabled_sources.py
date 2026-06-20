@@ -25,6 +25,7 @@ _ALL_SOURCES = frozenset(
         "weebcentral",
         "kagane",
         "mangafire",
+        "projectsuki",
     }
 )
 
