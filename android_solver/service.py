@@ -108,6 +108,7 @@ def _peer_disconnected(sock: socket.socket) -> bool:
     except OSError:
         return True
 
+
 # Cross-origin Cloudflare OOPIF readiness poll: the Turnstile iframe renders a
 # few seconds after the page loads, so wait for it before locating the checkbox.
 _CF_FRAME_URL_MARKER = "challenges.cloudflare.com"

@@ -213,9 +213,7 @@ class AndroidSolver:
         self._record_expiry(source_key, expires_at)
         return clearance
 
-    async def _coalesced_solve(
-        self, source_key: str
-    ) -> tuple[Clearance, float | None]:
+    async def _coalesced_solve(self, source_key: str) -> tuple[Clearance, float | None]:
         """Single-flight the sidecar ``_solve`` per source key (#296).
 
         Concurrent ``force_resolve`` / reactive / proactive-refresh callers for the
