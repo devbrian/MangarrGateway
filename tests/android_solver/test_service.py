@@ -43,6 +43,8 @@ class FakePipeline:
         delay: float = 0.0,
         healthy: bool = True,
         error: Exception | None = None,
+        started: threading.Event | None = None,
+        release: threading.Event | None = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.proxies: list[dict[str, object] | None] = []
@@ -50,6 +52,11 @@ class FakePipeline:
         self._delay = delay
         self._healthy = healthy
         self._error = error
+        # Optional gating for the 503-on-busy serialization test (#275): the worker
+        # signals ``started`` once it is in flight under the service lock and blocks on
+        # ``release`` so the test can deterministically fire a SECOND /solve mid-flight.
+        self._started = started
+        self._release = release
         self._counter_lock = threading.Lock()
         self._active = 0
         self.max_concurrent = 0
@@ -69,6 +76,14 @@ class FakePipeline:
         try:
             self.calls.append((challenge_url, host))
             self.proxies.append(proxy)
+            if self._started is not None:
+                self._started.set()
+            if self._release is not None:
+                # Block (cooperatively cancellable) until the test releases us.
+                while not self._release.wait(timeout=0.02):
+                    if cancel is not None and cancel.is_set():
+                        self.cancelled = True
+                        raise SolveCancelled("cancelled after timeout")
             if self._delay:
                 # Cooperative: poll the cancel signal in small steps (mirrors the
                 # real pipeline's adb/CDP checkpoints) so a timed-out solve frees
@@ -367,28 +382,66 @@ def test_proxied_payload_carries_verified_egress_ip() -> None:
 
 
 def test_solves_are_serialized() -> None:
-    pipeline = FakePipeline(delay=0.1)
+    # #275 req 2: a /solve arriving while one is already in flight is rejected 503 by
+    # the NON-blocking lock — it does NOT queue behind the single device. The first
+    # solve is gated so the second deterministically arrives mid-flight.
+    started = threading.Event()
+    release = threading.Event()
+    pipeline = FakePipeline(started=started, release=release)
     service = _service(pipeline, solve_timeout_s=5.0)
-    results: list[int] = []
-    lock = threading.Lock()
+    first_status: dict[str, int] = {}
 
-    def call() -> None:
+    def first() -> None:
         status, _ = service.solve(
             api_key="s3cret-solver-key",
             body=b'{"challenge_url": "https://mangadot.net/"}',
         )
-        with lock:
-            results.append(status)
+        first_status["status"] = status
 
-    threads = [threading.Thread(target=call) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    thread = threading.Thread(target=first)
+    thread.start()
+    try:
+        assert started.wait(timeout=5)  # the first solve is in flight under the lock
+        # A second /solve arriving now is rejected 503 — not queued behind the device.
+        second, payload = service.solve(
+            api_key="s3cret-solver-key",
+            body=b'{"challenge_url": "https://mangadot.net/"}',
+        )
+        assert second == 503
+        assert "busy" in payload["error"]
+    finally:
+        release.set()  # let the first solve finish
+        thread.join(timeout=5)
 
-    assert results == [200, 200]
-    # The lock + single-worker executor must prevent any overlap.
+    assert first_status["status"] == 200
+    # The single device was never driven by two solves at once.
     assert pipeline.max_concurrent == 1
+
+
+def test_disconnected_caller_cancels_inflight_solve() -> None:
+    # #275 req 1: a caller that abandons the request mid-flight fires the cancel Event
+    # and the solve returns 499 PROMPTLY — well under the (long) solve delay — instead
+    # of grinding the full deadline while the single device stays pinned.
+    pipeline = FakePipeline(delay=10.0)
+    service = _service(pipeline, solve_timeout_s=30.0, cancel_grace_s=5.0)
+    polls = {"n": 0}
+
+    def disconnected() -> bool:
+        # Connected on the first poll, then the peer is gone.
+        polls["n"] += 1
+        return polls["n"] > 1
+
+    start = time.monotonic()
+    status, payload = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+        disconnected=disconnected,
+    )
+    elapsed = time.monotonic() - start
+    assert status == 499
+    assert payload == {"error": "client disconnected"}
+    assert pipeline.cancelled is True  # the worker saw the cancel signal
+    assert elapsed < 10.0  # cancelled promptly, not after the full 10s delay
 
 
 def test_slow_pipeline_times_out() -> None:
@@ -634,6 +687,7 @@ class FakeDevice:
     def __init__(self) -> None:
         self.taps: list[tuple[int, int]] = []
         self.force_stops = 0
+        self.removed_forwards: list[int] = []
 
     def connect(self) -> None:
         return None
@@ -649,6 +703,9 @@ class FakeDevice:
 
     def forward_devtools(self, pid: int) -> int:
         return 9222
+
+    def remove_forward(self, local_port: int | None = None) -> None:
+        self.removed_forwards.append(local_port if local_port is not None else 9222)
 
     def screencap(self) -> bytes:
         return b"PNG"
@@ -1015,6 +1072,59 @@ def test_solve_resets_device_on_cancellation(
     assert device.force_stops == 2
     # The solve unwound before the locate→tap loop, so no tap landed.
     assert device.taps == []
+
+
+def test_forward_torn_down_on_every_solve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #275 req 3: the adb devtools forward is removed in a finally on a NORMAL solve —
+    # no leaked ESTABLISHED forward survives a completed solve.
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=SeqLocate([(50, 100)]),
+        extract=SeqExtract(token_after=1),  # token mints immediately
+        clock=FakeClock(),
+        timeout_s=60.0,
+    )
+
+    result = pipeline.solve("https://mangadot.net/", "mangadot.net")
+
+    assert result.cf_clearance == "MANGADOT_TOKEN"
+    assert device.removed_forwards == [9222]  # forward torn down after the solve
+
+
+def test_forward_torn_down_on_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #275 req 3: the forward is removed in the finally even when the solve is
+    # cancelled mid-flight AFTER the forward was established (mirrors
+    # test_solve_resets_device_on_cancellation, but the cancel fires post-forward).
+    device = FakeDevice()
+    cancel = threading.Event()
+    original_forward = device.forward_devtools
+
+    def forward_then_cancel(pid: int) -> int:
+        port = original_forward(pid)
+        cancel.set()  # cancel fires right after the forward is established
+        return port
+
+    monkeypatch.setattr(device, "forward_devtools", forward_then_cancel)
+
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=SeqLocate([(50, 100)]),
+        extract=SeqExtract(token_after=10_000),  # never mints → would run to deadline
+        clock=FakeClock(),
+        timeout_s=60.0,
+    )
+
+    with pytest.raises(SolveCancelled):
+        pipeline.solve("https://mangadot.net/", "mangadot.net", cancel)
+
+    assert device.removed_forwards == [9222]  # forward torn down on the cancel path
 
 
 def test_config_from_env_parses_allowlist_and_timeout() -> None:
