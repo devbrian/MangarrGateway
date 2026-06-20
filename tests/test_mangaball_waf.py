@@ -190,3 +190,147 @@ async def test_plain_403_still_feeds_source_health() -> None:
         await ctx.post_json(_API_URL, data={"search_input": "x"})
     # A non-WAF terminal 403 feeds health byte-for-byte as before.
     assert health.consecutive_failures == 1
+
+
+# ═══════════ groups (b/c/d): MangaBallSource sanitize-and-retry ════════════════
+
+from manga_gateway.framework.cooldown import SourceFailureCooldown  # noqa: E402
+from manga_gateway.framework.fanout import fan_out  # noqa: E402
+from manga_gateway.framework.health import SourceHealth  # noqa: E402
+from manga_gateway.models.search import SearchRequest  # noqa: E402
+from manga_gateway.sources.mangaball import (  # noqa: E402
+    MangaBallSource,
+    _sanitize_waf_query,
+)
+
+# Reuse the live-shaped envelope builders from the search-flow test module so the
+# bodies on the sanitized-retry 200 + the per-candidate chapter-listing are identical
+# to the ones the search-flow tests assert against (no second fabricated shape).
+from tests.test_mangaball_search import (  # noqa: E402
+    _chapter,
+    _chapter_listing,
+    _search_envelope,
+    _title,
+)
+
+_TITLE_ID = "68515540702284f8341784c8"
+
+
+def _source_transport(*, search_responses: list[httpx.Response]) -> _RecordingTransport:
+    return _RecordingTransport(
+        search_responses=search_responses,
+        listing_body=_chapter_listing([_chapter()]),
+    )
+
+
+def _titles_200() -> httpx.Response:
+    """A search-advanced 200 carrying one ``Solo Leveling`` title candidate."""
+    envelope = _search_envelope([_title(title_id=_TITLE_ID, name="Solo Leveling")])
+    return httpx.Response(200, json=envelope)
+
+
+# ─────────────────── _sanitize_waf_query unit coverage ───────────────────────
+
+
+def test_sanitize_waf_query_strips_only_the_literal_trigger_token() -> None:
+    # The trigger token is dropped; surrounding tokens are kept verbatim.
+    assert _sanitize_waf_query("Solo Leveling System") == "Solo Leveling"
+    # Possessive + trailing punctuation normalize to the bare trigger and drop.
+    assert _sanitize_waf_query("The System's Fall") == "The Fall"
+    assert _sanitize_waf_query("Beware, System, ahead") == "Beware, ahead"
+    # Plural / embedded forms are NOT stripped — only the literal word matches.
+    assert _sanitize_waf_query("Two Systems") == "Two Systems"
+    assert _sanitize_waf_query("Systemic Shock") == "Systemic Shock"
+    # A trigger-only query collapses to empty (caller short-circuits to []).
+    assert _sanitize_waf_query("System") == ""
+    assert _sanitize_waf_query("system's") == ""
+
+
+# ─────────────────── (b) sanitize-retry returns pruned-against-original ───────
+
+
+@pytest.mark.asyncio
+async def test_search_with_system_sanitize_retries_and_returns_results() -> None:
+    transport = _source_transport(
+        search_responses=[
+            _waf_403(),  # original "Solo Leveling System" → WAF block
+            _titles_200(),  # sanitized "Solo Leveling" → titles
+        ]
+    )
+    ctx = _ctx(transport)
+    releases = await MangaBallSource().search(
+        SearchRequest(type="manga", query="Solo Leveling System"), ctx
+    )
+
+    # Two search-advanced POSTs: the WAF block + the single sanitized retry.
+    posts = _search_posts(transport)
+    assert len(posts) == 2
+    # The retry carried the STRIPPED search_input.
+    assert posts[0] is not None and posts[0]["search_input"] == "Solo Leveling System"
+    assert posts[1] is not None and posts[1]["search_input"] == "Solo Leveling"
+    # The candidate was deep-enumerated and releases minted (pruned vs the ORIGINAL).
+    assert releases
+    assert all(rel.manga_title == "Solo Leveling" for rel in releases)
+
+
+# ─────────────────── (c) recovered WAF feeds neither health nor cooldown ──────
+
+
+@pytest.mark.asyncio
+async def test_recovered_waf_records_no_source_health_failure() -> None:
+    health = SourceHealth(threshold=3)
+    transport = _source_transport(
+        search_responses=[
+            _waf_403(),
+            _titles_200(),
+        ]
+    )
+    ctx = _ctx(transport, source_health=health)
+    releases = await MangaBallSource().search(
+        SearchRequest(type="manga", query="Solo Leveling System"), ctx
+    )
+    assert releases  # recovered
+    # The WAF block recorded NO failure; the recovered success reset the breaker.
+    assert health.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_recovered_waf_does_not_feed_fanout_cooldown() -> None:
+    cd = SourceFailureCooldown(base_seconds=30, max_seconds=600, clock=lambda: 0.0)
+    source = MangaBallSource()
+    transport = _source_transport(
+        search_responses=[
+            _waf_403(),
+            _titles_200(),
+        ]
+    )
+    ctx = _ctx(transport)
+
+    async def run_one(src: MangaBallSource) -> list[Any]:
+        return await src.search(
+            SearchRequest(type="manga", query="Solo Leveling System"), ctx
+        )
+
+    releases, warnings = await fan_out([source], run_one, cooldown=cd)
+    assert releases  # the recovered search returned results through fan_out
+    assert warnings == []  # no warning — the source absorbed the waf_blocked
+    assert cd.in_cooldown("mangaball") is False  # cooldown never fed
+
+
+# ─────────────────── (d) trigger-only query → [] with a single POST ───────────
+
+
+@pytest.mark.asyncio
+async def test_trigger_only_query_returns_empty_with_single_post() -> None:
+    health = SourceHealth(threshold=3)
+    transport = _source_transport(search_responses=[_waf_403()])
+    ctx = _ctx(transport, source_health=health)
+    releases = await MangaBallSource().search(
+        SearchRequest(type="manga", query="System"), ctx
+    )
+    # Soft empty result — never source_unavailable.
+    assert releases == []
+    # Exactly ONE search-advanced POST (no retry — the sanitized query is empty).
+    assert len(_search_posts(transport)) == 1
+    # No source-health failure recorded (waf_blocked is not fed; no success either).
+    assert health.consecutive_failures == 0

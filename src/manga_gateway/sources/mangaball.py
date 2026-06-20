@@ -73,6 +73,7 @@ import asyncio
 import json
 import posixpath
 import re
+import string
 from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -108,6 +109,46 @@ _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
     "filters[publicationStatus]": "any",
     "filters[userSettingsEnabled]": "false",
 }
+
+# WAF trigger-word denylist (260620-5yq). mangaball.net's WAF 403s ANY search POST
+# whose ``search_input`` contains a SQL-injection-flavoured token with the
+# ``Malicious payload detected`` body; the framework turns that into a catchable
+# ``waf_blocked`` SourceError (context.is_waf_block). Only ``"system"`` is
+# live-confirmed — add tokens here as more false-positives surface (a small frozenset
+# kept trivially extensible; single strip-and-retry is the live-verified approach,
+# NOT progressive multi-word stripping).
+_WAF_TRIGGER_WORDS = frozenset({"system"})
+
+# Characters stripped off a token's edges when normalizing it to a denylist "core"
+# (trailing comma/period/quote etc.), plus the unicode curly quotes the possessive
+# strip below also handles.
+_WAF_STRIP_CHARS = string.punctuation + "’‘"
+
+
+def _sanitize_waf_query(query: str) -> str:
+    """Drop WAF-trigger tokens from a search query (260620-5yq).
+
+    Tokenizes on whitespace and, for each token, computes a normalized core —
+    lowercased, with edge punctuation and a trailing possessive ``'s``/``’s``
+    stripped — so ``"system's"`` and ``"system,"`` both normalize to ``"system"``.
+    A token whose core is in :data:`_WAF_TRIGGER_WORDS` is DROPPED whole; every other
+    token is kept VERBATIM (original casing/punctuation preserved). Plural/embedded
+    forms (``"systems"``, ``"systemic"``) are NOT stripped — only the literal word
+    matches. Survivors re-join with single spaces; the result is stripped.
+
+    The caller (:meth:`MangaBallSource.search`) treats an empty or unchanged result as
+    "nothing to retry" and short-circuits to a soft ``[]``.
+    """
+    survivors: list[str] = []
+    for token in query.split():
+        core = token.lower().strip(_WAF_STRIP_CHARS)
+        if core.endswith(("'s", "’s")):
+            core = core[:-2]
+        if core in _WAF_TRIGGER_WORDS:
+            continue
+        survivors.append(token)
+    return " ".join(survivors).strip()
+
 
 # search() ALWAYS deep-enumerates this many title candidates (GAP-1 lock). The
 # MangaDex 15-interactive escalation is intentionally DROPPED for MangaBall —
@@ -590,13 +631,39 @@ class MangaBallSource(Source):
         """
 
         async def _resolve_fn() -> list[dict[str, Any]]:
-            form: dict[str, Any] = {
-                "search_input": req.query or "",
-                **_SEARCH_DEFAULT_FILTERS,
-            }
-            body = await ctx.post_json(
-                f"{self.base_url}/api/v1/title/search-advanced/", data=form
-            )
+            original = req.query or ""
+
+            async def _post_search(search_input: str) -> dict[str, Any]:
+                # Keep the form construction EXACTLY as before — only which
+                # ``search_input`` value is posted ever changes (the retry).
+                return await ctx.post_json(
+                    f"{self.base_url}/api/v1/title/search-advanced/",
+                    data={"search_input": search_input, **_SEARCH_DEFAULT_FILTERS},
+                )
+
+            # 260620-5yq: single sanitize-and-retry on a WAF false-positive 403. The
+            # framework mints a distinct ``waf_blocked`` code (context.is_waf_block) for
+            # mangaball.net's "Malicious payload" block — a SQL-injection false positive
+            # on common tokens like "System". The SOURCE fully ABSORBS that signal
+            # (returns releases or []), so it NEVER reaches fanout and fanout stays
+            # unchanged. Any OTHER SourceError re-raises (still a real failure →
+            # fanout/cooldown). Catch by ``exc.code == "waf_blocked"`` (mirror the
+            # engine's ``e.status == 403`` style — never substring-match the message).
+            try:
+                body = await _post_search(original)
+            except SourceError as exc:
+                if exc.code != "waf_blocked":
+                    raise
+                sanitized = _sanitize_waf_query(original)
+                if not sanitized or sanitized == original:
+                    # Only trigger words / nothing stripped → soft empty, NO 2nd POST.
+                    return []
+                try:
+                    body = await _post_search(sanitized)
+                except SourceError as exc2:
+                    if exc2.code != "waf_blocked":
+                        raise
+                    return []  # still blocked after the single retry → soft empty
             titles, _pagination = _items_and_pagination(body)
 
             dict_titles = [t for t in titles if isinstance(t, dict)]
