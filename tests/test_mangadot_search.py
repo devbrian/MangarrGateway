@@ -525,11 +525,3 @@ async def test_external_links_skipped_when_candidate_yields_no_releases() -> Non
     assert releases == []
     # No detail GET attempted for the empty candidate.
     assert ctx.detail_calls == []
-
-
-@pytest.mark.asyncio
-async def test_recent_is_noop() -> None:
-    ctx = _ctx(manga_list=[])
-    out = await MangadotSource().recent(languages=None, limit=50, since=None, ctx=ctx)
-    assert out == []
-    assert MangadotSource.supports_recent is False

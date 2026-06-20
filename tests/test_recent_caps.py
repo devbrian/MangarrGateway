@@ -20,6 +20,7 @@ import respx
 
 from manga_gateway.api.routes.recent import _split_multi
 from manga_gateway.sources.mangaball import MangaBallSource
+from manga_gateway.sources.mangadot import MangadotSource
 
 _MANGADEX = "https://api.mangadex.org"
 
@@ -415,6 +416,20 @@ def test_mangaball_class_declares_cloudflare_android_antibot() -> None:
     assert MangaBallSource.languages  # non-empty ALL_LANGUAGES set
     assert MangaBallSource.supports_search is True
     assert MangaBallSource.supports_recent is True
+
+
+def test_mangadot_class_declares_recent_and_cloudflare_android_antibot() -> None:
+    # #94: mangadot now advertises supportsRecent=true (title-feed fan-out seeded from
+    # sortBy=latest). Asserted at the CLASS level (mirrors
+    # test_mangaball_class_declares_cloudflare_android_antibot): like mangaball/kagane,
+    # mangadot is an android source that boots force_disabled in any env without a
+    # redroid sidecar, so a live ``/caps`` enabled check cannot hold deterministically
+    # (the conftest no-ops only CloudflareSolver.warm, not AndroidSolver.warm). The
+    # stable class attrs (antibot/solver_engine/supports_search) ride along.
+    assert MangadotSource.supports_recent is True
+    assert MangadotSource.antibot == "cloudflare"
+    assert MangadotSource.solver_engine == "android"
+    assert MangadotSource.supports_search is True
 
 
 @pytest.mark.asyncio
