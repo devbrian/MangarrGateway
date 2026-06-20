@@ -154,7 +154,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # debug pool-starves-search-cooldown (2026-06-17): a SEPARATE client/pool for
     # the download surface so a large download backlog can never exhaust the
     # connection pool the search fan-out needs (which would trip every source's
-    # 300s failure-cooldown → all-sources outage). Same settings → same UA / proxy
+    # failure-cooldown backoff → all-sources outage). Same settings → same UA / proxy
     # egress / per-request deadline; clearance rides per-request headers (not a
     # client cookie jar) so the two pools share ONE authenticated identity (R1).
     download_transport = HttpxTransport(settings)
@@ -444,12 +444,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # release-no-longer-resolvable, so a raised handle TTL is not silently clamped).
         max_ttl=settings.handle_ttl_seconds,
     )
-    # 260606-lyb Change 2: ONE process-wide per-source failure cooldown for the whole
-    # lifespan (R1), mirroring the enum_cache construction. The search/recent routes
-    # thread it into fan_out so a hard-down source is skipped (zero upstream calls)
-    # for source_failure_cooldown_seconds; 0 disables it entirely.
+    # 260606-lyb Change 2 / 260620 backoff rework: ONE process-wide per-source failure
+    # cooldown for the whole lifespan (R1), mirroring the enum_cache construction. The
+    # search/recent routes thread it into fan_out so a hard-down source is skipped
+    # (zero upstream calls) once its CONSECUTIVE-failure backoff opens a cooldown — no
+    # cooldown on the 1st failure, escalating from base_seconds up to the cap. Setting
+    # either knob to 0 disables it entirely.
     app.state.failure_cooldown = SourceFailureCooldown(
-        ttl_seconds=settings.source_failure_cooldown_seconds
+        base_seconds=settings.source_failure_cooldown_base_seconds,
+        max_seconds=settings.source_failure_cooldown_seconds,
     )
     # Download surface: aiosqlite job store + lifespan-owned JobManager (PLAT-03).
     store = await open_store(settings.db_path)
