@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 
 import httpx
 import pytest
@@ -50,15 +51,42 @@ def _solver(**over: object) -> AndroidSolver:
     return AndroidSolver(**kwargs)  # type: ignore[arg-type]
 
 
-def _solve_response(host: str = "mangadot.net") -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "cf_clearance": "android-minted-token",
-            "user_agent": _WEBVIEW_UA,
-            "host": host,
-        },
-    )
+# Default epoch expiry the sidecar mints (the precise-refresh contract). Far-future so
+# real-``time.time()`` math never treats a default-minted clearance as already expired.
+_DEFAULT_EXPIRES = 2000000000.0
+# Sentinel: pass ``expires=_ABSENT`` to omit ``cf_clearance_expires`` from the response
+# body (an OLDER sidecar). Distinct from ``None`` (present-but-session/unknown).
+_ABSENT: object = object()
+
+
+def _solve_response(
+    host: str = "mangadot.net",
+    *,
+    token: str = "android-minted-token",
+    expires: object = _DEFAULT_EXPIRES,
+) -> httpx.Response:
+    body: dict[str, object] = {
+        "cf_clearance": token,
+        "user_agent": _WEBVIEW_UA,
+        "host": host,
+    }
+    if expires is not _ABSENT:
+        body["cf_clearance_expires"] = expires
+    return httpx.Response(200, json=body)
+
+
+class _FakeCollector:
+    """Records ``emit_solve`` calls so a test can assert the android solve is now a
+    labeled metric event (the gap-mystery fix). Other ``emit_*`` are no-ops."""
+
+    def __init__(self) -> None:
+        self.solves: list[dict[str, object]] = []
+
+    def emit_solve(self, **kwargs: object) -> None:
+        self.solves.append(kwargs)
+
+    def __getattr__(self, _name: str):  # type: ignore[no-untyped-def]
+        return lambda *a, **k: None
 
 
 def test_satisfies_antibot_protocol() -> None:
@@ -308,3 +336,210 @@ async def test_warm_eager_solves_each_android_key() -> None:
     finally:
         await solver.aclose()
     assert isinstance(held, Clearance)
+
+
+# ── #1: the android solve is now a labeled metric event (the gap-mystery fix) ──
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_emits_solve_metric_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful sidecar solve emits a ``kind=solve`` event so its ~11s latency is
+    visible in the per-request breakdown (previously the android solve emitted nothing
+    → the gap read as a mystery)."""
+    fake = _FakeCollector()
+    monkeypatch.setattr("manga_gateway.metrics.collector.get_collector", lambda: fake)
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert len(fake.solves) == 1
+    ev = fake.solves[0]
+    assert ev["source_key"] == "mangadot"
+    assert ev["outcome"] == "ok"
+    assert ev["error"] is None
+    assert isinstance(ev["duration_ms"], float) and ev["duration_ms"] >= 0.0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_emits_error_metric_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed solve still emits an ``outcome=error`` event (and re-raises) — the
+    failure is observable, the token value never reaches the metric."""
+    fake = _FakeCollector()
+    monkeypatch.setattr("manga_gateway.metrics.collector.get_collector", lambda: fake)
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert len(fake.solves) == 1
+    assert fake.solves[0]["outcome"] == "error"
+    assert fake.solves[0]["error"] == "HTTPStatusError"
+
+
+# ── #2: the sidecar cookie expiry is captured and drives proactive refresh ─────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_clearance_records_cookie_expiry() -> None:
+    """A solve that returns ``cf_clearance_expires`` tracks it for the refresh loop."""
+    respx.post(f"{_SIDECAR}/solve").mock(
+        return_value=_solve_response(expires=1_900_000_000.0)
+    )
+    solver = _solver()
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert solver._expires_at["mangadot"] == 1_900_000_000.0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_missing_or_session_expiry_is_not_tracked() -> None:
+    """An OLDER sidecar (field absent) and a session cookie (expires=None / -1) both
+    leave NO tracked expiry → that key is refreshed reactively only (never proactively).
+    Degrades cleanly without a sidecar bump."""
+    respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=[
+            _solve_response(expires=_ABSENT),  # older sidecar: field omitted
+            _solve_response(expires=None),  # session/unknown lifetime
+            _solve_response(expires=-1),  # CDP session-cookie sentinel
+        ]
+    )
+    solver = _solver()
+    try:
+        for _ in range(3):
+            await solver.get_clearance("mangadot", force_resolve=True)
+            assert "mangadot" not in solver._expires_at
+    finally:
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_force_resolve_clears_tracked_expiry_then_resets() -> None:
+    """force_resolve discards the tracked expiry alongside the held clearance (WR-05)
+    before re-solving, then the fresh solve re-records it."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response(expires=1.0e9))
+    solver = _solver()
+    try:
+        await solver.get_clearance("mangadot")
+        assert solver._expires_at["mangadot"] == 1.0e9
+        await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert solver._expires_at["mangadot"] == 1.0e9
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_remints_expiring_key_and_swaps_atomically() -> None:
+    """The proactive tick re-mints a within-lead key WITHOUT force_resolve, swapping the
+    held clearance only on success (the old one keeps serving during the solve)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        return_value=_solve_response(token="fresh-token", expires=time.time() + 99999)
+    )
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    # Seed an about-to-expire held clearance (expiry inside the lead window).
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "stale-token"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() + 30.0  # 30s < 120s lead → expiring
+    try:
+        await solver._refresh_tick()
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1  # re-minted
+    assert solver._held["mangadot"].cookies == {"cf_clearance": "fresh-token"}
+    assert solver._expires_at["mangadot"] > time.time() + 9000  # expiry advanced
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_skips_on_demand_and_not_yet_expiring() -> None:
+    """The tick never re-mints an on-demand key, nor a key still far from expiry."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(on_demand_keys=frozenset({"mangadot"}))
+    solver._refresh_lead_s = 120.0
+    # mangadot is on-demand AND expiring; kagane is eager but far from expiry.
+    solver._expires_at["mangadot"] = time.time() + 1.0
+    solver._expires_at["kagane"] = time.time() + 100000.0
+    try:
+        await solver._refresh_tick()
+    finally:
+        await solver.aclose()
+    assert not route.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_keeps_old_clearance_when_resolve_fails() -> None:
+    """A failed proactive re-mint keeps the old (about-to-expire) clearance — the
+    reactive 403 self-heal remains the backstop; the tick must not raise."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    old = Clearance(cookies={"cf_clearance": "old-token"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = old
+    solver._expires_at["mangadot"] = time.time() + 10.0
+    try:
+        delay = await solver._refresh_tick()  # must NOT raise
+    finally:
+        await solver.aclose()
+    assert solver._held["mangadot"] is old  # unchanged
+    assert isinstance(delay, float)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_sleep_is_clamped() -> None:
+    """No known expiries → sleep the max; a far-off expiry is also clamped to max; a
+    near one floors at min."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    solver._refresh_min_sleep_s = 30.0
+    solver._refresh_max_sleep_s = 600.0
+    try:
+        assert await solver._refresh_tick() == 600.0  # nothing tracked → max
+        solver._expires_at["kagane"] = time.time() + 1_000_000.0  # very far
+        assert await solver._refresh_tick() == 600.0  # clamped to max
+    finally:
+        await solver.aclose()
+
+
+# ── #2 lifecycle: start() is a guarded no-op, aclose() cancels the loop ────────
+
+
+def test_start_is_noop_when_sidecar_unconfigured() -> None:
+    """An unconfigured sidecar spins NO background task (gate/CI/local-no-redroid stays
+    byte-for-byte unchanged)."""
+    solver = _solver(base_url=None)
+    solver.start()
+    assert solver._refresh_task is None
+
+
+@pytest.mark.asyncio
+async def test_start_then_aclose_cancels_refresh_task() -> None:
+    """start() launches the refresh loop; aclose() cancels and awaits it."""
+    solver = _solver()
+    solver.start()
+    task = solver._refresh_task
+    assert task is not None and not task.done()
+    solver.start()  # idempotent — does not spawn a second task
+    assert solver._refresh_task is task
+    await solver.aclose()
+    assert task.cancelled() or task.done()
+    assert solver._refresh_task is None

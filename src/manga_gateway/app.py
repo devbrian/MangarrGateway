@@ -398,6 +398,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine_by_source=engine_by_source,
     )
     app.state.solver = solver
+    # D-35 follow-up: start the android proactive-refresh loop so a held clearance is
+    # re-minted ahead of its cookie expiry (off the request hot path) instead of only
+    # reactively on a 403. No-op when the sidecar is unconfigured; cancelled by
+    # solver.aclose() → android.aclose() on shutdown.
+    android_solver.start()
 
     async def _warm_solver() -> None:
         # #88 / PR#90 review: per-domain warm isolation. ``solver.warm()`` returns

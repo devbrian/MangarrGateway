@@ -28,7 +28,9 @@ green. The ``cf_clearance`` value is NEVER logged (T-10-04).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -41,6 +43,61 @@ if TYPE_CHECKING:
     from pydantic import SecretStr
 
 _log = logging.getLogger("manga_gateway")
+
+# Proactive-refresh tuning (D-35 follow-up: keep the ~11s solve off the request hot
+# path). Re-mint a held clearance this many seconds BEFORE its real cookie expiry; the
+# background loop then sleeps until the soonest upcoming (expiry − lead), clamped to
+# [min, max] so a far-off expiry still re-checks periodically and a near one never
+# busy-loops. Expiry math is wall-clock (cookie ``expires`` is epoch seconds).
+_REFRESH_LEAD_S = 120.0
+_REFRESH_MIN_SLEEP_S = 30.0
+_REFRESH_MAX_SLEEP_S = 600.0
+
+
+def _emit_solve(
+    key: str,
+    *,
+    outcome: str,
+    duration_ms: float,
+    attempt: int,
+    error: str | None,
+) -> None:
+    """No-op-safe, failure-isolated ``emit_solve`` for the android sidecar solve.
+
+    The browser path emits its ``kind="solve"`` event from ``solver_lifecycle``; the
+    android path emitted NOTHING, so an in-band ~11s sidecar solve was invisible in the
+    per-request breakdown (it surfaced only as an unexplained gap between two http
+    events). This mirrors ``solver_lifecycle._emit_solve`` so the android solve shows as
+    a labeled ``solve`` row. A ``None`` collector is a no-op; a collector error never
+    breaks the solve. The ``cf_clearance`` value is NEVER passed here (T-10-04)."""
+    from ..metrics.collector import get_collector
+
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        collector.emit_solve(
+            source_key=key,
+            outcome=outcome,
+            duration_ms=duration_ms,
+            attempt=attempt,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001 — a metric failure must never break a solve
+        pass
+
+
+def _parse_expiry(raw: object) -> float | None:
+    """Coerce the sidecar's ``cf_clearance_expires`` → a positive epoch float | None.
+
+    A missing/null/non-numeric/non-positive value means "no known lifetime" → ``None``
+    (that key is then refreshed reactively only). Booleans are rejected (a stray
+    ``True`` is not an epoch). Mirrors the sidecar's own ``_cookie_expires`` guard so
+    an older sidecar that omits the field degrades cleanly to reactive-only.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw) if raw > 0 else None
 
 
 class AndroidSolver:
@@ -94,6 +151,16 @@ class AndroidSolver:
         # Last-good clearance per source key (the D-35 hold — mirrors the browser
         # solver's persistent-context clearance reuse).
         self._held: dict[str, Clearance] = {}
+        # Per-source wall-clock epoch expiry of the held clearance (only for keys whose
+        # sidecar response carried a real cookie lifetime). Drives the proactive
+        # refresh; a key absent here is refreshed only reactively (D-35 403 self-heal).
+        self._expires_at: dict[str, float] = {}
+        # The background proactive-refresh task (started by :meth:`start`, cancelled by
+        # :meth:`aclose`). Tunables are instance attrs so tests can shrink them.
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._refresh_lead_s = _REFRESH_LEAD_S
+        self._refresh_min_sleep_s = _REFRESH_MIN_SLEEP_S
+        self._refresh_max_sleep_s = _REFRESH_MAX_SLEEP_S
 
     async def get_clearance(
         self,
@@ -127,6 +194,7 @@ class AndroidSolver:
             # -bad token held — the next non-force call must re-solve rather than
             # silently re-serve the stale clearance that produced the 403.
             self._held.pop(source_key, None)
+            self._expires_at.pop(source_key, None)
         else:
             held = self._held.get(source_key)
             if held is not None:
@@ -134,9 +202,17 @@ class AndroidSolver:
             if not solve_if_missing:
                 # On-demand peek with nothing held — do NOT block on a sidecar solve.
                 return None
-        clearance = await self._solve(source_key)
+        clearance, expires_at = await self._solve(source_key)
         self._held[source_key] = clearance
+        self._record_expiry(source_key, expires_at)
         return clearance
+
+    def _record_expiry(self, source_key: str, expires_at: float | None) -> None:
+        """Track (or clear) the held clearance's epoch expiry for the refresh loop."""
+        if expires_at is not None:
+            self._expires_at[source_key] = expires_at
+        else:
+            self._expires_at.pop(source_key, None)
 
     async def warm(self) -> list[str]:
         """Best-effort eager solve per android key; return the FAILED keys.
@@ -169,7 +245,15 @@ class AndroidSolver:
         return failed
 
     async def aclose(self) -> None:
-        """Close the owned httpx client (no-op for an injected one)."""
+        """Cancel the refresh loop and close the owned httpx client (idempotent)."""
+        task = self._refresh_task
+        if task is not None:
+            self._refresh_task = None
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         if self._owns_client and self._client is not None:
             client = self._client
             self._client = None
@@ -185,14 +269,19 @@ class AndroidSolver:
             self._client = httpx.AsyncClient()
         return self._client
 
-    async def _solve(self, source_key: str) -> Clearance:
-        """POST the sidecar ``/solve`` and parse a :class:`Clearance` (BOT-02).
+    async def _solve(self, source_key: str) -> tuple[Clearance, float | None]:
+        """POST the sidecar ``/solve`` → ``(Clearance, epoch-expiry|None)`` (BOT-02).
 
         Sends ``X-Solver-Key`` (SEC-01) + ``{"challenge_url": <map[key]>}``; a
         non-200 raises (``raise_for_status``) so ``warm()`` reports the key failed and
         the lifespan disables it, exactly like a failed browser solve. The
         ``cf_clearance`` token is parsed into the SAME ``Clearance`` shape the httpx
-        leg injects via D-40 — and is NEVER logged (T-10-04).
+        leg injects via D-40 — and is NEVER logged (T-10-04). The optional
+        ``cf_clearance_expires`` (epoch seconds, or absent/null) rides back so the
+        caller can refresh the clearance proactively before it lapses.
+
+        Emits a ``kind="solve"`` metric event (success AND failure) so the sidecar
+        solve's latency is visible in the per-request breakdown (the gap-mystery fix).
         """
         if self._base_url is None:
             raise RuntimeError(
@@ -211,16 +300,106 @@ class AndroidSolver:
         body: dict[str, object] = {"challenge_url": challenge_url}
         if self._proxy is not None:
             body["proxy"] = self._proxy
-        resp = await self._ensure_client().post(
-            f"{self._base_url}/solve",
-            json=body,
-            headers=headers,
-            timeout=self._timeout_s,
+        start = time.perf_counter()
+        try:
+            resp = await self._ensure_client().post(
+                f"{self._base_url}/solve",
+                json=body,
+                headers=headers,
+                timeout=self._timeout_s,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            token = payload["cf_clearance"]
+            user_agent = payload["user_agent"]
+        except Exception as exc:
+            _emit_solve(
+                source_key,
+                outcome="error",
+                duration_ms=(time.perf_counter() - start) * 1000.0,
+                attempt=1,
+                error=type(exc).__name__,
+            )
+            raise
+        _emit_solve(
+            source_key,
+            outcome="ok",
+            duration_ms=(time.perf_counter() - start) * 1000.0,
+            attempt=1,
+            error=None,
         )
-        resp.raise_for_status()
-        payload = resp.json()
-        token = payload["cf_clearance"]
-        user_agent = payload["user_agent"]
+        expires_at = _parse_expiry(payload.get("cf_clearance_expires"))
         # Log the solve event only — never the token value (T-10-04).
         _log.info("AndroidSolver minted clearance for source %r", source_key)
-        return Clearance(cookies={"cf_clearance": token}, user_agent=user_agent)
+        return (
+            Clearance(cookies={"cf_clearance": token}, user_agent=user_agent),
+            expires_at,
+        )
+
+    # ─────────────────────── proactive expiry-driven refresh ──────────────────
+
+    def start(self) -> None:
+        """Start the background proactive-refresh loop (idempotent, app lifespan).
+
+        No-op when the sidecar is unconfigured or no android keys are mapped (gate /
+        CI / a local box without redroid stays byte-for-byte unchanged — no task spins)
+        or when already started. The loop is cancelled in :meth:`aclose`.
+        """
+        if (
+            self._refresh_task is not None
+            or self._base_url is None
+            or not self._challenge_urls
+        ):
+            return
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+    async def _refresh_loop(self) -> None:
+        """Re-mint expiring clearances ahead of their lapse until cancelled."""
+        while True:
+            try:
+                delay = await self._refresh_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a tick failure must not kill the loop
+                _log.warning("AndroidSolver refresh tick failed", exc_info=True)
+                delay = self._refresh_max_sleep_s
+            await asyncio.sleep(delay)
+
+    async def _refresh_tick(self) -> float:
+        """Re-mint any held clearance within the lead window; return the next sleep.
+
+        Re-mints with "solve-then-swap" semantics (NOT ``force_resolve``): it does NOT
+        discard the held entry first, so the still-valid clearance keeps serving during
+        the ~11s solve and is swapped atomically only on success. A failed refresh keeps
+        the old (about-to-expire) clearance — the reactive D-35 403 self-heal remains
+        the backstop. On-demand keys are never proactively refreshed (they solve only on
+        a live challenge). The returned delay is the soonest upcoming (expiry − lead),
+        clamped to [min, max]; with no known expiries it is ``max`` (re-check later).
+        """
+        now = time.time()
+        for key, expiry in list(self._expires_at.items()):
+            if key in self._on_demand_keys:
+                continue
+            if expiry - now > self._refresh_lead_s:
+                continue
+            try:
+                clearance, new_expiry = await self._solve(key)
+            except Exception:  # noqa: BLE001 — keep the held clearance; D-35 backstops
+                _log.warning(
+                    "AndroidSolver proactive refresh failed for source %r; keeping "
+                    "held clearance (reactive 403 self-heal still covers)",
+                    key,
+                    exc_info=True,
+                )
+                continue
+            self._held[key] = clearance
+            self._record_expiry(key, new_expiry)
+        upcoming = [
+            expiry - self._refresh_lead_s
+            for key, expiry in self._expires_at.items()
+            if key not in self._on_demand_keys
+        ]
+        if not upcoming:
+            return self._refresh_max_sleep_s
+        delay = min(upcoming) - time.time()
+        return max(self._refresh_min_sleep_s, min(self._refresh_max_sleep_s, delay))
