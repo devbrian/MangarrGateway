@@ -176,6 +176,18 @@ class AdbDevice:
         )
         return port
 
+    def remove_forward(self, local_port: int | None = None) -> None:
+        """Tear down the ``tcp:<local_port>`` devtools forward (counterpart of
+        :meth:`forward_devtools`).
+
+        Runs ``adb -s <target> forward --remove tcp:<port>`` so the ESTABLISHED
+        devtools forward created for a solve does not leak across solves (#275). The
+        port defaults to the configured ``local_port`` — the same value
+        :meth:`forward_devtools` forwards by default.
+        """
+        port = local_port if local_port is not None else self._local_port
+        self._device("forward", "--remove", f"tcp:{port}")
+
     def input_tap(self, x: int, y: int) -> None:
         """Hardware touch at device pixels ``(x, y)`` — a REAL tap, not synthetic JS."""
         self._device("shell", "input", "tap", str(int(x)), str(int(y)))
