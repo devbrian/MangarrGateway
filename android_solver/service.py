@@ -47,6 +47,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from android_solver.cdp import (
+    ClearanceCookie,
     HttpGetter,
     WebSocketFactory,
     WebSocketLike,
@@ -204,6 +205,10 @@ class SolveResult:
     user_agent: str
     host: str
     egress_ip: str = ""
+    # The minted cookie's wall-clock epoch expiry (the Cloudflare Challenge-Passage
+    # TTL), or ``None`` for a session/unknown lifetime. Additive-only (D-08): present
+    # on every response so the gateway can re-mint ahead of the lapse. Non-sensitive.
+    cf_clearance_expires: float | None = None
 
 
 class SolvePipeline(Protocol):
@@ -444,13 +449,14 @@ class AndroidSolvePipeline:
             # Page ws, DOM/Page enable, frame readiness, and the viewport scales
             # are computed ONCE; only locate+tap+poll repeats inside the loop.
             x_scale, y_scale = self._compute_scales(ws)
-            token = self._tap_until_cleared(
+            minted = self._tap_until_cleared(
                 ws, ws_url, host, x_scale, y_scale, deadline, cancel
             )
         finally:
             ws.close()
-        if not token:
+        if minted is None:
             raise SolveError(f"clearance not minted for {host} before deadline")
+        token, expires = minted.value, minted.expires
 
         # IN-01: use the INJECTED getter (so tests/proxy injection apply), and
         # guard the fetch — a trivial /json/version hiccup must not discard an
@@ -471,6 +477,7 @@ class AndroidSolvePipeline:
         return SolveResult(
             cf_clearance=token,
             user_agent=user_agent,
+            cf_clearance_expires=expires,
             host=host,
             egress_ip=expected_egress_ip,
         )
@@ -561,7 +568,7 @@ class AndroidSolvePipeline:
         y_scale: float,
         deadline: float,
         cancel: Event | None = None,
-    ) -> str | None:
+    ) -> ClearanceCookie | None:
         """Tap the Turnstile checkbox once it is interactive, then let it verify.
 
         On a COLD WebView the ``challenges.cloudflare.com`` OOPIF frame URL appears
@@ -584,7 +591,7 @@ class AndroidSolvePipeline:
         interactive (cold-start race handled, bounded by ``deadline``), and once a
         tap registers it is NEVER disrupted by a follow-up tap.
         """
-        token: str | None = None
+        minted: ClearanceCookie | None = None
         last_tap: float | None = None
         while time.monotonic() < deadline:
             # issue #207: abort the (longest) loop promptly on a post-timeout
@@ -595,14 +602,14 @@ class AndroidSolvePipeline:
             # in-progress ~60s solve — treat it as "no token yet" and continue,
             # mirroring the deliberately fail-open _in_verification probe below.
             try:
-                token = extract_clearance(ws_url, host)
+                minted = extract_clearance(ws_url, host)
             except Exception:  # noqa: BLE001 — a transient cookie poll must not abort the solve
                 _log.warning(
                     "clearance poll failed transiently; continuing", exc_info=True
                 )
-                token = None
-            if token:
-                return token
+                minted = None
+            if minted:
+                return minted
 
             if self._in_verification(ws):
                 # Post-tap verification underway — tapping now resets the widget.
@@ -621,7 +628,7 @@ class AndroidSolvePipeline:
                     self._device.input_tap(*coords)
                     last_tap = time.monotonic()
             time.sleep(self._poll_interval_s)
-        return token
+        return minted
 
     def _in_verification(self, ws: WebSocketLike) -> bool:
         """True while Turnstile's post-tap success/verification banner is showing.
@@ -923,6 +930,9 @@ class SolverService:
             # Req 6: present on EVERY response — the verified egress on a proxied
             # solve, "" on the no-proxy path (additive-only; D-08 keys unchanged).
             "egress_ip": result.egress_ip,
+            # Additive-only: the minted cookie's epoch expiry (or null) so the gateway
+            # re-mints ahead of the Challenge-Passage lapse. Non-sensitive (D-08).
+            "cf_clearance_expires": result.cf_clearance_expires,
         }
 
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:

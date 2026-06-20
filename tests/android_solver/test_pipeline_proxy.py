@@ -17,6 +17,7 @@ redroid / WebView / network. Asserts:
 from __future__ import annotations
 
 import pytest
+from android_solver.cdp import ClearanceCookie
 from android_solver.device import AdbError
 from android_solver.service import (
     AndroidSolvePipeline,
@@ -156,7 +157,9 @@ def _build_pipeline(
 
     def fake_extract(ws_url, host):  # type: ignore[no-untyped-def]
         extract_state["calls"] += 1
-        return "TOKEN" if extract_state["calls"] >= 2 else None
+        if extract_state["calls"] < 2:
+            return None
+        return ClearanceCookie(value="TOKEN", expires=2000000000.0)
 
     monkeypatch.setattr(service, "extract_clearance", fake_extract)
     monkeypatch.setattr(service, "webview_user_agent", lambda url, **kwargs: "UA-wv")

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from android_solver.cdp import extract_clearance, webview_user_agent
+from android_solver.cdp import ClearanceCookie, extract_clearance, webview_user_agent
 
 
 class FakeCdpWs:
@@ -44,17 +44,22 @@ def test_extract_clearance_returns_only_challenge_host_token() -> None:
     cookies = [
         {"name": "cf_clearance", "value": "OTHER_HOST_TOKEN", "domain": ".example.com"},
         {"name": "session", "value": "noise", "domain": ".mangadot.net"},
-        {"name": "cf_clearance", "value": "MANGADOT_TOKEN", "domain": ".mangadot.net"},
+        {
+            "name": "cf_clearance",
+            "value": "MANGADOT_TOKEN",
+            "domain": ".mangadot.net",
+            "expires": 2000000000.0,
+        },
     ]
     ws = FakeCdpWs({"Network.getAllCookies": {"cookies": cookies}})
 
-    value = extract_clearance(
+    minted = extract_clearance(
         "ws://localhost:9222/devtools/page/ABC",
         "mangadot.net",
         ws_factory=_factory(ws),
     )
 
-    assert value == "MANGADOT_TOKEN"
+    assert minted == ClearanceCookie(value="MANGADOT_TOKEN", expires=2000000000.0)
     assert ws.closed is True
 
 
@@ -79,13 +84,54 @@ def test_extract_clearance_matches_subdomain_binding() -> None:
     ]
     ws = FakeCdpWs({"Network.getAllCookies": {"cookies": cookies}})
 
-    value = extract_clearance(
+    minted = extract_clearance(
         "ws://localhost:9222/devtools/page/XYZ",
         "www.kagane.to",
         ws_factory=_factory(ws),
     )
 
-    assert value == "KAGANE_TOKEN"
+    assert minted is not None
+    assert minted.value == "KAGANE_TOKEN"
+
+
+def test_extract_clearance_normalizes_session_and_missing_expiry() -> None:
+    # CDP reports a session cookie as expires=-1 and may omit the field entirely; both
+    # mean "no known lifetime" → expires None (the gateway then refreshes reactively).
+    for cookie in (
+        {"name": "cf_clearance", "value": "TOK", "domain": "kagane.to", "expires": -1},
+        {"name": "cf_clearance", "value": "TOK", "domain": "kagane.to"},
+    ):
+        ws = FakeCdpWs({"Network.getAllCookies": {"cookies": [cookie]}})
+        minted = extract_clearance(
+            "ws://localhost:9222/devtools/page/XYZ",
+            "kagane.to",
+            ws_factory=_factory(ws),
+        )
+        assert minted == ClearanceCookie(value="TOK", expires=None)
+
+
+def test_extract_clearance_skips_invalid_value_and_selects_later_valid_cookie() -> None:
+    # A malformed host-scoped cf_clearance (empty/non-string value) must NOT abort the
+    # scan — a later valid host-scoped token in the same CDP payload wins.
+    cookies = [
+        {"name": "cf_clearance", "value": "", "domain": "kagane.to"},  # malformed
+        {"name": "cf_clearance", "value": None, "domain": "kagane.to"},  # malformed
+        {
+            "name": "cf_clearance",
+            "value": "GOOD_TOKEN",
+            "domain": "kagane.to",
+            "expires": 2000000000.0,
+        },
+    ]
+    ws = FakeCdpWs({"Network.getAllCookies": {"cookies": cookies}})
+
+    minted = extract_clearance(
+        "ws://localhost:9222/devtools/page/XYZ",
+        "kagane.to",
+        ws_factory=_factory(ws),
+    )
+
+    assert minted == ClearanceCookie(value="GOOD_TOKEN", expires=2000000000.0)
 
 
 def test_webview_user_agent_parses_json_version() -> None:

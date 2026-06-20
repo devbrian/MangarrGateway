@@ -14,6 +14,7 @@ import time
 from collections.abc import Iterator
 
 import pytest
+from android_solver.cdp import ClearanceCookie
 from android_solver.config import ConfigError, SidecarConfig
 from android_solver.service import (
     AndroidSolvePipeline,
@@ -26,6 +27,10 @@ from android_solver.service import (
 )
 
 from android_solver import service
+
+# A fixed, non-sensitive cookie expiry (epoch seconds) the extract stubs mint so tests
+# can assert it threads through SolveResult → the /solve payload.
+_STUB_EXPIRES = 2000000000.0
 
 
 class FakePipeline:
@@ -192,6 +197,7 @@ def test_solve_returns_clearance_for_allowlisted_host() -> None:
         "user_agent": "Mozilla/5.0 (Android 11) WebView wv",
         "host": "mangadot.net",
         "egress_ip": "",  # additive-only on the no-proxy path (D-08)
+        "cf_clearance_expires": None,  # additive-only; null when none minted (D-08)
     }
     assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
 
@@ -325,8 +331,15 @@ def test_no_proxy_payload_is_today_shape_plus_empty_egress_ip() -> None:
     )
     assert status == 200
     assert pipeline.proxies == [None]  # pipeline driven with proxy=None
-    assert set(payload) == {"cf_clearance", "user_agent", "host", "egress_ip"}
+    assert set(payload) == {
+        "cf_clearance",
+        "user_agent",
+        "host",
+        "egress_ip",
+        "cf_clearance_expires",
+    }
     assert payload["egress_ip"] == ""  # empty on the no-proxy path
+    assert payload["cf_clearance_expires"] is None  # default when none minted
 
 
 def test_proxied_payload_carries_verified_egress_ip() -> None:
@@ -679,16 +692,24 @@ class SeqLocate:
 
 
 class SeqExtract:
-    """``extract_clearance`` stub: returns the token once ``calls >= token_after``."""
+    """``extract_clearance`` stub: returns the cookie once ``calls >= token_after``."""
 
-    def __init__(self, token_after: int, token: str = "MANGADOT_TOKEN") -> None:
+    def __init__(
+        self,
+        token_after: int,
+        token: str = "MANGADOT_TOKEN",
+        expires: float | None = _STUB_EXPIRES,
+    ) -> None:
         self._token_after = token_after
         self._token = token
+        self._expires = expires
         self.calls = 0
 
     def __call__(self, ws_url, host):  # type: ignore[no-untyped-def]
         self.calls += 1
-        return self._token if self.calls >= self._token_after else None
+        if self.calls < self._token_after:
+            return None
+        return ClearanceCookie(value=self._token, expires=self._expires)
 
 
 class SeqVerify:
@@ -767,6 +788,9 @@ def test_solve_retaps_until_clearance_appears(
 
     assert result.cf_clearance == "MANGADOT_TOKEN"
     assert result.user_agent == "UA-wv"
+    # The minted cookie's expiry threads from extract_clearance → SolveResult so the
+    # gateway can refresh ahead of the lapse.
+    assert result.cf_clearance_expires == _STUB_EXPIRES
     # Re-tapped at least twice (cold-start race): one tap was not enough.
     assert len(device.taps) >= 2
 
@@ -868,7 +892,7 @@ class RaiseThenToken:
         self.calls += 1
         if self.calls <= self._raises:
             raise RuntimeError("transient CDP hiccup")
-        return self._token
+        return ClearanceCookie(value=self._token, expires=_STUB_EXPIRES)
 
 
 def test_solve_survives_transient_clearance_poll_failure(

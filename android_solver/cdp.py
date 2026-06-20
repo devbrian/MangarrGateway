@@ -25,12 +25,28 @@ from __future__ import annotations
 import json
 import logging
 import urllib.request
-from typing import Any, Protocol, cast
+from typing import Any, NamedTuple, Protocol, cast
 
 _log = logging.getLogger("android_solver.cdp")
 
 # CDP / Network cookie name for the Cloudflare clearance token.
 _CLEARANCE_COOKIE = "cf_clearance"
+
+
+class ClearanceCookie(NamedTuple):
+    """A minted ``cf_clearance`` cookie: its VALUE + the wall-clock epoch it expires.
+
+    ``expires`` is the CDP cookie ``expires`` field (Unix epoch seconds) when the site
+    set a real lifetime (the Cloudflare "Challenge Passage" TTL), or ``None`` for a
+    session cookie / a missing-or-non-positive value (CDP uses ``-1`` for session
+    cookies). The expiry lets the gateway re-mint the clearance proactively BEFORE it
+    lapses (off the request hot path) instead of only reactively on a 403. The
+    ``value`` is NEVER logged (T-10-01); the expiry is non-sensitive.
+    """
+
+    value: str
+    expires: float | None
+
 
 _DEFAULT_WS_TIMEOUT = 15.0
 _DEFAULT_HTTP_TIMEOUT = 10.0
@@ -121,12 +137,14 @@ def extract_clearance(
     ws_factory: WebSocketFactory | None = None,
     timeout: float = _DEFAULT_WS_TIMEOUT,
     command_id: int = 1,
-) -> str | None:
-    """Return the cleared cookie value scoped to ``host``, or ``None`` if absent.
+) -> ClearanceCookie | None:
+    """Return the cleared cookie (value + expiry) scoped to ``host``, or ``None``.
 
     Opens the CDP page websocket (``suppress_origin=True``), issues
-    ``Network.getAllCookies``, and selects the host-scoped token. The token
-    value is returned to the caller but never logged here.
+    ``Network.getAllCookies``, and selects the host-scoped token. The token value is
+    returned to the caller but never logged here; the cookie's ``expires`` (epoch
+    seconds, or ``None`` for a session/unknown lifetime) rides alongside it so the
+    gateway can refresh the clearance ahead of its lapse.
     """
     factory = ws_factory or _default_ws_factory
     ws = factory(devtools_ws_url, timeout=timeout)
@@ -136,20 +154,41 @@ def extract_clearance(
         ws.close()
 
     cookies = result.get("cookies", [])
-    value = _select_host_clearance(cookies, host)
-    if value is not None:
+    minted = _select_host_clearance(cookies, host)
+    if minted is not None:
         # Redacted event ONLY — the token value never reaches the logs (T-10-01).
-        _log.info("captured clearance for host %s", host)
+        # The expiry is non-sensitive and aids field diagnosis of refresh cadence.
+        _log.info("captured clearance for host %s (expires %s)", host, minted.expires)
     else:
         _log.warning("no host-scoped clearance cookie found for host %s", host)
-    return value
+    return minted
 
 
-def _select_host_clearance(cookies: list[dict[str, Any]], host: str) -> str | None:
+def _select_host_clearance(
+    cookies: list[dict[str, Any]], host: str
+) -> ClearanceCookie | None:
     for cookie in cookies:
         if cookie.get("name") == _CLEARANCE_COOKIE and _belongs_to_host(cookie, host):
-            return cookie.get("value")
+            value = cookie.get("value")
+            # Skip a malformed host match (empty/non-string value) and keep scanning —
+            # a later host-scoped cf_clearance in the same payload may be valid.
+            if not isinstance(value, str) or not value:
+                continue
+            return ClearanceCookie(value=value, expires=_cookie_expires(cookie))
     return None
+
+
+def _cookie_expires(cookie: dict[str, Any]) -> float | None:
+    """Normalize a CDP cookie's ``expires`` → a positive epoch float, else ``None``.
+
+    CDP reports ``expires`` as Unix epoch seconds, or ``-1`` for a session cookie; a
+    missing / non-positive / non-numeric value all mean "no known lifetime" → ``None``
+    (the gateway then falls back to reactive-only re-solve for that source).
+    """
+    raw = cookie.get("expires")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw) if raw > 0 else None
 
 
 def webview_user_agent(
