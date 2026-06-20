@@ -1194,7 +1194,15 @@ class ComixSource(Source):
             links_obj = await ctx.resolve_external_links(series_hid, _parse_links)
 
             series_releases: list[Release] = []
-            for chapter in chapters[req.offset : req.offset + result_window]:
+            # 260620-ki0: req.offset is NO LONGER consumed per-source — offset is now a
+            # ROUTE concern (search.py pages the cross-source merged newest-first list).
+            # The per-series window is kept only as a handle-minting bound, but widened
+            # to offset+result_window so the route's merged window
+            # [offset:offset+limit] can never be starved of items that belong to it
+            # from THIS series (a single series can contribute at most offset+limit
+            # items to the global newest-first window). result_window
+            # (= req.limit or _MAX_FEED_LIMIT) is unchanged.
+            for chapter in chapters[: max(req.offset, 0) + result_window]:
                 # Inject the series-page-known title into the chapter dict so the
                 # SOURCE-AGNOSTIC ``_to_release`` (which reads ``seriesTitle`` /
                 # ``series`` / ``title`` keys) does not need to know whether the

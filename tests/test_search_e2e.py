@@ -527,6 +527,89 @@ async def test_search_truncates_to_limit(client: httpx.AsyncClient) -> None:
     assert len(resp.json()["releases"]) == 2  # merged total truncated to limit
 
 
+def _offset_feed_payload(manga_id: str) -> dict:
+    # 5 chapters with DISTINCT, ascending publishAt so sort_newest_first yields a
+    # fully deterministic newest-first order [5, 4, 3, 2, 1] by chapterNumber.
+    def _ch(i: int) -> dict:
+        return {
+            "id": str(uuid.uuid4()),
+            "type": "chapter",
+            "attributes": {
+                "volume": None,
+                "chapter": str(i),
+                "title": None,
+                "translatedLanguage": "en",
+                "externalUrl": None,
+                "isUnavailable": False,
+                "publishAt": f"2026-05-0{i}T00:00:00+00:00",
+                "readableAt": f"2026-05-0{i}T00:00:00+00:00",
+                "pages": 2,
+            },
+            "relationships": [
+                {"id": "grp", "type": "scanlation_group", "attributes": {"name": "G"}},
+                {
+                    "id": manga_id,
+                    "type": "manga",
+                    "attributes": {"title": {"en": "Solo Leveling"}},
+                },
+            ],
+        }
+
+    chapters = [_ch(i) for i in range(1, 6)]
+    return {
+        "result": "ok",
+        "response": "collection",
+        "data": chapters,
+        "total": len(chapters),
+        "limit": 100,
+        "offset": 0,
+    }
+
+
+@respx.mock
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("offset", "limit", "expected"),
+    [
+        (0, 2, [Decimal("5"), Decimal("4")]),  # page 1 of merged newest-first
+        (2, 2, [Decimal("3"), Decimal("2")]),  # non-overlapping window past page 1
+        (10, 2, []),  # past-the-end → empty window, 200 (not error/wraparound)
+        (-5, 2, [Decimal("5"), Decimal("4")]),  # negative clamped to 0 at the route
+    ],
+)
+async def test_search_applies_offset_to_merged_window(
+    client: httpx.AsyncClient,
+    offset: int,
+    limit: int,
+    expected: list[Decimal],
+) -> None:
+    # 260620-ki0 / SRCH-01: offset pages the MERGED, newest-first list before the
+    # limit cut, so distinct offsets yield distinct, non-overlapping windows; a
+    # negative offset is clamped to 0 rather than triggering Python negative-index
+    # slicing.
+    manga_id = str(uuid.uuid4())
+    respx.get(f"{_MANGADEX}/manga").mock(
+        return_value=httpx.Response(200, json=_manga_search_payload(manga_id))
+    )
+    respx.get(f"{_MANGADEX}/chapter").mock(
+        return_value=httpx.Response(200, json=_offset_feed_payload(manga_id))
+    )
+
+    resp = await client.post(
+        "/search",
+        json={
+            "type": "chapter",
+            "query": "X",
+            "offset": offset,
+            "limit": limit,
+            "sources": ["mangadex"],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [Decimal(str(r["chapterNumber"])) for r in body["releases"]] == expected
+
+
 def _floor_family_feed_payload(manga_id: str) -> dict:
     """A chapter feed exercising the 179.x floor-family + a 180 + a null-chapter row.
 

@@ -156,13 +156,17 @@ class MangaDexSource(Source):
                 return await self.fetch_external_links(_mid, ctx)
 
             links = await ctx.resolve_external_links(manga_id, _parse_links)
-            # CACHE-02: the chapter_matches floor filter + the req.offset window are
-            # applied AFTER the cache (at the enumeration boundary), exactly like comix
-            # — never baked into the cache key. Under type=chapter+chapter this keeps
-            # only the requested whole-number/floor family (gate-off type=manga =
-            # pass-through, #144); a floor-family member on a later feed page is never
-            # missed because the WHOLE feed is cached. req.limit truncation stays at the
-            # route (search.py), so the source still must NOT pre-truncate to req.limit.
+            # CACHE-02: the chapter_matches floor filter is applied AFTER the cache (at
+            # the enumeration boundary), exactly like comix — never baked into the cache
+            # key. Under type=chapter+chapter this keeps only the requested
+            # whole-number/floor family (gate-off type=manga = pass-through, #144); a
+            # floor-family member on a later feed page is never missed because the WHOLE
+            # feed is cached.
+            #
+            # 260620-ki0: req.offset is NO LONGER consumed per-source — offset is now a
+            # ROUTE concern (search.py applies offset+limit on the cross-source merged
+            # newest-first list). The source returns the complete matched feed; it still
+            # must NOT pre-truncate to req.limit (the route owns both offset and limit).
             matched = [
                 rel
                 for chapter in enum.items
@@ -173,7 +177,7 @@ class MangaDexSource(Source):
             # the series — all N share the identical object (R4).
             for rel in matched:
                 rel.external_links = links
-            releases.extend(matched[req.offset :] if req.offset else matched)
+            releases.extend(matched)
         return releases
 
     # IN-02: recent() intentionally does NOT populate Release.externalLinks. MangaDex's
@@ -340,8 +344,9 @@ class MangaDexSource(Source):
         by ``_MAX_FEED_PAGES`` so a pathological/looping feed can never spin unbounded.
         The walk returns the COMPLETE feed — no per-request early-stop or offset window
         — so the cached enumeration can answer any chapter/offset query; the
-        ``chapter_matches`` floor filter + the offset window run in ``search`` AFTER the
-        cache (CACHE-02), exactly like comix/mangaball. The walker does NOT filter.
+        ``chapter_matches`` floor filter runs in ``search`` AFTER the cache (CACHE-02),
+        exactly like comix/mangaball, and ``offset`` is a ROUTE concern (search.py pages
+        the merged list — 260620-ki0). The walker does NOT filter.
         """
         collected: list[dict[str, Any]] = []
         offset = 0
