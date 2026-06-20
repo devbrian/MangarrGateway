@@ -701,22 +701,25 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
-    async def get_bytes(self, url: str) -> bytes:
-        """GET ``url`` → decrypted response bytes, retried like ``get_json`` but NOT
-        rate-limited.
+    async def get_bytes(self, url: str, *, limited: bool = False) -> bytes:
+        """GET ``url`` → decrypted response bytes, retried like ``get_json``.
 
         Image bytes are served by the at-home node host (``uploads.mangadex.org``),
         NOT ``api.mangadex.org``: they are not counted against the per-source API
-        budget, so this deliberately does NOT acquire ``self._limiter`` (D-31 /
-        Pitfall 3). The per-job ``asyncio.Semaphore`` (Plan 03) is the real ceiling.
-        Raises ``SourceError`` on a permanent 4xx; lets transport errors / 5xx bubble
-        to tenacity. Bytes are decrypted (D-39) but never recompressed (PKG-04).
+        budget, so by default this does NOT acquire ``self._limiter`` (D-31 /
+        Pitfall 3). The per-job ``asyncio.Semaphore`` (Plan 03) is the real ceiling
+        for image fetch. Callers that issue API/page GETs which DO count against the
+        per-source budget (e.g. WeebCentral's metadata detail GET, WR-03) pass
+        ``limited=True`` so the call is gated by the same per-minute rate limiter as
+        the source's other traffic. Raises ``SourceError`` on a permanent 4xx; lets
+        transport errors / 5xx bubble to tenacity. Bytes are decrypted (D-39) but
+        never recompressed (PKG-04).
         """
 
         async def _attempt() -> bytes:
             try:
                 body = await self._request_bytes(
-                    url, params=None, limited=False, op="get_bytes"
+                    url, params=None, limited=limited, op="get_bytes"
                 )
             except SourceError:
                 self._feed_failure()

@@ -116,6 +116,8 @@ class _FakeCtxForSearch:
         self._details = details or {}
         self.calls: list[str] = []
         self.detail_calls: list[str] = []
+        # WR-03: records the ``limited`` flag passed for each detail (main-page) GET.
+        self.detail_limited: list[bool] = []
         self.candidates_enumerated: int | None = None
         # 13-02 seam: per-request scratch stash (unused by weebcentral's main-page GET
         # path, present for parity with the real SourceContext).
@@ -144,7 +146,7 @@ class _FakeCtxForSearch:
     async def cached_enumerate(self, key: tuple[Any, ...], fetch_fn: Any) -> Any:
         return await fetch_fn()
 
-    async def get_bytes(self, url: str) -> bytes:
+    async def get_bytes(self, url: str, *, limited: bool = False) -> bytes:
         self.calls.append(url)
         parsed = urlparse(url)
         path = parsed.path
@@ -158,6 +160,7 @@ class _FakeCtxForSearch:
         if main is not None and main.group(2) != "full-chapter-list":
             token = f"{main.group(1)}/{main.group(2)}"
             self.detail_calls.append(token)
+            self.detail_limited.append(limited)
             staged = self._details.get(token)
             if isinstance(staged, Exception):
                 raise staged
@@ -390,6 +393,8 @@ async def test_external_links_track_canonical_and_stamped_once() -> None:
     assert len(releases) == 2
     # At most one main-page GET per series, keyed on the slugged token.
     assert ctx.detail_calls == [_SOLO_TOKEN]
+    # WR-03: the metadata detail GET is rate-limited (shares the per-minute budget).
+    assert ctx.detail_limited == [True]
     links = releases[0].external_links
     assert links is not None
     dumped = links.model_dump(by_alias=True, exclude_none=True)

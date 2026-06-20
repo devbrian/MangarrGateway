@@ -591,7 +591,10 @@ class WeebCentralSource(Source):
         the 5s timeout + swallow-all-to-``None`` (D-03); a raising/slow GET or an
         absent/malformed Track section leaves the chapter releases intact (R6).
         """
-        html = await ctx.get_bytes(f"{self.base_url}/series/{series_id}")
+        # WR-03: rate-limit this metadata detail GET (limited=True) so the up-to-5
+        # extra per-search GETs share the SAME per-minute budget as the rest of
+        # WeebCentral's traffic and cannot independently tip the 429 ceiling (#187).
+        html = await ctx.get_bytes(f"{self.base_url}/series/{series_id}", limited=True)
         track = await asyncio.to_thread(_parse_track_links, html)
         return normalize(track, "weebcentral")
 
