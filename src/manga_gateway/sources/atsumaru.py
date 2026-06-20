@@ -714,8 +714,8 @@ def _scanlator_names(page: Any) -> dict[str, str]:
 
     Best-effort: returns ``{}`` for any non-dict ``page`` / missing-or-malformed
     ``scanlators`` so the advisory group never breaks the caller. Shared by the
-    search path (``_fetch_scanlator_names`` GETs ``manga.page`` for the map) and the
-    recent path (which already holds the ``manga.page`` body and needs both the
+    search path (``_fetch_page_meta`` GETs ``manga.page`` for the map + tracker links)
+    and the recent path (which already holds the ``manga.page`` body and needs both the
     newest chapter and the map from it).
     """
     scanlators = page.get("scanlators") if isinstance(page, dict) else None

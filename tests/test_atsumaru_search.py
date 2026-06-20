@@ -305,7 +305,7 @@ async def test_search_empty_hits_returns_no_releases() -> None:
 
 
 class _PageCtx:
-    """Minimal ctx for _fetch_scanlator_names: get_json returns canned/raises."""
+    """Minimal ctx for _fetch_page_meta: get_json returns canned/raises."""
 
     def __init__(self, behavior: Any) -> None:
         self._behavior = behavior
