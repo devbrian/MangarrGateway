@@ -46,7 +46,7 @@ def test_release_emits_only_populated_keys() -> None:
 
 
 def test_release_without_links_emits_null() -> None:
-    """Test 2: ``external_links=None`` → ``externalLinks`` null/absent, never 10 nulls."""
+    """Test 2: a None external_links emits null/absent externalLinks (no 10 nulls)."""
     rel = _release(external_links=None)
     wire = json.loads(rel.model_dump_json(by_alias=True))
     assert wire.get("externalLinks") is None

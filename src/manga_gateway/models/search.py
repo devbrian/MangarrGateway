@@ -9,6 +9,11 @@ matching ``manga-gateway.openapi.yaml`` exactly (Pitfall 3 — never re-declare
 survives to >=3 places (SRCH-06 / Pitfall 1) — never round-tripped through a lossy
 float intermediate. Structured fields are populated whenever the source supplies them
 and are the forward primary path for a future Mangarr (D-19/D-20).
+
+``ExternalLinks`` carries the D-07 exclude-none behavior on its own
+``@model_serializer`` (not a route-level ``exclude_none``) because the ``/search``
+route serializes with no ``exclude_none`` — so unset tracker keys are dropped on the
+wire by the sub-model itself, never emitted as an object of 10 nulls.
 """
 
 from __future__ import annotations
@@ -16,9 +21,38 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import Field, field_serializer
+from pydantic import Field, field_serializer, model_serializer
 
 from .common import ApiModel
+
+
+class ExternalLinks(ApiModel):
+    """Series-level cross-reference tracker IDs (D-04/D-05/D-06/D-07).
+
+    Ten frozen canonical fields, each an optional bare ID/slug string (never a URL).
+    The ``@model_serializer`` emits ONLY populated keys by their camelCase alias, so a
+    series with two trackers serializes to exactly two keys (D-07, Pitfall 1).
+    """
+
+    anilist: str | None = Field(default=None, alias="anilist")
+    my_anime_list: str | None = Field(default=None, alias="myAnimeList")
+    manga_updates: str | None = Field(default=None, alias="mangaUpdates")
+    manga_baka: str | None = Field(default=None, alias="mangaBaka")
+    kitsu: str | None = Field(default=None, alias="kitsu")
+    anime_planet: str | None = Field(default=None, alias="animePlanet")
+    bookwalker: str | None = Field(default=None, alias="bookwalker")
+    ann: str | None = Field(default=None, alias="ann")
+    kenmei: str | None = Field(default=None, alias="kenmei")
+    manga_dex: str | None = Field(default=None, alias="mangaDex")
+
+    @model_serializer
+    def _serialize(self) -> dict[str, str]:
+        """Emit only populated keys, by alias (D-07 — drop unset keys on the wire)."""
+        return {
+            field.alias or name: value
+            for name, field in type(self).model_fields.items()
+            if (value := getattr(self, name)) is not None
+        }
 
 
 class SearchRequest(ApiModel):
@@ -64,6 +98,7 @@ class Release(ApiModel):
     votes: int | None = Field(default=None, alias="votes")
     size_bytes: int = Field(default=0, alias="sizeBytes")
     ids: dict[str, Any] | None = None
+    external_links: ExternalLinks | None = Field(default=None, alias="externalLinks")
 
     @field_serializer("chapter_number", when_used="json")
     def _serialize_chapter_number(self, value: Decimal | None) -> float | None:
