@@ -70,8 +70,9 @@ async def fan_out[S: _HasKey, R](
     ``cooldown`` (optional, 260606-lyb Change 2) is the per-source failure negative
     cache. Defaulted ``None`` so existing callers/tests stay green. When supplied: a
     source already ``in_cooldown`` is SKIPPED (no upstream call, instant
-    ``source_unavailable`` warning), and a source whose run hits a HARD-failure branch
-    records a cooldown so the next identical search short-circuits.
+    ``source_unavailable`` warning); a source whose run hits a HARD-failure branch
+    records a failure (consecutive-failure backoff — no cooldown on the 1st, escalating
+    on the 2nd+); and a clean run records a success that resets that backoff.
     """
     releases: list[R] = []
     warnings: list[WarningTuple] = []
@@ -91,10 +92,11 @@ async def fan_out[S: _HasKey, R](
             # per-source isolation guarantee (SRCH-03). The cooldown-check time it
             # now includes is negligible vs the actual source run (CodeRabbit, #223).
             started = time.perf_counter()
-            # 260606-lyb Change 2: a source in cooldown is SKIPPED — no upstream
-            # call, no retry, no backoff. This return happens INSIDE the try (like
-            # the success return below), so it never reaches the trailing
-            # record_failure: a cooldown-skip is not itself a fresh failure.
+            # 260606-lyb Change 2: a source in a live backoff cooldown is SKIPPED — no
+            # upstream call, no retry. This return happens INSIDE the try (like the
+            # success return below), so it never reaches the trailing record_failure
+            # NOR record_success: a cooldown-skip is neither a fresh failure nor a
+            # recovery — the failure streak must stay intact so it keeps escalating.
             if cooldown is not None and cooldown.in_cooldown(src.key):
                 warnings.append(
                     (src.key, "source_unavailable", "upstream unavailable (cooldown)")
@@ -102,6 +104,11 @@ async def fan_out[S: _HasKey, R](
                 return src.key, []
             async with asyncio.timeout(per_source_timeout):
                 result = await run_one(src)
+            # 260620 backoff rework: a clean run resets the consecutive-failure streak
+            # and clears any live cooldown, so a recovered source starts fresh
+            # ("failure 1 = live") instead of carrying an escalated backoff forward.
+            if cooldown is not None:
+                cooldown.record_success(src.key)
             if collect_warnings is not None:
                 for code, message in collect_warnings(src):
                     warnings.append((src.key, code, message))
@@ -172,7 +179,8 @@ async def fan_out[S: _HasKey, R](
         # except branches above ran — BOTH non-error returns (the success return AND
         # the cooldown-skip return) happen INSIDE the try, so they never fall through
         # here. Therefore record_failure trips on HARD FAILURE ONLY: a 200-empty /
-        # zero-results success never sets a cooldown.
+        # zero-results success never records a failure. record_failure grows the
+        # per-source backoff (no cooldown on the 1st failure; 2nd+ escalates).
         if cooldown is not None:
             cooldown.record_failure(src.key)
         return src.key, []

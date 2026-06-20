@@ -37,8 +37,8 @@ _USER_AGENT = "MangaGateway/1.0"
 # plus a concurrent search fan-out (8 sources, each deep-enumerating candidates at
 # _CHAPTERS_FANOUT_CONCURRENCY) jointly drove the one pool to its 100 ceiling;
 # whichever side lost the acquisition race raised PoolTimeout, and a search source
-# that PoolTimeouts trips the 300s SourceFailureCooldown → ALL sources report
-# source_unavailable. The fix gives the download surface its OWN client/pool
+# that repeatedly PoolTimeouts trips its SourceFailureCooldown backoff → ALL sources
+# report source_unavailable. The fix gives the download surface its OWN client/pool
 # (app.py builds two HttpxTransport instances; SessionManager.download_transport
 # routes the engine's download contexts there) so download saturation can never
 # starve search. The 500/100 bump is extra headroom on top of the structural split

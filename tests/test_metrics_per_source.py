@@ -154,7 +154,7 @@ def _deps() -> dict[str, object]:
         "health_map": {},
         "session_prep": None,
         "enum_cache": EnumerationCache(),
-        "failure_cooldown": SourceFailureCooldown(ttl_seconds=300),
+        "failure_cooldown": SourceFailureCooldown(base_seconds=30, max_seconds=600),
     }
 
 
