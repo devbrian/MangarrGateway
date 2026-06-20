@@ -53,6 +53,15 @@ class LiveSmokeProfile:
     # pins as an early-warning signal: a site correcting/drifting an ID surfaces as
     # a nightly failure and is repinned.
     expected_external_links: dict[str, str] = field(default_factory=dict)
+    # Decoupled external-links canary (Phase 13, USER DECISION 2026-06-19).
+    # OPTIONAL: when set, ``test_external_links_smoke`` searches THIS query
+    # instead of ``default_query`` to verify the pinned ``expected_external_links``
+    # superset — used for sources whose ``default_query`` title (tuned for the
+    # DOWNLOAD smoke) legitimately exposes NO tracker links live (mangadex,
+    # mangadot). ``None`` (the default) falls back to ``default_query``. ONLY the
+    # external-links smoke honors this field; every other live test stays on
+    # ``default_query``, so the download-smoke path is unaffected.
+    expected_external_links_query: str | None = None
     fixture_drift_paths: list[Path] = field(default_factory=list)
     perf_budget_s: float | None = None
     # Alt-title live smoke (#139). OPTIONAL: populate ONLY for sources where a

@@ -94,13 +94,20 @@ LIVE_SMOKE = LiveSmokeProfile(
     max_releases_to_try=3,
     min_releases_returned=1,
     expected_release_pattern={"sourceKey": "mangadot", "id_field": "mangaId"},
-    # External tracker links (Phase 13, D-08 / R7). RESEARCH-frozen canary IDs
-    # for *Solo Leveling* (manga 118): mangadot exposes flat tracker fields on
-    # the detail JSON. ``mangaDex`` is OMITTED — it is null for Solo Leveling
-    # (RESEARCH Open Question 3). NOTE: ``default_query`` above is "Murim
-    # Psychopath" (download-leg canary), NOT Solo Leveling — Task 3 (nightly)
-    # must reconcile: either repoint the links-canary or confirm/repin these IDs
-    # against whatever ``default_query`` returns live.
+    # External tracker links (Phase 13, D-08 / R7). DECOUPLED canary (USER
+    # DECISION, 2026-06-19): mangadot's ``default_query="Murim Psychopath"``
+    # (download-leg canary) returns all-empty ``externalLinks`` live (a nightly
+    # 27858894114 capture saw 50 releases, all ``{}`` — that title legitimately
+    # carries no tracker links), so the links smoke uses a dedicated
+    # ``expected_external_links_query="Solo Leveling"`` while ``default_query``
+    # (download smoke) stays UNCHANGED. The IDs below are RESEARCH-frozen for
+    # *Solo Leveling* (manga 118): anilist=105398, myAnimeList=121496,
+    # mangaUpdates=6z1uqw7, mangaBaka=3397, kitsu=54114 (canonical camelCase keys
+    # exactly as the normalizer emits). ``mangaDex`` is OMITTED — null/dropped for
+    # Solo Leveling (RESEARCH Open Question 3). These CANNOT be captured locally
+    # (the android-solver sidecar that clears mangadot's Cloudflare Turnstile is
+    # unreachable from this host) — they are RESEARCH-frozen and will be CONFIRMED
+    # by the re-run nightly (the orchestrator owns nightly dispatch).
     expected_external_links={
         "anilist": "105398",
         "myAnimeList": "121496",
@@ -108,6 +115,7 @@ LIVE_SMOKE = LiveSmokeProfile(
         "mangaBaka": "3397",
         "kitsu": "54114",
     },
+    expected_external_links_query="Solo Leveling",
     # No fixture-drift anchors captured yet — added after the first live smoke pins
     # the real search / chapters-list / images shapes (mirrors comix.py).
     fixture_drift_paths=[],

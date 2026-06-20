@@ -50,16 +50,27 @@ LIVE_SMOKE = LiveSmokeProfile(
     max_releases_to_try=3,
     min_releases_returned=1,
     expected_release_pattern={"sourceKey": "mangadex"},
-    # External tracker links (Phase 13, D-08 / R7). LEFT EMPTY by the
-    # repin-to-default_query reconciliation (USER DECISION, 2026-06-19): the
-    # live ``default_query="Hayakawa Family"`` (a doujinshi download-leg canary)
-    # returns a single release carrying NO ``attributes.links`` at all — a live
-    # 2026-06-19 capture observed ``externalLinks={}``. Since the canonical rule
-    # is "pin ONLY IDs observed live for this profile's default_query title", and
-    # this title exposes none, the map stays empty and ``test_external_links_smoke``
-    # SKIPS mangadex (not fails). (The prior Berserk pins were for a DIFFERENT
-    # title than default_query and could never pass — dropped.)
-    expected_external_links={},
+    # External tracker links (Phase 13, D-08 / R7). DECOUPLED canary (USER
+    # DECISION, 2026-06-19): ``default_query="Hayakawa Family"`` (the doujinshi
+    # download-leg canary) legitimately exposes NO ``attributes.links`` live
+    # (a 2026-06-19 capture observed ``externalLinks={}``), so it cannot anchor
+    # the external-links assertion. Instead this profile points the links smoke at
+    # a dedicated ``expected_external_links_query="Berserk"`` while leaving
+    # ``default_query`` (download smoke) UNCHANGED. The IDs below were captured
+    # LIVE from the gateway's own ``POST /api/v1/search`` for "Berserk" on
+    # 2026-06-19 (search source=mangadex query='Berserk' results=421; all 50
+    # returned releases are the Berserk series and carry identical canonical
+    # ``externalLinks``). Observed live union also included animePlanet="berserk"
+    # and bookwalker="16664"; we pin the four canonical TRACKER IDs (the same key
+    # convention the other profiles use) — every value below was read from a real
+    # live response, never invented. Bare IDs only, no URLs (T-13-03).
+    expected_external_links={
+        "anilist": "30002",
+        "myAnimeList": "2",
+        "mangaUpdates": "njeqwry",
+        "kitsu": "8",
+    },
+    expected_external_links_query="Berserk",
     fixture_drift_paths=[],
     perf_budget_s=None,
     # Alt-title live smoke (#139): INTENTIONALLY DISABLED for MangaDex (left None

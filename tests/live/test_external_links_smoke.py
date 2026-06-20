@@ -55,12 +55,19 @@ async def test_external_links_match_pinned_ids(
             "source exposes no/blocked tracker links or is not yet frozen (D-08)"
         )
 
+    # Decoupled external-links canary (USER DECISION 2026-06-19): some sources'
+    # ``default_query`` titles (tuned for the DOWNLOAD smoke) legitimately expose
+    # no tracker links live, so the external-links assertion uses a dedicated
+    # ``expected_external_links_query`` when present. This is the ONLY live test
+    # that diverges from ``default_query``.
+    links_query = profile.expected_external_links_query or profile.default_query
+
     async with live_client_for(profile) as client:
         resp = await client.post(
             "/api/v1/search",
             json={
                 "type": "chapter",
-                "query": profile.default_query,
+                "query": links_query,
                 "sources": [source_key],
             },
         )
@@ -71,7 +78,7 @@ async def test_external_links_match_pinned_ids(
         payload = resp.json()
         releases = payload.get("releases") or []
         assert releases, (
-            f"{source_key}: search for {profile.default_query!r} returned no "
+            f"{source_key}: search for {links_query!r} returned no "
             f"releases — cannot verify externalLinks: {payload}"
         )
 
@@ -84,6 +91,6 @@ async def test_external_links_match_pinned_ids(
         )
         assert matched, (
             f"{source_key}: no release's externalLinks ⊇ pinned "
-            f"{expected!r} for query {profile.default_query!r}. "
+            f"{expected!r} for query {links_query!r}. "
             f"Observed externalLinks across {len(releases)} releases: {observed}"
         )
