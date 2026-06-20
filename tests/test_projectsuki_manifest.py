@@ -73,6 +73,7 @@ class _FakeCtxForManifest:
         return self._read_html.encode()
 
     async def post_json_body(self, url: str, *, body: dict[str, Any]) -> dict[str, Any]:
+        assert url == f"{_BASE}/callpage"
         self.post_calls.append(body)
         if not self._callpage:
             raise AssertionError("unexpected extra /callpage POST")
@@ -114,6 +115,17 @@ async def test_fetch_manifest_multi_iteration_super_loop() -> None:
     assert len(ctx.post_calls) == 2
     assert ctx.post_calls[0] == {"bookid": "9", "chapterid": "ch-7", "first": True}
     assert ctx.post_calls[1] == {"bookid": "9", "chapterid": "next-1", "first": False}
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_super_without_chapter_id_raises() -> None:
+    """``super:true`` but no ``chapter_id`` → fail loud, not a silent partial."""
+    ctx = _FakeCtxForManifest(
+        _read_html("9"),
+        [{"src": _callpage_src("9", [2, 3]), "super": True}],  # super but no cursor
+    )
+    with pytest.raises(SourceError, match="stalled"):
+        await ProjectSukiSource().fetch_manifest("9:ch-7", ctx)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("bad_id", ["ch-1", ":ch-1", "180716:", "", ":"])

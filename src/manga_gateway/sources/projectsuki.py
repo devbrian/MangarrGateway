@@ -153,6 +153,9 @@ def _is_allowed_image_url(url: str) -> bool:
     return (
         parsed.scheme == "https"
         and host in _PROJECTSUKI_IMAGE_HOSTS
+        # Pin the default HTTPS port — an allowlisted host on an alternate port
+        # (e.g. ``:8443``) is rejected, shrinking the same-host SSRF surface.
+        and parsed.port in (None, 443)
         and bool(_PROJECTSUKI_IMG_PATH_RE.match(norm_path))
     )
 
@@ -702,11 +705,26 @@ class ProjectSukiSource(Source):
                 urls.extend(extracted)
             if not resp.get("super"):
                 break
+            # ``super`` says there are more pages — fail LOUD rather than returning a
+            # silently-truncated manifest if the cursor to fetch them is missing.
             next_chapter = resp.get("chapter_id")
             if not next_chapter:
-                break
+                raise SourceError(
+                    "source_unavailable",
+                    f"/callpage pagination stalled for chapter {chapter_id}: "
+                    "super=true but chapter_id missing",
+                )
             current_chapter = str(next_chapter)
             first = False
+        else:
+            # The for-loop ran to the iteration cap WITHOUT a ``not super`` break — the
+            # page-walk never reached the end, so the manifest would be partial. Fail
+            # loud instead of silently dropping the tail pages (req #7).
+            raise SourceError(
+                "source_unavailable",
+                f"/callpage exceeded {_CALLPAGE_MAX_ITERATIONS} iterations "
+                f"for chapter {chapter_id}",
+            )
 
         if not urls:
             raise SourceError(
