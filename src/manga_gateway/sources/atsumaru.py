@@ -391,10 +391,10 @@ class AtsumaruSource(Source):
 
     # ─────────────────────────────── recent ──────────────────────────────────
 
-    # IN-02: recent() intentionally does NOT populate Release.externalLinks. Atsumaru's
-    # recent feed does not carry tracker links in the response, so there is no zero-cost
-    # source for them on this path; interactive search() does carry them. See review
-    # finding IN-02 if a future phase needs externalLinks on recent rows.
+    # Phase-13 (CR #289): recent() DOES populate Release.externalLinks. The per-title
+    # ``manga.page`` body fetched below for the newest chapter + scanlator map ALSO
+    # carries the series' 8 tracker-link fields (the SAME body the search path lifts
+    # links off), so externalLinks ride that existing fetch — zero added HTTP.
     async def recent(
         self,
         *,
@@ -463,7 +463,24 @@ class AtsumaruSource(Source):
             newest["_group"] = group_names.get(
                 str(newest.get("scanlationMangaId") or "")
             )
-            return self._to_release(manga_id, manga_title, newest, ctx)
+            rel = self._to_release(manga_id, manga_title, newest, ctx)
+            if rel is None:
+                return None
+            # Phase-13 (CR #289): the SAME ``manga.page`` body fetched above carries the
+            # series' tracker-link fields — populate externalLinks with ZERO added HTTP,
+            # mirroring the search path. Stash the raw links, resolve once via the
+            # framework seam (resolve-once cache + timeout + swallow-all), stamp it on.
+            links_raw = _mangapage_links(page)
+            if links_raw:
+                ctx.external_links_raw[manga_id] = links_raw
+
+            async def _parse_links() -> ExternalLinks | None:
+                return await self.fetch_external_links(manga_id, ctx)
+
+            rel.external_links = await ctx.resolve_external_links(
+                manga_id, _parse_links
+            )
+            return rel
 
         tasks: list[Coroutine[Any, Any, Release | None]] = []
         for title in titles[:bound]:

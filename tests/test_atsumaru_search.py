@@ -451,3 +451,109 @@ async def test_search_non_english_language_filter_returns_empty() -> None:
     )
     assert releases == []
     assert ctx.calls == []  # short-circuits before any network call
+
+
+# ─────────────────────────── recent() external tracker links ────────────────────
+# CR #289: recent()'s per-title ``manga.page`` body (already fetched for the newest
+# chapter + scanlator map) ALSO carries the tracker-link fields — so recent Releases
+# carry externalLinks with ZERO added HTTP, mirroring the search path.
+
+_RECENTLY_UPDATED = "https://atsu.moe/api/infinite/recentlyUpdated"
+
+
+class _FakeCtxForRecent:
+    """``SourceContext`` stand-in for the recent path: routes ``get_json`` by URL
+    (recentlyUpdated vs manga.page) and records calls for assertion."""
+
+    def __init__(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        pages: dict[str, dict[str, Any]],
+    ) -> None:
+        self.handle_store = HandleStore()
+        self._items = items
+        # Per-manga ``mangaPage`` body keyed by manga id (carries chapters +
+        # scanlators + tracker links — the SAME body recent's newest-chapter read uses).
+        self._pages = pages
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.external_links_raw: dict[str, dict[str, Any]] = {}
+
+    async def resolve_external_links(self, series_id: str, parse_fn: Any) -> Any:
+        return await parse_fn()
+
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((url, params))
+        if url == _RECENTLY_UPDATED:
+            return {"items": self._items}
+        if url == _MANGAPAGE:
+            manga_id = str(params.get("id"))
+            return {"mangaPage": self._pages.get(manga_id, {})}
+        raise AssertionError(f"unexpected get_json url: {url}")
+
+
+def _recent_page(
+    *, chapter_id: str = "c1", number: Any = 5, links: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    page: dict[str, Any] = {
+        "chapters": [
+            {
+                "id": chapter_id,
+                "scanlationMangaId": "cmgz",
+                "number": number,
+                "index": int(number) if str(number).isdigit() else 0,
+                "pageCount": 13,
+            }
+        ],
+        "scanlators": _DEFAULT_SCANLATORS,
+    }
+    if links:
+        page.update(links)
+    return page
+
+
+@pytest.mark.asyncio
+async def test_recent_emits_external_links_from_mangapage_zero_added_http() -> None:
+    """CR #289: recent() carries canonical externalLinks lifted off the per-title
+    ``manga.page`` body — with NO extra HTTP (exactly one page GET per title)."""
+    ctx = _FakeCtxForRecent(
+        items=[{"id": "m1", "title": "Solo Leveling"}],
+        pages={"m1": _recent_page(links=_ATSU_RAW_LINKS)},
+    )
+    releases = await AtsumaruSource().recent(
+        languages=None,
+        limit=20,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
+    )
+
+    assert len(releases) == 1
+    links = releases[0].external_links
+    assert links is not None
+    assert links.model_dump() == _ATSU_EXPECTED
+    # No emitted value contains a URL (R2).
+    assert all(
+        "http" not in v
+        for v in links.model_dump(by_alias=True, exclude_none=True).values()
+    )
+    # Zero added HTTP: one recentlyUpdated feed + exactly one manga.page per title.
+    urls = [u for u, _ in ctx.calls]
+    assert urls.count(_RECENTLY_UPDATED) == 1
+    assert urls.count(_MANGAPAGE) == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_external_links_none_when_page_has_no_trackers() -> None:
+    """A title whose ``manga.page`` carries no tracker fields → externalLinks None."""
+    ctx = _FakeCtxForRecent(
+        items=[{"id": "m1", "title": "No Links"}],
+        pages={"m1": _recent_page()},
+    )
+    releases = await AtsumaruSource().recent(
+        languages=None,
+        limit=20,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
+    )
+    assert len(releases) == 1
+    assert releases[0].external_links is None
