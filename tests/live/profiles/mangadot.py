@@ -96,24 +96,30 @@ LIVE_SMOKE = LiveSmokeProfile(
     expected_release_pattern={"sourceKey": "mangadot", "id_field": "mangaId"},
     # External tracker links (Phase 13, D-08 / R7). DECOUPLED canary (USER
     # DECISION, 2026-06-19): mangadot's ``default_query="Murim Psychopath"``
-    # (download-leg canary) returns all-empty ``externalLinks`` live (a nightly
-    # 27858894114 capture saw 50 releases, all ``{}`` — that title legitimately
-    # carries no tracker links), so the links smoke uses a dedicated
-    # ``expected_external_links_query="Solo Leveling"`` while ``default_query``
-    # (download smoke) stays UNCHANGED. The IDs below are RESEARCH-frozen for
-    # *Solo Leveling* (manga 118): anilist=105398, myAnimeList=121496,
-    # mangaUpdates=6z1uqw7, mangaBaka=3397, kitsu=54114 (canonical camelCase keys
-    # exactly as the normalizer emits). ``mangaDex`` is OMITTED — null/dropped for
-    # Solo Leveling (RESEARCH Open Question 3). These CANNOT be captured locally
-    # (the android-solver sidecar that clears mangadot's Cloudflare Turnstile is
-    # unreachable from this host) — they are RESEARCH-frozen and will be CONFIRMED
-    # by the re-run nightly (the orchestrator owns nightly dispatch).
+    # (download-leg canary) returns all-empty ``externalLinks`` live, so the links
+    # smoke uses a dedicated ``expected_external_links_query="Solo Leveling"`` while
+    # ``default_query`` (download smoke) stays UNCHANGED.
+    #
+    # LIVE-PINNED 2026-06-20 (RESEARCH A1 correction). The detail body's tracker
+    # fields live NESTED under ``body["manga"]`` — NOT flat at the top level as the
+    # headed-Patchright recon had frozen (that recon was never re-verified). With the
+    # unwrap fixed, an android-solver live capture of ``POST /search "Solo Leveling"``
+    # showed the date-sorted top-50 releases are dominated by the ONGOING
+    # *Solo Leveling: Ragnarok* (manga 20348/1256), whose releases carry the IDs
+    # below. The ORIGINAL *Solo Leveling* (manga 118: anilist=105398, mal=121496,
+    # mangaUpdates=6z1uqw7, mangaBaka=3397, kitsu=54114) is COMPLETED — its older
+    # chapters sort BELOW the 50-release cap (api/sorting.py newest-first) and never
+    # appear in the returned window, so the original's frozen IDs are unobservable via
+    # this query. The 4-key set below is the COMMON subset of BOTH Ragnarok series
+    # (manga 20348 has ``mangaupdates_id=null``; 1256 has ``m13i58t``), so the superset
+    # assertion holds whichever Ragnarok release tops the date sort. ``mangaUpdates``
+    # and ``mangaDex`` are OMITTED (null/divergent across the two Ragnarok series).
+    # CONFIRMED live against the real android-solver (test PASSES locally).
     expected_external_links={
-        "anilist": "105398",
-        "myAnimeList": "121496",
-        "mangaUpdates": "6z1uqw7",
-        "mangaBaka": "3397",
-        "kitsu": "54114",
+        "anilist": "179445",
+        "myAnimeList": "172429",
+        "mangaBaka": "1252",
+        "kitsu": "72544",
     },
     expected_external_links_query="Solo Leveling",
     # No fixture-drift anchors captured yet — added after the first live smoke pins

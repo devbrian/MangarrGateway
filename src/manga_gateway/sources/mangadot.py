@@ -391,12 +391,14 @@ class MangadotSource(Source):
     ) -> ExternalLinks | None:
         """One best-effort detail GET → canonical tracker links (D-02/R6).
 
-        Issues a SINGLE ``GET /api/manga/{series_id}`` (the flat detail object,
-        distinct from the ``/chapters/list`` enumeration) through the framework
-        transport + the source's CF-cleared android-solver session — no new anti-bot
-        plumbing — and routes the flat tracker fields (``anilist_id``, ``mal_id``,
-        ``mangaupdates_id``, ``mangabaka_id``, ``kitsu_id``, ``mangadex_id``) through
-        the shared normalizer (numeric fields stringified, ``null`` fields dropped).
+        Issues a SINGLE ``GET /api/manga/{series_id}`` (the detail object, distinct
+        from the ``/chapters/list`` enumeration) through the framework transport + the
+        source's CF-cleared android-solver session — no new anti-bot plumbing — and
+        routes the tracker fields (``anilist_id``, ``mal_id``, ``mangaupdates_id``,
+        ``mangabaka_id``, ``kitsu_id``, ``mangadex_id``) through the shared normalizer
+        (numeric fields stringified, ``null`` fields dropped). Those fields live in the
+        NESTED ``manga`` sub-object of the detail body (live-verified 2026-06-20,
+        RESEARCH A1) — the unwrap is below.
 
         ``series_id`` is a gateway-internal id (this source's OWN search candidate),
         so the URL is never a Mangarr-supplied value (SSRF-safe, T-13-01). NO
@@ -405,7 +407,21 @@ class MangadotSource(Source):
         raising/slow detail GET leaves the chapter releases intact (R6).
         """
         body = await ctx.get_json(f"{self.base_url}/api/manga/{series_id}")
-        return normalize(body, "mangadot")
+        # The tracker fields live in the NESTED ``manga`` sub-object, NOT at the top
+        # level (live-verified 2026-06-20 via the android-solver, RESEARCH A1 — the
+        # headed-Patchright recon that froze the flat-shape assumption was never
+        # re-verified). The real detail body is
+        # ``{"manga": {…, anilist_id, mal_id, mangaupdates_id, mangabaka_id,
+        # kitsu_id, mangadex_id, …}, "total_chapters": …, "first_chapter_id": …,
+        # "first_chapter_source": …, "status_text": …, "date_added_formatted": …}``.
+        # The flat top-level body carries NONE of the tracker keys, so the normalizer
+        # dropped everything → empty ``externalLinks`` for every release (the live-smoke
+        # gate that caught this). The field NAMES inside ``manga`` match _MANGADOT_MAP
+        # verbatim, so only the unwrap changes; ``mangadex_id`` is ``null`` (dropped).
+        manga = body.get("manga")
+        if not isinstance(manga, dict):
+            return None
+        return normalize(manga, "mangadot")
 
     def _chapters_to_releases(
         self,

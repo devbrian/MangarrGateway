@@ -413,16 +413,30 @@ def _detail(
     kitsu_id: Any = 54114,
     mangadex_id: Any = None,
 ) -> dict[str, Any]:
-    """The flat ``GET /api/manga/{id}`` detail body (RESEARCH frozen table)."""
+    """The ``GET /api/manga/{id}`` detail body (live-verified shape, 2026-06-20).
+
+    The tracker fields live in the NESTED ``manga`` sub-object, NOT at the top level
+    (RESEARCH A1 — the headed-Patchright recon that froze a flat shape was never
+    re-verified; the android-solver live capture proved the real shape is wrapped).
+    The outer body also carries ``total_chapters`` / ``first_chapter_*`` /
+    ``status_text`` / ``date_added_formatted`` siblings the normalizer ignores.
+    """
     return {
-        "id": 118,
-        "title": "Solo Leveling",
-        "anilist_id": anilist_id,
-        "mal_id": mal_id,
-        "mangaupdates_id": mangaupdates_id,
-        "mangabaka_id": mangabaka_id,
-        "kitsu_id": kitsu_id,
-        "mangadex_id": mangadex_id,
+        "manga": {
+            "id": 118,
+            "title": "Solo Leveling",
+            "anilist_id": anilist_id,
+            "mal_id": mal_id,
+            "mangaupdates_id": mangaupdates_id,
+            "mangabaka_id": mangabaka_id,
+            "kitsu_id": kitsu_id,
+            "mangadex_id": mangadex_id,
+        },
+        "total_chapters": 231,
+        "first_chapter_id": 999,
+        "first_chapter_source": "scraper",
+        "status_text": "Completed",
+        "date_added_formatted": "Feb 19, 2026",
     }
 
 
