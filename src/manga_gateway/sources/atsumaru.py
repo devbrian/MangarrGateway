@@ -628,14 +628,17 @@ class AtsumaruSource(Source):
         ``[{id, name}]``, resolved from the chapter rows' opaque ``scanlationMangaId``)
         AND the series' 8 tracker-link fields (Pitfall 5) on the SAME ``mangaPage``
         body. Both are advisory (D-19/D-03): ANY missing/malformed shape OR a fetch
-        error (``SourceError`` swallowed) degrades to ``({}, {})`` so a flaky/absent
-        ``manga.page`` never fails the load-bearing ``allChapters`` enumeration. The
+        error degrades to ``({}, {})`` so a flaky/absent ``manga.page`` never fails the
+        load-bearing ``allChapters`` enumeration. ANY exception is swallowed (CR #289 —
+        ``ctx.get_json`` reraises raw httpx transport/5xx errors after retries; only a
+        permanent 4xx + parse become ``SourceError``, so a final timeout/5xx must NOT
+        fail the search candidate); ``asyncio.CancelledError`` still propagates. The
         links are returned VERBATIM (raw upstream keys) — the framework normalizer owns
         the canonical mapping + the kenmei URL->slug rule.
         """
         try:
             body = await ctx.get_json(f"{self.base_url}/api/manga/page", id=manga_id)
-        except SourceError:
+        except Exception:  # noqa: BLE001 — advisory metadata must not fail search
             return {}, {}
         # Defence-in-depth: ``get_json`` already raises SourceError on a non-object
         # body (caught above), but guard explicitly so the never-fail-enumeration

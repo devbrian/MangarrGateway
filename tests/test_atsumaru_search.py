@@ -19,10 +19,12 @@ allChapters) and records calls for assertions.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 
 from manga_gateway.framework.errors import SourceError
@@ -313,6 +315,8 @@ class _PageCtx:
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         if self._behavior == "raise":
             raise SourceError("source_unavailable", "boom")
+        if isinstance(self._behavior, BaseException):
+            raise self._behavior
         return self._behavior
 
 
@@ -352,6 +356,36 @@ async def test_fetch_page_meta_happy_and_best_effort() -> None:
         "oops",  # non-dict (str) body
     ):
         assert await src._fetch_page_meta("m", _PageCtx(bad)) == ({}, {})  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_meta_swallows_non_source_error() -> None:
+    """CR #289: ``ctx.get_json`` reraises raw httpx transport/5xx errors after
+    retries (only permanent 4xx + parse become ``SourceError``), so a final
+    timeout/5xx must NOT fail the search candidate — ``_fetch_page_meta`` swallows
+    ANY exception to ``({}, {})``."""
+    src = AtsumaruSource()
+    request = httpx.Request("GET", "https://atsu.moe/api/manga/page")
+    non_source_errors: list[Exception] = [
+        httpx.ReadTimeout("timed out", request=request),
+        httpx.HTTPStatusError(
+            "502",
+            request=request,
+            response=httpx.Response(502, request=request),
+        ),
+        httpx.ConnectError("refused", request=request),
+    ]
+    for err in non_source_errors:
+        assert await src._fetch_page_meta("m", _PageCtx(err)) == ({}, {})  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_meta_propagates_cancellation() -> None:
+    """CR #289: ``except Exception`` must NOT swallow ``asyncio.CancelledError`` —
+    cooperative cancellation has to propagate out of the advisory fetch."""
+    src = AtsumaruSource()
+    with pytest.raises(asyncio.CancelledError):
+        await src._fetch_page_meta("m", _PageCtx(asyncio.CancelledError()))  # type: ignore[arg-type]
 
 
 # ─────────────────────────── external tracker links (R2/R4/R5) ──────────────────
