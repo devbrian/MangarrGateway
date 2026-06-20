@@ -75,7 +75,16 @@ _MANGAFIRE_IMG_PATH_RE = re.compile(
     r"^/mf/[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp)$",
     re.IGNORECASE,
 )
-_MANGAFIRE_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECASE)
+# MangaFire page images are ALWAYS served from a ``{prefix}.mfcdn{N}.xyz`` CDN zone
+# (prefix ∈ nw8/l1n/k99/m3z/o48; N ∈ _MANGAFIRE_CDN_ZONES). Pin the SSRF allowlist to
+# exactly that zone family (WR-02): a compromised/hostile manifest URL pointing at an
+# internal address or an attacker host no longer passes the public-host shape — it is a
+# hard validation failure. If MangaFire ever adds a second CDN domain family it will
+# surface here as an immediately-visible rejection rather than silently fetching any
+# host. (The metadata-link detail GET in fetch_external_links targets the MAIN site host
+# via base_url and does NOT route through this image allowlist, so pinning to the CDN
+# family does not affect it.)
+_MANGAFIRE_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.mfcdn\d+\.xyz$", re.IGNORECASE)
 _MANGAFIRE_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
 
 # ── adaptive CDN zone-retry (debug mangafire-stale-manifest-reresolve-budget) ───
