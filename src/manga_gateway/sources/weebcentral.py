@@ -88,13 +88,14 @@ import lxml.html
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
+from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
-    from ..models.search import SearchRequest
+    from ..models.search import ExternalLinks, SearchRequest
 
 # Live frontend defaults for ``GET /search/data`` (RECON §3, 2026-06-08). The
 # keyword rides ``text``; the rest mirror the site's own search form so server-side
@@ -132,6 +133,12 @@ _CHAPTERS_FANOUT_CONCURRENCY = 6
 # and NEVER reconstruct a URL from them (the host/path are read verbatim, SSRF).
 _ULID_RE = re.compile(r"[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}")
 _SERIES_ID_RE = re.compile(r"/series/(" + _ULID_RE.pattern + r")")
+# The slug path segment after the series ULID in ``/series/{ULID}/{slug}``. Captured
+# so the DETAIL main-page GET (Phase 13 external links) can hit the main page
+# ``/series/{ULID}/{slug}`` — the main page (NOT the ULID-only ``/full-chapter-list``
+# feed) is what carries the Track section. The slug is read VERBATIM from the source's
+# OWN search href, never reconstructed and never client-supplied (SSRF).
+_SERIES_SLUG_RE = re.compile(r"/series/" + _ULID_RE.pattern + r"/([^/?#]+)")
 _CHAPTER_ID_RE = re.compile(r"/chapters/(" + _ULID_RE.pattern + r")")
 # Chapter number after a ``Chapter`` label. Anchored to a clean ``N`` / ``N.M`` shape
 # (mirror mangaball's WR-04) so ``_parse_decimal`` always gets a clean capture; a
@@ -216,13 +223,16 @@ def _is_allowed_image_url(url: str) -> bool:
 
 
 def _parse_search(html: bytes) -> list[dict[str, str]]:
-    """Parse ``GET /search/data`` HTML → ``[{id, title}]`` per series (TITLE-ONLY).
+    """Parse ``GET /search/data`` HTML → ``[{id, title, slug}]`` per series.
 
     One top-level ``<article class="bg-base-300 …">`` per result; the series ULID is
-    captured from its first ``/series/{ULID}/…`` anchor and the title from the cover
-    ``<img alt="<Title> cover">`` (the " cover" suffix stripped). Returns the series
-    candidates in document (relevance) order, deduped by id; a result with no series
-    id or no title is skipped (it cannot mint a sane guid).
+    captured from its first ``/series/{ULID}/{slug}`` anchor (and the ``slug`` path
+    segment after it — empty when the href carries none), and the title from the cover
+    ``<img alt="<Title> cover">`` (the " cover" suffix stripped). The ``slug`` lets the
+    Phase-13 external-links path hit the series MAIN page (``/series/{ULID}/{slug}``),
+    which carries the Track section — the ULID-only ``/full-chapter-list`` feed does
+    not. Returns the series candidates in document (relevance) order, deduped by id; a
+    result with no series id or no title is skipped (it cannot mint a sane guid).
     """
     try:
         doc = lxml.html.fromstring(html)
@@ -234,18 +244,21 @@ def _parse_search(html: bytes) -> list[dict[str, str]]:
         hrefs = article.xpath(".//a[contains(@href, '/series/')]/@href")
         if not hrefs:
             continue
-        match = _SERIES_ID_RE.search(str(hrefs[0]))
+        href = str(hrefs[0])
+        match = _SERIES_ID_RE.search(href)
         if match is None:
             continue
         series_id = match.group(1)
         if series_id in seen:
             continue
+        slug_match = _SERIES_SLUG_RE.search(href)
+        slug = slug_match.group(1) if slug_match else ""
         alts = article.xpath(".//img/@alt")
         title = _ALT_COVER_SUFFIX_RE.sub("", str(alts[0]).strip()) if alts else ""
         if not title:
             continue
         seen.add(series_id)
-        out.append({"id": series_id, "title": title})
+        out.append({"id": series_id, "title": title, "slug": slug})
     return out
 
 
@@ -328,6 +341,37 @@ def _parse_image_urls(html: bytes) -> list[str]:
     except Exception:
         return []
     return [str(src).strip() for src in doc.xpath("//img/@src") if str(src).strip()]
+
+
+def _parse_track_links(html: bytes) -> dict[str, str]:
+    """Parse the series MAIN page's ``Track:`` section → ``{data_tip_label: href}``.
+
+    The section renders as ``<strong>Track:</strong>`` followed (within the same
+    container) by one ``<span data-tip="<Label>"><a href="<URL>"></span>`` per
+    tracker — labels ``AniList`` / ``MangaUpdates`` / ``Official Source`` (the only
+    three that ever appear, RESEARCH WeebCentral frozen table). Returns ALL labels
+    VERBATIM keyed by their ``data-tip`` (the normalizer drops ``Official Source`` by
+    having no map entry, and extracts the bare id/slug from the full-URL href). Anchored
+    to the ``Track:`` ``<strong>``'s container so unrelated ``data-tip`` spans elsewhere
+    on the page are not collected. Returns ``{}`` on any parse miss (no Track section /
+    malformed HTML) — the normalizer turns ``{}`` into ``None`` (R6). Blocking (lxml
+    C-parse) by design: the caller offloads it via ``asyncio.to_thread`` (ruff ASYNC).
+    """
+    try:
+        doc = lxml.html.fromstring(html)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for strong in doc.xpath("//strong[contains(text(), 'Track')]"):
+        section = strong.getparent()
+        if section is None:
+            continue
+        for span in section.xpath(".//span[@data-tip]"):
+            label = (span.get("data-tip") or "").strip()
+            hrefs = span.xpath(".//a/@href")
+            if label and hrefs:
+                out.setdefault(label, str(hrefs[0]).strip())
+    return out
 
 
 class WeebCentralSource(Source):
@@ -427,7 +471,9 @@ class WeebCentralSource(Source):
         per_candidate_limit = req.limit or 50
         sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
 
-        async def _fetch_candidate(series_id: str, manga_title: str) -> list[Release]:
+        async def _fetch_candidate(
+            series_id: str, manga_title: str, slug: str
+        ) -> list[Release]:
             # Layer 2 (CACHE-02/03): cache the UNFILTERED per-candidate chapter list
             # per (series_id). The semaphore + the GET live INSIDE ``_enum_fn`` so a
             # cache HIT acquires neither the fan-out slot nor a rate-limit token.
@@ -453,9 +499,27 @@ class WeebCentralSource(Source):
             enum = await ctx.cached_enumerate(
                 ctx.cached_enumerate_key(series_id, []), _enum_fn
             )
-            return self._chapters_to_releases(
+            releases = self._chapters_to_releases(
                 enum.items, series_id, manga_title, per_candidate_limit, ctx, req
             )
+
+            # Phase-13 (R4/R6/D-02): resolve the series' tracker links ONCE via the
+            # framework wrapper (resolve-once cache + 5s timeout + swallow-all, D-03),
+            # then stamp the single resolved object onto every release (one shared
+            # object, R4). The chapter-list path uses the bare ULID; the links path uses
+            # the SLUGGED main-page token (``{ULID}/{slug}``) because the Track section
+            # lives on the main page, not the ULID-only ``/full-chapter-list`` feed. The
+            # token is built from gateway-internal id/slug (this source's OWN search
+            # results), never client input (SSRF-safe, T-13-01).
+            token = f"{series_id}/{slug}" if slug else series_id
+
+            async def _parse_links(t: str = token) -> ExternalLinks | None:
+                return await self.fetch_external_links(t, ctx)
+
+            links = await ctx.resolve_external_links(token, _parse_links)
+            for rel in releases:
+                rel.external_links = links
+            return releases
 
         tasks: list[Coroutine[Any, Any, list[Release]]] = []
         for doc in candidates:
@@ -463,7 +527,8 @@ class WeebCentralSource(Source):
             if not series_id:
                 continue
             manga_title = str(doc.get("title") or "Unknown")
-            tasks.append(_fetch_candidate(str(series_id), manga_title))
+            slug = str(doc.get("slug") or "")
+            tasks.append(_fetch_candidate(str(series_id), manga_title, slug))
 
         # gather (not TaskGroup): re-raise the FIRST child SourceError UNCHANGED so
         # fanout.py classifies it as the source's own failure (mirror atsumaru).
@@ -505,6 +570,30 @@ class WeebCentralSource(Source):
             if rel is not None:
                 releases.append(rel)
         return releases
+
+    # ──────────────────────── Phase-13 external links (R6/D-02) ───────────────────
+
+    async def fetch_external_links(
+        self, series_id: str, ctx: SourceContext
+    ) -> ExternalLinks | None:
+        """One best-effort main-page GET → ``{anilist, mangaUpdates}`` (D-02/R6).
+
+        Issues a SINGLE ``GET /series/{series_id}`` (where ``series_id`` is the combined
+        ``{ULID}/{slug}`` main-page token) through the framework transport, parses the
+        ``Track:`` section off-loop (``asyncio.to_thread`` — lxml is blocking), and
+        routes the ``{label: href}`` dict through the shared normalizer, which keeps the
+        ``AniList``/``MangaUpdates`` labels ONLY (extracting the bare id/slug from each
+        full URL) and DROPS ``Official Source`` (no map entry, R3).
+
+        ``series_id`` is the gateway-internal ``{ULID}/{slug}`` token (this source's OWN
+        search results), so the URL is never a Mangarr-supplied value (SSRF-safe,
+        T-13-01). NO try/except/timeout here — the framework wrapper owns resolve-once +
+        the 5s timeout + swallow-all-to-``None`` (D-03); a raising/slow GET or an
+        absent/malformed Track section leaves the chapter releases intact (R6).
+        """
+        html = await ctx.get_bytes(f"{self.base_url}/series/{series_id}")
+        track = await asyncio.to_thread(_parse_track_links, html)
+        return normalize(track, "weebcentral")
 
     # ─────────────────────────────── recent ──────────────────────────────────
 
