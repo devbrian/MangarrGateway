@@ -268,12 +268,68 @@ async def test_aclose_closes_both_even_if_one_raises() -> None:
 
 def test_router_exposes_comix_browser_primitives() -> None:
     """Exactly comix ``_solver_from_ctx``'s gate: the router must expose BOTH
-    off-Protocol browser primitives so it is a faithful superset of CloudflareSolver."""
+    off-Protocol browser primitives so it is a faithful superset of CloudflareSolver.
+    Plan 14-02 adds the inverse ``eval_in_webview`` primitive (routed to android)."""
     router, _, _ = _router()
     assert hasattr(router, "fetch_via_browser")
     assert hasattr(router, "fetch_via_browser_paginated")
     assert hasattr(router, "fetch_via_browser_parallel_pages")
     assert hasattr(router, "fetch_via_browser_typed")
+    assert hasattr(router, "eval_in_webview")
+
+
+# ─────────────── off-Protocol in-WebView eval (EVAL-02, comix gate) ─────────────
+
+
+class _FakeEvalBackend:
+    """A backend recording ``eval_in_webview`` calls so the router's INVERSE
+    delegation (→ android, NOT patchright) can be pinned. Both fakes record, so the
+    test proves the android fake was hit and the patchright fake was NOT."""
+
+    def __init__(self, *, tag: str) -> None:
+        self._tag = tag
+        self.eval_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def eval_in_webview(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 — mirrors the backend's op-budget kwarg
+    ) -> object:
+        self.eval_calls.append(
+            (challenge_url, js, {"wait_for": wait_for, "timeout": timeout})
+        )
+        return f"{self._tag}-eval"
+
+
+@pytest.mark.asyncio
+async def test_eval_in_webview_delegates_to_android() -> None:
+    """The INVERSE of the browser passthroughs: ``eval_in_webview`` routes to the
+    ANDROID backend (the one with the cleared WebView), never patchright."""
+    patchright = _FakeEvalBackend(tag="pw")
+    android = _FakeEvalBackend(tag="droid")
+    router = SolverRouter(
+        patchright=patchright,  # type: ignore[arg-type]
+        android=android,  # type: ignore[arg-type]
+        engine_by_source={},
+    )
+    result = await router.eval_in_webview(
+        "https://comix.to/",
+        "return await c.list({})",
+        wait_for="() => true",
+        timeout=42.0,
+    )
+    assert result == "droid-eval"
+    assert android.eval_calls == [
+        (
+            "https://comix.to/",
+            "return await c.list({})",
+            {"wait_for": "() => true", "timeout": 42.0},
+        )
+    ]
+    assert patchright.eval_calls == []  # patchright (browser engine) NEVER consulted
 
 
 @pytest.mark.asyncio

@@ -339,6 +339,110 @@ async def test_warm_eager_solves_each_android_key() -> None:
     assert isinstance(held, Clearance)
 
 
+# ─────────────────────────── eval_in_webview (EVAL-02) ──────────────────────────
+# The off-Protocol in-WebView eval client (Plan 14-02): POST /eval, returns
+# ``payload["value"]``; same X-Solver-Key + raise_for_status contract as /solve.
+
+_EVAL_URL = "https://comix.to/"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_in_webview_posts_key_and_body_and_returns_value() -> None:
+    """The sidecar /eval contract: POST {challenge_url, js, wait_for?} with the
+    X-Solver-Key header → return the response's ``value`` (Plan 14-01)."""
+    payload = {"value": [{"hid": "abc", "title": "Ch 1"}]}
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    solver = _solver()
+    try:
+        result = await solver.eval_in_webview(
+            _EVAL_URL, "return await c.list({})", wait_for="() => !!window.__c"
+        )
+    finally:
+        await solver.aclose()
+    assert result == payload["value"]
+    assert route.called
+    sent = route.calls.last.request
+    assert sent.headers["X-Solver-Key"] == "sidecar-secret"
+    body = json.loads(sent.content)
+    assert body == {
+        "challenge_url": _EVAL_URL,
+        "js": "return await c.list({})",
+        "wait_for": "() => !!window.__c",
+    }
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_in_webview_omits_wait_for_when_none() -> None:
+    """``wait_for`` rides the body ONLY when given (mirrors _solve's proxy gate)."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": 7})
+    )
+    solver = _solver()
+    try:
+        result = await solver.eval_in_webview(_EVAL_URL, "return 7")
+    finally:
+        await solver.aclose()
+    assert result == 7
+    body = json.loads(route.calls.last.request.content)
+    assert body == {"challenge_url": _EVAL_URL, "js": "return 7"}
+    assert "wait_for" not in body
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_in_webview_non_200_raises() -> None:
+    """Same failure contract as _solve: a non-200 /eval raises (raise_for_status)."""
+    respx.post(f"{_SIDECAR}/eval").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_eval_in_webview_unconfigured_raises() -> None:
+    """D-33 / T-14-07: an unconfigured sidecar URL makes eval raise RuntimeError
+    (fails loud — never a silent empty result that looks like an empty chapter
+    list); the gate / CI / a local box without redroid stays green."""
+    solver = _solver(base_url=None)
+    try:
+        with pytest.raises(RuntimeError):
+            await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_in_webview_does_not_log_js_or_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-14-04: neither the gateway-authored ``js`` nor the eval result appears in
+    any log record (mirrors test_solve_does_not_log_proxy_or_token)."""
+    secret_js = "return await __SECRET_TOKEN_MINT__()"
+    secret_result = "SUPER-SECRET-EVAL-RESULT-zzz9"
+    respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": secret_result})
+    )
+    solver = _solver()
+    with caplog.at_level("DEBUG", logger="manga_gateway"):
+        try:
+            out = await solver.eval_in_webview(_EVAL_URL, secret_js)
+        finally:
+            await solver.aclose()
+    assert out == secret_result
+    for record in caplog.records:
+        msg = record.getMessage()
+        assert secret_js not in msg
+        assert secret_result not in msg
+
+
 # ── #296: per-source-key single-flight coalescing around _solve ───────────────
 
 
