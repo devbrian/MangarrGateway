@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -374,6 +374,61 @@ class AndroidSolver:
             Clearance(cookies={"cf_clearance": token}, user_agent=user_agent),
             expires_at,
         )
+
+    # ───────────────────────────── in-WebView eval ────────────────────────────
+
+    async def eval_in_webview(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        # ASYNC109 waived: matches the sidecar's per-eval op-budget — an explicit
+        # per-call override of ``self._timeout_s`` (the chapter-list fan-out is ~8s
+        # plus nav + SPA hydration, so the default MUST exceed the sidecar cap).
+        timeout: float | None = None,  # noqa: ASYNC109
+    ) -> Any:
+        """POST the sidecar ``/eval`` → the marshalled JS result (EVAL-02).
+
+        Runs gateway-authored ``js`` inside the warm Turnstile-cleared redroid
+        WebView (the only fingerprint that clears comix.to) and returns the
+        sidecar's ``{"value": <json>}`` payload's ``value``. This is an
+        OFF-Protocol primitive (not part of ``AntiBotSolver.get_clearance``):
+        comix calls it through :class:`SolverRouter` in Plan 03.
+
+        Mirrors :meth:`_solve`'s request shape exactly — sends ``X-Solver-Key``
+        (SEC-01, the ``SecretStr`` unpacked only at the POST call site) and a
+        ``{"challenge_url", "js"}`` body (``wait_for`` added only when given) and
+        ``raise_for_status()`` so a non-200 raises the same failure contract.
+        ``base_url is None`` raises ``RuntimeError`` (D-33) so an unconfigured
+        sidecar fails loud — comix's ``_solver_from_ctx`` surfaces it as a
+        per-source ``SourceError`` (the gate / CI / a local box without redroid
+        stays green) and NEVER silently no-ops to an empty result (T-14-07).
+
+        Unlike ``_solve`` this is NOT held/cached and NOT single-flighted — each
+        comix call site evals fresh (the clearance hold stays in
+        ``get_clearance`` / ``_coalesced_solve``, untouched). The ``js`` and the
+        eval result are NEVER logged (T-14-04).
+        """
+        if self._base_url is None:
+            raise RuntimeError(
+                "android_solver_url is not configured — cannot eval against "
+                f"{challenge_url!r} (the android-solver sidecar is unwired)"
+            )
+        headers: dict[str, str] = {}
+        if self._api_key is not None:
+            headers["X-Solver-Key"] = self._api_key.get_secret_value()
+        body: dict[str, object] = {"challenge_url": challenge_url, "js": js}
+        if wait_for is not None:
+            body["wait_for"] = wait_for
+        resp = await self._ensure_client().post(
+            f"{self._base_url}/eval",
+            json=body,
+            headers=headers,
+            timeout=timeout if timeout is not None else self._timeout_s,
+        )
+        resp.raise_for_status()
+        return resp.json()["value"]
 
     # ─────────────────────── proactive expiry-driven refresh ──────────────────
 

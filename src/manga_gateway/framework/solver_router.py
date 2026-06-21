@@ -97,6 +97,28 @@ class _BrowserFetchSolver(Protocol):
     ) -> list[Any]: ...
 
 
+class _EvalSolver(Protocol):
+    """The off-Protocol ``eval_in_webview`` primitive the ANDROID backend exposes.
+
+    Declared locally — mirroring :class:`_BrowserFetchSolver` — so the router can
+    ``cast`` ``self._android`` (typed as the engine-agnostic ``AntiBotSolver``
+    Protocol, which intentionally omits it) to a shape that declares it, and
+    delegate mypy-strict-clean with NO ``# type: ignore``. The INVERSE of the four
+    ``fetch_via_browser*`` passthroughs: those cast ``self._patchright`` (the only
+    engine with a real browser); this one casts ``self._android`` (the only engine
+    with the cleared WebView the eval runs inside).
+    """
+
+    async def eval_in_webview(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
+    ) -> Any: ...
+
+
 # The android engine name (matches ``Source.solver_engine`` on mangadot/kagane).
 # Every other value (notably the ``"patchright"`` default) routes to the desktop
 # backend — the router is permissive so an unmapped/unknown key falls through to the
@@ -253,6 +275,32 @@ class SolverRouter:
             extract=extract,
             wait_for=wait_for,
             timeout=timeout,
+        )
+
+    # ── off-Protocol in-WebView eval (EVAL-02) — pass-through for comix ──────────
+    # The INVERSE of the four browser passthroughs above: this delegates to the
+    # ANDROID backend, NOT patchright. comix runs its in-page token-mint /
+    # chapter-list / manifest JS inside the redroid WebView (the only fingerprint
+    # that clears comix.to's Cloudflare); only the android backend owns that
+    # cleared WebView. Plan 03 flips comix's ``_solver_from_ctx`` ``hasattr`` gate
+    # to ``eval_in_webview`` and calls it through this router.
+    async def eval_in_webview(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
+    ) -> Any:
+        """Delegate the in-WebView JS eval to the ANDROID backend (EVAL-02).
+
+        Unlike the four ``fetch_via_browser*`` passthroughs (which route to
+        ``self._patchright``), this routes to ``self._android`` — the engine that
+        owns the Turnstile-cleared redroid WebView the eval runs inside.
+        """
+        backend = cast("_EvalSolver", self._android)
+        return await backend.eval_in_webview(
+            challenge_url, js, wait_for=wait_for, timeout=timeout
         )
 
     async def warm(self) -> list[str]:
