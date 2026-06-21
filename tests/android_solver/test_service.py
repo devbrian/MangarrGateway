@@ -1595,3 +1595,175 @@ def test_boot_defensive_clear_gives_up_after_retries(
     assert ok is False
     assert attempts["connect"] == 3
     assert attempts["cleared"] == 0
+
+
+# ── Fix A (bug 4 cause #1): non-destructive in-page egress-verify for /eval ────
+#
+# The proxied eval's egress-verify must NOT navigate the main WebView away to the
+# IP echo (that defeated the bug-3 fast path → every eval re-cleared comix's
+# managed Cloudflare challenge). It now verifies the egress with an IN-PAGE fetch
+# (no Page.navigate), keeping the byte-equal T-11-01 assertion on every eval, and
+# only falls back to the destructive nav-away probe when the in-page probe is
+# unavailable (CSP/CORS/transient). These drive the real ``_drive_eval`` with a
+# recording cdp_call so the no-nav / mismatch / fallback behaviour is asserted.
+
+_EVAL_HOST = "comix.to"
+_EVAL_URL = "https://comix.to/"
+_EVAL_JS = "(async()=>{return {marker:'EVAL_JS_MARKER'};})()"
+
+
+class _DriveEvalCdp:
+    """Records every cdp_call; returns scripted ``result.value`` by command id.
+
+    Page/DOM.enable, Page.navigate, and any unscripted id return an empty value;
+    ``Page.getFrameTree`` carries no ``frameTree`` so the CF-interstitial probe
+    reads "not a challenge" (fail-open to the fast path).
+    """
+
+    def __init__(self, values: dict[int, object]) -> None:
+        self.values = values
+        self.calls: list[tuple[str, dict[str, object], int]] = []
+
+    def __call__(self, ws, method, params=None, *, command_id):  # type: ignore[no-untyped-def]
+        self.calls.append((method, params or {}, command_id))
+        return {"result": {"value": self.values.get(command_id)}}
+
+    def navigated_to(self, url: str) -> bool:
+        return any(
+            m == "Page.navigate" and p.get("url") == url for m, p, _ in self.calls
+        )
+
+    def ran_command(self, command_id: int) -> bool:
+        return any(c == command_id for _, _, c in self.calls)
+
+
+def _eval_pipeline(
+    monkeypatch: pytest.MonkeyPatch, cdp: _DriveEvalCdp
+) -> AndroidSolvePipeline:
+    page_targets = b'[{"type":"page","webSocketDebuggerUrl":"ws://localhost:9222/p"}]'
+    pipeline = AndroidSolvePipeline(
+        FakeDevice(),  # type: ignore[arg-type]
+        timeout_s=60.0,
+        ws_factory=lambda url, *, timeout: FakeWs(),  # type: ignore[arg-type,return-value]
+        http_get=lambda url, *, timeout: page_targets,
+        launch_settle_s=0.0,
+        poll_interval_s=0.0,
+        egress_read_timeout_s=1.0,
+    )
+    monkeypatch.setattr(service, "cdp_call", cdp)
+    return pipeline
+
+
+def _drive(pipeline: AndroidSolvePipeline, expected_egress_ip: str):  # type: ignore[no-untyped-def]
+    return pipeline._drive_eval(
+        _EVAL_URL,
+        _EVAL_HOST,
+        _EVAL_JS,
+        None,
+        wait_for=None,
+        deadline=time.monotonic() + 60.0,
+        expected_egress_ip=expected_egress_ip,
+    )
+
+
+def test_proxied_eval_inpage_probe_matches_does_not_navigate_away(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # In-page probe returns the EXPECTED egress IP → the eval runs and the WebView
+    # is NEVER navigated to the IP echo (the warm comix page survives → fast path).
+    cdp = _DriveEvalCdp(
+        {
+            service._EGRESS_IN_PAGE_CMD_ID: "1.2.3.4",
+            service._EVAL_LOCATION_CMD_ID: _EVAL_HOST,  # fast-path: on the comix page
+            service._EVAL_HYDRATION_CMD_ID: True,  # SPA hydrated
+            service._EVAL_CMD_ID: {"items": [1, 2, 3]},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+
+    with caplog.at_level("INFO", logger="android_solver.service"):
+        result = _drive(pipeline, expected_egress_ip="1.2.3.4")
+
+    assert result == {"items": [1, 2, 3]}
+    # The in-page probe ran (id 43) and verified egress WITHOUT navigating away.
+    assert cdp.ran_command(service._EGRESS_IN_PAGE_CMD_ID)
+    assert not cdp.navigated_to(service._EGRESS_ECHO_URL)
+    assert not cdp.navigated_to(_EVAL_URL)  # fast path: no re-nav of the main page
+    assert cdp.ran_command(service._EVAL_CMD_ID)  # the gateway js DID run
+    # Logged the in-page verification; NEVER the eval js or the marshalled result.
+    assert "(in-page)" in caplog.text
+    assert "EVAL_JS_MARKER" not in caplog.text
+    assert "items" not in caplog.text
+
+
+def test_proxied_eval_inpage_probe_mismatch_raises_and_runs_no_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In-page probe returns a DIFFERENT IP → the rotating/non-sticky-proxy SolveError
+    # is raised and the gateway js is NEVER evaluated (no wrong-IP eval).
+    cdp = _DriveEvalCdp(
+        {
+            service._EGRESS_IN_PAGE_CMD_ID: "9.9.9.9",
+            service._EVAL_CMD_ID: {"items": [1]},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+
+    with pytest.raises(SolveError, match="rotating/non-sticky proxy"):
+        _drive(pipeline, expected_egress_ip="1.2.3.4")
+
+    assert not cdp.ran_command(service._EVAL_CMD_ID)  # no eval on a mismatch
+    assert not cdp.navigated_to(service._EGRESS_ECHO_URL)  # in-page, no nav-away
+
+
+def test_proxied_eval_inpage_probe_unavailable_falls_back_to_destructive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In-page probe unavailable (returns None — CSP/CORS) → fall back to the
+    # destructive nav-away verify (a Page.navigate to the IP echo IS recorded), then
+    # the eval still runs verified — NEVER an unverified eval.
+    cdp = _DriveEvalCdp(
+        {
+            service._EGRESS_IN_PAGE_CMD_ID: None,  # IIFE returned null ⇒ unavailable
+            service._EGRESS_READ_CMD_ID: "1.2.3.4",  # destructive innerText read
+            service._EVAL_HYDRATION_CMD_ID: True,
+            service._EVAL_CMD_ID: {"ok": True},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+    # The re-nav clear machinery is exercised by its own units; collapse it here so
+    # the fallback-then-eval flow runs deterministically.
+    monkeypatch.setattr(
+        pipeline,
+        "_clear_challenge_if_present",
+        lambda ws, ws_url, host, cancel, deadline: None,
+    )
+
+    result = _drive(pipeline, expected_egress_ip="1.2.3.4")
+
+    assert result == {"ok": True}
+    # The destructive fallback navigated the main page AWAY to the IP echo.
+    assert cdp.navigated_to(service._EGRESS_ECHO_URL)
+    assert cdp.ran_command(service._EVAL_CMD_ID)  # still verified, eval still ran
+
+
+def test_no_proxy_eval_runs_no_egress_probe_of_either_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No-proxy path (expected_egress_ip == "") → NEITHER the in-page probe NOR the
+    # destructive nav-away runs; byte-for-byte the prior no-proxy eval (D-08).
+    cdp = _DriveEvalCdp(
+        {
+            service._EVAL_LOCATION_CMD_ID: _EVAL_HOST,
+            service._EVAL_HYDRATION_CMD_ID: True,
+            service._EVAL_CMD_ID: {"x": 1},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+
+    result = _drive(pipeline, expected_egress_ip="")
+
+    assert result == {"x": 1}
+    assert not cdp.ran_command(service._EGRESS_IN_PAGE_CMD_ID)  # no in-page probe
+    assert not cdp.navigated_to(service._EGRESS_ECHO_URL)  # no destructive nav
