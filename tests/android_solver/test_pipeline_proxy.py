@@ -442,3 +442,120 @@ def test_username_only_proxy_uri_omits_credentials_fragment(
         _HOP_CONTROL_PORT,
         "http://up.example:8080",
     )
+
+
+# ── Req 7: /eval proxy parity — set+verify+clear, no-proxy byte-unchanged ──────
+
+
+def test_proxied_eval_verifies_egress_sets_and_clears_device_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Req 7 parity with the proxied solve: an eval with a proxy sets the device-wide
+    # proxy (resolved hop IP:port) BEFORE the eval navigation, verifies the WebView
+    # egress against the self-probe, runs, and ALWAYS clears the proxy + idles the hop
+    # in finally — so the eval runs under the EXACT residential IP the clearance was
+    # minted on. NO tap is involved on the eval path.
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,  # WebView observed == self-probe expected
+        repoint_calls=repoint_calls,
+    )
+
+    pipeline.eval_in_webview(
+        "https://mangadot.net/", "mangadot.net", "extract()", proxy=_PROXY
+    )
+
+    # Proxy set with the RESOLVED hop IP:port (Pitfall 1), set then cleared — and the
+    # eval path never taps.
+    assert device.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
+    assert device.events == ["set_proxy", "clear_proxy"]
+    assert device.proxy_cleared == 1
+    assert device.taps == []
+    # Hop repointed to the authed upstream then back to DIRECT over the LOOPBACK
+    # control endpoint (never the cross-container proxy port).
+    assert repoint_calls[0] == (
+        _HOP_CONTROL_HOST,
+        _HOP_CONTROL_PORT,
+        "http://up.example:8080#u:p",
+    )
+    assert repoint_calls[-1] == (_HOP_CONTROL_HOST, _HOP_CONTROL_PORT, None)
+
+
+def test_proxied_eval_egress_mismatch_raises_without_eval_and_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T-11-01 parity: a bypassed proxy (WebView egress != self-probe expected) raises
+    # BEFORE the eval runs — a wrong-IP (re-challenged) session must NOT be eval'd —
+    # and finally STILL clears the device proxy + idles the hop.
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body="198.51.100.99",  # WebView egress != expected → bypass
+        repoint_calls=repoint_calls,
+        expected_ip=_EXPECTED_IP,
+    )
+
+    with pytest.raises(SolveError):
+        pipeline.eval_in_webview(
+            "https://mangadot.net/", "mangadot.net", "extract()", proxy=_PROXY
+        )
+
+    assert device.proxy_cleared == 1  # cleared in finally despite the raise
+    assert repoint_calls[-1] == (_HOP_CONTROL_HOST, _HOP_CONTROL_PORT, None)
+
+
+def test_eval_proxy_cleared_even_when_eval_raises_midflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Req 5 parity: a raise AFTER the proxy was set (here the hydration wait blows up)
+    # must STILL clear the device proxy in finally.
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+    )
+
+    def boom(*a: object, **k: object) -> None:
+        raise RuntimeError("hydration wait exploded")
+
+    monkeypatch.setattr(pipeline, "_wait_for_hydration", boom)
+
+    with pytest.raises(RuntimeError):
+        pipeline.eval_in_webview(
+            "https://mangadot.net/", "mangadot.net", "x()", proxy=_PROXY
+        )
+
+    assert device.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
+    assert device.proxy_cleared == 1  # cleared despite the mid-flight raise
+
+
+def test_no_proxy_eval_sets_no_device_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D-08: a no-proxy /eval sets NO device proxy, repoints NO hop, runs NO
+    # egress-verify — byte-for-byte the pre-Phase-14 eval path.
+    device = FakeDevice()
+    repoint_calls: list[tuple[str, int, str | None]] = []
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        clock=FakeClock(),
+        egress_body=_EXPECTED_IP,
+        repoint_calls=repoint_calls,
+    )
+
+    pipeline.eval_in_webview("https://mangadot.net/", "mangadot.net", "extract()")
+
+    assert device.proxy_set == []  # no global http_proxy set
+    assert device.proxy_cleared == 0  # nothing to clear
+    assert repoint_calls == []  # hop never repointed
+    assert device.events == []  # no proxy + no tap on the eval path

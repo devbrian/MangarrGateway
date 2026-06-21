@@ -54,6 +54,10 @@ class FakePipeline:
         # /eval call recording (Phase 14): the js of each eval, so tests can assert
         # the pipeline was (or was NOT) driven without leaking it elsewhere.
         self.eval_js: list[str] = []
+        # The proxy each /eval was driven with (Req 7 parity with ``solve`` →
+        # ``self.proxies``): a separate list so the eval-vs-solve serialization test's
+        # shared counters never conflate solve-proxy and eval-proxy assertions.
+        self.eval_proxies: list[dict[str, object] | None] = []
         self._result = result
         # The value /eval marshals back; parametrizable to a large list for the A4
         # no-truncation regression. Defaults to a small dict.
@@ -125,6 +129,7 @@ class FakePipeline:
         *,
         wait_for: str | None = None,
         deadline: float | None = None,
+        proxy: dict[str, object] | None = None,
     ) -> object:
         # Mirrors ``solve``'s recording + gating (shared counters/events) so the
         # eval-vs-solve serialization test can hold the lock with EITHER endpoint.
@@ -134,6 +139,7 @@ class FakePipeline:
         try:
             self.calls.append((challenge_url, host))
             self.eval_js.append(js)
+            self.eval_proxies.append(proxy)
             if self._started is not None:
                 self._started.set()
             if self._release is not None:
@@ -697,6 +703,103 @@ def test_eval_pipeline_failure_is_504() -> None:
     status, _ = _service(pipeline).eval(
         api_key="s3cret-solver-key",
         body=b'{"challenge_url": "https://mangadot.net/", "js": "boom()"}',
+    )
+    assert status == 504
+
+
+# ── /eval per-eval proxy parity with /solve (Req 7) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Same malformed-proxy matrix as /solve — every shape is a PRE-device 422.
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()", "proxy": 5}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()", "proxy": {}}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "proxy": {"server": "socks5://p:1"}}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "proxy": {"server": "http://host:99999"}}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "proxy": {"server": "http://p:1", "username": "u"}}',
+    ],
+)
+def test_eval_rejects_malformed_proxy_before_any_device_action(body: bytes) -> None:
+    # Req 7 / T-11-06 parity: a malformed eval proxy is a PRE-action 422 — the
+    # device pipeline is never invoked (no hop repoint, no global http_proxy set).
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # never reaches the device
+    assert "proxy" in payload["error"]
+
+
+def test_eval_forwards_wellformed_proxy_to_pipeline() -> None:
+    # Req 7 parity with test_solve_forwards_wellformed_proxy_to_pipeline: a valid
+    # proxy rides the /eval body verbatim into the pipeline so the eval navigation
+    # egresses the clearance's residential IP.
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+            b' "proxy": {"server": "http://up.example:8080",'
+            b' "username": "u", "password": "p"}}'
+        ),
+    )
+    assert status == 200
+    assert pipeline.eval_proxies == [
+        {"server": "http://up.example:8080", "username": "u", "password": "p"}
+    ]
+
+
+def test_eval_without_proxy_passes_none_to_pipeline() -> None:
+    # D-08: a no-proxy /eval drives the pipeline with proxy=None (byte-for-byte the
+    # pre-Phase-14 eval body).
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()"}',
+    )
+    assert status == 200
+    assert pipeline.eval_proxies == [None]
+
+
+def test_proxied_eval_uses_proxy_timeout_not_base() -> None:
+    # Req 7 parity with test_proxied_solve_uses_proxy_timeout_not_base: with a proxy
+    # present the eval's outer future is bounded by the LONGER proxy_solve_timeout_s
+    # (it adds the hop + egress-verify overhead), so a delay between the base (tiny)
+    # and proxy (generous) timeout completes (200) where a base-timeout eval 504s.
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+            b' "proxy": {"server": "http://up.example:8080"}}'
+        ),
+    )
+    assert status == 200
+
+
+def test_no_proxy_eval_uses_base_timeout_and_times_out() -> None:
+    # The same delay under the base (tiny) timeout and NO proxy must 504 — proving
+    # the eval timeout selection keys off proxy-presence, not a constant (D-08).
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()"}',
     )
     assert status == 504
 

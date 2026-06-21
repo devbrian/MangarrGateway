@@ -394,6 +394,43 @@ async def test_eval_in_webview_omits_wait_for_when_none() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_eval_in_webview_body_carries_proxy_when_configured() -> None:
+    """Req 7 parity with test_solve_body_carries_proxy_when_configured: a configured
+    proxy rides the /eval body verbatim so the eval navigation egresses the SAME
+    residential IP the proxied clearance was minted on."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": 1})
+    )
+    solver = _solver(proxy=dict(_PROXY))
+    try:
+        await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert body["challenge_url"] == _EVAL_URL
+    assert body["js"] == "return 1"
+    assert body["proxy"] == _PROXY
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_in_webview_body_omits_proxy_when_unconfigured() -> None:
+    """D-08: proxy=None ⇒ the /eval body has NO ``proxy`` key (today's body
+    byte-for-byte)."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": 1})
+    )
+    solver = _solver(proxy=None)
+    try:
+        await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert "proxy" not in body
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_eval_in_webview_non_200_raises() -> None:
     """Same failure contract as _solve: a non-200 /eval raises (raise_for_status)."""
     respx.post(f"{_SIDECAR}/eval").mock(return_value=httpx.Response(504))

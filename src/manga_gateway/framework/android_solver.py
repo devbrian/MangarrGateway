@@ -421,6 +421,17 @@ class AndroidSolver:
         body: dict[str, object] = {"challenge_url": challenge_url, "js": js}
         if wait_for is not None:
             body["wait_for"] = wait_for
+        # Req 7 parity with ``_solve``: thread the single static proxy into the
+        # /eval body so the eval navigation egresses the SAME residential IP the
+        # proxied clearance was minted on — a different egress IP makes the
+        # WebView's cf_clearance invalid and CF re-challenges (it wedges on the
+        # "Just a moment..." interstitial, the comix SPA never hydrates, and a
+        # correctly-wrapped extractor still finds no env-*.js). Gated exactly like
+        # ``_solve``: when unconfigured the body carries NO ``proxy`` key (D-08,
+        # the no-proxy path stays byte-for-byte unchanged). Passed through verbatim
+        # (already unpacked by build_proxy) and NEVER logged (T-14-04 / T-11-02).
+        if self._proxy is not None:
+            body["proxy"] = self._proxy
         resp = await self._ensure_client().post(
             f"{self._base_url}/eval",
             json=body,

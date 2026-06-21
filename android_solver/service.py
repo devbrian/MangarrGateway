@@ -284,6 +284,7 @@ class SolvePipeline(Protocol):
         *,
         wait_for: str | None = None,
         deadline: float | None = None,
+        proxy: dict[str, Any] | None = None,
     ) -> Any: ...
 
     def health(self) -> bool: ...
@@ -399,19 +400,27 @@ class AndroidSolvePipeline:
         *,
         wait_for: str | None = None,
         deadline: float | None = None,
+        proxy: dict[str, Any] | None = None,
     ) -> Any:
         """Run ``js`` in the warm cleared WebView and return its marshalled value.
 
         Re-uses the already-Turnstile-cleared WebView from the prior ``/solve`` — it
         deliberately does NOT ``force_stop_and_clear`` (that would wipe the cookie
         jar and re-trigger the challenge). Mirrors ``_drive_solve``'s scaffolding
-        minus the tap/egress machinery: re-forward devtools (torn down in a
-        ``finally`` on EVERY exit, #275) → CDP ``Page.navigate`` the ``challenge_url``
-        → poll for SPA hydration (``env-*.js`` in Resource-Timing + an optional
-        ``wait_for`` JS boolean predicate, returning anyway on the deadline) →
+        minus the tap machinery: re-forward devtools (torn down in a ``finally`` on
+        EVERY exit, #275) → CDP ``Page.navigate`` the ``challenge_url`` → poll for SPA
+        hydration (``env-*.js`` in Resource-Timing + an optional ``wait_for`` JS
+        boolean predicate, returning anyway on the deadline) →
         ``Runtime.evaluate(awaitPromise:true, returnByValue:true)`` → marshal
         ``result.result.value``. ``awaitPromise:true`` is the ONE new CDP option over
         the three existing eval sites (comix's extractors are async; spike 021 A2).
+
+        When ``proxy`` is supplied the eval navigation egresses through the SAME
+        per-solve authenticated hop + egress-verify the proxied ``/solve`` uses, so
+        the eval runs under the EXACT residential IP the proxied clearance was minted
+        on (Req 7 parity — a different egress IP makes the cleared cookie invalid and
+        CF re-challenges the eval nav). When ``None`` today's direct-egress eval runs
+        byte-for-byte unchanged (D-08).
 
         A4 (research §6): the marshalled value (e.g. a 4,716-row chapter list) is
         NOT subject to the inbound ``_MAX_BODY_BYTES`` cap — that cap is inbound-only.
@@ -429,6 +438,70 @@ class AndroidSolvePipeline:
         # Re-use the warm cleared WebView — connect only (NO force_stop_and_clear).
         self._device.connect()
         _raise_if_cancelled(cancel)
+
+        if proxy is None:
+            # D-08: no-proxy evals run the direct-egress flow byte-for-byte unchanged
+            # — no hop repoint, no global http_proxy, no egress-verify.
+            return self._drive_eval(
+                challenge_url,
+                host,
+                js,
+                cancel,
+                wait_for=wait_for,
+                deadline=deadline,
+                expected_egress_ip="",
+            )
+
+        # Proxied eval (Req 7 parity with ``_solve``): set the device-wide proxy and
+        # ALWAYS clear it in finally — even on a mid-flight raise (mirroring
+        # ``_solve``'s discipline). The hop is repointed to the per-solve
+        # authenticated upstream BEFORE the eval navigation so the warm WebView picks
+        # the proxy up on its next load. The credential-bearing upstream URI is never
+        # logged (T-14-04 / T-11-02).
+        upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
+        try:
+            # WR-01 parity: the hop repoint AND the device-proxy set both live INSIDE
+            # the try so ``finally: self._clear_proxy_quietly()`` ALWAYS idles the hop
+            # + clears the device, even if either step raises an AdbError mid-flight.
+            repoint(self._hop_control_host, self._hop_control_port, upstream)
+            self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
+            _raise_if_cancelled(cancel)
+            # Learn the egress this SAME upstream should present (stdlib self-probe,
+            # D-05); the WebView's observed egress is asserted against it pre-eval.
+            expected = expected_egress(up_host, up_port, user, pw)
+            return self._drive_eval(
+                challenge_url,
+                host,
+                js,
+                cancel,
+                wait_for=wait_for,
+                deadline=deadline,
+                expected_egress_ip=expected,
+            )
+        finally:
+            self._clear_proxy_quietly()
+
+    def _drive_eval(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: Event | None,
+        *,
+        wait_for: str | None,
+        deadline: float,
+        expected_egress_ip: str,
+    ) -> Any:
+        """Forward devtools → (egress-verify when proxied) → navigate → eval.
+
+        When ``expected_egress_ip`` is non-empty (proxied path) the WebView's observed
+        egress is read in-browser and asserted to equal it BEFORE the eval runs (Req 3
+        / T-11-01 parity with ``_drive_solve``); a mismatch or transient echo failure
+        raises with NO eval result — a silently-bypassed proxy must NOT eval against a
+        wrong-IP (re-challenged) session. When it is ``""`` (no-proxy path) the
+        egress-verify is skipped and this flow is byte-for-byte today's direct-egress
+        eval (D-08). The device is already connected by the caller.
+        """
         pid = self._device.pidof()
         _raise_if_cancelled(cancel)
         port = self._device.forward_devtools(pid)
@@ -442,6 +515,27 @@ class AndroidSolvePipeline:
             try:
                 cdp_call(ws, "Page.enable", command_id=10)
                 cdp_call(ws, "DOM.enable", command_id=11)
+                if expected_egress_ip:
+                    # Req 3 / T-11-01 parity: prove the WebView egresses through the
+                    # verified proxy IP BEFORE running the eval. Mismatch/transient
+                    # echo failure ⇒ no eval. The egress-verify navigates AWAY to the
+                    # ip echo, so the eval's own ``Page.navigate`` below returns to the
+                    # challenge under the now-verified egress.
+                    observed = self._observe_webview_egress(ws, cancel)
+                    if observed != expected_egress_ip:
+                        # WR-02 parity: byte-equal egress assertion REQUIRES a STICKY
+                        # upstream that holds one exit IP across the self-probe CONNECT
+                        # and the WebView's separate connection. A ROTATING residential
+                        # proxy mismatches on nearly every call — name the cause so it
+                        # is not mistaken for a Cloudflare failure.
+                        raise SolveError(
+                            f"proxied egress IP differed "
+                            f"(expected {expected_egress_ip}, observed {observed}) — "
+                            f"is the upstream a rotating/non-sticky proxy? "
+                            f"egress-verify needs a sticky-session upstream that holds "
+                            f"one exit IP across connections"
+                        )
+                    _log.info("verified proxied WebView egress %s for eval", observed)
                 cdp_call(
                     ws,
                     "Page.navigate",
@@ -1103,7 +1197,17 @@ class SolverService:
                 "error": "wait_for must be a string"
             }
 
-        return self._run_eval(challenge_url, host, js, wait_for, disconnected)
+        # Req 7 parity with /solve: validate the optional per-eval proxy SHAPE BEFORE
+        # any device action — a malformed proxy is a pre-action 422 (no hop repoint,
+        # no global http_proxy set). Same validator as /solve (T-11-06: the only
+        # caller-supplied URL is the upstream proxy server, validated for scheme +
+        # hostname, never blindly fetched). The credentials are never logged.
+        proxy_err = self._validate_proxy(payload.get("proxy"))
+        if proxy_err is not None:
+            return proxy_err
+        proxy = payload.get("proxy")
+
+        return self._run_eval(challenge_url, host, js, wait_for, proxy, disconnected)
 
     @staticmethod
     def _validate_proxy(
@@ -1250,6 +1354,7 @@ class SolverService:
         host: str,
         js: str,
         wait_for: str | None = None,
+        proxy: dict[str, Any] | None = None,
         disconnected: Callable[[], bool] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         """Serialize + timeout-bound one in-WebView eval (mirrors ``_run_solve``).
@@ -1262,9 +1367,18 @@ class SolverService:
         returns ``(200, {"value": <marshalled eval result>})``. The ``js`` and the
         result value are NEVER logged (T-14-04) — the success event carries only the
         host.
+
+        When ``proxy`` is supplied the eval adds the cross-container CONNECT hop +
+        egress-verify before the eval nav (Req 7 parity with ``_run_solve``), so the
+        outer future wait is bounded by the LONGER ``proxy_solve_timeout_s`` to absorb
+        that overhead. A no-proxy eval keeps the base ``solve_timeout_s`` (D-08).
         """
         cancel = Event()
-        timeout_s = self._config.solve_timeout_s
+        timeout_s = (
+            self._config.proxy_solve_timeout_s
+            if proxy is not None
+            else self._config.solve_timeout_s
+        )
         # T-14-05 / PERF-01: NON-blocking acquire — an eval (or solve) arriving while
         # one is already in flight is rejected 503 immediately rather than queuing
         # behind the single device.
@@ -1279,6 +1393,7 @@ class SolverService:
                 js,
                 cancel,
                 wait_for=wait_for,
+                proxy=proxy,
             )
             deadline = time.monotonic() + timeout_s
             while True:
