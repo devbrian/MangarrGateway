@@ -101,13 +101,14 @@ list regardless of the CDN URL shape, so it is robust to the next rotation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 from PIL import Image, UnidentifiedImageError
@@ -121,6 +122,8 @@ from ..handles.store import ResolutionRecord
 from ..models.search import Release
 
 if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
+
     from ..framework.context import SourceContext
     from ..models.search import ExternalLinks, SearchRequest
 
@@ -1118,85 +1121,99 @@ class ComixSource(Source):
         # candidate-count discriminator, so a mode flip (interactive↔non-interactive)
         # for a warmed query is a HIT, not a deliberate MISS — there is no width
         # difference to reconcile, so no wrong-width list can be served.
-        series = await ctx.cached_resolve(
-            ctx.cached_resolve_key(_normalize(req.query or ""), languages),
-            _resolve_fn,
-        )
-        # 260605-e9a deliverable 5: report how many series candidates we deep-
-        # enumerate (one browser fan-out each; correct on a HIT too).
-        ctx.candidates_enumerated = len(series)
-
-        # Per-series OUTPUT window — honors the CALLER's requested limit, NOT the
-        # per-page upstream fetch ceiling. ``_MAX_FEED_LIMIT`` is the page size the
-        # ``route_limit_rewrite`` requests from upstream (the ``/chapters`` API), so
-        # reusing it to clamp the result window capped EVERY comix search at 100
-        # chapters regardless of ``req.limit`` (debug comix-page-walker-100-cap).
-        # The canonical ``req.limit`` truncation is the route's
-        # ``releases[: req.limit]`` over the merged, newest-first result (the same
-        # point MangaDex relies on) — the source must NOT pre-clamp to the fetch
-        # ceiling. Per-series windowing to ``req.limit`` still bounds handle minting
-        # (the merged top-``limit`` can never need more than ``limit`` from any one
-        # series) without starving a >100-chapter series.
-        #
-        # 260620-ki0 (CodeRabbit): clamp non-negative. A negative ``req.limit`` would
-        # otherwise leave ``result_window`` negative and turn the
-        # ``chapters[: offset + result_window]`` bound into a Python negative slice,
-        # minting all-but-last as dropped handles even though the route clamps limit
-        # and returns an empty page. A zero limit windows to 0 (route returns empty).
-        result_window = max(req.limit, 0)
-
-        # Layer 2 (CACHE-02/03): cache the UNFILTERED, newest-first raw chapter list
-        # per (series_hid, languages). The browser-DOM read is the SINGLE biggest cost
-        # on this source (7-18s/nav), so a HIT here is the headline win — a repeat
-        # same-series chapter search skips the navigation entirely. The DOM read is the
-        # COMPLETE v1 enumeration (there is no deeper-limit fetch on Comix), so the
-        # Enumeration is marked ``exhausted=True`` — ``covers_floor`` therefore never
-        # forces a pointless re-nav for a below-window chapter.
-        async def _enum_for(series_hid: str, series_slug: str) -> Enumeration:
-            async def _enum_fn() -> Enumeration:
-                items = await self._fetch_series_chapters_raw(
-                    series_hid, series_slug, ctx
-                )
-                parsed = [
-                    d
-                    for c in items
-                    if (d := self._parse_decimal(c.get("chapter") or c.get("number")))
-                    is not None
-                ]
-                return Enumeration(
-                    items=items,
-                    chapter_numbers=tuple(parsed),
-                    exhausted=True,
-                    # The per-page upstream fetch ceiling (the route_limit_rewrite
-                    # target), NOT the output window — the browser walk is the
-                    # COMPLETE enumeration so this is informational only
-                    # (``covers_floor`` short-circuits on ``exhausted=True``).
-                    requested_limit=_MAX_FEED_LIMIT,
-                )
-
-            # IN-02: Comix's chapter enumeration is language-AGNOSTIC — the
-            # browser-DOM read is English-only and the language filter is applied
-            # post-cache (in ``search()``), so the cached walk does not depend on
-            # ``languages``. Key on ``[]`` so different-language requests for the
-            # same series share the one cached (expensive) browser walk.
-            return await ctx.cached_enumerate(
-                ctx.cached_enumerate_key(series_hid, []), _enum_fn
+        # Bug 4 Fix C: hold the foreground device lease across the WHOLE comix
+        # resolve+enumerate sequence — the ``_search_series`` token-mint eval (via
+        # ``cached_resolve``) AND the per-candidate chapter-list ``asyncio.gather``
+        # fan-out — so the android proactive-refresh loop DEFERS and the cleared comix
+        # WebView page stays warm across the evals (the sidecar fast-path engages, no
+        # per-eval Cloudflare re-clear). The gather stays concurrent: Fix B's
+        # ``_device_lock`` serializes the candidate evals AT the gateway; the
+        # ``device_session`` lease only holds the foreground counter. No-op-safe for a
+        # non-android solver (a test/fake) — the router always exposes it in prod.
+        async with self._device_session(self._solver_from_ctx(ctx)):
+            series = await ctx.cached_resolve(
+                ctx.cached_resolve_key(_normalize(req.query or ""), languages),
+                _resolve_fn,
             )
+            # 260605-e9a deliverable 5: report how many series candidates we deep-
+            # enumerate (one browser fan-out each; correct on a HIT too).
+            ctx.candidates_enumerated = len(series)
 
-        # Parallel fan-out across series candidates. ``return_exceptions=True``
-        # isolates per-candidate failures — a SourceError on one candidate
-        # surfaces as an item in ``results`` rather than cancelling the gather,
-        # so the other candidates still flow. The actual concurrency is bounded
-        # by the framework's ``CloudflareSolver._browser_lock`` Semaphore
-        # (``cloudflare_fetch_concurrency``), so the default deployment
-        # (concurrency=1) runs these one-at-a-time exactly as before. A cache HIT
-        # never reaches the solver, so concurrent same-series misses collapse to ONE
-        # nav via the SingleFlightCache (D-04) on top of that Semaphore.
-        coros = [
-            _enum_for(series_hid, series_slug)
-            for series_hid, series_slug, _series_title, _alt, _links in series
-        ]
-        results = await asyncio.gather(*coros, return_exceptions=True)
+            # Per-series OUTPUT window — honors the CALLER's requested limit, NOT the
+            # per-page upstream fetch ceiling. ``_MAX_FEED_LIMIT`` is the page size the
+            # ``route_limit_rewrite`` requests from upstream (the ``/chapters`` API), so
+            # reusing it to clamp the result window capped EVERY comix search at 100
+            # chapters regardless of ``req.limit`` (debug comix-page-walker-100-cap).
+            # The canonical ``req.limit`` truncation is the route's
+            # ``releases[: req.limit]`` over the merged, newest-first result (the same
+            # point MangaDex relies on) — the source must NOT pre-clamp to the fetch
+            # ceiling. Per-series windowing to ``req.limit`` still bounds handle minting
+            # (the merged top-``limit`` can never need more than ``limit`` from any one
+            # series) without starving a >100-chapter series.
+            #
+            # 260620-ki0 (CodeRabbit): clamp non-negative. A negative ``req.limit``
+            # would otherwise leave ``result_window`` negative and turn the
+            # ``chapters[: offset + result_window]`` bound into a Python negative slice,
+            # minting all-but-last as dropped handles even though the route clamps limit
+            # and returns an empty page. A zero limit windows to 0 (route empty).
+            result_window = max(req.limit, 0)
+
+            # Layer 2 (CACHE-02/03): cache the UNFILTERED, newest-first raw chapter list
+            # per (series_hid, languages). The browser-DOM read is the SINGLE biggest
+            # cost on this source (7-18s/nav), so a HIT here is the headline win — a
+            # repeat same-series chapter search skips the navigation entirely. The DOM
+            # read is the COMPLETE v1 enumeration (no deeper-limit fetch on Comix), so
+            # the Enumeration is marked ``exhausted=True`` — ``covers_floor`` therefore
+            # never forces a pointless re-nav for a below-window chapter.
+            async def _enum_for(series_hid: str, series_slug: str) -> Enumeration:
+                async def _enum_fn() -> Enumeration:
+                    items = await self._fetch_series_chapters_raw(
+                        series_hid, series_slug, ctx
+                    )
+                    parsed = [
+                        d
+                        for c in items
+                        if (
+                            d := self._parse_decimal(
+                                c.get("chapter") or c.get("number")
+                            )
+                        )
+                        is not None
+                    ]
+                    return Enumeration(
+                        items=items,
+                        chapter_numbers=tuple(parsed),
+                        exhausted=True,
+                        # The per-page upstream fetch ceiling (the route_limit_rewrite
+                        # target), NOT the output window — the browser walk is the
+                        # COMPLETE enumeration so this is informational only
+                        # (``covers_floor`` short-circuits on ``exhausted=True``).
+                        requested_limit=_MAX_FEED_LIMIT,
+                    )
+
+                # IN-02: Comix's chapter enumeration is language-AGNOSTIC — the
+                # browser-DOM read is English-only and the language filter is applied
+                # post-cache (in ``search()``), so the cached walk does not depend on
+                # ``languages``. Key on ``[]`` so different-language requests for the
+                # same series share the one cached (expensive) browser walk.
+                return await ctx.cached_enumerate(
+                    ctx.cached_enumerate_key(series_hid, []), _enum_fn
+                )
+
+            # Parallel fan-out across series candidates. ``return_exceptions=True``
+            # isolates per-candidate failures — a SourceError on one candidate
+            # surfaces as an item in ``results`` rather than cancelling the gather,
+            # so the other candidates still flow. The actual concurrency is bounded
+            # by the framework's ``CloudflareSolver._browser_lock`` Semaphore
+            # (``cloudflare_fetch_concurrency``), so the default deployment
+            # (concurrency=1) runs these one-at-a-time exactly as before. A cache HIT
+            # never reaches the solver, so concurrent same-series misses collapse to ONE
+            # nav via the SingleFlightCache (D-04) on top of that Semaphore.
+            coros = [
+                _enum_for(series_hid, series_slug)
+                for series_hid, series_slug, _series_title, _alt, _links in series
+            ]
+            results = await asyncio.gather(*coros, return_exceptions=True)
 
         releases: list[Release] = []
         for (series_hid, series_slug, series_title, _alt, _links), result in zip(
@@ -1457,69 +1474,81 @@ class ComixSource(Source):
             raise SourceError(
                 "source_unavailable", f"malformed comix chapter id: {exc}"
             ) from None
-        # Issue #42: recent-feed handles defer chapter-id resolution to download
-        # time. One extra browser nav (re-reads the series page chapter list,
-        # the same path search uses) replaces the DEFERRED sentinel with the
-        # real numeric id. Strict-match staleness (locked decision 4): a
-        # missing chapter surfaces as SourceError, never a silent rebind.
-        if numeric_id == _DEFERRED_SENTINEL:
-            chapters = await self._series_chapters(hid, slug, _MAX_FEED_LIMIT, 0, ctx)
-            try:
-                numeric_id = _resolve_deferred(number, chapters)
-            except _DeferredResolutionError as exc:
-                raise SourceError("source_unavailable", str(exc)) from None
+        # Bug 4 Fix C: hold the foreground device lease across this download's whole
+        # in-WebView sequence — the deferred chapter-list re-read (``_series_chapters``)
+        # AND the chapter-pages manifest eval loop below — so the android proactive-
+        # refresh loop DEFERS and the cleared comix page stays warm + CONTIGUOUS across
+        # both evals (no per-eval re-clear). The lease is no-op-safe for a non-android
+        # solver (a test/fake); comix only ever uses the android-routed solver in prod.
         solver = self._solver_from_ctx(ctx)
-        chapter_url = (
-            f"{self.base_url}/title/{hid}-{slug}/{numeric_id}-chapter-{number}"
-        )
-        # Issue #171: a cold browser can race the page's readiness and yield an
-        # EMPTY page list. Retry only that signature once (a warm re-nav lets the
-        # SPA module load + interceptors wire); a genuinely empty chapter returns
-        # [] again and falls through to the malformed-manifest raise, while a
-        # populated-but-invalid manifest is a real fault that does NOT retry.
-        urls: Any = None
-        for attempt in range(_MANIFEST_COLD_RACE_ATTEMPTS):
-            try:
-                urls = await solver.eval_in_webview(
-                    chapter_url,
-                    # spike 019/021: call comix's OWN internal ``chapters/{id}`` loader
-                    # in-page INSIDE the cleared redroid WebView — returns the
-                    # decrypted ``pages.items[].url`` list, robust to the image-CDN
-                    # URL-scheme rotation that broke the old lazy-DOM scrape (debug
-                    # comix-cdn-scheme-rotation). Image BYTES still fetch over httpx.
-                    _CHAPTER_PAGES_API_EXTRACT_JS,
-                    # Wait for the reader scaffold so the SPA has fetched+decrypted
-                    # the page list — which guarantees the API ES module is loaded
-                    # and its axios interceptors are wired before the extract
-                    # ``import()``s it and calls ``/chapters/{id}`` itself.
-                    wait_for=_CHAPTER_PAGES_WAIT_FOR,
-                    # The in-page API call is a couple of decrypted requests, not an
-                    # O(pages) DOM walk; 60s stays as a generous margin for the
-                    # scaffold wait + Cloudflare/first-paint tail. The per-source
-                    # rate limiter bounds outer cadence.
-                    timeout=60.0,
+        async with self._device_session(solver):
+            # Issue #42: recent-feed handles defer chapter-id resolution to download
+            # time. One extra browser nav (re-reads the series page chapter list,
+            # the same path search uses) replaces the DEFERRED sentinel with the
+            # real numeric id. Strict-match staleness (locked decision 4): a
+            # missing chapter surfaces as SourceError, never a silent rebind.
+            if numeric_id == _DEFERRED_SENTINEL:
+                chapters = await self._series_chapters(
+                    hid, slug, _MAX_FEED_LIMIT, 0, ctx
                 )
-            except Exception as exc:  # noqa: BLE001 — surface as a typed source failure
-                raise SourceError(
-                    "source_unavailable", f"browser manifest fetch failed: {exc}"
-                ) from exc
-            # Cold-race signature: an EMPTY list on a non-final attempt → re-nav once.
-            if (
-                isinstance(urls, list)
-                and not urls
-                and attempt < _MANIFEST_COLD_RACE_ATTEMPTS - 1
-            ):
-                continue
-            break
-        if (
-            not isinstance(urls, list)
-            or not urls
-            or not all(
-                isinstance(u, str) and u and _is_allowed_image_url(u) for u in urls
+                try:
+                    numeric_id = _resolve_deferred(number, chapters)
+                except _DeferredResolutionError as exc:
+                    raise SourceError("source_unavailable", str(exc)) from None
+            chapter_url = (
+                f"{self.base_url}/title/{hid}-{slug}/{numeric_id}-chapter-{number}"
             )
-        ):
-            raise SourceError("source_unavailable", "malformed chapter manifest")
-        return urls
+            # Issue #171: a cold browser can race the page's readiness and yield an
+            # EMPTY page list. Retry only that signature once (a warm re-nav lets the
+            # SPA module load + interceptors wire); a genuinely empty chapter returns
+            # [] again and falls through to the malformed-manifest raise, while a
+            # populated-but-invalid manifest is a real fault that does NOT retry.
+            urls: Any = None
+            for attempt in range(_MANIFEST_COLD_RACE_ATTEMPTS):
+                try:
+                    urls = await solver.eval_in_webview(
+                        chapter_url,
+                        # spike 019/021: call comix's OWN internal ``chapters/{id}``
+                        # loader in-page INSIDE the cleared redroid WebView — returns
+                        # the decrypted ``pages.items[].url`` list, robust to the
+                        # image-CDN URL-scheme rotation that broke the old lazy-DOM
+                        # scrape (debug comix-cdn-scheme-rotation). Image BYTES still
+                        # fetch over httpx.
+                        _CHAPTER_PAGES_API_EXTRACT_JS,
+                        # Wait for the reader scaffold so the SPA has fetched+decrypted
+                        # the page list — which guarantees the API ES module is loaded
+                        # and its axios interceptors are wired before the extract
+                        # ``import()``s it and calls ``/chapters/{id}`` itself.
+                        wait_for=_CHAPTER_PAGES_WAIT_FOR,
+                        # The in-page API call is a couple of decrypted requests, not
+                        # an O(pages) DOM walk; 60s stays a generous margin for the
+                        # scaffold wait + Cloudflare/first-paint tail. The per-source
+                        # rate limiter bounds outer cadence.
+                        timeout=60.0,
+                    )
+                except Exception as exc:  # noqa: BLE001 — typed source failure
+                    raise SourceError(
+                        "source_unavailable",
+                        f"browser manifest fetch failed: {exc}",
+                    ) from exc
+                # Cold-race signature: an EMPTY list on a non-final attempt →
+                # re-nav once.
+                if (
+                    isinstance(urls, list)
+                    and not urls
+                    and attempt < _MANIFEST_COLD_RACE_ATTEMPTS - 1
+                ):
+                    continue
+                break
+            if (
+                not isinstance(urls, list)
+                or not urls
+                or not all(
+                    isinstance(u, str) and u and _is_allowed_image_url(u) for u in urls
+                )
+            ):
+                raise SourceError("source_unavailable", "malformed chapter manifest")
+            return urls
 
     @staticmethod
     def _decode_enc_prefix(
@@ -1752,6 +1781,23 @@ class ComixSource(Source):
                 "comix requires a solver with eval_in_webview",
             )
         return solver
+
+    @staticmethod
+    def _device_session(solver: Any) -> AbstractAsyncContextManager[None]:
+        """The android device-session lease (bug 4 Fix C) if the solver exposes it.
+
+        Production comix always uses the android-routed ``SolverRouter``, which exposes
+        ``device_session`` (the foreground lease the android proactive-refresh loop
+        defers to, keeping the cleared comix WebView warm across a solve+eval sequence).
+        A test/fake solver WITHOUT it gets a no-op async context, so the wrap stays
+        STRICTLY ADDITIVE: the deferral the lease drives only exists on the real android
+        backend, so skipping it offline changes nothing. Returned as a CM so the call
+        sites use it directly as ``async with``.
+        """
+        factory = getattr(solver, "device_session", None)
+        if factory is None:
+            return contextlib.nullcontext()
+        return cast("AbstractAsyncContextManager[None]", factory())
 
     # ─────────────────────────── External tracker links ─────────────────────────
 
