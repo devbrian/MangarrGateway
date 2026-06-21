@@ -37,6 +37,8 @@ import logging
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
+
     from .antibot import AntiBotSolver, Clearance
 
 _log = logging.getLogger("manga_gateway")
@@ -117,6 +119,17 @@ class _EvalSolver(Protocol):
         wait_for: str | None = None,
         timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
     ) -> Any: ...
+
+    def device_session(self) -> AbstractAsyncContextManager[None]:
+        """The bug-4 Fix C foreground-device lease the android backend exposes.
+
+        comix wraps its whole solve+eval sequence in ``async with
+        solver.device_session():`` so the proactive-refresh loop defers and the warm
+        comix page survives across the sequence's evals. Declared here (not a
+        coroutine — it returns an async context manager) so the router can ``cast``
+        ``self._android`` and delegate mypy-strict-clean.
+        """
+        ...
 
 
 # The android engine name (matches ``Source.solver_engine`` on mangadot/kagane).
@@ -302,6 +315,23 @@ class SolverRouter:
         return await backend.eval_in_webview(
             challenge_url, js, wait_for=wait_for, timeout=timeout
         )
+
+    def device_session(self) -> AbstractAsyncContextManager[None]:
+        """Delegate the foreground-device lease to the ANDROID backend (bug 4 Fix C).
+
+        Like :meth:`eval_in_webview` (and unlike the four ``fetch_via_browser*``
+        passthroughs), this routes to ``self._android`` — the engine that owns the
+        single redroid. comix wraps its solve+eval sequence in ``async with
+        self._solver_from_ctx(ctx).device_session():`` so the android backend's
+        proactive-refresh loop defers and the warm comix page survives across the
+        sequence. It is a no-op-safe CM even when the android backend is unconfigured
+        (``base_url is None``): the lease is just a counter, so a local box / CI /
+        the gate without a redroid enters+exits it cleanly (the evals inside raise
+        ``RuntimeError`` anyway). Returns the CM (not a coroutine) so callers use it
+        directly as ``async with``.
+        """
+        backend = cast("_EvalSolver", self._android)
+        return backend.device_session()
 
     async def warm(self) -> list[str]:
         """Warm BOTH backends; return the UNION of their failed keys (deduped).

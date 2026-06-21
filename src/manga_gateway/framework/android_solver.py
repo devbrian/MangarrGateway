@@ -29,6 +29,7 @@ green. The ``cf_clearance`` value is NEVER logged (T-10-04).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -38,7 +39,7 @@ import httpx
 from .antibot import Clearance
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import AsyncIterator, Iterable
 
     from pydantic import SecretStr
 
@@ -52,6 +53,13 @@ _log = logging.getLogger("manga_gateway")
 _REFRESH_LEAD_S = 120.0
 _REFRESH_MIN_SLEEP_S = 30.0
 _REFRESH_MAX_SLEEP_S = 600.0
+
+# Bug 4 Fix B: the bounded-acquire budget for the single gateway-side device lock.
+# Sized to EXCEED a normal solve (~30s) plus a normal eval (~10s) so a legitimate
+# queue of coordinated comix evals + a refresh solve never trips the contention
+# guard; a wedged device past this surfaces a clean per-source RuntimeError instead
+# of an unbounded hang. Instance attr (so tests can shrink it).
+_DEVICE_ACQUIRE_TIMEOUT_S = 90.0
 
 
 def _emit_solve(
@@ -167,6 +175,19 @@ class AndroidSolver:
         self._refresh_lead_s = _REFRESH_LEAD_S
         self._refresh_min_sleep_s = _REFRESH_MIN_SLEEP_S
         self._refresh_max_sleep_s = _REFRESH_MAX_SLEEP_S
+        # Bug 4 Fix B: the SINGLE gateway-side serializer for the one redroid — every
+        # sidecar device op (_solve POST + eval POST) holds it per-op so the comix
+        # fan-out + the refresh loop QUEUE on the device instead of storming the
+        # sidecar with `503 solver busy`. Bounded-acquire via _device_acquire_timeout_s.
+        self._device_lock = asyncio.Lock()
+        self._device_acquire_timeout_s = _DEVICE_ACQUIRE_TIMEOUT_S
+        # Bug 4 Fix C: count of in-flight FOREGROUND android sequences (raised by
+        # device_session(), read by _refresh_tick). A non-zero count defers the
+        # proactive-refresh loop so it never navigates the shared WebView away while a
+        # comix solve+eval sequence holds the device (the page stays warm). A counter
+        # (nesting-safe) holding NO lock — the gathered evals inside still serialize
+        # per-op on _device_lock.
+        self._foreground_inflight = 0
 
     async def get_clearance(
         self,
@@ -308,6 +329,61 @@ class AndroidSolver:
             self._client = httpx.AsyncClient()
         return self._client
 
+    @contextlib.asynccontextmanager
+    async def _device_op(self) -> AsyncIterator[None]:
+        """Serialize ONE sidecar device op behind the single gateway-side lock (Fix B).
+
+        Bug 4 cause #2: the one redroid serves all android solves+evals, and the
+        sidecar REJECTS concurrency with `503 solver busy` rather than queueing. The
+        comix search fan-out (N candidate chapter-list evals gathered concurrently) +
+        the proactive-refresh loop's solves would each hit that rejection. This
+        bounded-acquire lock turns those concurrent calls into an orderly gateway-side
+        QUEUE so the sidecar sees exactly one op at a time. The acquire is bounded by
+        ``_device_acquire_timeout_s`` (sized to exceed a normal solve + eval) so a
+        wedged device surfaces a clean per-source ``RuntimeError`` (comix maps it to a
+        per-candidate ``SourceError``) instead of an unbounded hang. The lock is
+        released ONLY if it was acquired — guarding the timeout-during-acquire race
+        (an acquire that completes exactly as the deadline fires is released here, an
+        acquire that never completed holds nothing).
+        """
+        got = False
+        try:
+            async with asyncio.timeout(self._device_acquire_timeout_s):
+                await self._device_lock.acquire()
+                got = True
+        except TimeoutError as exc:
+            if got:  # acquired-then-timed-out-on-context-exit: do not leak the lock
+                self._device_lock.release()
+            raise RuntimeError(
+                "android device busy — could not acquire the single redroid within "
+                f"{self._device_acquire_timeout_s:.0f}s (device contention)"
+            ) from exc
+        try:
+            yield
+        finally:
+            self._device_lock.release()
+
+    @contextlib.asynccontextmanager
+    async def device_session(self) -> AsyncIterator[None]:
+        """Lease the redroid for a whole foreground solve+eval sequence (Fix C).
+
+        A nesting-safe COUNTER (NOT a lock): increments ``_foreground_inflight`` on
+        enter, decrements in ``finally`` (back to 0 even on exception). comix wraps its
+        whole solve+eval sequence in this so the proactive-refresh loop DEFERS (see
+        :meth:`_refresh_tick`) while the sequence holds the device — the background
+        loop never navigates the shared WebView away mid-sequence, so the page stays
+        warm on comix across the search/download evals. It holds NO lock: the gathered
+        candidate evals inside it still each take ``_device_lock`` per op (via
+        :meth:`_device_op`) and serialize; holding a lock ACROSS the gather would
+        deadlock. Deferral is safe — the held clearance keeps serving and the reactive
+        D-35 403 self-heal still backstops an expired clearance.
+        """
+        self._foreground_inflight += 1
+        try:
+            yield
+        finally:
+            self._foreground_inflight -= 1
+
     async def _solve(self, source_key: str) -> tuple[Clearance, float | None]:
         """POST the sidecar ``/solve`` → ``(Clearance, epoch-expiry|None)`` (BOT-02).
 
@@ -341,16 +417,20 @@ class AndroidSolver:
             body["proxy"] = self._proxy
         start = time.perf_counter()
         try:
-            resp = await self._ensure_client().post(
-                f"{self._base_url}/solve",
-                json=body,
-                headers=headers,
-                timeout=self._timeout_s,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            token = payload["cf_clearance"]
-            user_agent = payload["user_agent"]
+            # Fix B: serialize the sidecar /solve behind the single gateway-side
+            # _device_lock so the refresh loop's solves + the comix fan-out's evals
+            # QUEUE on the one redroid (no `503 solver busy` from our own calls).
+            async with self._device_op():
+                resp = await self._ensure_client().post(
+                    f"{self._base_url}/solve",
+                    json=body,
+                    headers=headers,
+                    timeout=self._timeout_s,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                token = payload["cf_clearance"]
+                user_agent = payload["user_agent"]
         except Exception as exc:
             _emit_solve(
                 source_key,
@@ -432,14 +512,19 @@ class AndroidSolver:
         # (already unpacked by build_proxy) and NEVER logged (T-14-04 / T-11-02).
         if self._proxy is not None:
             body["proxy"] = self._proxy
-        resp = await self._ensure_client().post(
-            f"{self._base_url}/eval",
-            json=body,
-            headers=headers,
-            timeout=timeout if timeout is not None else self._timeout_s,
-        )
-        resp.raise_for_status()
-        return resp.json()["value"]
+        # Fix B: serialize the sidecar /eval behind the single gateway-side
+        # _device_lock — the comix candidate-chapter-list fan-out gathers N evals
+        # concurrently, but each takes the lock per-op so they QUEUE on the one
+        # redroid instead of N storming the sidecar into `503 solver busy`.
+        async with self._device_op():
+            resp = await self._ensure_client().post(
+                f"{self._base_url}/eval",
+                json=body,
+                headers=headers,
+                timeout=timeout if timeout is not None else self._timeout_s,
+            )
+            resp.raise_for_status()
+            return resp.json()["value"]
 
     # ─────────────────────── proactive expiry-driven refresh ──────────────────
 
@@ -480,7 +565,17 @@ class AndroidSolver:
         the backstop. On-demand keys are never proactively refreshed (they solve only on
         a live challenge). The returned delay is the soonest upcoming (expiry − lead),
         clamped to [min, max]; with no known expiries it is ``max`` (re-check later).
+
+        Fix C: while a FOREGROUND android sequence holds the device
+        (``_foreground_inflight > 0`` — a comix solve+eval sequence inside
+        :meth:`device_session`) the tick DEFERS — it performs NO solve and returns a
+        short re-check delay — so the background loop never navigates the shared
+        WebView away mid comix sequence. The held clearance keeps serving during the
+        deferral and the reactive D-35 403 self-heal still backstops a clearance that
+        lapses while the device stays continuously busy.
         """
+        if self._foreground_inflight > 0:
+            return self._refresh_min_sleep_s
         now = time.time()
         for key, expiry in list(self._expires_at.items()):
             if key in self._on_demand_keys:
