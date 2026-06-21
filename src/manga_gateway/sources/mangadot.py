@@ -69,10 +69,17 @@ a COMPOSITE ``{id}|{source}`` (debug mangadot-resolve-404) so the stateless
 comix's composite-chapter-id idiom. Still DIRECT — no ``:DEFERRED`` (Mangadot exposes
 the stable id, unlike Comix's recent feed).
 
-recent(): a verbatim no-op (``return []``, ``supports_recent=False``). Mangadot
-exposes no clean chapter-level JSON feed (CONTEXT.md / RESEARCH.md — live-probed
-2026-06-02). The core value (search → handle → download → CBZ, R1/R6) is fully
-delivered without recent(). Tracked for revisit as a GitHub issue (mirrors comix #31).
+recent(): a TITLE-FEED fan-out (#94), mirroring atsumaru/mangafire. mangadot has no
+chapter-level feed, but it has both halves of the title-feed shape: a title-level
+newest-updated feed (``GET /api/search?sortBy=latest``, ``search=""``) and the
+per-title chapter list (``GET /api/manga/{id}/chapters/list``). recent() becomes
+search()'s candidate fan-out seeded from the ``sortBy=latest`` feed instead of a
+keyword, taking only each title's SINGLE NEWEST chapter and minting a DIRECT release
+(``1 + N`` calls per poll, no ``:DEFERRED`` — the id is always present). The KEY
+difference from atsumaru/mangafire: mangadot's ``chapters/list`` is NOT newest-first,
+so the newest chapter is selected by parsed ``date_added`` (``_parse_ts``), NOT the
+array head. The route owns the authoritative newest-first sort + ``since`` cut
+(IN-01 — recent() does not implement source-side ``since``).
 
 ⚠️ Chapter-id namespace split (debug mangadot-resolve-404, CONFIRMED LIVE via the
 reader's own network calls): mangadot has TWO manifest namespaces —
@@ -115,12 +122,21 @@ if TYPE_CHECKING:
 # mangaball, ``req.interactive`` does NOT widen the candidate count.
 _DEFAULT_MANGA_CANDIDATES = 5
 
-# Bounds the per-candidate ``chapters/list`` fan-out in ``search`` — at most this
-# many chapter-list fetches run concurrently. The candidates are no longer fetched
+# Source-wide fan-out concurrency: the single bound on every per-source fan-out
+# (search()'s per-candidate ``chapters/list`` fetches AND recent()'s per-title
+# ``chapters/list`` fetches). Sized to ``_RECENT_TITLE_CAP`` (>= it) so the widest
+# fan-out — recent()'s 20-wide title set — clears the title cap in ONE wave under
+# fanout.py's 30s per-source budget (mirrors atsumaru's reasoning, atsumaru.py
+# lines 105-118). search() enumerates <=5 candidates, so the wider bound is a
+# harmless ceiling there (already one wave). The candidates are no longer fetched
 # serially after the #101 fix (sequential at rate_limit=10 crossed the 30s fanout
-# timeout); 6 collapses the wall-clock while staying well under the per-source
-# rate budget (480/min).
-_CHAPTERS_FANOUT_CONCURRENCY = 6
+# timeout). The shared 480/min limiter still paces issuance.
+_CHAPTERS_FANOUT_CONCURRENCY = 20
+
+# recent() fans out one ``chapters/list`` call per recently-updated title; bound the
+# title count so a single recent poll can never balloon into dozens of full-feed
+# fetches (mirrors atsumaru.py line 122 / mangafire line 129).
+_RECENT_TITLE_CAP = 20
 
 # Floor for empty/malformed timestamps so they sort oldest and never crash.
 _TS_FLOOR = datetime.min.replace(tzinfo=UTC)
@@ -240,9 +256,12 @@ class MangadotSource(Source):
     decrypt_scheme = None
     session_prep = None
     supports_search = True
-    # No clean chapter-level JSON feed (CONTEXT.md / RESEARCH.md). recent() is a
-    # verbatim no-op; tracked for revisit as a GitHub issue (mirrors comix #31).
-    supports_recent = False
+    # recent() (#94): a TITLE-FEED fan-out seeded from ``GET /api/search?sortBy=latest``
+    # (``search=""``) — one DIRECT newest-chapter release per recently-updated title,
+    # the newest chapter chosen by parsed ``date_added`` (mangadot's ``chapters/list``
+    # is NOT newest-first). Mirrors atsumaru/mangafire; ``/caps`` advertises
+    # ``supportsRecent: true``.
+    supports_recent = True
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
         """Keyword search → per-(chapter row) Releases (SRCH-01..07, D-08).
@@ -487,20 +506,86 @@ class MangadotSource(Source):
         since: str | None,
         ctx: SourceContext,
     ) -> list[Release]:
-        """No-op recent feed — ``supports_recent=False`` for v1 (verbatim comix).
+        """Newest-updated titles → DIRECT newest-chapter releases (#94, RCNT-01/02).
 
-        Mangadot exposes no clean chapter-level JSON feed (CONTEXT.md / RESEARCH.md,
-        live-probed 2026-06-02: ``/api/search?sortBy=latest`` is manga-level with
-        ``chapter_count:0``; ``/view-all/latest-updates`` is SSR HTML with no
-        chapter id/date/language; the ``.data`` loader is a React-Router
-        turbo-stream). The core value (search → handle → download → CBZ, R1/R6) is
-        fully delivered without recent(). Tracked for revisit as a GitHub issue
-        (mirrors comix #31). ``framework/fanout.py`` does not gate on
-        ``supports_recent``, so an empty list is a clean no-op, not a contract
-        failure.
+        Title-feed fan-out, mirroring atsumaru/mangafire: GETs the ``sortBy=latest``
+        title feed (``GET /api/search``, ``search=""``, ``page=1`` — manga-level, no
+        embedded chapters), then fans out exactly ONE ``GET /api/manga/{id}/chapters/
+        list`` per recently-updated title and mints that title's SINGLE newest chapter
+        as a DIRECT release (id always present, no ``:DEFERRED``; the resolve unit is
+        the existing ``{id}|{source}`` composite). This keeps recent at ``1 + N`` calls
+        per poll.
+
+        The KEY difference from atsumaru/mangafire (whose feeds are pre-sorted
+        newest-first): mangadot's ``chapters/list`` is NOT newest-first, so the newest
+        chapter is selected by parsed ``date_added`` (:meth:`_parse_ts`, ``max(...)``),
+        NOT the array head ``rows[0]``. Within a title, row selection mirrors
+        :meth:`_chapters_to_releases` — skip rows with no ``id``; when ``languages`` is
+        given, skip rows whose language is not wanted (mangadot is en-only).
+
+        A non-English ``languages`` request short-circuits to ``[]`` BEFORE any network
+        call. An empty title feed → ``[]``; a title whose ``chapters/list`` is empty (or
+        has no qualifying row) is dropped, never a crash. The route owns the
+        authoritative newest-first sort + ``since`` cut (IN-01 — recent() does not
+        implement source-side ``since``). recent() intentionally does NOT populate
+        ``Release.externalLinks`` (see the IN-02 note above). Zero glue (SRC-02).
         """
-        _ = (languages, limit, since, ctx)  # deliberately unused — see docstring
-        return []
+        if not self._language_wanted(languages):
+            return []
+        envelope = await ctx.get_json(
+            f"{self.base_url}/api/search",
+            search="",
+            sortBy="latest",
+            page=1,
+        )
+        manga_list = envelope.get("manga_list")
+        titles = [m for m in (manga_list or []) if isinstance(m, dict)]
+
+        # Bound the per-title fan-out: never more than the requested limit or the cap.
+        bound = min(_RECENT_TITLE_CAP, limit or _RECENT_TITLE_CAP)
+        wanted_langs = set(languages) if languages else None
+        # Single-wave concurrency: _CHAPTERS_FANOUT_CONCURRENCY (20) is sized to the
+        # title cap, so the whole chapters/list fan-out completes inside the 30s
+        # per-source budget in ONE wave. Constructed HERE so it binds to the running
+        # loop (skill §6), never at import time.
+        sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
+
+        async def _newest_release(manga_id: str, manga_title: str) -> Release | None:
+            async with sem:
+                rows = await ctx.get_json_array(
+                    f"{self.base_url}/api/manga/{manga_id}/chapters/list"
+                )
+            # Select the NEWEST surviving row by parsed date_added (NOT rows[0] —
+            # mangadot's chapters/list is not newest-first). Filter rows the same way
+            # _chapters_to_releases does: skip no-id rows, skip non-wanted languages.
+            best: dict[str, Any] | None = None
+            best_ts = _TS_FLOOR
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if row.get("id") is None:
+                    continue
+                language = str(row.get("language") or "en")
+                if wanted_langs is not None and language not in wanted_langs:
+                    continue
+                ts = self._parse_ts(row.get("date_added"))
+                if best is None or ts >= best_ts:
+                    best, best_ts = row, ts
+            if best is None:
+                return None
+            return self._to_release(manga_id, manga_title, best, ctx)
+
+        tasks: list[Coroutine[Any, Any, Release | None]] = []
+        for title in titles[:bound]:
+            manga_id = title.get("id")
+            if manga_id is None:
+                continue
+            tasks.append(
+                _newest_release(str(manga_id), str(title.get("title") or "Unknown"))
+            )
+
+        results = await asyncio.gather(*tasks)
+        return [rel for rel in results if rel is not None]
 
     # ───────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
 
@@ -734,6 +819,16 @@ class MangadotSource(Source):
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+    @classmethod
+    def _language_wanted(cls, languages: list[str] | None) -> bool:
+        """True unless the caller asked for languages that exclude English.
+
+        Mangadot is English-only, so a request constrained to other languages yields
+        nothing (recent() returns ``[]`` before any network call). An unset /
+        English-inclusive filter passes through.
+        """
+        return not languages or "en" in languages
 
     @classmethod
     def _build_resolve_id(cls, chapter_id: str, source: Any) -> str:
