@@ -157,7 +157,7 @@ _MAX_FEED_LIMIT = 100
 # (the one external-derived value entering the eval) becomes a JSON STRING LITERAL,
 # data and never code (SEC T-14-06: it cannot break out of the JS string). The JS
 # template itself is gateway-authored. raw-string literal (single-backslash regex).
-_SEARCH_LIST_API_EXTRACT_JS = r"""
+_SEARCH_LIST_API_EXTRACT_JS = r"""(async () => {
   // (1) Discover the API-client module (env-*.js) at RUNTIME — hash rotates per
   // deploy, so NEVER hardcode it; it is already in the Resource-Timing buffer.
   const envUrl = performance.getEntriesByType('resource')
@@ -189,6 +189,7 @@ _SEARCH_LIST_API_EXTRACT_JS = r"""
   // Axios responses carry the body on `.data`; the decrypt interceptor may also
   // return the body directly — unwrap to the SAME envelope `_result_items` reads.
   return (res && res.data !== undefined) ? res.data : res;
+})()
 """
 # Seconds budget for the in-WebView search eval (env-*.js hydration + one signed
 # c.list call). Name retained for call-site continuity (the typed path is gone).
@@ -207,7 +208,7 @@ _SEARCH_TYPED_TIMEOUT = 60.0
 # ``/api/v1/manga`` ``result.items`` shape is unchanged, so the deferred-composite
 # synthesis in :meth:`recent` is untouched. The ordering is the one piece NOT
 # spike-validated; Plan 04 live-verifies newest-first. raw-string literal.
-_RECENT_LIST_API_EXTRACT_JS = r"""
+_RECENT_LIST_API_EXTRACT_JS = r"""(async () => {
   // (1) Discover the API-client module (env-*.js) at RUNTIME (hash rotates).
   const envUrl = performance.getEntriesByType('resource')
     .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
@@ -235,6 +236,7 @@ _RECENT_LIST_API_EXTRACT_JS = r"""
     content_rating: 'suggestive',
   });
   return (res && res.data !== undefined) ? res.data : res;
+})()
 """
 # Seconds budget for the in-WebView recent eval (env-*.js hydration + one signed
 # c.list call). Name retained for call-site continuity (the /browse nav is gone).
@@ -678,7 +680,7 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 # The env-*.js URL hash + the axios instance are discovered at RUNTIME (never
 # hardcoded). The image BYTES are still fetched via httpx (CLAUDE.md), and the
 # per-page byte/tile decryption in ``fetch_image`` is unchanged. raw-string literal.
-_CHAPTER_PAGES_API_EXTRACT_JS = r"""
+_CHAPTER_PAGES_API_EXTRACT_JS = r"""(async () => {
   // (1) Discover the API-client module (env-*.js) at RUNTIME — hash rotates per
   // deploy, so NEVER hardcode it; it is already in the Resource-Timing buffer.
   const envUrl = performance.getEntriesByType('resource')
@@ -751,6 +753,7 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""
     urls.push(u);
   }
   return urls;
+})()
 """
 
 # JS boolean predicate the sidecar ``/eval`` waits for before the chapter-pages
@@ -794,7 +797,7 @@ _MANIFEST_COLD_RACE_ATTEMPTS = 2
 # unchanged. The env-*.js URL hash and minified export names can rotate per deploy,
 # so both are discovered at RUNTIME (Resource-Timing buffer + export scan), never
 # hardcoded. raw-string literal — the JS regexes use single-backslash escapes.
-_CHAPTER_LIST_API_EXTRACT_JS = r"""
+_CHAPTER_LIST_API_EXTRACT_JS = r"""(async () => {
   // Bounded parallel page-fetch tuning. limit=100 (comix signs the token for any
   // limit); CONCURRENCY caps simultaneous in-page API calls; MAX_PAGES is a
   // runaway guard (200*100 = 20k rows — far past comix's longest series).
@@ -945,6 +948,7 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""
   }
 
   return Array.from(byId.values());
+})()
 """
 
 # JS boolean predicate the sidecar ``/eval`` waits for before running the chapter-
