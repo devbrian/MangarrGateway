@@ -8,7 +8,9 @@ solves + timeout (T-10-11), and that the token value never reaches the logs
 
 from __future__ import annotations
 
+import contextlib
 import http.client
+import json
 import threading
 import time
 from collections.abc import Iterator
@@ -45,10 +47,17 @@ class FakePipeline:
         error: Exception | None = None,
         started: threading.Event | None = None,
         release: threading.Event | None = None,
+        eval_result: object = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.proxies: list[dict[str, object] | None] = []
+        # /eval call recording (Phase 14): the js of each eval, so tests can assert
+        # the pipeline was (or was NOT) driven without leaking it elsewhere.
+        self.eval_js: list[str] = []
         self._result = result
+        # The value /eval marshals back; parametrizable to a large list for the A4
+        # no-truncation regression. Defaults to a small dict.
+        self._eval_result = eval_result if eval_result is not None else {"ok": True}
         self._delay = delay
         self._healthy = healthy
         self._error = error
@@ -107,6 +116,47 @@ class FakePipeline:
             with self._counter_lock:
                 self._active -= 1
 
+    def eval_in_webview(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: threading.Event | None = None,
+        *,
+        wait_for: str | None = None,
+        deadline: float | None = None,
+    ) -> object:
+        # Mirrors ``solve``'s recording + gating (shared counters/events) so the
+        # eval-vs-solve serialization test can hold the lock with EITHER endpoint.
+        with self._counter_lock:
+            self._active += 1
+            self.max_concurrent = max(self.max_concurrent, self._active)
+        try:
+            self.calls.append((challenge_url, host))
+            self.eval_js.append(js)
+            if self._started is not None:
+                self._started.set()
+            if self._release is not None:
+                while not self._release.wait(timeout=0.02):
+                    if cancel is not None and cancel.is_set():
+                        self.cancelled = True
+                        raise SolveCancelled("cancelled after timeout")
+            if self._delay:
+                waited = 0.0
+                step = 0.02
+                while waited < self._delay:
+                    if cancel is not None and cancel.is_set():
+                        self.cancelled = True
+                        raise SolveCancelled("cancelled after timeout")
+                    time.sleep(step)
+                    waited += step
+            if self._error is not None:
+                raise self._error
+            return self._eval_result
+        finally:
+            with self._counter_lock:
+                self._active -= 1
+
     def health(self) -> bool:
         return self._healthy
 
@@ -124,6 +174,25 @@ def _config(**overrides: object) -> SidecarConfig:
 
 def _service(pipeline: FakePipeline, **cfg: object) -> SolverService:
     return SolverService(_config(**cfg), pipeline)
+
+
+@contextlib.contextmanager
+def _running_server(pipeline: FakePipeline) -> Iterator[int]:
+    """Serve ``pipeline`` over the real stdlib ``_Handler`` on an ephemeral port.
+
+    Yields the bound port so a test can drive the actual HTTP transport (the
+    ``do_POST`` pre-auth + body-cap rails and the JSON response writer), then
+    shuts the server down. Used by the /eval transport + A4 large-result tests.
+    """
+    srv = _SolverHTTPServer(("127.0.0.1", 0), _Handler, service=_service(pipeline))
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv.server_address[1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
 
 
 # ── auth (T-10-08) ───────────────────────────────────────────────────────────
@@ -507,6 +576,221 @@ def test_next_solve_not_starved_by_timed_out_orphan() -> None:
     assert second == 200
     assert payload["cf_clearance"] == "MANGADOT_TOKEN"
     assert elapsed < 5.0  # not queued behind the cancelled orphan
+
+
+# ── /eval (Phase 14: EVAL-01 / SEC-01) ───────────────────────────────────────
+#
+# /eval reuses /solve's rails verbatim — X-Solver-Key auth before any device
+# action (T-14-01), the scheme-pinned-then-host-allowlisted SSRF guard before any
+# device action (T-14-02) — and adds a js parse (T-14-03). These assert each
+# rejection path takes NO device action (pipeline.calls == []), that an eval and a
+# solve are mutually exclusive against the one device, and that a large result
+# round-trips intact (A4). The fake pipeline records the js but the tests never
+# assert it reaches a log (secret discipline, T-14-04).
+
+
+def test_eval_rejects_missing_key() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(api_key=None, body=b"{}")
+    assert status == 401
+    assert pipeline.calls == []  # no device action on an unauthenticated /eval
+
+
+def test_eval_rejects_non_allowlisted_host() -> None:
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://evil.example/", "js": "1+1"}',
+    )
+    assert status == 422
+    assert pipeline.calls == []  # the device pipeline is NEVER invoked
+    assert "allowlist" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"challenge_url": "file://mangadot.net/etc/passwd", "js": "1+1"}',
+        b'{"challenge_url": "intent://mangadot.net/#Intent;end", "js": "1+1"}',
+        b'{"challenge_url": "content://mangadot.net/data", "js": "1+1"}',
+    ],
+)
+def test_eval_rejects_non_http_scheme_even_for_allowlisted_host(body: bytes) -> None:
+    # T-14-02: an allowlisted HOST with a non-http(s) SCHEME is still rejected
+    # before any device action — the scheme is pinned ahead of the host check.
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # never navigates
+    assert "scheme" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"challenge_url": "https://mangadot.net/"}',  # js absent
+        b'{"challenge_url": "https://mangadot.net/", "js": ""}',  # js empty
+        b'{"challenge_url": "https://mangadot.net/", "js": 5}',  # js not a str
+    ],
+)
+def test_eval_rejects_missing_or_empty_js(body: bytes) -> None:
+    # T-14-03: js is required — a missing/empty/non-str js is a pre-device 422.
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # never reaches the device
+    assert "js" in payload["error"]
+
+
+def test_eval_requires_challenge_url() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key", body=b'{"js": "1+1"}'
+    )
+    assert status == 422
+    assert pipeline.calls == []
+
+
+def test_eval_rejects_malformed_body() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(api_key="s3cret-solver-key", body=b"not json")
+    assert status == 400
+    assert pipeline.calls == []
+
+
+def test_eval_returns_marshalled_value_on_success() -> None:
+    pipeline = FakePipeline(eval_result={"chapters": [1, 2, 3]})
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 200
+    assert payload == {"value": {"chapters": [1, 2, 3]}}
+    assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
+    assert pipeline.eval_js == ["extract()"]
+
+
+def test_eval_forwards_wait_for_predicate_to_pipeline() -> None:
+    # wait_for is an optional JS boolean predicate string; a non-str is a 422.
+    pipeline = FakePipeline()
+    ok, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+            b' "wait_for": "window.ready === true"}'
+        ),
+    )
+    assert ok == 200
+
+    pipeline2 = FakePipeline()
+    bad, payload = _service(pipeline2).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()", "wait_for": 5}',
+    )
+    assert bad == 422
+    assert pipeline2.calls == []
+    assert "wait_for" in payload["error"]
+
+
+def test_eval_pipeline_failure_is_504() -> None:
+    pipeline = FakePipeline(error=RuntimeError("env module import failed"))
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "boom()"}',
+    )
+    assert status == 504
+
+
+def test_eval_and_solve_are_serialized() -> None:
+    # PERF-01 / T-14-05: /eval shares /solve's Lock + single-worker executor, so an
+    # eval arriving while a solve is in flight is rejected 503 (and vice-versa) —
+    # the two can never run concurrently against the one redroid.
+    started = threading.Event()
+    release = threading.Event()
+    pipeline = FakePipeline(started=started, release=release)
+    service = _service(pipeline, solve_timeout_s=5.0)
+    first_status: dict[str, int] = {}
+
+    def first() -> None:
+        status, _ = service.solve(
+            api_key="s3cret-solver-key",
+            body=b'{"challenge_url": "https://mangadot.net/"}',
+        )
+        first_status["status"] = status
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    try:
+        assert started.wait(timeout=5)  # the solve is in flight under the lock
+        # An /eval arriving now is rejected 503 — not queued behind the device.
+        second, payload = service.eval(
+            api_key="s3cret-solver-key",
+            body=b'{"challenge_url": "https://mangadot.net/", "js": "1+1"}',
+        )
+        assert second == 503
+        assert "busy" in payload["error"]
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert first_status["status"] == 200
+    assert pipeline.max_concurrent == 1  # the single device was never doubly driven
+
+
+def test_eval_large_result_round_trips() -> None:
+    # A4 (research §6): a chapter-list-sized result (thousands of rows) marshals
+    # back through eval → do_POST → the JSON response writer with len() preserved.
+    # The _MAX_BODY_BYTES cap is INBOUND-only and must not truncate the outbound
+    # result. Driven over the real HTTP transport to prove no frame/body truncation.
+    big = [{"i": i} for i in range(5000)]
+    pipeline = FakePipeline(eval_result=big)
+    with _running_server(pipeline) as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request(
+            "POST",
+            "/eval",
+            body=b'{"challenge_url": "https://mangadot.net/", "js": "listAll()"}',
+            headers={"X-Solver-Key": "s3cret-solver-key"},
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+    assert resp.status == 200
+    payload = json.loads(data)
+    assert len(payload["value"]) == 5000  # nothing dropped on the outbound side
+    assert payload["value"][-1] == {"i": 4999}  # the tail survived intact
+
+
+def test_http_eval_rejects_oversized_body_before_reading() -> None:
+    # The /eval branch shares /solve's pre-auth body cap: a multi-GB declared body
+    # is rejected 413 on the Content-Length alone, before a byte is read.
+    pipeline = FakePipeline()
+    with _running_server(pipeline) as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/eval", skip_host=True, skip_accept_encoding=True)
+        conn.putheader("X-Solver-Key", "s3cret-solver-key")
+        conn.putheader("Content-Length", str(10_000_000_000))
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+    assert resp.status == 413
+    assert pipeline.calls == []  # body never read → pipeline never invoked
+
+
+def test_http_eval_rejects_unauthenticated_before_reading_body() -> None:
+    # T-14-01: auth fails FIRST on /eval, before any attempt to read the body.
+    pipeline = FakePipeline()
+    with _running_server(pipeline) as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/eval", skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Content-Length", str(10_000_000_000))
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+    assert resp.status == 401
+    assert pipeline.calls == []
 
 
 # ── healthz ──────────────────────────────────────────────────────────────────

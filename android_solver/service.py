@@ -485,15 +485,12 @@ class AndroidSolvePipeline:
         bounded by ``_EVAL_HYDRATION_TIMEOUT_S`` so it never consumes the whole eval
         budget waiting on a signal that will not appear.
         """
-        hydration_deadline = min(
-            deadline, time.monotonic() + _EVAL_HYDRATION_TIMEOUT_S
-        )
+        hydration_deadline = min(deadline, time.monotonic() + _EVAL_HYDRATION_TIMEOUT_S)
         while time.monotonic() < hydration_deadline:
             _raise_if_cancelled(cancel)
             ready = self._eval_bool(ws, _EVAL_HYDRATION_JS, _EVAL_HYDRATION_CMD_ID)
             if ready and (
-                wait_for is None
-                or self._eval_bool(ws, wait_for, _EVAL_WAIT_FOR_CMD_ID)
+                wait_for is None or self._eval_bool(ws, wait_for, _EVAL_WAIT_FOR_CMD_ID)
             ):
                 return
             time.sleep(self._poll_interval_s)
