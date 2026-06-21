@@ -15,8 +15,9 @@ The single anti-bot declaration that distinguishes Comix from MangaDex:
   ``cf_clearance`` + matching UA per request and re-solves a challenge 403 (D-40/D-35).
 
 In the Option A pivot (Plan 04-04 commit 2/3, 2026-05-30), the chapter-pages and
-chapter-list paths switched to a browser-DOM read via ``solver.fetch_via_browser``,
-and the plaintext search endpoint uses ``get_json_plain``. As a result Comix has
+chapter-list paths switched to an in-page browser read; Phase 14 (spike 021) then
+moved ALL in-page reads (search/recent/chapter-list/chapter-pages) onto
+``solver.eval_in_webview`` inside the cleared redroid WebView. As a result Comix has
 no live encrypted-response path — ``decrypt_scheme`` stays ``None`` (issue #46
 Option A: the ``comix-v1`` browser-evaluated decrypt seam was non-functional dead
 code on the current ``secure-*.js`` bundle and has been removed; the
@@ -101,6 +102,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
@@ -133,86 +135,109 @@ _DEFAULT_SERIES_CANDIDATES = 5
 # Comix chapter-feed page-size ceiling (live recon: server default limit=20).
 _MAX_FEED_LIMIT = 100
 
-# ── Search token gate (debug ``comix-search-api-403``, 2026-06-13) ────────────
+# ── Search token gate (Phase 14 / spike 021 — env-module ``c.list({keyword})``) ─
 # Comix moved the plaintext search API ``GET /api/v1/manga`` behind a JS-minted
-# ``_=`` request token — exactly as it earlier did to
-# ``/api/v1/manga/{hid}/chapter-indexes`` ("Invalid token."). A plain httpx call
-# carrying a valid cf_clearance now 403s ``{"message":"Missing token."}``; so does
-# an in-page ``fetch`` WITHOUT the token (proven live: the gate is the token, not
-# the IP/fingerprint — the same cleared+proxied client still fetches the image
-# CDN, and the SPA on the same IP gets 200). The token is minted by the
-# VM-obfuscated ``secure-*.js`` on the search box's keyup handler and is a
-# SIGNATURE bound to the EXACT query string (replaying the captured URL with
-# ``limit=6``→``18`` → 403 "Invalid token."), so it can be neither minted
-# statically NOR replayed with different params. So search drives the SPA's own
-# search box (the MangaFire ``fetch_via_browser_typed`` pattern, Plan 12-01): type
-# the keyword, let the page mint the token + fire the XHR, read the EXACT tokenized
-# URL off the Resource-Timing buffer, and replay THAT url verbatim via httpx. The
-# search response is PLAINTEXT (not encrypted), so the ``result.items`` shape
+# ``_=`` request token — exactly as it did to the chapter-list / chapter-pages
+# endpoints. A plain httpx call carrying a valid cf_clearance 403s
+# ``{"message":"Missing token."}``; the token is a SIGNATURE bound to the EXACT
+# query string minted by the VM-obfuscated ``secure-*.js`` (so it can be neither
+# minted statically NOR replayed with different params). The PRIOR fix typed the
+# keyword into the SPA's real search box (a desktop real-keyboard primitive) and
+# scraped the tokenized URL off Resource-Timing — that desktop-Patchright path is DEAD:
+# comix.to now 403s the Patchright-Linux fingerprint even WITH a cf_clearance
+# (debug ``comix-search-fails-on-server``). Spike 021 proved the env-module's OWN
+# signed axios mints the token for arbitrary params with NO keyboard and NO DOM
+# event: ``c.list({keyword, limit})`` returns the decrypted (plaintext) search
+# envelope directly. So search now runs ENTIRELY in-page via ``eval_in_webview``
+# inside the Turnstile-cleared redroid WebView. The envelope shape
 # ``_result_items`` parses — incl. ``altTitles``/``hasChapters`` — is unchanged.
-# The SPA autocomplete fixes ``limit=6``; ``search()`` only keeps 5 candidates
-# (``_DEFAULT_SERIES_CANDIDATES``) after the prune, so 6 is sufficient.
-_SEARCH_INPUT_SELECTOR = "input[placeholder*='earch']"
-# Wait for the tokenized keyword XHR itself to have COMPLETED (it lands in the
-# Resource-Timing buffer regardless of how many results it returned), NOT for a
-# result ROW to render. A legitimately zero-result query renders no
-# ``.search-pop__item--result`` row, so waiting on the row would hang to the 60s
-# timeout and surface a spurious ``source_unavailable`` instead of an empty result
-# (CodeRabbit, PR #235). The ``keyword=`` filter still distinguishes the search XHR
-# from the homepage "latest" feed (whose ``/api/v1/manga`` call carries
-# ``order[...]`` and no ``keyword=``), so the pre-rendered feed can't satisfy this
-# early. Mirrors what ``_SEARCH_TOKEN_URL_EXTRACT_JS`` reads, so once this is true
-# the extract has a URL to return. JS predicate (``=>``) → page.wait_for_function.
-_SEARCH_REQUEST_FIRED_JS = (
-    "() => performance.getEntriesByType('resource')"
-    ".some(e => e.name.includes('/api/v1/manga') && e.name.includes('keyword='))"
-)
-# Reads the tokenized ``/api/v1/manga?keyword=…&_=…`` URL the SPA fetched off the
-# Resource-Timing buffer. The box debounces, so the full-keyword XHR fires last;
-# take the last matching entry. Returns ``null`` when none fired (capture failed).
-_SEARCH_TOKEN_URL_EXTRACT_JS = (
-    "const m = performance.getEntriesByType('resource')"
-    ".map(e => e.name)"
-    ".filter(n => n.includes('/api/v1/manga') && n.includes('keyword='));"
-    "return m.length ? m[m.length - 1] : null;"
-)
-# Seconds budget for the typed search nav (type + dropdown render). Matches the
-# MangaFire typed-search budget — a CF-warm page plus a debounced XHR.
+#
+# The ``__COMIX_SEARCH_KEYWORD__`` / ``__COMIX_SEARCH_LIMIT__`` placeholders are
+# filled at the call site (:meth:`_search_series`) via ``json.dumps`` — the keyword
+# (the one external-derived value entering the eval) becomes a JSON STRING LITERAL,
+# data and never code (SEC T-14-06: it cannot break out of the JS string). The JS
+# template itself is gateway-authored. raw-string literal (single-backslash regex).
+_SEARCH_LIST_API_EXTRACT_JS = r"""
+  // (1) Discover the API-client module (env-*.js) at RUNTIME — hash rotates per
+  // deploy, so NEVER hardcode it; it is already in the Resource-Timing buffer.
+  const envUrl = performance.getEntriesByType('resource')
+    .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
+  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
+
+  // (2) import() returns the LIVE cached singleton whose axios instance already
+  // has comix's request-SIGN + response-DECRYPT interceptors wired. Prefer the
+  // proven `c` export; fall back to scanning exports (minified names rotate).
+  const mod = await import(envUrl);
+  const findApi = (m) => {
+    if (!m) return null;
+    if (m.c && typeof m.c.list === 'function') return m.c;
+    for (const v of Object.values(m)) {
+      if (v && typeof v === 'object' && typeof v.list === 'function') return v;
+    }
+    return null;
+  };
+  const api = findApi(mod) || findApi(mod.default);
+  if (!api) throw new Error('comix: list() API not found in env module');
+
+  // (3) c.list signs the _= token over the EXACT query string and returns the
+  // decrypted search envelope (spike 021 U3: no keyboard, no DOM event). The
+  // keyword + limit are JSON literals interpolated by the Python call site.
+  const res = await api.list({
+    keyword: __COMIX_SEARCH_KEYWORD__,
+    limit: __COMIX_SEARCH_LIMIT__,
+  });
+  // Axios responses carry the body on `.data`; the decrypt interceptor may also
+  // return the body directly — unwrap to the SAME envelope `_result_items` reads.
+  return (res && res.data !== undefined) ? res.data : res;
+"""
+# Seconds budget for the in-WebView search eval (env-*.js hydration + one signed
+# c.list call). Name retained for call-site continuity (the typed path is gone).
 _SEARCH_TYPED_TIMEOUT = 60.0
 
-# ── Recent feed token gate (debug ``comix-chapters-token-232``, 2026-06-13) ───
+# ── Recent feed token gate (Phase 14 / spike 021 — env-module ``c.list({order})``) ─
 # Comix also moved the recent feed ``GET /api/v1/manga?order[chapter_updated_at]=desc``
-# behind the JS-minted ``_=`` request token (same SIGNATURE-over-query-string gate
-# as search/chapter-list). A plain httpx call now 403s ``{"message":"Missing
-# token."}``, and there is NO keyword to type. Live recon (#232) found the trigger:
-# the ``/browse`` page's DEFAULT view fires the EXACT tokenized
-# ``/api/v1/manga?order[chapter_updated_at]=desc&page=1&limit=28&content_rating=
-# suggestive&_=<token>`` XHR. So ``recent()`` navigates ``/browse`` and PASSIVELY
-# captures that tokenized URL off the Resource-Timing buffer (the same technique
-# the search fix uses — NEVER mint or rewrite the token; Patchright suppresses
-# init-script injection), then replays it verbatim via ``get_json_plain``. The
-# PLAINTEXT response is the unchanged ``/api/v1/manga`` ``result.items`` shape, so
-# the deferred-composite synthesis below is untouched. The homepage "Most Recent"
-# tab is server-rendered (no tokenized XHR — recon-confirmed), so it is NOT used.
-_BROWSE_PATH = "/browse"
-# Reads the tokenized ``order[chapter_updated_at]`` ``/api/v1/manga`` URL off the
-# Resource-Timing buffer. ``order[...]`` is URL-encoded as ``order%5B…%5D`` in the
-# Resource-Timing ``name`` — match either form. Returns ``null`` when none fired.
-_RECENT_TOKEN_URL_EXTRACT_JS = (
-    "const m = performance.getEntriesByType('resource')"
-    ".map(e => e.name)"
-    ".filter(n => n.includes('/api/v1/manga')"
-    " && (n.includes('order%5Bchapter_updated_at%5D')"
-    " || n.includes('order[chapter_updated_at]')));"
-    "return m.length ? m[m.length - 1] : null;"
-)
-# JS predicate: the ``/browse`` feed's tokenized XHR has resolved by the time its
-# ``/title/`` cards paint, so wait for at least one to render before reading the
-# Resource-Timing buffer. JS predicate (contains ``=>``) → page.wait_for_function.
-_BROWSE_FEED_WAIT_FOR = (
-    "() => document.querySelectorAll('a[href*=\"/title/\"]').length > 0"
-)
-# Seconds budget for the browse nav (CF-warm page + the feed XHR).
+# behind the same ``_=`` signature-over-query-string token. The PRIOR fix navigated
+# ``/browse`` and scraped the tokenized URL the SPA's default view fired — that
+# desktop-Patchright path is DEAD for the same reason as search. The ``/browse``
+# default view's exact query was ``order[chapter_updated_at]=desc&page=1&limit=28&
+# content_rating=suggestive&_=<token>``; this extractor reproduces that query via
+# the env-module's OWN ``c.list`` (axios serializes ``{order:{chapter_updated_at:
+# 'desc'}}`` → ``order[chapter_updated_at]=desc`` and the interceptor signs it),
+# returning the decrypted newest-first envelope directly — NO httpx replay. The
+# ``/api/v1/manga`` ``result.items`` shape is unchanged, so the deferred-composite
+# synthesis in :meth:`recent` is untouched. The ordering is the one piece NOT
+# spike-validated; Plan 04 live-verifies newest-first. raw-string literal.
+_RECENT_LIST_API_EXTRACT_JS = r"""
+  // (1) Discover the API-client module (env-*.js) at RUNTIME (hash rotates).
+  const envUrl = performance.getEntriesByType('resource')
+    .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
+  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
+
+  // (2) Resolve the LIVE signed-axios manga API (same discovery as search).
+  const mod = await import(envUrl);
+  const findApi = (m) => {
+    if (!m) return null;
+    if (m.c && typeof m.c.list === 'function') return m.c;
+    for (const v of Object.values(m)) {
+      if (v && typeof v === 'object' && typeof v.list === 'function') return v;
+    }
+    return null;
+  };
+  const api = findApi(mod) || findApi(mod.default);
+  if (!api) throw new Error('comix: list() API not found in env module');
+
+  // (3) Reproduce the /browse default-view recent query (source-of-truth params
+  // from the prior token-capture path), signed + decrypted in one call.
+  const res = await api.list({
+    order: { chapter_updated_at: 'desc' },
+    page: 1,
+    limit: 28,
+    content_rating: 'suggestive',
+  });
+  return (res && res.data !== undefined) ? res.data : res;
+"""
+# Seconds budget for the in-WebView recent eval (env-*.js hydration + one signed
+# c.list call). Name retained for call-site continuity (the /browse nav is gone).
 _RECENT_NAV_TIMEOUT = 60.0
 
 # Composite chapter-id separator. ``chapter_id`` for Comix is the composite
@@ -728,13 +753,17 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""
   return urls;
 """
 
-# CSS selector ``solver.fetch_via_browser`` waits for before the chapter-pages
-# extract runs. The reader scaffolds `<div class="rpage-page" data-page="N">`
-# once it has fetched + decrypted the page list — which means the SPA's API ES
-# module is loaded and its axios interceptors are wired, exactly what
-# ``_CHAPTER_PAGES_API_EXTRACT_JS`` needs before it ``import()``s the module and
-# calls ``/chapters/{id}`` itself (we read the API, not the rendered <img>s).
-_CHAPTER_PAGES_WAIT_FOR = ".rpage-page[data-page]"
+# JS boolean predicate the sidecar ``/eval`` waits for before the chapter-pages
+# extract runs (Plan 01: ``wait_for`` is a JS predicate string, NOT a CSS selector).
+# The reader scaffolds `<div class="rpage-page" data-page="N">` once it has fetched +
+# decrypted the page list — which means the SPA's API ES module is loaded and its
+# axios interceptors are wired, exactly what ``_CHAPTER_PAGES_API_EXTRACT_JS`` needs
+# before it ``import()``s the module and calls ``/chapters/{id}`` itself. (The
+# sidecar ALSO does a built-in env-*.js hydration wait; this predicate is the
+# reader-render readiness signal on top of it.)
+_CHAPTER_PAGES_WAIT_FOR = (
+    "() => document.querySelector('.rpage-page[data-page]') !== null"
+)
 
 # Issue #171: how many times fetch_manifest navigates the chapter page before
 # giving up on an EMPTY capture. A cold Patchright context (right after a restart
@@ -918,15 +947,13 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""
   return Array.from(byId.values());
 """
 
-# CSS selector ``solver.fetch_via_browser`` waits for before reading the series
-# page DOM — any anchor whose href contains ``-chapter-``. Once at least one
-# such anchor has rendered, the chapter-list SPA component has hydrated.
-# JS predicate (not CSS selector — routes to page.wait_for_function): chapter
-# anchors carry class ``mchap-row__primary`` once the live recon confirmed the
-# series-page reader rendered them. We poll DOM attachment (not visibility)
-# because some anchors render off-screen / inside scroll containers and the
-# default CSS-selector wait_for would block on visibility forever (the e2e
-# test uncovered this — a[href*="-chapter-"] timed out at 20s).
+# JS boolean predicate the sidecar ``/eval`` waits for before running the chapter-
+# list extract — gated on the series-page chapter anchors having rendered (so the
+# SPA's API ES module is loaded + interceptors wired before the extract import()s
+# it). chapter anchors carry class ``mchap-row__primary`` once the live recon
+# confirmed the series-page reader rendered them. We poll DOM attachment (not
+# visibility) because some anchors render off-screen / inside scroll containers.
+# JS predicate string (Plan 01: ``wait_for`` is a JS boolean expression, not CSS).
 _CHAPTER_LIST_WAIT_FOR = (
     "() => document.querySelectorAll('a.mchap-row__primary').length > 0"
 )
@@ -956,10 +983,13 @@ def _title_to_slug(title: str) -> str:
 class ComixSource(Source):
     """Comix — antibot ``cloudflare+encrypted`` (SRC-06).
 
-    Comix's live read path is Option A browser-DOM (``solver.fetch_via_browser``)
-    + plaintext httpx (``get_json_plain``/``get_bytes_plain``), so the framework
-    decrypt seam is never invoked here. ``decrypt_scheme`` is inherited as
-    ``None`` from the base.
+    Phase 14 (EVAL-03 / spike 021): Comix runs ALL of its in-page logic — search
+    ``c.list({keyword})``, chapter-list enumeration, and chapter-pages manifest —
+    through ``solver.eval_in_webview`` inside the Turnstile-cleared redroid WebView
+    (``solver_engine = "android"``), the only fingerprint that clears comix.to. The
+    per-page image BYTES are still fetched over httpx (CLAUDE.md), and the static
+    image decrypt in :meth:`fetch_image` is unchanged. The framework decrypt seam is
+    never invoked here. ``decrypt_scheme`` is inherited as ``None`` from the base.
     """
 
     key = "comix"
@@ -979,6 +1009,17 @@ class ComixSource(Source):
     # ``cloudflare_fetch_concurrency`` and image bytes are
     # ``get_bytes(limited=False)``-exempt.
     rate_limit_per_minute = 120
+    # Phase 14 (EVAL-03 / D-40): route comix's Cloudflare solve AND its in-page eval
+    # to the Android-WebView solver sidecar, NOT the desktop Patchright solver.
+    # comix.to tightened its Turnstile midday 2026-06-21 and now 403s the desktop
+    # Patchright-on-Linux fingerprint even WITH a captured cf_clearance (debug
+    # ``comix-search-fails-on-server``); the real Android WebView is the only
+    # fingerprint that clears it (spike 021). Clearance still injects on the httpx
+    # image leg via the existing D-40 path (cf_clearance + WebView UA), exactly like
+    # kagane/mangadot/mangaball. This one-line attr is the only per-source wiring the
+    # engine switch needs — app.py's ``engine_by_source`` partition, the router's
+    # ``_backend_for``, and the live-conftest ``_ANDROID_KEYS`` all derive from it.
+    solver_engine = "android"
     # caps.AntibotLevel already carries this literal (CAPS-02). The framework injects
     # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
     antibot = "cloudflare+encrypted"
@@ -1243,12 +1284,15 @@ class ComixSource(Source):
 
         Issue #42 (supersedes #31): synthesizes one ``Release`` per viable item
         from the ``/api/v1/manga?order[chapter_updated_at]=desc`` feed. #232: that
-        feed is now ``_=``-token-gated (a plain httpx call 403s "Missing token."),
-        so instead of a direct ``get_json_plain`` we navigate ``/browse`` in the
-        warm browser, PASSIVELY capture the tokenized feed URL the SPA mints off
-        the Resource-Timing buffer, and replay it verbatim (see ``_BROWSE_PATH`` /
-        ``_RECENT_TOKEN_URL_EXTRACT_JS``). The plaintext response shape is
-        unchanged, so the per-item synthesis below is identical. Each Release
+        feed is ``_=``-token-gated (a plain httpx call 403s "Missing token."). Phase
+        14 (spike 021): rather than navigating ``/browse`` and scraping the tokenized
+        URL (the dead desktop-Patchright path), we run the env-module's OWN signed
+        ``c.list({order:{chapter_updated_at:'desc'}, …})`` INSIDE the cleared redroid
+        WebView via ``eval_in_webview`` (see ``_RECENT_LIST_API_EXTRACT_JS``) — it
+        reproduces the ``/browse`` default-view recent query, signs the token, and
+        returns the decrypted newest-first envelope directly (NO httpx replay). The
+        ``/api/v1/manga`` ``result.items`` shape is unchanged, so the per-item
+        synthesis below is identical. Each Release
         carries a ``:DEFERRED`` guid suffix and a deferred composite ``chapter_id``
         whose numeric id is late-bound by :meth:`fetch_manifest` at download time
         (one extra browser nav per FIRST download of a recent-minted Release — not
@@ -1270,27 +1314,17 @@ class ComixSource(Source):
         requires ``format: date-time``).
         """
         _ = (languages, since, limit)  # see docstring — all deliberately unused
-        # #232: capture the SPA-minted tokenized recent-feed URL off /browse and
-        # replay it verbatim (the token is a signature over the EXACT query string,
-        # so no param is added or rewritten). NEVER mint/rewrite the token.
+        # Phase 14 (spike 021): run the env-module's OWN signed ``c.list`` with the
+        # recent-order params INSIDE the cleared redroid WebView — it mints the ``_=``
+        # token + decrypts in one device round-trip; the unchanged ``result.items``
+        # parse follows. NEVER mint/rewrite the token outside the env-module axios.
         solver = self._solver_from_ctx(ctx)
-        token_url = await solver.fetch_via_browser(
-            f"{self.base_url}{_BROWSE_PATH}",
-            extract=_RECENT_TOKEN_URL_EXTRACT_JS,
-            wait_for=_BROWSE_FEED_WAIT_FOR,
+        data = await solver.eval_in_webview(
+            f"{self.base_url}/",
+            _RECENT_LIST_API_EXTRACT_JS,
+            wait_for=None,
             timeout=_RECENT_NAV_TIMEOUT,
         )
-        if not isinstance(token_url, str) or "/api/v1/manga" not in token_url:
-            # The browse nav ran but no tokenized recent XHR was captured — surface
-            # as the source's own failure (WR-06 per-source warning), not a crash.
-            raise SourceError(
-                "source_unavailable",
-                "comix recent token capture failed (no tokenized "
-                "order[chapter_updated_at] /api/v1/manga URL)",
-            )
-        # PLAINTEXT endpoint — replay the tokenized URL verbatim (same path the
-        # search fix uses); the unchanged ``result.items`` parse follows.
-        data = await ctx.get_json_plain(token_url)
         items = self._result_items(data)
 
         releases: list[Release] = []
@@ -1395,7 +1429,7 @@ class ComixSource(Source):
         ``"{numeric_id}|{hid}|{slug}|{number}"`` composite the search step
         encoded into the handle's ``ResolutionRecord.chapter_id``. We decode
         here, construct the live chapter URL, and call
-        :meth:`solver.fetch_via_browser` with the internal-API extractor. A
+        :meth:`solver.eval_in_webview` with the internal-API extractor. A
         malformed composite or an empty page list raises
         ``SourceError("source_unavailable")`` so it surfaces as a contract
         warning, never a raw KeyError (WR-06). The manifest is consumed only by
@@ -1442,13 +1476,14 @@ class ComixSource(Source):
         urls: Any = None
         for attempt in range(_MANIFEST_COLD_RACE_ATTEMPTS):
             try:
-                urls = await solver.fetch_via_browser(
+                urls = await solver.eval_in_webview(
                     chapter_url,
-                    # spike 019: call comix's OWN internal ``chapters/{id}`` loader
-                    # in-page — returns the decrypted ``pages.items[].url`` list,
-                    # robust to the image-CDN URL-scheme rotation that broke the old
-                    # lazy-DOM scrape (debug comix-cdn-scheme-rotation).
-                    extract=_CHAPTER_PAGES_API_EXTRACT_JS,
+                    # spike 019/021: call comix's OWN internal ``chapters/{id}`` loader
+                    # in-page INSIDE the cleared redroid WebView — returns the
+                    # decrypted ``pages.items[].url`` list, robust to the image-CDN
+                    # URL-scheme rotation that broke the old lazy-DOM scrape (debug
+                    # comix-cdn-scheme-rotation). Image BYTES still fetch over httpx.
+                    _CHAPTER_PAGES_API_EXTRACT_JS,
                     # Wait for the reader scaffold so the SPA has fetched+decrypted
                     # the page list — which guarantees the API ES module is loaded
                     # and its axios interceptors are wired before the extract
@@ -1687,40 +1722,30 @@ class ComixSource(Source):
         return parts[0], parts[1], parts[2], parts[3]
 
     @staticmethod
-    def _solver_from_ctx(ctx: SourceContext, *, need_typed: bool = False) -> Any:
-        """Pull the AntiBotSolver out of ``ctx`` for the browser-fetch paths.
+    def _solver_from_ctx(ctx: SourceContext) -> Any:
+        """Pull the AntiBotSolver out of ``ctx`` for the WebView-eval paths.
 
         The framework wires the solver into ``SourceContext`` for any
-        ``cloudflare*`` source (D-40 clearance injection). For Comix's browser-
-        DOM reads we ALSO need off-Protocol browser primitives (D-41), same
-        instance, distinct from the request-clearance use:
+        ``cloudflare*`` source (D-40 clearance injection). Since Phase 14 (EVAL-03)
+        comix runs ALL of its in-page logic — the search ``c.list({keyword})`` token
+        mint, the chapter-list enumeration, and the chapter-pages manifest read —
+        through the off-Protocol ``eval_in_webview`` primitive, which runs gateway
+        JS inside the Turnstile-cleared redroid WebView (the only fingerprint that
+        clears comix.to; spike 021). The desktop Patchright browser-fetch family is
+        eliminated for comix, not ported (comix.to 403s the Patchright-Linux
+        fingerprint even WITH a valid cf_clearance — debug
+        ``comix-search-fails-on-server``).
 
-        * ``fetch_via_browser`` — the one-shot primitive used for BOTH the
-          chapter-list enumeration (:meth:`_fetch_series_chapters_raw`, which runs
-          comix's own internal ``chapters(hid, {limit:100})`` loader in the warm
-          tab — spike 019) AND the chapter-pages manifest read
-          (:meth:`fetch_manifest`); and
-        * ``fetch_via_browser_typed`` — the real-keyboard typed search that mints
-          the ``_=`` request token (``need_typed=True``, :meth:`_search_series`;
-          debug ``comix-search-api-403``).
-
-        Raises ``SourceError`` when the solver is missing OR lacks a REQUIRED
-        primitive (a wiring bug, not a runtime condition). (Comix no longer needs
-        ``fetch_via_browser_paginated`` — spike 019 replaced the DOM Next-walk with
-        the in-page API loader on the one-shot ``fetch_via_browser`` — nor the
-        PARALLEL ``fetch_via_browser_parallel_pages``; both framework primitives
-        stay for other sources.)
+        Raises ``SourceError`` when the solver is missing OR lacks ``eval_in_webview``
+        (a wiring bug, not a runtime condition). An UNCONFIGURED android sidecar still
+        exposes ``eval_in_webview`` and raises ``RuntimeError`` at call time (D-33), so
+        a missing redroid fails loud rather than silently no-opping.
         """
         solver = getattr(ctx, "_solver", None)
-        if solver is None or not hasattr(solver, "fetch_via_browser"):
+        if solver is None or not hasattr(solver, "eval_in_webview"):
             raise SourceError(
                 "source_unavailable",
-                "comix browser-fetch requires a solver with fetch_via_browser",
-            )
-        if need_typed and not hasattr(solver, "fetch_via_browser_typed"):
-            raise SourceError(
-                "source_unavailable",
-                "comix search requires a solver with fetch_via_browser_typed",
+                "comix requires a solver with eval_in_webview",
             )
         return solver
 
@@ -1761,36 +1786,29 @@ class ComixSource(Source):
         ``list[str]`` from the same payload, e.g. the Korean native name) and feed
         the alt-title-aware prune (#139) — nothing extra is fetched.
 
-        ``GET /api/v1/manga`` now requires a JS-minted ``_=`` request token (debug
-        ``comix-search-api-403``; see ``_SEARCH_TOKEN_URL_EXTRACT_JS``). We drive
-        the SPA's own search box so the page mints the token and fires the XHR,
-        read the EXACT tokenized URL off the Resource-Timing buffer, then replay
-        THAT url verbatim (the ``_=`` signature is bound to the exact query string,
-        so no param is added or rewritten — ``get_json_plain`` GETs it as-is). The
-        ``limit`` arg is no longer threaded into the request: the SPA autocomplete
-        fixes ``limit=6`` and ``search()`` keeps only ``_DEFAULT_SERIES_CANDIDATES``
-        candidates after the prune, so 6 covers it.
+        ``GET /api/v1/manga`` requires a JS-minted ``_=`` request token (a signature
+        bound to the EXACT query string). Phase 14 (spike 021): rather than typing the
+        keyword into the SPA's search box (the dead desktop-Patchright path — comix.to
+        now 403s that fingerprint even WITH a cf_clearance), we run the env-module's
+        OWN signed ``c.list({keyword, limit})`` INSIDE the Turnstile-cleared redroid
+        WebView via ``eval_in_webview`` — it mints the token with NO keyboard and
+        returns the decrypted (plaintext) search envelope directly. The ``keyword`` is
+        interpolated as a JSON string literal (``json.dumps`` — data, never code; SEC
+        T-14-06); ``limit`` (``_DEFAULT_SERIES_CANDIDATES`` from the caller) bounds the
+        candidate set the prune narrows.
         """
-        _ = limit  # SPA-controlled (autocomplete limit=6); see docstring.
-        solver = self._solver_from_ctx(ctx, need_typed=True)
-        token_url = await solver.fetch_via_browser_typed(
+        solver = self._solver_from_ctx(ctx)
+        search_js = _SEARCH_LIST_API_EXTRACT_JS.replace(
+            "__COMIX_SEARCH_KEYWORD__", json.dumps(query)
+        ).replace("__COMIX_SEARCH_LIMIT__", json.dumps(limit))
+        # The eval returns the decrypted ``{result:{items:[…]}}`` envelope directly,
+        # so the existing ``_result_items`` parse + item loop are reused verbatim.
+        data = await solver.eval_in_webview(
             f"{self.base_url}/",
-            type_selector=_SEARCH_INPUT_SELECTOR,
-            type_text=query,
-            extract=_SEARCH_TOKEN_URL_EXTRACT_JS,
-            wait_for=_SEARCH_REQUEST_FIRED_JS,
+            search_js,
+            wait_for=None,
             timeout=_SEARCH_TYPED_TIMEOUT,
         )
-        if not isinstance(token_url, str) or "/api/v1/manga" not in token_url:
-            # The typed nav ran but no tokenized search XHR was captured — surface
-            # as the source's own failure (WR-06 per-source warning), not a crash.
-            raise SourceError(
-                "source_unavailable",
-                "comix search token capture failed (no tokenized /api/v1/manga URL)",
-            )
-        # PLAINTEXT endpoint (search is not encrypted) — get_json_plain keeps the
-        # framework decrypt seam out of this path and replays the URL verbatim.
-        data = await ctx.get_json_plain(token_url)
         items = self._result_items(data)
         out: list[tuple[str, str, str, list[str], dict[str, Any] | None]] = []
         for item in items:
@@ -1895,7 +1913,7 @@ class ComixSource(Source):
         PERF (spike 019, live): the in-page API fan-out replaces the per-page DOM
         Next-walk — One Piece drops from ~236 sequential limit=20 pages (timeout) to
         ~47 limit=100 in-page API calls fanned out in one tab. Bounded by the 30s
-        ``fetch_via_browser`` timeout (≤ the framework's 30s per-source fan-out
+        ``eval_in_webview`` timeout (≤ the framework's 30s per-source fan-out
         timeout, ``framework/fanout.py::_DEFAULT_TIMEOUT``); the per-source aiolimiter
         still bounds outer cadence. A failed fetch surfaces as
         ``SourceError("source_unavailable")`` → per-source warning (WR-06).
@@ -1903,12 +1921,15 @@ class ComixSource(Source):
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
         try:
-            raw = await solver.fetch_via_browser(
+            raw = await solver.eval_in_webview(
                 series_url,
-                # Run comix's own internal ``chapters(hid, {limit:100})`` loader in
-                # the warm cleared tab (spike 019) — signs the ``_=`` token for
-                # limit=100 AND decrypts the response in-page, no VM crack.
-                extract=_CHAPTER_LIST_API_EXTRACT_JS,
+                # Run comix's own internal ``chapters(hid, {limit:100})`` loader
+                # INSIDE the cleared redroid WebView (spike 019/021) — signs the
+                # ``_=`` token for limit=100 AND decrypts the response in-page, no VM
+                # crack. The in-page ``Promise.all`` fan-out enumerates the WHOLE
+                # series in ONE eval / one device round-trip (PERF-01; spike 021 D1:
+                # One Piece 4,716 chapters in one eval).
+                _CHAPTER_LIST_API_EXTRACT_JS,
                 # Wait for the chapter-list anchors so the SPA has booted and the
                 # API ES module is loaded with its interceptors wired before import.
                 wait_for=_CHAPTER_LIST_WAIT_FOR,
