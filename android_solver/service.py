@@ -171,6 +171,30 @@ _CHALLENGE_RENAV_CMD_ID = 42
 _EGRESS_READ_TIMEOUT_S = 15.0
 _EGRESS_READ_JS = "document.body.innerText"
 
+# Phase 14 bug 4 / Fix A: a NON-DESTRUCTIVE in-page egress probe for the proxied
+# /eval path. The destructive ``_observe_webview_egress`` above navigates the main
+# WebView AWAY to the IP echo, which defeats the bug-3 fast path (the cleared+
+# hydrated comix page is gone, so every eval re-navigates → re-clears comix's
+# managed Cloudflare challenge — the ~10-15s per-eval cost behind bug 4). This probe
+# instead reads the egress with an IN-PAGE ``fetch`` of the SAME ``_EGRESS_ECHO_URL``
+# (NO ``Page.navigate``), so the warm comix page survives and the fast path engages.
+# The byte-equal egress assertion (T-11-01) still runs on EVERY proxied eval; only
+# the transport changes (destructive nav-away → same-device-proxy XHR). The fetch
+# runs in comix's origin, so a CSP/CORS block or a transient network error makes the
+# IIFE return ``null`` → the caller treats it as "probe unavailable" and FALLS BACK
+# to the destructive probe (an eval is NEVER run unverified). ``_EGRESS_IN_PAGE_CMD_ID``
+# is a fresh id distinct from every ``_EGRESS_*`` / ``_EVAL_*`` id so its response
+# never aliases another in-flight frame.
+_EGRESS_IN_PAGE_CMD_ID = 43
+_EGRESS_IN_PAGE_JS = (
+    "(async () => {"
+    "  try {"
+    f"    const r = await fetch({_EGRESS_ECHO_URL!r}, {{cache: 'no-store'}});"
+    "    return (await r.text()).trim();"
+    "  } catch (e) { return null; }"
+    "})()"
+)
+
 # ── /eval (Phase 14): run gateway-supplied JS in the warm cleared WebView ─────
 # The /eval endpoint re-composes the existing navigate + Runtime.evaluate
 # primitives so comix's in-page token-mint / chapter-list / manifest logic runs
@@ -544,27 +568,34 @@ class AndroidSolvePipeline:
                 navigated_away = False
                 if expected_egress_ip:
                     # Req 3 / T-11-01 parity: prove the WebView egresses through the
-                    # verified proxy IP BEFORE running the eval. Mismatch/transient
-                    # echo failure ⇒ no eval. The egress-verify navigates AWAY to the
-                    # ip echo, so the cleared+hydrated comix page MUST be re-established
-                    # below (a fresh nav comix re-challenges) — never take the
-                    # already-hydrated fast path on this path.
-                    observed = self._observe_webview_egress(ws, cancel)
+                    # verified proxy IP BEFORE running the eval. Fix A (bug 4 cause #1):
+                    # verify NON-DESTRUCTIVELY first — an IN-PAGE fetch of the IP echo
+                    # (NO Page.navigate), so the cleared+hydrated comix page survives
+                    # and the bug-3 fast path below can engage (NO per-eval re-clear).
+                    # Only when the in-page probe is unavailable (CSP/CORS/transient ⇒
+                    # ``None``) do we FALL BACK to the destructive nav-away probe — an
+                    # eval is NEVER run unverified, and the worst case is today's
+                    # behaviour (re-nav + clear). The byte-equal assertion runs on EVERY
+                    # eval whichever transport observed the egress.
+                    observed = self._observe_webview_egress_in_page(ws, cancel)
+                    if observed is None:
+                        # Probe unavailable — the destructive verify navigates the page
+                        # AWAY to the ip echo, so the fast path can no longer engage and
+                        # the eval must re-establish the cleared+hydrated comix page.
+                        observed = self._observe_webview_egress(ws, cancel)
+                        navigated_away = True
                     if observed != expected_egress_ip:
                         # WR-02 parity: byte-equal egress assertion REQUIRES a STICKY
                         # upstream that holds one exit IP across the self-probe CONNECT
                         # and the WebView's separate connection. A ROTATING residential
                         # proxy mismatches on nearly every call — name the cause so it
                         # is not mistaken for a Cloudflare failure.
-                        raise SolveError(
-                            f"proxied egress IP differed "
-                            f"(expected {expected_egress_ip}, observed {observed}) — "
-                            f"is the upstream a rotating/non-sticky proxy? "
-                            f"egress-verify needs a sticky-session upstream that holds "
-                            f"one exit IP across connections"
-                        )
-                    _log.info("verified proxied WebView egress %s for eval", observed)
-                    navigated_away = True
+                        raise self._egress_mismatch_error(expected_egress_ip, observed)
+                    _log.info(
+                        "verified proxied WebView egress %s for eval%s",
+                        observed,
+                        "" if navigated_away else " (in-page)",
+                    )
                 # Bug 3: a fresh Page.navigate reloads the page and re-triggers comix's
                 # MANAGED Cloudflare challenge (the cf_clearance COOKIE alone does NOT
                 # pass a top-level reload), and /eval — unlike /solve — never taps to
@@ -935,6 +966,63 @@ class AndroidSolvePipeline:
                 last_err = exc
                 continue
         raise SolveError(f"could not read a valid WebView egress IP: {last_err}")
+
+    def _observe_webview_egress_in_page(
+        self, ws: WebSocketLike, cancel: Event | None
+    ) -> str | None:
+        """Read the WebView egress via an IN-PAGE ``fetch`` (no nav-away); Fix A.
+
+        The non-destructive counterpart to :meth:`_observe_webview_egress`: it runs
+        ``_EGRESS_IN_PAGE_JS`` (an async IIFE that ``fetch``es the SAME
+        ``_EGRESS_ECHO_URL`` with ``cache:'no-store'``, ``awaitPromise:true``) in the
+        CURRENT page instead of navigating away, so the cleared+hydrated comix page
+        survives and the bug-3 fast path can engage. Returns the normalized egress IP
+        on success, or ``None`` when the probe is unavailable — the IIFE returned
+        ``null`` (CSP/CORS/network block in comix's origin), the body is not an IP, or
+        the CDP call itself errored — so the caller can FALL BACK to the destructive
+        probe rather than run an eval unverified. The observed IP is loggable; no token
+        is involved here.
+        """
+        _raise_if_cancelled(cancel)
+        try:
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {
+                    "expression": _EGRESS_IN_PAGE_JS,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                },
+                command_id=_EGRESS_IN_PAGE_CMD_ID,
+            )
+        except SolveCancelled:
+            raise
+        except Exception:  # noqa: BLE001 — a probe error ⇒ unavailable, fall back
+            return None
+        value = result.get("result", {}).get("value")
+        if value is None:
+            return None
+        try:
+            return str(ipaddress.ip_address(str(value).strip()))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _egress_mismatch_error(expected: str, observed: str | None) -> SolveError:
+        """The SAME rotating/non-sticky-proxy ``SolveError`` both egress paths raise.
+
+        Shared by the in-page and destructive-fallback verify in ``_drive_eval`` so a
+        mismatch surfaces an identical, byte-equal T-11-01 failure whichever transport
+        observed the egress (the message names the rotating-proxy cause so a config
+        mismatch is not mistaken for a Cloudflare failure).
+        """
+        return SolveError(
+            f"proxied egress IP differed "
+            f"(expected {expected}, observed {observed}) — "
+            f"is the upstream a rotating/non-sticky proxy? "
+            f"egress-verify needs a sticky-session upstream that holds "
+            f"one exit IP across connections"
+        )
 
     def _device_hop_host(self) -> str:
         """The hop host the DEVICE routes ``global http_proxy`` through, as an IP.
