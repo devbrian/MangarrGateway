@@ -61,17 +61,23 @@ _CF_UA = "Mozilla/5.0 (Comix-Chrome) AppleWebKit/537.36"
 
 
 class _SlowComixSolver:
-    """Fake solver whose ``fetch_via_browser`` sleeps per URL (URL→delay map).
+    """Fake solver whose ``eval_in_webview`` sleeps per URL (URL→delay map).
 
-    Used to assert parallel fan-out: if 5 candidates each sleep 0.1s and the
-    fetches run in PARALLEL, the gathered wall-clock is ~0.1s, NOT 0.5s. If a
-    regression re-introduces a sequential ``for`` loop, the test sees a
-    wall-clock close to 0.5s and ``max_in_flight == 1`` and fails.
+    Phase 14: comix runs BOTH its search token-mint (one eval on the homepage)
+    and its per-candidate chapter-list enumeration (one eval per series page)
+    through ``eval_in_webview`` inside the redroid WebView. The search eval is
+    awaited once up front; the per-candidate chapter-list evals then fan out
+    CONCURRENTLY. Used to assert that fan-out: if 5 candidates each sleep 0.1s and
+    the evals run in PARALLEL, the gathered wall-clock is ~0.1s, NOT 0.5s. If a
+    regression re-introduces a sequential ``for`` loop, the test sees a wall-clock
+    close to 0.5s and ``max_in_flight == 1`` and fails.
 
-    Optionally returns an exception on a given URL (instead of the staged
-    result) to drive the per-candidate-failure-isolation test. An optional
-    ``gate`` Semaphore models the framework's ``_browser_lock`` so the cap test
-    can assert the gather self-throttles.
+    ``browser_fetch_calls`` records ONLY the per-candidate series-page evals (the
+    ``/title/`` navs), so the prune-narrowing assertions count chapter-list
+    fan-out independently of the single up-front search eval. Optionally returns
+    an exception on a given URL to drive the per-candidate-failure-isolation test.
+    An optional ``gate`` Semaphore models the framework's ``_browser_lock`` so the
+    cap test can assert the gather self-throttles.
     """
 
     def __init__(self, gate: asyncio.Semaphore | None = None) -> None:
@@ -79,6 +85,9 @@ class _SlowComixSolver:
         self.browser_errors: dict[str, Exception] = {}
         self.browser_delays: dict[str, float] = {}
         self.browser_fetch_calls: list[str] = []
+        # Homepage search token-mint evals (the Layer-1 / search-XHR analog), kept
+        # separate from the per-candidate chapter-list evals in browser_fetch_calls.
+        self.search_evals = 0
         self._gate = gate
         # Cross-call concurrency observability — the parallel test asserts
         # ``max_in_flight > 1`` so a regression to the sequential ``for`` loop
@@ -106,7 +115,7 @@ class _SlowComixSolver:
         return Clearance(cookies=dict(_CF_COOKIE), user_agent=_CF_UA)
 
     async def _gated_fetch(self, url: str) -> object:
-        """Shared in-flight/gate/delay accounting for the browser primitives."""
+        """Shared in-flight/gate/delay accounting for the eval primitive."""
         if self._gate is not None:
             await self._gate.acquire()
         try:
@@ -117,7 +126,7 @@ class _SlowComixSolver:
                 if url in self.browser_errors:
                     raise self.browser_errors[url]
                 if url not in self.browser_results:
-                    raise AssertionError(f"unmocked browser fetch({url!r})")
+                    raise AssertionError(f"unmocked eval_in_webview({url!r})")
                 return self.browser_results[url]
             finally:
                 self.in_flight -= 1
@@ -125,60 +134,25 @@ class _SlowComixSolver:
             if self._gate is not None:
                 self._gate.release()
 
-    async def fetch_via_browser(
+    async def eval_in_webview(
         self,
-        url: str,
+        challenge_url: str,
+        js: str,
         *,
-        extract: str,
         wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the seam contract
     ) -> object:
-        _ = (extract, wait_for, timeout)
-        self.browser_fetch_calls.append(url)
-        return await self._gated_fetch(url)
-
-    async def fetch_via_browser_typed(
-        self,
-        url: str,
-        *,
-        type_selector: str,
-        type_text: str,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
-    ) -> object:
-        # Comix search mints a `_=` token by typing into the SPA search box
-        # (debug comix-search-api-403). The production extract reads the tokenized
-        # /api/v1/manga URL off Resource-Timing; the fake returns the equivalent
-        # URL so the source's verbatim get_json_plain replay hits the respx mock
-        # (respx matches /api/v1/manga by path, ignoring the query/token).
-        _ = (url, type_selector, extract, wait_for, timeout)
-        return (
-            f"{_COMIX}/api/v1/manga?keyword={type_text}"
-            "&limit=6&content_rating=suggestive&_=faketoken"
-        )
-
-    async def fetch_via_browser_paginated(
-        self,
-        url: str,
-        *,
-        extract: str,
-        wait_for: str | None = None,
-        next_selector: str,
-        route_limit_rewrite: tuple[str, int] | None = None,
-        max_pages: int = 200,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
-    ) -> object:
-        # Retired on the comix path (spike 019): ``_series_chapters`` now enumerates
-        # via comix's own internal ``chapters()`` loader on the one-shot
-        # ``fetch_via_browser`` (the method the source actually calls — and which
-        # routes through the SAME ``_gated_fetch`` accounting above, so the
-        # per-candidate concurrency assertions still hold). This stub stays only for
-        # back-compat and shares the gate; it is no longer invoked by the source.
-        _ = (extract, wait_for, next_selector, route_limit_rewrite)
-        _ = (max_pages, timeout)
-        self.browser_fetch_calls.append(url)
-        return await self._gated_fetch(url)
+        # Route by nav target: the homepage eval is the search ``c.list`` token
+        # mint (returns the candidates envelope); a ``/title/`` eval is a per-
+        # candidate chapter-list enumeration (returns that series' rows). Only the
+        # per-candidate evals count toward ``browser_fetch_calls`` so the prune
+        # assertions measure the chapter-list fan-out, not the single search eval.
+        _ = (js, wait_for, timeout)
+        if "/title/" in challenge_url:
+            self.browser_fetch_calls.append(challenge_url)
+        else:
+            self.search_evals += 1
+        return await self._gated_fetch(challenge_url)
 
 
 @pytest.fixture
@@ -250,9 +224,9 @@ def _mock_five_series(solver: _SlowComixSolver, delays: list[float]) -> list[str
         }
         for i in range(5)
     ]
-    respx.get(f"{_COMIX}/api/v1/manga").mock(
-        return_value=httpx.Response(200, json=_candidates_json(items))
-    )
+    # Phase 14: search mints candidates via the homepage ``c.list`` eval — the fake
+    # returns the decrypted envelope directly (no httpx/get_json_plain replay).
+    solver.stage(f"{_COMIX}/", result=_candidates_json(items))
     for i in range(5):
         series_url = f"{_COMIX}/title/{hids[i]}-slug{i}"
         chapter = {
@@ -421,9 +395,8 @@ async def test_search_fan_out_is_capped_by_browser_semaphore(
 ) -> None:
     """The parallel gather self-throttles to the framework's ``_browser_lock``.
 
-    In production the per-nav ``fetch_via_browser`` calls all queue on the one
-    ``CloudflareSolver._browser_lock`` ``asyncio.Semaphore(fetch_concurrency)``,
-    so ``cloudflare_fetch_concurrency`` is the real cap — ComixSource.search()
+    In production the per-nav ``eval_in_webview`` calls all serialize on the one
+    redroid device (the single-device sidecar lock) — ComixSource.search()
     adds no second gate. Here we wrap the fake solver in a 2-wide Semaphore (the
     ``_browser_lock`` analog) and assert that with five 0.1s candidates the
     observed ``max_in_flight`` never exceeds 2 — i.e. the gather honors the cap
@@ -515,9 +488,10 @@ def _stage_forgotten_field(solver: _SlowComixSolver) -> list[str]:
     Returns the list of valid series URLs (so the test can assert the prune
     narrowed the browser fan-out to a strict SUBSET — ideally the single
     ``mr3m0`` URL)."""
-    respx.get(f"{_COMIX}/api/v1/manga").mock(
-        return_value=httpx.Response(200, json=_forgotten_field_fixture())
-    )
+    # Phase 14: the real ``/api/v1/manga`` search payload is returned by the
+    # homepage ``c.list`` eval (no httpx replay); the production parse + prune
+    # still run for real over this fixture.
+    solver.stage(f"{_COMIX}/", result=_forgotten_field_fixture())
     urls = _valid_series_urls()
     for url in urls:
         solver.stage(

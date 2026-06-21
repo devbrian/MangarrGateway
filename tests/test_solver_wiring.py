@@ -44,8 +44,8 @@ async def test_lifespan_swaps_in_solver_router() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
         solver = app.state.solver
-        # Phase 10: the ONE shared solver is now a SolverRouter composing the
-        # Patchright (comix) and Android (mangadot/kagane) backends.
+        # Phase 10 / Phase 14: the ONE shared solver is a SolverRouter composing the
+        # Patchright (mangafire) and Android (comix/mangadot/kagane/mangaball) backends.
         assert isinstance(solver, SolverRouter)
         assert isinstance(solver._patchright, CloudflareSolver)
         assert isinstance(solver._android, AndroidSolver)
@@ -58,28 +58,27 @@ async def test_lifespan_swaps_in_solver_router() -> None:
 
 
 async def test_engine_partition_splits_patchright_and_android_challenge_urls() -> None:
-    """Phase 10 (T-10-13): the lifespan partitions the per-domain challenge-URL map
-    by ``Source.solver_engine``. The Patchright leg owns ONLY the patchright sources
-    — comix (``https://comix.to/``) and mangafire (``https://mangafire.to/``, Phase 12)
-    — so its browser warm/solve is byte-for-byte unchanged and the unclearable-from-
-    Linux android sources NEVER enter the Patchright warm set. The Android leg covers
-    the android sources (mangadot ``https://mangadot.net/``, kagane
-    ``https://kagane.to/``, and mangaball ``https://mangaball.net/`` — debug
-    mangaball-cloudflare-csrf-243, whose managed challenge desktop Chromium could not
-    clear from Linux), routed to the redroid-WebView sidecar. Guards against drift that
-    would let either source leak into the wrong engine's challenge map.
+    """Phase 10 (T-10-13) / Phase 14: the lifespan partitions the per-domain
+    challenge-URL map by ``Source.solver_engine``. The Patchright leg now owns ONLY
+    mangafire (``https://mangafire.to/``, Phase 12) — comix moved to the Android leg
+    in Phase 14 (comix.to 403s the Patchright-Linux fingerprint even WITH a
+    cf_clearance; the redroid WebView is the only fingerprint that clears it). The
+    Android leg covers comix (``https://comix.to/``) plus the other android sources
+    (mangadot ``https://mangadot.net/``, kagane ``https://kagane.to/``, mangaball
+    ``https://mangaball.net/``), all routed to the redroid-WebView sidecar. Guards
+    against drift that would let a source leak into the wrong engine's challenge map.
     """
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
         solver = app.state.solver
         assert isinstance(solver, SolverRouter)
-        # Patchright leg: comix + mangafire (NOT the android sources).
+        # Patchright leg: mangafire only (comix moved to android in Phase 14).
         assert solver._patchright._challenge_urls == {
-            "comix": "https://comix.to/",
             "mangafire": "https://mangafire.to/",
         }
-        # Android leg: mangadot + kagane + mangaball (NOT comix/mangafire).
+        # Android leg: comix + mangadot + kagane + mangaball (NOT mangafire).
         assert solver._android._challenge_urls == {
+            "comix": "https://comix.to/",
             "mangadot": "https://mangadot.net/",
             "kagane": "https://kagane.to/",
             "mangaball": "https://mangaball.net/",

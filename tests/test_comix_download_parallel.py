@@ -7,7 +7,7 @@ stall)? Investigation answer: **no new guard** — the download path is already
 guarded TRANSITIVELY.
 
 Anatomy (verified in ``sources/comix.py``):
-* ``fetch_manifest`` does exactly ONE ``solver.fetch_via_browser`` browser nav
+* ``fetch_manifest`` does exactly ONE ``solver.eval_in_webview`` browser nav
   per job — the SAME primitive ``search()`` uses.
 * ``fetch_image`` uses ``ctx.get_bytes_plain`` (plain httpx) — the browser is
   NEVER used for bulk image fetch, so the per-job image fan-out drives no navs.
@@ -23,9 +23,9 @@ produce more simultaneous navs than ``cloudflare_fetch_concurrency`` allows.
 This file PROVES that parity:
 
 * (a) Two concurrent comix downloads each issue exactly ONE manifest-resolve
-  ``fetch_via_browser`` nav (and zero browser navs for the image bytes) — the
+  ``eval_in_webview`` nav (and zero browser navs for the image bytes) — the
   download nav count equals the job count, image bytes go over httpx.
-* (b) Wrapping the fake solver's ``fetch_via_browser`` in a 1-wide Semaphore
+* (b) Wrapping the fake solver's ``eval_in_webview`` in a 1-wide Semaphore
   (the ``_browser_lock`` analog under camoufox's forced concurrency=1) caps the
   observed ``max_in_flight`` at 1 even with ``max_concurrent_per_source=2`` —
   i.e. the download navs honor the SAME browser gate search does, so the
@@ -85,11 +85,11 @@ def _page_urls(job_idx: int) -> list[str]:
 
 
 class _GatedBrowserSolver:
-    """Fake solver recording cross-call ``fetch_via_browser`` concurrency.
+    """Fake solver recording cross-call ``eval_in_webview`` concurrency.
 
     Mirrors ``_SlowComixSolver`` from ``test_comix_search_parallel.py`` but is
-    aimed at the DOWNLOAD manifest-resolve path: every ``fetch_via_browser``
-    call (the comix chapter-page DOM read) parks on a barrier while the test
+    aimed at the DOWNLOAD manifest-resolve path: every ``eval_in_webview`` call
+    (the comix chapter-pages in-WebView read) parks on a barrier while the test
     measures how many are simultaneously in flight, optionally bounded by a
     ``_browser_lock``-analog Semaphore. ``get_clearance`` feeds the D-40 seam.
 
@@ -115,16 +115,16 @@ class _GatedBrowserSolver:
     async def get_clearance(self, source_key: str) -> Clearance:
         return Clearance(cookies=dict(_CF_COOKIE), user_agent=_CF_UA)
 
-    async def fetch_via_browser(
+    async def eval_in_webview(
         self,
-        url: str,
+        challenge_url: str,
+        js: str,
         *,
-        extract: str,
         wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the seam contract
     ) -> object:
-        _ = (extract, wait_for, timeout)
-        self.browser_calls.append(url)
+        _ = (js, wait_for, timeout)
+        self.browser_calls.append(challenge_url)
         self.first_nav.set()
         if self._gate is not None:
             await self._gate.acquire()
@@ -133,32 +133,14 @@ class _GatedBrowserSolver:
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
             try:
                 await self.release.wait()
-                if url not in self.results:
-                    raise AssertionError(f"unmocked fetch_via_browser({url!r})")
-                return self.results[url]
+                if challenge_url not in self.results:
+                    raise AssertionError(f"unmocked eval_in_webview({challenge_url!r})")
+                return self.results[challenge_url]
             finally:
                 self.in_flight -= 1
         finally:
             if self._gate is not None:
                 self._gate.release()
-
-    async def fetch_via_browser_paginated(
-        self,
-        url: str,
-        *,
-        extract: str,
-        wait_for: str | None = None,
-        next_selector: str,
-        route_limit_rewrite: tuple[str, int] | None = None,
-        max_pages: int = 200,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
-    ) -> object:
-        # Retired on the comix path (spike 019) and kept only for back-compat.
-        # These DOWNLOAD-path tests drive RESOLVED composites only, so the deferred
-        # chapter-list enumeration never runs — this stub is never invoked.
-        raise AssertionError(  # pragma: no cover — never called on the resolved path
-            f"fetch_via_browser_paginated unexpectedly called ({url!r})"
-        )
 
 
 def _comix_record(idx: int) -> ResolutionRecord:
@@ -256,7 +238,7 @@ async def test_concurrent_comix_download_navs_honor_browser_lock_cap(
     tmp_path: Path,
 ) -> None:
     """Two concurrent comix downloads (``max_concurrent_per_source=2``) whose
-    manifest-resolve navs queue on a 1-wide ``fetch_via_browser`` gate (the
+    manifest-resolve navs queue on a 1-wide ``eval_in_webview`` gate (the
     ``_browser_lock`` analog under camoufox's forced ``cloudflare_fetch_concurrency=1``)
     never have more than 1 nav in flight — the download navs honor the SAME
     browser gate search does. This is why ``max_concurrent_per_source > 1``

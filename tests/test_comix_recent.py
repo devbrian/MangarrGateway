@@ -261,14 +261,14 @@ def test_make_deferred_composite_decimal_chapter_roundtrips() -> None:
 
 
 class _FakeSolver:
-    """Records the ``chapter_url`` passed to ``fetch_via_browser`` so the test
-    can assert the deferred branch resolved the sentinel before navigating.
+    """Records the ``chapter_url`` passed to ``eval_in_webview`` so the test can
+    assert the deferred branch resolved the sentinel before navigating.
 
-    Also backs the chapter-list enumeration (spike 019: comix's own internal
-    ``chapters()`` loader on the one-shot ``fetch_via_browser``): tests that
+    Phase 14: comix runs BOTH the chapter-list enumeration AND the chapter-pages
+    manifest read through ``eval_in_webview`` (the redroid WebView). Tests that
     exercise the REAL deferred path (no ``_series_chapters`` monkeypatch) stage the
-    full series chapter list keyed by the series URL; ``fetch_via_browser`` serves
-    it for the series URL and the chapter-page image URLs for chapter URLs."""
+    full series chapter list keyed by the series URL; ``eval_in_webview`` serves it
+    for the series URL and the chapter-page image URLs for chapter URLs."""
 
     def __init__(self, urls: list[str] | None = None) -> None:
         self.last_url: str | None = None
@@ -282,44 +282,23 @@ class _FakeSolver:
     def stage_browser_paginated(self, url: str, result: list[dict[str, Any]]) -> None:
         self.paginated_results[url] = result
 
-    async def fetch_via_browser(
+    async def eval_in_webview(
         self,
-        url: str,
+        challenge_url: str,
+        js: str,
         *,
-        extract: str,
-        wait_for: Any,
-        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
-    ) -> list[str] | list[dict[str, Any]]:
-        _ = (extract, wait_for, timeout)
-        self.last_url = url
-        # The chapter-list enumeration (spike 019) rides the one-shot primitive,
-        # keyed by the series URL; serve the staged full list for it. Chapter-page
-        # manifest reads (chapter URLs) return the image-URL list.
-        if url in self.paginated_results:
-            self.paginated_fetch_calls.append(url)
-            return self.paginated_results[url]
-        return self._urls
-
-    async def fetch_via_browser_paginated(
-        self,
-        url: str,
-        *,
-        extract: str,
         wait_for: Any = None,
-        next_selector: str,
-        route_limit_rewrite: tuple[str, int] | None = None,
-        max_pages: int = 200,
-        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
-    ) -> list[dict[str, Any]]:
-        _ = (extract, wait_for, next_selector, route_limit_rewrite)
-        _ = (max_pages, timeout)
-        self.paginated_fetch_calls.append(url)
-        if url not in self.paginated_results:
-            raise AssertionError(
-                f"unmocked fetch_via_browser_paginated({url!r}); "
-                f"call stage_browser_paginated first"
-            )
-        return self.paginated_results[url]
+        timeout: float | None = None,  # noqa: ASYNC109 — mirrors the seam signature
+    ) -> list[str] | list[dict[str, Any]]:
+        _ = (js, wait_for, timeout)
+        self.last_url = challenge_url
+        # The chapter-list enumeration (spike 019/021) rides the eval seam, keyed by
+        # the series URL; serve the staged full list for it. Chapter-page manifest
+        # reads (chapter URLs) return the image-URL list.
+        if challenge_url in self.paginated_results:
+            self.paginated_fetch_calls.append(challenge_url)
+            return self.paginated_results[challenge_url]
+        return self._urls
 
 
 class _FakeCtxForFetchManifest:
@@ -484,8 +463,8 @@ async def test_fetch_manifest_deferred_resolves_against_full_walked_list() -> No
 
     urls = await source.fetch_manifest(composite, _ctx_for_fetch(solver))
     assert urls  # the fake returns a non-empty allowed-CDN list
-    # The chapter-list enumeration (spike 019) was served for the series URL via
-    # the one-shot fetch_via_browser (recorded here), feeding the full list to
+    # The chapter-list enumeration (spike 019/021) was served for the series URL via
+    # the eval_in_webview seam (recorded here), feeding the full list to
     # _resolve_deferred.
     assert solver.paginated_fetch_calls == [series_url]
     # Chapter 5's numeric id (9938805) was resolved from the deep row and used to
@@ -498,63 +477,52 @@ async def test_fetch_manifest_deferred_resolves_against_full_walked_list() -> No
 # ───────────────────────── recent() shape (Task 3) ──────────────────────────
 
 
-# The tokenized recent-feed URL the SPA mints on /browse (#232). recent() reads
-# this verbatim off the Resource-Timing buffer (via the fake solver below) and
-# replays it through get_json_plain — the ``order[...]`` is URL-encoded and the
-# ``_=`` token signs the EXACT query string, so recent() adds NO params.
-_RECENT_TOKEN_URL = (
-    "https://comix.to/api/v1/manga?order%5Bchapter_updated_at%5D=desc"
-    "&page=1&limit=28&content_rating=suggestive&_=faketoken"
-)
+# The homepage nav target the recent eval runs against (Phase 14). recent() now
+# runs the env-module ``c.list({order:{chapter_updated_at:'desc'}, …})`` eval INSIDE
+# the cleared WebView (``_RECENT_LIST_API_EXTRACT_JS``) and gets the decrypted
+# newest-first envelope back DIRECTLY — no /browse nav, no token-URL capture, no
+# get_json_plain replay (the ``_=`` token is signed by the env-module axios in-page).
+_RECENT_EVAL_URL = "https://comix.to/"
 
 
 class _RecentFakeSolver:
-    """Fake solver for the ``recent()`` browse-capture path (#232).
+    """Fake solver for the ``recent()`` in-WebView ``c.list`` eval path (Phase 14).
 
-    ``recent()`` navigates ``/browse`` via ``fetch_via_browser`` and reads the
-    tokenized ``order[chapter_updated_at]`` URL the SPA minted; this fake records
-    the nav target and returns ``_RECENT_TOKEN_URL``. ``fetch_via_browser_paginated``
-    exists only so ``_solver_from_ctx``'s hasattr guard passes — recent() never
-    enumerates a chapter list (locked decision 7).
+    ``recent()`` runs ONE ``eval_in_webview`` against the homepage that mints the
+    signed recent-feed query and returns the decrypted envelope; this fake records
+    the nav target and returns the staged recent payload. recent() never enumerates
+    a per-series chapter list (locked decision 7) — there is exactly one eval.
     """
 
-    def __init__(self) -> None:
-        self.browse_navs: list[str] = []
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.eval_navs: list[str] = []
+        self._payload = payload
 
-    async def fetch_via_browser(
+    async def eval_in_webview(
         self,
-        url: str,
+        challenge_url: str,
+        js: str,
         *,
-        extract: str,
         wait_for: Any = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — mirrors the real solver signature
-    ) -> str:
-        _ = (extract, wait_for, timeout)
-        self.browse_navs.append(url)
-        return _RECENT_TOKEN_URL
-
-    async def fetch_via_browser_paginated(  # pragma: no cover — never called
-        self, url: str, **kwargs: Any
-    ) -> list[dict[str, Any]]:
-        raise AssertionError("recent() must not enumerate a chapter list")
+        timeout: float | None = None,  # noqa: ASYNC109 — mirrors the seam signature
+    ) -> dict[str, Any]:
+        _ = (js, wait_for, timeout)
+        self.eval_navs.append(challenge_url)
+        return self._payload
 
 
 class _FakeCtxForRecent:
-    """Minimal ``SourceContext`` stand-in for the ``recent()`` browse-capture path.
+    """Minimal ``SourceContext`` stand-in for the ``recent()`` in-WebView eval path.
 
-    ``recent()`` (#232) reads ``ctx`` via ``_solver`` (the browse nav + token
-    capture), :meth:`get_json_plain` (one verbatim-URL call) and
-    ``handle_store.mint``. We capture the get_json_plain URL + params for
-    assertion and serve a canned payload. No respx needed — ``recent()`` does not
-    touch httpx directly; the production ``SourceContext.get_json_plain`` is the
-    layer that does.
+    ``recent()`` (Phase 14) reads ``ctx`` only via ``_solver`` (the one homepage
+    ``eval_in_webview`` that mints + decrypts the recent feed) and
+    ``handle_store.mint``. The recent payload is served by the solver's eval (no
+    httpx / get_json_plain replay anymore).
     """
 
     def __init__(self, payload: dict[str, Any]) -> None:
         self.handle_store = HandleStore()
-        self._payload = payload
-        self.calls: list[tuple[str, dict[str, Any]]] = []
-        self._solver = _RecentFakeSolver()
+        self._solver = _RecentFakeSolver(payload)
         # Phase-13 (WR-01): per-request scratch stash + best-effort resolve seam.
         self.external_links_raw: dict[str, dict[str, Any]] = {}
 
@@ -564,10 +532,6 @@ class _FakeCtxForRecent:
             return await parse_fn()
         except Exception:
             return None
-
-    async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
-        self.calls.append((url, params))
-        return self._payload
 
 
 def _ctx_for_recent(payload: dict[str, Any]) -> SourceContext:
@@ -606,10 +570,9 @@ async def test_recent_returns_releases_with_deferred_guids_and_composites() -> N
       ``_make_deferred_composite(hid, slug, ch_str)``.
     * ``chapter_number`` for the ``"30.1"`` row equals ``Decimal('30.1')``
       (decimal-normalized; not ``Decimal('30.10')``).
-    * recent() navigates ``/browse`` once (token capture) and records exactly
-      one ``get_json_plain`` call replaying the captured URL VERBATIM with NO
-      added params (#232: the ``_=`` token signs the exact query string), and
-      no series-page chapter-list enumeration (locked decision 7).
+    * recent() runs exactly one in-WebView ``c.list`` eval against the homepage
+      (Phase 14: the env-module mints + decrypts the recent feed in one device
+      round-trip), and no series-page chapter-list enumeration (locked decision 7).
     """
     payload = {
         "status": "ok",
@@ -711,15 +674,11 @@ async def test_recent_returns_releases_with_deferred_guids_and_composites() -> N
     releases = await source.recent(languages=None, limit=20, since=None, ctx=ctx)
 
     assert len(releases) == 10
-    # #232: recent() navigates /browse ONCE to capture the SPA-minted token URL.
-    assert ctx._solver.browse_navs == ["https://comix.to/browse"]  # type: ignore[attr-defined]
-    # Locked decision 7: exactly one outbound plaintext call from recent() — the
-    # captured tokenized URL replayed VERBATIM, with NO added params (the ``_=``
-    # token signs the exact query string, so get_json_plain GETs it as-is).
-    assert len(ctx.calls) == 1  # type: ignore[attr-defined]
-    called_url, called_params = ctx.calls[0]  # type: ignore[attr-defined]
-    assert called_url == _RECENT_TOKEN_URL
-    assert called_params == {}
+    # Phase 14 / locked decision 7: recent() runs EXACTLY ONE in-WebView eval against
+    # the homepage (the env-module ``c.list`` recent query mints + decrypts the feed
+    # in one device round-trip) — no /browse nav, no token-URL replay, no
+    # per-series chapter-list enumeration.
+    assert ctx._solver.eval_navs == [_RECENT_EVAL_URL]  # type: ignore[attr-defined]
 
     # Locked decision 1: literal `:DEFERRED` guid suffix on every Release.
     for rel in releases:
@@ -765,7 +724,7 @@ async def test_recent_populates_external_links_from_item_links() -> None:
     * An item WITH ``links`` → Release.external_links carries the canonical bare IDs
       (URLs reduced to IDs, R2; storefront keys dropped, R3).
     * An item WITHOUT ``links`` → Release.external_links is ``None``.
-    * No extra outbound call is made (still exactly one get_json_plain).
+    * No extra outbound call is made (still exactly one in-WebView eval).
     """
     item_with = _viable_item(
         hid="bbbb1",
@@ -790,8 +749,8 @@ async def test_recent_populates_external_links_from_item_links() -> None:
     releases = await source.recent(languages=None, limit=20, since=None, ctx=ctx)
 
     assert len(releases) == 2
-    # Still exactly one outbound plaintext call — links rode the SAME feed (no HTTP).
-    assert len(ctx.calls) == 1  # type: ignore[attr-defined]
+    # Still exactly one in-WebView eval — links rode the SAME feed (no extra call).
+    assert ctx._solver.eval_navs == [_RECENT_EVAL_URL]  # type: ignore[attr-defined]
     by_hid = {rel.ids["comixSeriesId"]: rel for rel in releases}
 
     links = by_hid["bbbb1"].external_links
