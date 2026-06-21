@@ -171,6 +171,16 @@ _CHALLENGE_RENAV_CMD_ID = 42
 _EGRESS_READ_TIMEOUT_S = 15.0
 _EGRESS_READ_JS = "document.body.innerText"
 
+# ── /eval (Phase 14): run gateway-supplied JS in the warm cleared WebView ─────
+# The /eval endpoint re-composes the existing navigate + Runtime.evaluate
+# primitives so comix's in-page token-mint / chapter-list / manifest logic runs
+# inside the only fingerprint that clears comix.to's Cloudflare. The ONE new CDP
+# option over the three existing Runtime.evaluate sites is ``awaitPromise:true``
+# (comix's extractors are async; spike 021 A2). ``_EVAL_CMD_ID`` is a fresh
+# command id distinct from the solve path's ``_*_CMD_ID`` values above so the
+# eval's Runtime.evaluate response never aliases an in-flight solve frame.
+_EVAL_CMD_ID = 400
+
 
 class SolveError(RuntimeError):
     """The solve pipeline could not mint a clearance (surfaces as 504)."""
@@ -251,6 +261,17 @@ class SolvePipeline(Protocol):
         *,
         proxy: dict[str, Any] | None = None,
     ) -> SolveResult: ...
+
+    def eval_in_webview(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: Event | None = None,
+        *,
+        wait_for: str | None = None,
+        deadline: float | None = None,
+    ) -> Any: ...
 
     def health(self) -> bool: ...
 
@@ -355,6 +376,22 @@ class AndroidSolvePipeline:
             self._device.force_stop_and_clear()
         except Exception:  # noqa: BLE001 — cleanup must not mask the cancellation
             _log.warning("device reset after cancellation failed", exc_info=True)
+
+    def eval_in_webview(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: Event | None = None,
+        *,
+        wait_for: str | None = None,
+        deadline: float | None = None,
+    ) -> Any:
+        # Declared interface-first so the SolvePipeline Protocol is satisfied and
+        # the service layer type-checks. The real CDP eval primitive (navigate →
+        # hydration-wait → Runtime.evaluate(awaitPromise:true) → marshal) lands in
+        # Task 2.
+        raise NotImplementedError("eval_in_webview is implemented in Task 2")
 
     def _solve(
         self,
@@ -878,6 +915,73 @@ class SolverService:
 
         return self._run_solve(challenge_url, host, proxy, disconnected)
 
+    def eval(
+        self,
+        *,
+        api_key: str | None,
+        body: bytes,
+        disconnected: Callable[[], bool] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Run gateway-supplied JS in the warm cleared WebView (EVAL-01 / SEC-01).
+
+        Replicates ``/solve``'s rails verbatim — ``X-Solver-Key`` auth BEFORE any
+        body read or device action (T-14-01), the ``urlsplit`` scheme-pinned-then-
+        host-allowlisted SSRF guard BEFORE any device action (T-14-02) — then adds a
+        ``js`` parse. ``js`` is sidecar-trusted (gateway-authored, sent over the
+        authenticated control channel with no published host port, T-14-03) but
+        STILL requires the key + allowlist. The ``js`` and the eval result are NEVER
+        logged (T-14-04).
+        """
+        if not self._authenticate(api_key):
+            # T-14-01: no device action without a valid key.
+            return int(HTTPStatus.UNAUTHORIZED), {
+                "error": "invalid or missing X-Solver-Key"
+            }
+
+        try:
+            payload = json.loads(body or b"{}")
+        except (ValueError, TypeError):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "malformed JSON body"}
+        if not isinstance(payload, dict):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "body must be a JSON object"}
+
+        challenge_url = payload.get("challenge_url")
+        if not isinstance(challenge_url, str) or not challenge_url:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge_url is required"
+            }
+
+        split = urlsplit(challenge_url)
+        host = (split.hostname or "").lower()
+        if split.scheme not in ("http", "https"):
+            # T-14-02 SSRF guard: pin the scheme BEFORE the host check (mirrors
+            # /solve) so a non-http(s) URL with an allowlisted host never navigates.
+            _log.warning("rejected non-http(s) eval challenge scheme %r", split.scheme)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge url scheme not allowed"
+            }
+        if host not in self._config.allowed_hosts:
+            # T-14-02 SSRF guard: reject BEFORE any device action.
+            _log.warning("rejected non-allowlisted eval challenge host %r", host)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge host not allowlisted"
+            }
+
+        # The gateway-authored JS to run in-page. Sidecar-trusted, but the request
+        # still had to pass the key + allowlist above (T-14-03). NEVER logged.
+        js = payload.get("js")
+        if not isinstance(js, str) or not js:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {"error": "js is required"}
+        # Optional SPA-readiness predicate: a JS boolean EXPRESSION string (NOT a
+        # CSS selector) the eval polls until truthy before running ``js``.
+        wait_for = payload.get("wait_for")
+        if wait_for is not None and not isinstance(wait_for, str):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "wait_for must be a string"
+            }
+
+        return self._run_eval(challenge_url, host, js, wait_for, disconnected)
+
     @staticmethod
     def _validate_proxy(
         proxy: Any,
@@ -1017,6 +1121,71 @@ class SolverService:
         finally:
             self._lock.release()
 
+    def _run_eval(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        wait_for: str | None = None,
+        disconnected: Callable[[], bool] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Serialize + timeout-bound one in-WebView eval (mirrors ``_run_solve``).
+
+        Shares the SAME ``self._lock`` + single-worker ``self._executor`` as
+        ``_run_solve`` (never a second executor), so an eval and a solve can never
+        run concurrently against the one redroid (PERF-01 / R1). NON-blocking lock
+        acquire → 503 busy; short-poll the worker future bounded by the solve
+        timeout, cancelling-and-draining on timeout / caller disconnect. On success
+        returns ``(200, {"value": <marshalled eval result>})``. The ``js`` and the
+        result value are NEVER logged (T-14-04) — the success event carries only the
+        host.
+        """
+        cancel = Event()
+        timeout_s = self._config.solve_timeout_s
+        # T-14-05 / PERF-01: NON-blocking acquire — an eval (or solve) arriving while
+        # one is already in flight is rejected 503 immediately rather than queuing
+        # behind the single device.
+        if not self._lock.acquire(blocking=False):
+            _log.info("solver busy; rejecting concurrent /eval for host %s", host)
+            return int(HTTPStatus.SERVICE_UNAVAILABLE), {"error": "solver busy"}
+        try:
+            future = self._executor.submit(
+                self._pipeline.eval_in_webview,
+                challenge_url,
+                host,
+                js,
+                cancel,
+                wait_for=wait_for,
+            )
+            deadline = time.monotonic() + timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _log.warning("eval timed out for host %s", host)
+                    self._cancel_and_drain(future, cancel, host)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "eval timed out"}
+                try:
+                    value = future.result(timeout=min(_DISCONNECT_POLL_S, remaining))
+                except FuturesTimeout:
+                    if disconnected is not None and disconnected():
+                        _log.info(
+                            "caller disconnected mid-eval for host %s; cancelling",
+                            host,
+                        )
+                        self._cancel_and_drain(future, cancel, host)
+                        return _CLIENT_CLOSED_REQUEST, {"error": "client disconnected"}
+                    continue
+                except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
+                    # Never logs the js or the result (the value isn't in the
+                    # traceback message) — keep the trace for field diagnosis.
+                    _log.warning("eval failed for host %s", host, exc_info=True)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "eval failed"}
+                # Redacted success event ONLY (T-14-04) — never the js or the result.
+                _log.info("evaluated in webview for host %s", host)
+                return int(HTTPStatus.OK), {"value": value}
+        finally:
+            self._lock.release()
+
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
         """Signal cancellation and wait (bounded) for the orphan to unwind (#207).
 
@@ -1093,7 +1262,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
-        if self.path != "/solve":
+        # Phase 14: /eval shares /solve's pre-auth + body-cap rails verbatim — only
+        # the service method dispatched at the end differs.
+        if self.path not in ("/solve", "/eval"):
             self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
             return
         # CR-01: authenticate BEFORE reading the body. An unauthenticated caller
@@ -1115,7 +1286,9 @@ class _Handler(BaseHTTPRequestHandler):
                 int(HTTPStatus.BAD_REQUEST), {"error": "invalid Content-Length"}
             )
             return
-        # CR-01: cap the declared body size BEFORE reading a single byte.
+        # CR-01 / T-14-05: cap the declared INBOUND body size BEFORE reading a single
+        # byte. (The cap is inbound-only; a large chapter-list eval RESULT travels on
+        # the outbound side and is NOT capped — research A4.)
         if length > _MAX_BODY_BYTES:
             self.close_connection = True
             self._send_json(
@@ -1123,20 +1296,27 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         body = self.rfile.read(length) if length > 0 else b""
-        # #275 req 1: let the service detect a mid-solve caller disconnect (peek the
-        # socket for EOF) so an abandoned /solve cancels its device work promptly.
-        status, payload = self.server.service.solve(
-            api_key=api_key,
-            body=body,
-            disconnected=lambda: _peer_disconnected(self.connection),
-        )
+        # #275 req 1: let the service detect a mid-call caller disconnect (peek the
+        # socket for EOF) so an abandoned /solve or /eval cancels its device work.
+        if self.path == "/solve":
+            status, payload = self.server.service.solve(
+                api_key=api_key,
+                body=body,
+                disconnected=lambda: _peer_disconnected(self.connection),
+            )
+        else:  # /eval
+            status, payload = self.server.service.eval(
+                api_key=api_key,
+                body=body,
+                disconnected=lambda: _peer_disconnected(self.connection),
+            )
         # #275 cleanup: the client may already be gone (CLOSE_WAIT / BrokenPipe). A
         # write to a dead peer must not crash the daemon worker thread — swallow it
         # (OSError covers BrokenPipeError/ConnectionError, its subclasses).
         try:
             self._send_json(status, payload)
         except OSError:
-            _log.info("client gone before /solve response could be sent for host")
+            _log.info("client gone before %s response could be sent", self.path)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Silence the default access log (keeps request lines — and any header
