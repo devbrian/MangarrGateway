@@ -11,6 +11,9 @@ Protocol. Also asserts the source ``solver_engine`` class-attrs (mangadot/kagane
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+
 import pytest
 
 from manga_gateway.framework.antibot import AntiBotSolver, Clearance
@@ -330,6 +333,52 @@ async def test_eval_in_webview_delegates_to_android() -> None:
         )
     ]
     assert patchright.eval_calls == []  # patchright (browser engine) NEVER consulted
+
+
+# ───────────── off-Protocol device_session lease (bug 4 Fix C, comix) ───────────
+
+
+class _FakeDeviceSessionBackend:
+    """A backend recording ``device_session`` enter/exit so the router's INVERSE
+    delegation (→ android, NOT patchright) can be pinned — like _FakeEvalBackend."""
+
+    def __init__(self, *, tag: str) -> None:
+        self._tag = tag
+        self.entered = 0
+        self.exited = 0
+        self.depth = 0
+        self.max_depth = 0
+
+    @contextlib.asynccontextmanager
+    async def device_session(self) -> AsyncIterator[None]:
+        self.entered += 1
+        self.depth += 1
+        self.max_depth = max(self.max_depth, self.depth)
+        try:
+            yield
+        finally:
+            self.depth -= 1
+            self.exited += 1
+
+
+@pytest.mark.asyncio
+async def test_device_session_delegates_to_android() -> None:
+    """The INVERSE of the browser passthroughs (like ``eval_in_webview``):
+    ``device_session`` routes to the ANDROID backend — the engine that owns the single
+    redroid — never patchright. Usable directly as ``async with``."""
+    patchright = _FakeDeviceSessionBackend(tag="pw")
+    android = _FakeDeviceSessionBackend(tag="droid")
+    router = SolverRouter(
+        patchright=patchright,  # type: ignore[arg-type]
+        android=android,  # type: ignore[arg-type]
+        engine_by_source={},
+    )
+    async with router.device_session():
+        assert android.entered == 1  # the android lease was taken
+        assert android.depth == 1
+        assert patchright.entered == 0  # browser engine NEVER holds the device lease
+    assert android.exited == 1  # cleanly unwound
+    assert patchright.entered == 0
 
 
 @pytest.mark.asyncio

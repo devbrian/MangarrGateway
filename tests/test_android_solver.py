@@ -816,3 +816,171 @@ async def test_start_then_aclose_cancels_refresh_task() -> None:
     await solver.aclose()
     assert task.cancelled() or task.done()
     assert solver._refresh_task is None
+
+
+# ── bug 4 Fix B: gateway-side device-op serialization (no `503 solver busy`) ────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_concurrent_evals_do_not_overlap_device_ops() -> None:
+    """Fix B: two concurrent ``eval_in_webview`` calls QUEUE on the single
+    ``_device_lock`` — the second's sidecar POST starts only after the first's
+    completes (max in-flight is ever 1, never 2), so the gateway never storms the
+    sidecar into `503 solver busy` with its own coordinated evals."""
+    inflight = 0
+    max_inflight = 0
+    entered = asyncio.Semaphore(0)
+    release = asyncio.Event()
+
+    async def _gated(request: httpx.Request) -> httpx.Response:
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        entered.release()
+        await release.wait()
+        inflight -= 1
+        return httpx.Response(200, json={"value": 1})
+
+    respx.post(f"{_SIDECAR}/eval").mock(side_effect=_gated)
+    solver = _solver()
+    try:
+        t1 = asyncio.create_task(solver.eval_in_webview(_EVAL_URL, "j1"))
+        t2 = asyncio.create_task(solver.eval_in_webview(_EVAL_URL, "j2"))
+        await entered.acquire()  # the FIRST eval is inside the sidecar handler
+        await asyncio.sleep(0.05)  # the second must be blocked on _device_lock
+        assert inflight == 1  # only one device op in flight
+        assert max_inflight == 1
+        release.set()
+        await asyncio.gather(t1, t2)
+    finally:
+        await solver.aclose()
+    assert max_inflight == 1  # never two overlapping device ops
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_concurrent_solve_and_eval_serialize_on_the_device() -> None:
+    """Fix B: a concurrent ``_solve`` (via get_clearance) and ``eval_in_webview``
+    likewise serialize — one device op at a time across BOTH sidecar endpoints."""
+    inflight = 0
+    max_inflight = 0
+    release = asyncio.Event()
+
+    async def _gated_solve(request: httpx.Request) -> httpx.Response:
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        await release.wait()
+        inflight -= 1
+        return _solve_response()
+
+    async def _gated_eval(request: httpx.Request) -> httpx.Response:
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        await release.wait()
+        inflight -= 1
+        return httpx.Response(200, json={"value": 1})
+
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_gated_solve)
+    respx.post(f"{_SIDECAR}/eval").mock(side_effect=_gated_eval)
+    solver = _solver()
+    try:
+        t1 = asyncio.create_task(solver.get_clearance("mangadot", force_resolve=True))
+        t2 = asyncio.create_task(solver.eval_in_webview(_EVAL_URL, "j1"))
+        await asyncio.sleep(0.05)  # one acquires the lock, the other queues behind it
+        assert max_inflight == 1
+        release.set()
+        await asyncio.gather(t1, t2)
+    finally:
+        await solver.aclose()
+    assert max_inflight == 1  # solve + eval never overlapped on the one device
+
+
+@pytest.mark.asyncio
+async def test_device_op_acquire_timeout_raises_clean_runtimeerror() -> None:
+    """Fix B: a ``_device_op`` acquire that cannot be satisfied within
+    ``_device_acquire_timeout_s`` raises a clean ``RuntimeError`` naming device
+    contention rather than hanging unboundedly."""
+    solver = _solver()
+    solver._device_acquire_timeout_s = 0.05
+    await solver._device_lock.acquire()  # hold the device so the next acquire times out
+    try:
+        with pytest.raises(RuntimeError, match="device contention"):
+            async with solver._device_op():
+                pass  # pragma: no cover — the acquire never succeeds
+    finally:
+        solver._device_lock.release()
+        await solver.aclose()
+    # The timed-out acquire did NOT leave the lock held (it was never ours).
+    assert not solver._device_lock.locked()
+
+
+# ── bug 4 Fix C: device_session lease + proactive-refresh deferral ─────────────
+
+
+@pytest.mark.asyncio
+async def test_device_session_counts_and_unwinds_including_nested_and_exception() -> (
+    None
+):
+    """Fix C: ``device_session`` increments then decrements ``_foreground_inflight``
+    (back to 0 on exit, INCLUDING on exception); nested sessions stack and unwind."""
+    solver = _solver()
+    try:
+        assert solver._foreground_inflight == 0
+        async with solver.device_session():
+            assert solver._foreground_inflight == 1
+            async with solver.device_session():
+                assert solver._foreground_inflight == 2  # nested sessions stack
+            assert solver._foreground_inflight == 1
+        assert solver._foreground_inflight == 0
+        with pytest.raises(ValueError, match="boom"):
+            async with solver.device_session():
+                assert solver._foreground_inflight == 1
+                raise ValueError("boom")
+        assert solver._foreground_inflight == 0  # decremented even on exception
+    finally:
+        await solver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_device_session_clean_when_unconfigured() -> None:
+    """Fix C: an unconfigured backend (base_url None) still enters/exits the lease
+    cleanly — the gate / CI / a local box without redroid path is unchanged (the
+    evals inside would raise RuntimeError anyway; the lease is just a counter)."""
+    solver = _solver(base_url=None)
+    try:
+        async with solver.device_session():
+            assert solver._foreground_inflight == 1
+        assert solver._foreground_inflight == 0
+    finally:
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_defers_while_foreground_session_held() -> None:
+    """Fix C: ``_refresh_tick`` performs NO solve and returns the short defer delay
+    while ``_foreground_inflight > 0``; once the session exits, a subsequent tick
+    re-mints the expiring key normally (the deferral is not a permanent skip)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        return_value=_solve_response(token="fresh-token", expires=time.time() + 99999)
+    )
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "stale-token"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() + 30.0  # inside lead → expiring
+    try:
+        async with solver.device_session():
+            delay = await solver._refresh_tick()
+            assert delay == solver._refresh_min_sleep_s  # deferred to a short re-check
+            assert not route.called  # NO solve while a foreground session holds device
+        # Session exited → the next tick re-mints normally.
+        await solver._refresh_tick()
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1
+    assert solver._held["mangadot"].cookies == {"cf_clearance": "fresh-token"}
