@@ -180,6 +180,19 @@ _EGRESS_READ_JS = "document.body.innerText"
 # command id distinct from the solve path's ``_*_CMD_ID`` values above so the
 # eval's Runtime.evaluate response never aliases an in-flight solve frame.
 _EVAL_CMD_ID = 400
+_EVAL_NAV_CMD_ID = 401  # Page.navigate to the challenge_url before the eval runs
+_EVAL_HYDRATION_CMD_ID = 402  # env-*.js Resource-Timing SPA-readiness probe
+_EVAL_WAIT_FOR_CMD_ID = 403  # the optional caller-supplied wait_for JS predicate
+# SPA-ready signal (spike 021 A1): comix's ``env-*.js`` module appears in the
+# Resource-Timing buffer once the SPA has hydrated enough to run the in-page
+# extractors. Polled (bounded by the eval deadline) before running the gateway js.
+_EVAL_HYDRATION_JS = (
+    "performance.getEntriesByType('resource')"
+    ".some(function(e){return /env-.*\\.js/.test(e.name);})"
+)
+# Settle floor before the env-*.js readiness poll, mirroring the solve path's
+# launch-settle before the devtools socket is driven.
+_EVAL_HYDRATION_TIMEOUT_S = 20.0
 
 
 class SolveError(RuntimeError):
@@ -387,11 +400,124 @@ class AndroidSolvePipeline:
         wait_for: str | None = None,
         deadline: float | None = None,
     ) -> Any:
-        # Declared interface-first so the SolvePipeline Protocol is satisfied and
-        # the service layer type-checks. The real CDP eval primitive (navigate →
-        # hydration-wait → Runtime.evaluate(awaitPromise:true) → marshal) lands in
-        # Task 2.
-        raise NotImplementedError("eval_in_webview is implemented in Task 2")
+        """Run ``js`` in the warm cleared WebView and return its marshalled value.
+
+        Re-uses the already-Turnstile-cleared WebView from the prior ``/solve`` — it
+        deliberately does NOT ``force_stop_and_clear`` (that would wipe the cookie
+        jar and re-trigger the challenge). Mirrors ``_drive_solve``'s scaffolding
+        minus the tap/egress machinery: re-forward devtools (torn down in a
+        ``finally`` on EVERY exit, #275) → CDP ``Page.navigate`` the ``challenge_url``
+        → poll for SPA hydration (``env-*.js`` in Resource-Timing + an optional
+        ``wait_for`` JS boolean predicate, returning anyway on the deadline) →
+        ``Runtime.evaluate(awaitPromise:true, returnByValue:true)`` → marshal
+        ``result.result.value``. ``awaitPromise:true`` is the ONE new CDP option over
+        the three existing eval sites (comix's extractors are async; spike 021 A2).
+
+        A4 (research §6): the marshalled value (e.g. a 4,716-row chapter list) is
+        NOT subject to the inbound ``_MAX_BODY_BYTES`` cap — that cap is inbound-only.
+        The CDP ``ws.recv`` reassembles fragmented frames and the stdlib JSON
+        response writer streams the full Content-Length body, so a large result
+        round-trips intact with no transport truncation (offline-proven in the
+        service tests); no in-eval pagination is required.
+
+        ``wait_for`` is a JS boolean EXPRESSION string (NOT a CSS selector) so Plan
+        03 can pass readiness predicates. The ``js`` and the marshalled value are
+        NEVER logged (T-14-04).
+        """
+        if deadline is None:
+            deadline = time.monotonic() + self._timeout_s
+        # Re-use the warm cleared WebView — connect only (NO force_stop_and_clear).
+        self._device.connect()
+        _raise_if_cancelled(cancel)
+        pid = self._device.pidof()
+        _raise_if_cancelled(cancel)
+        port = self._device.forward_devtools(pid)
+        # #275: from the moment the adb/CDP forward exists, tear it down in a finally
+        # on EVERY exit — success, failure, timeout, AND cancellation.
+        try:
+            _raise_if_cancelled(cancel)
+            ws_url = self._discover_page_ws(port)
+            _raise_if_cancelled(cancel)
+            ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
+            try:
+                cdp_call(ws, "Page.enable", command_id=10)
+                cdp_call(ws, "DOM.enable", command_id=11)
+                cdp_call(
+                    ws,
+                    "Page.navigate",
+                    {"url": challenge_url},
+                    command_id=_EVAL_NAV_CMD_ID,
+                )
+                self._wait_for_hydration(ws, wait_for, cancel, deadline)
+                _raise_if_cancelled(cancel)
+                # awaitPromise:true is the ONLY new option over the existing eval
+                # sites — comix's extractors wrap an async ``import()`` IIFE.
+                result = cdp_call(
+                    ws,
+                    "Runtime.evaluate",
+                    {
+                        "expression": js,
+                        "returnByValue": True,
+                        "awaitPromise": True,
+                    },
+                    command_id=_EVAL_CMD_ID,
+                )
+                return result.get("result", {}).get("value")
+            finally:
+                ws.close()
+        finally:
+            self._remove_forward_quietly(port)
+
+    def _wait_for_hydration(
+        self,
+        ws: WebSocketLike,
+        wait_for: str | None,
+        cancel: Event | None,
+        deadline: float,
+    ) -> None:
+        """Poll until the comix SPA has hydrated, bounded by ``deadline``.
+
+        Readiness = ``env-*.js`` present in the Resource-Timing buffer (the SPA-ready
+        signal, spike 021 A1) AND, when ``wait_for`` is supplied, that JS boolean
+        predicate is truthy. Returns anyway on the deadline (does NOT hard-fail) —
+        comix routes by hid and the slug is cosmetic, so a cosmetic-readiness miss
+        must not abort an otherwise-runnable eval (spike 021). The wait is also
+        bounded by ``_EVAL_HYDRATION_TIMEOUT_S`` so it never consumes the whole eval
+        budget waiting on a signal that will not appear.
+        """
+        hydration_deadline = min(
+            deadline, time.monotonic() + _EVAL_HYDRATION_TIMEOUT_S
+        )
+        while time.monotonic() < hydration_deadline:
+            _raise_if_cancelled(cancel)
+            ready = self._eval_bool(ws, _EVAL_HYDRATION_JS, _EVAL_HYDRATION_CMD_ID)
+            if ready and (
+                wait_for is None
+                or self._eval_bool(ws, wait_for, _EVAL_WAIT_FOR_CMD_ID)
+            ):
+                return
+            time.sleep(self._poll_interval_s)
+        _log.warning(
+            "comix SPA hydration signal not seen before eval deadline; "
+            "running the eval anyway"
+        )
+
+    def _eval_bool(self, ws: WebSocketLike, expression: str, command_id: int) -> bool:
+        """Evaluate a JS boolean predicate; any CDP/eval error is treated as False.
+
+        Fail-open like ``_in_verification`` — a transient CDP hiccup on a readiness
+        probe must never abort the eval; it just means "not ready yet, keep polling".
+        """
+        try:
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {"expression": expression, "returnByValue": True},
+                command_id=command_id,
+            )
+        except Exception:  # noqa: BLE001 — a readiness probe must never abort the eval
+            return False
+        return bool(result.get("result", {}).get("value"))
 
     def _solve(
         self,
