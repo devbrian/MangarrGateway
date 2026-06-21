@@ -183,6 +183,8 @@ _EVAL_CMD_ID = 400
 _EVAL_NAV_CMD_ID = 401  # Page.navigate to the challenge_url before the eval runs
 _EVAL_HYDRATION_CMD_ID = 402  # env-*.js Resource-Timing SPA-readiness probe
 _EVAL_WAIT_FOR_CMD_ID = 403  # the optional caller-supplied wait_for JS predicate
+_EVAL_LOCATION_CMD_ID = 404  # location.host probe for the already-hydrated fast path
+_EVAL_FRAME_TREE_CMD_ID = 405  # Page.getFrameTree CF-interstitial probe (bug 3)
 # SPA-ready signal (spike 021 A1): comix's ``env-*.js`` module appears in the
 # Resource-Timing buffer once the SPA has hydrated enough to run the in-page
 # extractors. Polled (bounded by the eval deadline) before running the gateway js.
@@ -406,14 +408,30 @@ class AndroidSolvePipeline:
 
         Re-uses the already-Turnstile-cleared WebView from the prior ``/solve`` — it
         deliberately does NOT ``force_stop_and_clear`` (that would wipe the cookie
-        jar and re-trigger the challenge). Mirrors ``_drive_solve``'s scaffolding
-        minus the tap machinery: re-forward devtools (torn down in a ``finally`` on
-        EVERY exit, #275) → CDP ``Page.navigate`` the ``challenge_url`` → poll for SPA
-        hydration (``env-*.js`` in Resource-Timing + an optional ``wait_for`` JS
-        boolean predicate, returning anyway on the deadline) →
+        jar and re-trigger the challenge). Re-forwards devtools (torn down in a
+        ``finally`` on EVERY exit, #275), then guarantees the WebView is on a
+        CF-cleared, HYDRATED comix page BEFORE ``Runtime.evaluate``:
+
+          * FAST PATH (spike 021, the common case — a comix ``/solve`` runs right
+            before each comix eval and leaves the page cleared): when the warm WebView
+            is ALREADY on a hydrated, non-challenged comix page for ``host``, eval
+            DIRECTLY with NO ``Page.navigate`` and NO tap. A re-navigation reloads the
+            page and re-triggers comix's MANAGED Cloudflare challenge (bug 3: the
+            cf_clearance COOKIE alone does NOT pass a fresh top-level load), so the
+            needless re-nav is skipped.
+          * CLEAR-IF-CHALLENGED (fallback — wrong page/host, or the proxied path's
+            egress-verify navigated the page away): ``Page.navigate`` the
+            ``challenge_url``, and if comix re-challenges, clear the interstitial with
+            the SAME Turnstile tap machinery ``/solve`` uses (``_wait_for_cf_frame`` +
+            ``_compute_scales`` + ``_tap_until_cleared``) before proceeding.
+
+        Then polls for SPA hydration (``env-*.js`` in Resource-Timing + an optional
+        ``wait_for`` JS boolean predicate, returning anyway on the deadline) →
         ``Runtime.evaluate(awaitPromise:true, returnByValue:true)`` → marshal
         ``result.result.value``. ``awaitPromise:true`` is the ONE new CDP option over
         the three existing eval sites (comix's extractors are async; spike 021 A2).
+        The clearance minted/observed during a clear-if-challenged is NEVER logged or
+        returned (T-14-04) — the eval returns only the JS value.
 
         When ``proxy`` is supplied the eval navigation egresses through the SAME
         per-solve authenticated hop + egress-verify the proxied ``/solve`` uses, so
@@ -492,15 +510,23 @@ class AndroidSolvePipeline:
         deadline: float,
         expected_egress_ip: str,
     ) -> Any:
-        """Forward devtools → (egress-verify when proxied) → navigate → eval.
+        """Forward devtools → (egress-verify) → ensure cleared+hydrated → eval.
 
         When ``expected_egress_ip`` is non-empty (proxied path) the WebView's observed
         egress is read in-browser and asserted to equal it BEFORE the eval runs (Req 3
         / T-11-01 parity with ``_drive_solve``); a mismatch or transient echo failure
         raises with NO eval result — a silently-bypassed proxy must NOT eval against a
         wrong-IP (re-challenged) session. When it is ``""`` (no-proxy path) the
-        egress-verify is skipped and this flow is byte-for-byte today's direct-egress
-        eval (D-08). The device is already connected by the caller.
+        egress-verify is skipped (D-08). The device is already connected by the caller.
+
+        Bug 3: comix re-challenges a fresh top-level load, so the eval does NOT blindly
+        re-navigate. If the warm WebView is already on a cleared, hydrated comix page
+        (the spike-021 fast path the prior /solve leaves alive) the eval runs DIRECTLY
+        with no re-nav and no tap. Otherwise — wrong page/host, or the egress-verify
+        navigated the page AWAY to the ip echo — it navigates to ``challenge_url`` and,
+        if comix re-challenges, clears the interstitial with ``/solve``'s tap machinery
+        BEFORE waiting for hydration. The clear/hydrate therefore always happens AFTER
+        any egress-verify nav-away, so the eval never runs against a re-challenged page.
         """
         pid = self._device.pidof()
         _raise_if_cancelled(cancel)
@@ -515,12 +541,14 @@ class AndroidSolvePipeline:
             try:
                 cdp_call(ws, "Page.enable", command_id=10)
                 cdp_call(ws, "DOM.enable", command_id=11)
+                navigated_away = False
                 if expected_egress_ip:
                     # Req 3 / T-11-01 parity: prove the WebView egresses through the
                     # verified proxy IP BEFORE running the eval. Mismatch/transient
                     # echo failure ⇒ no eval. The egress-verify navigates AWAY to the
-                    # ip echo, so the eval's own ``Page.navigate`` below returns to the
-                    # challenge under the now-verified egress.
+                    # ip echo, so the cleared+hydrated comix page MUST be re-established
+                    # below (a fresh nav comix re-challenges) — never take the
+                    # already-hydrated fast path on this path.
                     observed = self._observe_webview_egress(ws, cancel)
                     if observed != expected_egress_ip:
                         # WR-02 parity: byte-equal egress assertion REQUIRES a STICKY
@@ -536,13 +564,28 @@ class AndroidSolvePipeline:
                             f"one exit IP across connections"
                         )
                     _log.info("verified proxied WebView egress %s for eval", observed)
-                cdp_call(
-                    ws,
-                    "Page.navigate",
-                    {"url": challenge_url},
-                    command_id=_EVAL_NAV_CMD_ID,
-                )
-                self._wait_for_hydration(ws, wait_for, cancel, deadline)
+                    navigated_away = True
+                # Bug 3: a fresh Page.navigate reloads the page and re-triggers comix's
+                # MANAGED Cloudflare challenge (the cf_clearance COOKIE alone does NOT
+                # pass a top-level reload), and /eval — unlike /solve — never taps to
+                # clear it, so a blind re-nav left every comix eval running against the
+                # "Just a moment..." interstitial (empty result). FAST PATH: when the
+                # warm WebView is ALREADY on the cleared, hydrated comix page the prior
+                # /solve left alive, eval directly with NO re-nav and NO tap.
+                if not navigated_away and self._is_hydrated_comix_page(ws, host):
+                    self._wait_for_hydration(ws, wait_for, cancel, deadline)
+                else:
+                    # Re-navigation required (wrong page/host, or the egress-verify
+                    # navigated the page away). comix re-challenges the fresh load,
+                    # so clear it with /solve's tap machinery before hydrating.
+                    cdp_call(
+                        ws,
+                        "Page.navigate",
+                        {"url": challenge_url},
+                        command_id=_EVAL_NAV_CMD_ID,
+                    )
+                    self._clear_challenge_if_present(ws, ws_url, host, cancel, deadline)
+                    self._wait_for_hydration(ws, wait_for, cancel, deadline)
                 _raise_if_cancelled(cancel)
                 # awaitPromise:true is the ONLY new option over the existing eval
                 # sites — comix's extractors wrap an async ``import()`` IIFE.
@@ -561,6 +604,77 @@ class AndroidSolvePipeline:
                 ws.close()
         finally:
             self._remove_forward_quietly(port)
+
+    def _is_hydrated_comix_page(self, ws: WebSocketLike, host: str) -> bool:
+        """True when the warm WebView is ALREADY on a cleared, hydrated ``host`` page.
+
+        The spike-021 fast path: the prior ``/solve`` leaves the WebView alive on the
+        cleared comix page (``env-*.js`` in Resource-Timing, NO CF interstitial). When
+        ALL three hold — current ``location.host`` == ``host`` AND ``env-*.js`` present
+        AND NOT a CF interstitial — the eval runs with NO ``Page.navigate`` and NO tap,
+        avoiding the reload that re-triggers comix's managed challenge (bug 3). Any
+        probe failure ⇒ ``False`` (take the safe re-nav + clear-if-challenged path).
+        """
+        try:
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {"expression": "location.host", "returnByValue": True},
+                command_id=_EVAL_LOCATION_CMD_ID,
+            )
+        except Exception:  # noqa: BLE001 — a probe error ⇒ take the safe re-nav path
+            return False
+        current = result.get("result", {}).get("value")
+        if not isinstance(current, str) or current.lower() != host.lower():
+            return False
+        if self._cf_frame_present(ws):
+            return False
+        return self._eval_bool(ws, _EVAL_HYDRATION_JS, _EVAL_HYDRATION_CMD_ID)
+
+    def _cf_frame_present(self, ws: WebSocketLike) -> bool:
+        """True when the page is a CF interstitial — the ``challenges.cloudflare.com``
+        OOPIF is in the frame tree (the SAME ``_CF_FRAME_URL_MARKER`` /
+        ``_frame_tree_has_cf`` the solve path's ``_wait_for_cf_frame`` uses, not a new
+        detector). Any CDP error is treated as 'not a CF interstitial' (fail-open to
+        the safe re-nav path; never a token-bearing decision).
+        """
+        try:
+            tree = cdp_call(ws, "Page.getFrameTree", command_id=_EVAL_FRAME_TREE_CMD_ID)
+        except Exception:  # noqa: BLE001 — a probe error must not abort the eval
+            return False
+        return self._frame_tree_has_cf(tree.get("frameTree"))
+
+    def _clear_challenge_if_present(
+        self,
+        ws: WebSocketLike,
+        ws_url: str,
+        host: str,
+        cancel: Event | None,
+        deadline: float,
+    ) -> None:
+        """Clear the CF interstitial after a fresh eval nav, if comix re-challenged.
+
+        comix re-challenges a fresh top-level load (the cf_clearance COOKIE alone does
+        NOT pass a reload — bug 3), and on the proxied path the egress-verify navigates
+        the page away, so a re-nav is always freshly challenged. Wait for the Cloudflare
+        OOPIF (the solve path's ``_wait_for_cf_frame``); if it is a CF interstitial,
+        drive the SAME tap machinery ``/solve`` uses (``_compute_scales`` +
+        ``_tap_until_cleared`` — NOT a forked implementation) to clear it. If no
+        challenge frame appears (the warm clearance still passed the nav) there is
+        nothing to clear. The clearance minted/observed here is NEVER logged or returned
+        (T-14-04) — clearing is the only goal; the eval returns just the JS value.
+        """
+        self._wait_for_cf_frame(ws, cancel)
+        if not self._cf_frame_present(ws):
+            return
+        x_scale, y_scale = self._compute_scales(ws)
+        minted = self._tap_until_cleared(
+            ws, ws_url, host, x_scale, y_scale, deadline, cancel
+        )
+        if minted is None:
+            raise SolveError(
+                f"could not clear CF challenge for {host} before the eval deadline"
+            )
 
     def _wait_for_hydration(
         self,
