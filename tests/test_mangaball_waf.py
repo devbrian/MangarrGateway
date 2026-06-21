@@ -343,6 +343,9 @@ async def test_trigger_only_query_returns_empty_with_single_post() -> None:
 # surface it via a soft ``ctx.warn`` (rides the success path → shows in the response
 # ``warnings[]`` WITHOUT feeding the cooldown). Otherwise a silent coverage loss —
 # or a NEW WAF trigger word our denylist misses — looks identical to a real 0-results.
+# A RECOVERED block (sanitized retry returned results) is the exception: it surfaces
+# NO warning, because a query that ends up succeeding must not report an error to the
+# API consumer (user decision, debug waf-metropolitan-system).
 
 
 def _waf_warnings(ctx: SourceContext) -> list[tuple[str, str]]:
@@ -390,17 +393,19 @@ async def test_sanitized_retry_still_blocked_surfaces_soft_warning() -> None:
 
 
 @pytest.mark.asyncio
-async def test_recovered_waf_surfaces_soft_warning() -> None:
-    # A recovered block returned results, but for a DEGRADED (sanitized) query — so it
-    # STILL surfaces a soft warning disclosing the fallback (results are approximate,
-    # not an exact-query match). The warning rides the success path → no cooldown.
+async def test_recovered_waf_surfaces_no_warning() -> None:
+    # A query that SUCCEEDS after the sanitize-and-retry surfaces NO warning/error to
+    # the API consumer (user decision, debug waf-metropolitan-system). The sanitized
+    # retry returned results, so the recovery is silent on the response warnings[] —
+    # only the genuinely-failed paths ([] results) still warn. The recovery is logged
+    # internally, not surfaced.
     transport = _source_transport(search_responses=[_waf_403(), _titles_200()])
     ctx = _ctx(transport)
     releases = await MangaBallSource().search(
         SearchRequest(type="manga", query="Solo Leveling System"), ctx
     )
     assert releases  # recovered
-    assert len(_waf_warnings(ctx)) == 1
+    assert _waf_warnings(ctx) == []  # success after retry → no API warning
 
 
 @pytest.mark.asyncio
