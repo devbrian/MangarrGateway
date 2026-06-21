@@ -170,7 +170,7 @@ services:
       # against (the strict-Turnstile sources). Anything else → 422. mangaball.net
       # joined 2026-06-15 (#243): its managed challenge is unclearable by desktop
       # Chromium from our Linux fingerprint, same as mangadot/kagane.
-      SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to,mangaball.net"
+      SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to,mangaball.net,comix.to"
       # Per-solve wall-clock cap (an Android WebView solve is slower than desktop).
       SOLVER_SOLVE_TIMEOUT_S: "120"
     restart: unless-stopped
