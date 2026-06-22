@@ -209,6 +209,11 @@ _EVAL_HYDRATION_CMD_ID = 402  # env-*.js Resource-Timing SPA-readiness probe
 _EVAL_WAIT_FOR_CMD_ID = 403  # the optional caller-supplied wait_for JS predicate
 _EVAL_LOCATION_CMD_ID = 404  # location.host probe for the already-hydrated fast path
 _EVAL_FRAME_TREE_CMD_ID = 405  # Page.getFrameTree CF-interstitial probe (bug 3)
+# Bound on the in-page eval-throw summary surfaced by ``EvalError`` (Mode-E). The
+# summary is the JS error's first description line only — never the ``js`` or the
+# marshalled value (T-14-04); the cap keeps a hostile/verbose stack from bloating a
+# log line.
+_EVAL_EXC_SUMMARY_MAX = 300
 # SPA-ready signal (spike 021 A1): comix's ``env-*.js`` module appears in the
 # Resource-Timing buffer once the SPA has hydrated enough to run the in-page
 # extractors. Polled (bounded by the eval deadline) before running the gateway js.
@@ -231,6 +236,27 @@ class SolveCancelled(RuntimeError):
     Raised by the pipeline when it observes the cancel signal at one of its
     adb/CDP checkpoints. The pipeline resets the device on its way out so the next
     solve starts clean; the service treats it as a (clean) post-timeout exit.
+    """
+
+
+class EvalError(RuntimeError):
+    """An in-page ``/eval`` JS expression THREW (its promise rejected).
+
+    ``Runtime.evaluate(awaitPromise:true)`` returns a successful CDP response with
+    an ``exceptionDetails`` block (and NO ``result.value``) when the evaluated
+    promise rejects. Without this the sidecar marshalled the absent value as
+    ``None`` and returned ``200 {"value": null}`` — which the gateway's tolerant
+    extractors (``_result_items`` / ``_chapter_list``) silently coerce to ``[]``,
+    so a transient in-page failure (a hydration race where ``env-*.js`` is not yet
+    importable, a momentary CF re-challenge, or an ``api.list`` network blip)
+    became a FAST, WARNING-LESS zero-result search that was then cached as a sticky
+    negative (Mode-E, debug ``comix-warm-hydration-wait``). Raising instead surfaces
+    the throw as a ``504`` the gateway propagates → the per-source fan-out emits a
+    warning, the empty is NEVER cached (``SingleFlightCache`` never caches a raise),
+    and the next search self-heals. A GENUINE empty (the promise RESOLVES with an
+    empty envelope, no ``exceptionDetails``) is unaffected — it returns ``[]`` as
+    before. The summary message is bounded + first-line-only and NEVER carries the
+    evaluated ``js`` or the marshalled value (T-14-04).
     """
 
 
@@ -541,6 +567,38 @@ class AndroidSolvePipeline:
         finally:
             self._clear_proxy_quietly()
 
+    @staticmethod
+    def _raise_if_eval_threw(result: dict[str, Any]) -> None:
+        """Raise :class:`EvalError` if a ``Runtime.evaluate`` response shows a throw.
+
+        ``Runtime.evaluate(awaitPromise:true)`` reports a rejected in-page promise via
+        an ``exceptionDetails`` block on an otherwise-200 response (Mode-E root cause).
+        The summary is built from the JS error's first description line (or its class /
+        the top-level ``text``), bounded to ``_EVAL_EXC_SUMMARY_MAX`` chars — CDP does
+        NOT echo the evaluated ``expression`` in ``exceptionDetails``, and the gateway's
+        own extractor throws are token-free, so the summary carries neither the ``js``
+        nor the marshalled value (T-14-04). A response with no ``exceptionDetails`` (the
+        common case, INCLUDING a promise that resolved with an empty envelope) is a
+        no-op.
+        """
+        details = result.get("exceptionDetails")
+        if not details:
+            return
+        exception = details.get("exception") if isinstance(details, dict) else None
+        summary = ""
+        if isinstance(exception, dict):
+            description = exception.get("description")
+            if isinstance(description, str) and description:
+                summary = description.splitlines()[0]
+            elif isinstance(exception.get("className"), str):
+                summary = str(exception["className"])
+        if not summary and isinstance(details, dict):
+            text = details.get("text")
+            if isinstance(text, str):
+                summary = text
+        summary = (summary or "in-page promise rejected")[:_EVAL_EXC_SUMMARY_MAX]
+        raise EvalError(f"in-page eval threw: {summary}")
+
     def _drive_eval(
         self,
         challenge_url: str,
@@ -649,6 +707,13 @@ class AndroidSolvePipeline:
                     },
                     command_id=_EVAL_CMD_ID,
                 )
+                # Mode-E (debug comix-warm-hydration-wait): a REJECTED in-page promise
+                # comes back as a successful CDP response carrying ``exceptionDetails``
+                # and NO ``result.value``. Detect it and RAISE — otherwise the absent
+                # value marshals to ``None`` and the gateway silently coerces it to an
+                # empty (warning-less, sticky-cached) zero-result search. A throw is a
+                # transient failure, not a genuine empty.
+                self._raise_if_eval_threw(result)
                 value = result.get("result", {}).get("value")
                 if not with_clearance:
                     return value

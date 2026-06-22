@@ -123,12 +123,18 @@ class FakeCdp:
         cf_present: bool,
         egress_body: object = None,
         eval_value: object = "RESULT",
+        eval_exception: dict[str, object] | None = None,
     ) -> None:
         self.location_host = location_host
         self.env_ready = env_ready
         self.cf_present = cf_present
         self.egress_body = egress_body
         self.eval_value = eval_value
+        # Mode-E: when set, the extractor ``Runtime.evaluate`` (``_EVAL_CMD_ID``)
+        # answers with an ``exceptionDetails`` block (a rejected in-page promise) and
+        # NO ``result.value`` — exactly what CDP returns for a throw under
+        # ``awaitPromise:true``.
+        self.eval_exception = eval_exception
         self.navigations: list[str] = []
 
     def __call__(self, ws, method, params=None, *, command_id):  # type: ignore[no-untyped-def]
@@ -159,6 +165,13 @@ class FakeCdp:
             if command_id == service._EVAL_WAIT_FOR_CMD_ID:
                 return {"result": {"value": True}}
             if command_id == service._EVAL_CMD_ID:
+                if self.eval_exception is not None:
+                    # A rejected in-page promise: CDP returns exceptionDetails and the
+                    # result carries NO value (type "undefined").
+                    return {
+                        "result": {"type": "undefined"},
+                        "exceptionDetails": self.eval_exception,
+                    }
                 return {"result": {"value": self.eval_value}}
             if command_id == service._EGRESS_READ_CMD_ID:
                 return {"result": {"value": self.egress_body}}
@@ -245,6 +258,72 @@ def test_already_hydrated_eval_skips_nav_and_tap(
     assert value == {"chapters": [1, 2, 3]}
     assert fake.navigations == []  # bug 3 fast path: NO needless re-navigation
     assert device.taps == []  # already cleared: NO tap
+
+
+# ── Mode-E: a REJECTED in-page promise must RAISE, not marshal to a swallowed empty ─
+
+
+def test_eval_raises_when_inpage_promise_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mode-E root cause (debug comix-warm-hydration-wait): when the extractor's
+    in-page promise REJECTS, ``Runtime.evaluate(awaitPromise:true)`` returns
+    ``exceptionDetails`` and NO ``result.value``. The pipeline must RAISE ``EvalError``
+    rather than marshal the absent value to ``None`` — otherwise the gateway's tolerant
+    extractors coerce ``None`` to ``[]`` and a transient eval throw becomes a fast,
+    warning-less, sticky-cached zero-result search.
+
+    The raised summary is bounded + first-line-only and carries NEITHER the evaluated
+    ``js`` NOR the marshalled value (T-14-04) — only the JS error's first line.
+    """
+    device = FakeDevice()
+    fake = FakeCdp(
+        location_host="comix.to",
+        env_ready=True,
+        cf_present=False,
+        eval_exception={
+            "text": "Uncaught (in promise)",
+            "exception": {
+                "className": "Error",
+                "description": (
+                    "Error: comix: env-*.js module URL not found\n"
+                    "    at <anonymous>:5:11"
+                ),
+            },
+        },
+    )
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=FakeClock(), fake=fake)
+
+    with pytest.raises(service.EvalError) as excinfo:
+        pipeline.eval_in_webview("https://comix.to/", "comix.to", "c.list({})")
+
+    message = str(excinfo.value)
+    # First-line-only summary surfaces the cause for field diagnosis …
+    assert "comix: env-*.js module URL not found" in message
+    # … but never the second stack line, the evaluated js, or a marshalled value.
+    assert "at <anonymous>" not in message
+    assert "c.list" not in message
+
+
+def test_eval_genuine_empty_envelope_is_not_treated_as_a_throw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A promise that RESOLVES with a genuinely-empty envelope (no exceptionDetails)
+    is returned verbatim — only a THROW raises. This keeps a real no-match search
+    (``{"result": {"items": []}}``) flowing as an ordinary empty result."""
+    device = FakeDevice()
+    empty_envelope = {"result": {"items": []}}
+    fake = FakeCdp(
+        location_host="comix.to",
+        env_ready=True,
+        cf_present=False,
+        eval_value=empty_envelope,
+    )
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=FakeClock(), fake=fake)
+
+    value = pipeline.eval_in_webview("https://comix.to/", "comix.to", "c.list({})")
+
+    assert value == empty_envelope  # genuine empty resolves, never raises
 
 
 # ── Bug 5 follow-on #3: with_clearance → eval ALSO extracts the cf_clearance ─────
