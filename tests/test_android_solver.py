@@ -1870,3 +1870,111 @@ async def test_warm_completes_while_foreground_search_waits_at_gate() -> None:
         if not search.done():
             search.cancel()
         await solver.aclose()
+
+
+# ── #3: eval_in_webview emits a real-timed, redacted eval metric (260622-pl9) ──
+
+
+def _eval_solver(**over: object) -> AndroidSolver:
+    """A solver whose challenge map attributes evals to comix (reverse-mapped)."""
+    kwargs: dict[str, object] = {
+        "base_url": _SIDECAR,
+        "api_key": SecretStr("sidecar-secret"),
+        "challenge_urls": {"comix": "https://comix.to/"},
+        "timeout_s": 5.0,
+    }
+    kwargs.update(over)
+    return AndroidSolver(**kwargs)  # type: ignore[arg-type]
+
+
+# Sentinels: if EITHER appears in any emitted metric field the redaction broke.
+_EVAL_JS_SENTINEL = "SENTINEL_JS_must_never_be_recorded_42"
+_EVAL_RESULT_SENTINEL = "SENTINEL_RESULT_must_never_be_recorded_99"
+
+
+@pytest.mark.asyncio
+async def test_eval_in_webview_emits_real_timed_redacted_eval_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through the REAL Collector/InMemoryStore (not a call-asserting mock): a
+    successful eval emits exactly ONE kind="eval" event with duration_ms>0 attributed
+    to comix, and NEITHER the eval js NOR the eval result leaks into any field."""
+    from dataclasses import asdict
+
+    from manga_gateway.metrics.collector import Collector, set_collector
+    from manga_gateway.metrics.context import current_source
+    from manga_gateway.metrics.store import InMemoryStore
+    from tests._metrics_helpers import CapturingRingWriter
+
+    ring = CapturingRingWriter()
+    set_collector(Collector(InMemoryStore(slow_factor=3.0), ring_writer=ring))  # type: ignore[arg-type]
+
+    async def _fake_post_eval(*_a: object, **_k: object) -> dict[str, object]:
+        return {"value": _EVAL_RESULT_SENTINEL}
+
+    solver = _eval_solver()
+    monkeypatch.setattr(solver, "_post_eval", _fake_post_eval)
+    try:
+        result = await solver.eval_in_webview("https://comix.to/", _EVAL_JS_SENTINEL)
+    finally:
+        await solver.aclose()
+        set_collector(None)
+        current_source.set(None)
+
+    assert result == _EVAL_RESULT_SENTINEL  # observability only — value untouched
+
+    evals = [e for e in ring.iter_recent() if e.kind == "eval"]
+    assert len(evals) == 1  # exactly one emit per outer call
+    ev = evals[0]
+    assert ev.outcome == "ok"
+    assert ev.op == "eval"
+    assert ev.source_key == "comix"  # reverse-mapped challenge_url → comix
+    assert ev.duration_ms > 0.0  # real perf_counter timing, not 0ms CACHE
+    assert ev.url is None  # redaction: structurally no js/result/token
+
+    # REDACTION — neither the js nor the eval result appears in ANY field.
+    for field_value in asdict(ev).values():
+        text = str(field_value)
+        assert _EVAL_JS_SENTINEL not in text
+        assert _EVAL_RESULT_SENTINEL not in text
+
+
+@pytest.mark.asyncio
+async def test_eval_in_webview_emits_error_metric_then_reraises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing eval (its _post_eval raises a non-retryable error) emits exactly ONE
+    kind="eval" event with outcome="error" + the exc type name, then the original
+    exception re-raises unchanged."""
+    from manga_gateway.metrics.collector import Collector, set_collector
+    from manga_gateway.metrics.context import current_source
+    from manga_gateway.metrics.store import InMemoryStore
+    from tests._metrics_helpers import CapturingRingWriter
+
+    ring = CapturingRingWriter()
+    set_collector(Collector(InMemoryStore(slow_factor=3.0), ring_writer=ring))  # type: ignore[arg-type]
+
+    class _EvalBoom(RuntimeError):
+        pass
+
+    async def _boom_post_eval(*_a: object, **_k: object) -> dict[str, object]:
+        raise _EvalBoom(_EVAL_RESULT_SENTINEL)
+
+    solver = _eval_solver()
+    monkeypatch.setattr(solver, "_post_eval", _boom_post_eval)
+    try:
+        with pytest.raises(_EvalBoom):
+            await solver.eval_in_webview("https://comix.to/", _EVAL_JS_SENTINEL)
+    finally:
+        await solver.aclose()
+        set_collector(None)
+        current_source.set(None)
+
+    evals = [e for e in ring.iter_recent() if e.kind == "eval"]
+    assert len(evals) == 1
+    ev = evals[0]
+    assert ev.outcome == "error"
+    assert ev.error == "_EvalBoom"
+    assert ev.source_key == "comix"
+    assert ev.duration_ms > 0.0
+    assert ev.url is None
