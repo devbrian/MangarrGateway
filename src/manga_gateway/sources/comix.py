@@ -1042,10 +1042,16 @@ class ComixSource(Source):
     # the shared redroid WebView (search ``c.list``, chapter-list, chapter-pages — it
     # navigates to comix.to once and STAYS there for every ``eval_in_webview`` call),
     # so it is the android source that HOLDS the warm cleared page. The app wiring
-    # passes this key to ``AndroidSolver`` as a ``warm_last_keys`` member so startup
-    # ``warm()`` solves comix LAST — the single redroid ends startup parked on comix's
-    # cleared page (no first-search re-nav) with mangadot/kagane already cleared, so
-    # their proactive refresh won't steal the shared WebView during a comix search.
+    # passes this key to ``AndroidSolver`` as a ``warm_last_keys`` member. Bug 5
+    # follow-on #3 (Option A2): comix is EXCLUDED from the eager ``cf_clearance``
+    # ``/solve`` — that path runs ``pm clear`` (cold-wiping cf_clearance + __cf_bm + the
+    # cached env-*.js) then a cold launch, on which comix's managed CF challenge
+    # presents NO tappable Turnstile and NO cf_clearance, so the solve burns its
+    # deadline AND poisons the warm page comix's eval path needs. Instead startup
+    # EVAL-PRIMES comix LAST (a no-op warm-navigate eval, the proven eval-path clear) so
+    # the single redroid ends startup parked on comix's CLEARED + hydrated page with
+    # mangadot/kagane already solved — the first post-boot search is fast and nothing
+    # steals the shared WebView.
     holds_webview_page = True
     # caps.AntibotLevel already carries this literal (CAPS-02). The framework injects
     # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.

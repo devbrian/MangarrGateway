@@ -220,11 +220,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # Bug 5 perf (warm-ordering): the android source(s) that run their whole sequence
     # as in-page evals and HOLD the warm cleared WebView page (``holds_webview_page`` —
-    # comix). Threaded to AndroidSolver as ``warm_last_keys`` so the startup eager
-    # warm() solves them LAST: the single redroid ends startup parked on the holder's
-    # cleared page (no first-search re-nav) with mangadot/kagane already cleared, so
-    # their proactive refresh won't navigate the shared WebView away during a comix
-    # search. Derived from the class attr exactly like engine_by_source above.
+    # comix). Threaded to AndroidSolver as ``warm_last_keys``. Bug 5 follow-on #3
+    # (Option A2): warm() EXCLUDES these keys from the eager cf_clearance /solve (which
+    # would pm clear + cold-launch and poison the warm page they need) and instead
+    # EVAL-PRIMES them LAST via a no-op warm-navigate eval — so the single redroid ends
+    # startup parked on the holder's CLEARED + hydrated page with mangadot/kagane
+    # already solved, and the first post-boot search is fast (no startup-warm steal).
+    # Derived from the class attr exactly like engine_by_source above.
     webview_page_keys: frozenset[str] = frozenset(
         key
         for key, cls in cf_sources.items()
@@ -396,8 +398,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # warm() skips on-demand android sources (mangaball) — they solve on-demand,
         # never eager (debug pooltimeout-recurrence).
         on_demand_keys=on_demand_keys & android_keys,
-        # Bug 5 perf (warm-ordering): eager-warm the page-holding android key (comix)
-        # LAST so the redroid ends startup parked on its cleared page (see above).
+        # Bug 5 perf (warm-ordering) + follow-on #3 (Option A2): the page-holding
+        # android key (comix) is EXCLUDED from the eager /solve and EVAL-PRIMED last by
+        # warm() instead, so the redroid ends startup parked on its cleared page.
         warm_last_keys=webview_page_keys,
         # Bug 5 Lever A: proactive-refresh-by-age cap (None ⇒ disabled — the default;
         # the operator tunes the VALUE from the measured comix re-challenge cadence).

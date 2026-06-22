@@ -20,7 +20,7 @@ import pytest
 import respx
 from pydantic import SecretStr
 
-from manga_gateway.framework.android_solver import AndroidSolver
+from manga_gateway.framework.android_solver import _WEBVIEW_PRIME_JS, AndroidSolver
 from manga_gateway.framework.antibot import AntiBotSolver, Clearance
 
 _SIDECAR = "http://android-solver:8080"
@@ -1115,20 +1115,37 @@ async def test_warm_solve_defers_when_foreground_lease_held() -> None:
         await solver.aclose()
 
 
+# ── bug 5 follow-on #3 (Option A2): page-holders are EVAL-PRIMED, NOT /solve'd ──
+# The eager cf_clearance /solve runs `pm clear` (cold-wipes the WebView: cf_clearance,
+# __cf_bm, the cached env-*.js) then a cold launch, on which comix's managed CF
+# challenge presents NEITHER a tappable Turnstile OOPIF NOR a host-scoped cf_clearance →
+# the solve burns the full deadline AND poisons the warm page comix's eval path needs.
+# So warm() EXCLUDES the page-holders (holds_webview_page → warm_last_keys) from /solve
+# and instead eval-primes them LAST via a no-op eval over the warm WebView (the proven
+# eval-path clear: warm Page.navigate → interactive OOPIF tap, NO pm clear → hydrated).
+
+
 @respx.mock
 @pytest.mark.asyncio
-async def test_warm_orders_page_holding_keys_last() -> None:
-    """Lever B (warm-ordering): ``warm()`` eager-solves the page-HOLDING keys
-    (``warm_last_keys`` — comix) LAST, preserving ``challenge_urls`` order within each
-    group, so the single redroid ends startup parked on the holder's cleared page with
-    the clearance-only sources already cleared."""
-    order: list[str] = []
+async def test_warm_eval_primes_page_holder_instead_of_solving_it() -> None:
+    """Option A2: ``warm()`` does NOT route the page-HOLDING key (``warm_last_keys`` —
+    comix) through the cf_clearance ``/solve`` (which would ``pm clear`` + cold-launch
+    and poison the warm page). It ``/solve``s ONLY the clearance-only sources (in
+    ``challenge_urls`` order) and EVAL-PRIMES the page-holder LAST — a no-op eval that
+    leaves the warm WebView parked on a cleared+hydrated comix page."""
+    solved: list[str] = []
+    evaled: list[dict[str, object]] = []
 
-    async def _record(request: httpx.Request) -> httpx.Response:
-        order.append(json.loads(request.content)["challenge_url"])
+    async def _record_solve(request: httpx.Request) -> httpx.Response:
+        solved.append(json.loads(request.content)["challenge_url"])
         return _solve_response()
 
-    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_record)
+    async def _record_eval(request: httpx.Request) -> httpx.Response:
+        evaled.append(json.loads(request.content))
+        return httpx.Response(200, json={"value": True})
+
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_record_solve)
+    respx.post(f"{_SIDECAR}/eval").mock(side_effect=_record_eval)
     solver = _solver(
         challenge_urls={
             "comix": "https://comix.to/",
@@ -1142,13 +1159,84 @@ async def test_warm_orders_page_holding_keys_last() -> None:
     finally:
         await solver.aclose()
     assert failed == []
-    # comix (the page holder) is solved LAST; the clearance-only keys keep their
-    # challenge_urls order ahead of it.
-    assert order == [
-        "https://mangadot.net/",
-        "https://kagane.to/",
-        "https://comix.to/",
-    ]
+    # The page-holder (comix) is NEVER /solve'd — only the clearance-only keys are,
+    # in challenge_urls order.
+    assert solved == ["https://mangadot.net/", "https://kagane.to/"]
+    # comix is eval-primed exactly once, with the no-op prime JS and NO wait_for (it
+    # relies only on the solver's env-*.js hydration signal, never a DOM predicate).
+    assert len(evaled) == 1
+    assert evaled[0]["challenge_url"] == "https://comix.to/"
+    assert evaled[0]["js"] == _WEBVIEW_PRIME_JS
+    assert "wait_for" not in evaled[0]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_warm_eval_prime_failure_is_best_effort_not_disabled() -> None:
+    """Option A2: a FAILED page-holder eval-prime (e.g. CF flaky → /eval non-200) must
+    NOT hang startup or mark the source failed (force-disable it). warm() swallows the
+    prime error, completes normally, releases the gate, and reports only genuine
+    /solve failures — comix is left to clear on its first real /search via the same
+    eval path."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    respx.post(f"{_SIDECAR}/eval").mock(return_value=httpx.Response(502))
+    solver = _solver(
+        challenge_urls={
+            "comix": "https://comix.to/",
+            "mangadot": "https://mangadot.net/",
+        },
+        warm_last_keys={"comix"},
+    )
+    try:
+        failed = await solver.warm()
+    finally:
+        await solver.aclose()
+    # The prime failed but comix is NOT reported failed (never force-disabled); the
+    # clearance-only key warmed fine.
+    assert failed == []
+    assert "comix" not in failed
+    assert solver._warm_complete.is_set()  # gate released despite the prime failure
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_warm_gate_released_only_after_page_holder_prime() -> None:
+    """Option A2 × Fix #2: the startup-warm gate (``_warm_complete``) is released ONLY
+    after BOTH the clearance ``/solve`` loop AND the page-holder eval-prime complete —
+    so a parked foreground search proceeds against a device with comix already primed,
+    not mid-prime. Holding the /eval response open keeps ``_warm_complete`` UNSET until
+    the prime returns."""
+    release_eval = asyncio.Event()
+
+    async def _gated_eval(request: httpx.Request) -> httpx.Response:
+        await release_eval.wait()
+        return httpx.Response(200, json={"value": True})
+
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    respx.post(f"{_SIDECAR}/eval").mock(side_effect=_gated_eval)
+    solver = _solver(
+        challenge_urls={
+            "comix": "https://comix.to/",
+            "mangadot": "https://mangadot.net/",
+        },
+        warm_last_keys={"comix"},
+    )
+    warm_task: asyncio.Task[list[str]] | None = None
+    try:
+        warm_task = asyncio.create_task(solver.warm())
+        await asyncio.sleep(0.05)
+        # The clearance /solve is done, but the prime is parked on the gated /eval —
+        # the gate must NOT be released yet (it waits on the prime too).
+        assert not solver._warm_complete.is_set()
+        release_eval.set()  # let the prime complete
+        failed = await asyncio.wait_for(warm_task, timeout=1.0)
+        assert failed == []
+        assert solver._warm_complete.is_set()  # released only after the prime returned
+    finally:
+        release_eval.set()
+        if warm_task is not None and not warm_task.done():
+            warm_task.cancel()
+        await solver.aclose()
 
 
 # ── bug 5 Lever A: proactive-refresh-by-AGE cap (cf_clearance cookie expiry lies) ──

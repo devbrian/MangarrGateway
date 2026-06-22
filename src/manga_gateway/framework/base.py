@@ -81,11 +81,13 @@ class Source(ABC):
     # (default) = a clearance-only android source (mangadot/kagane) that mints a
     # ``cf_clearance`` and lets the httpx leg fetch — it does NOT keep the WebView
     # parked on its page. The app wiring passes the page-HOLDING android keys to
-    # ``AndroidSolver`` as ``warm_last_keys`` so the startup eager ``warm()`` solves
-    # them LAST: the single redroid then ends startup parked on the holder's cleared
-    # page (no first-search re-nav) and the lighter clearance-only sources are already
-    # cleared before the holder takes the page, so their proactive refresh has nothing
-    # due that would navigate the shared WebView away during the holder's first search.
+    # ``AndroidSolver`` as ``warm_last_keys``. Bug 5 follow-on #3 (Option A2): these
+    # keys are EXCLUDED from the eager ``cf_clearance`` ``/solve`` (which would
+    # ``pm clear`` + cold-launch and poison the warm page they depend on) and instead
+    # EVAL-PRIMED LAST in ``warm()`` — a no-op warm-navigate eval that leaves the single
+    # redroid parked on the holder's CLEARED + hydrated page, with the lighter
+    # clearance-only sources already solved first, so the first post-boot search is
+    # fast.
     holds_webview_page: bool = False
     # D-01: the httpx session-prep style the framework resolves into a SessionPrep
     # provider (framework/session_prep.py). ``None`` = no bootstrap (MangaDex/Comix

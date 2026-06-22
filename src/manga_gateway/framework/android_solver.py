@@ -61,6 +61,17 @@ _REFRESH_MAX_SLEEP_S = 600.0
 # of an unbounded hang. Instance attr (so tests can shrink it).
 _DEVICE_ACQUIRE_TIMEOUT_S = 90.0
 
+# Bug 5 follow-on #3 (Option A2): the NO-OP JS expression used to EVAL-PRIME a
+# page-holding source (comix) during ``warm()`` via the EVAL path. The sidecar's
+# ``_drive_eval`` warm-navigates → clears-if-challenged (the interactive Turnstile tap,
+# NO ``pm clear``) → waits for hydration BEFORE running this JS, so evaluating a trivial
+# resolved Promise leaves the shared WebView parked on a CLEARED + hydrated comix page
+# WITHOUT running an extractor or minting a downloadHandle. It is an EXPRESSION (the
+# sidecar runs ``Runtime.evaluate {expression, awaitPromise:true}`` — comix's real
+# extractors are async IIFEs of the same shape), so an async-arrow IIFE that resolves to
+# ``true`` is the minimal valid prime. The ``js`` is never logged (T-14-04).
+_WEBVIEW_PRIME_JS = "(async () => true)()"
+
 
 class _RefreshDeferred(Exception):  # noqa: N818 — control-flow sentinel, not an error
     """Bug 5 Fix (a): a background (proactive-refresh) solve bailed under the device
@@ -423,35 +434,47 @@ class AndroidSolver:
         try/except; the underlying exception is logged with ``exc_info`` (NEVER the
         clearance value).
 
-        Bug 5 perf (warm-ordering): the page-HOLDING keys (``warm_last_keys`` — comix)
-        are solved LAST so the single redroid ends startup parked on the holder's
-        cleared page (no first-search re-nav) with the clearance-only keys already
-        cleared. ``challenge_urls`` order is preserved WITHIN each group, so the only
-        change when ``warm_last_keys`` is empty is none.
+        Bug 5 follow-on #3 (Option A2): the page-HOLDING keys (``warm_last_keys`` —
+        comix) are NOT routed through the ``cf_clearance`` ``/solve`` at all. ``_solve``
+        runs ``force_stop_and_clear`` (``pm clear`` — a COLD storage wipe of the
+        WebView: ``cf_clearance``, ``__cf_bm``, the cached ``env-*.js`` module) then a
+        cold launch, on which comix's managed Cloudflare challenge presents NEITHER a
+        tappable Turnstile OOPIF NOR a host-scoped ``cf_clearance`` → the solve burns
+        the full deadline AND poisons the warm page comix's eval path depends on. comix
+        clears ONLY via the EVAL path (a warm ``Page.navigate`` that RETAINS ``__cf_bm``
+        + the env module → the interactive OOPIF clears in 5-9s). So the page-holders
+        are EVAL-PRIMED LAST instead (:meth:`_prime_webview_page`): a no-op eval over
+        the warm WebView that leaves the single redroid ended startup parked on a
+        CLEARED + hydrated comix page (even the first post-boot search is fast). The
+        clearance-only keys are solved FIRST, in ``challenge_urls`` order.
 
-        Bug 5 Lever B: each eager solve passes ``defer_if_foreground=True`` so a request
-        that arrives DURING startup warm() (claiming a :meth:`device_session` foreground
-        lease) is never robbed of the shared WebView by a queued warm solve — the warm
-        solve BAILS (:class:`_RefreshDeferred`) instead. A deferred key is NOT a fail:
-        it is left unwarmed and solves on-demand on first use (the request that holds
-        the lease) or via the next proactive refresh, so it must NOT be force-disabled.
+        Bug 5 Lever B: each eager clearance solve passes ``defer_if_foreground=True`` so
+        a request that arrives DURING startup warm() (claiming a :meth:`device_session`
+        foreground lease) is never robbed of the shared WebView by a queued warm
+        solve — the warm solve BAILS (:class:`_RefreshDeferred`) instead. A deferred key
+        is NOT a fail: it is left unwarmed and solves on-demand on first use (the
+        request holding the lease) or via the next proactive refresh — NOT disabled.
 
         Bug 5 Fix #2 (startup-warm gate): the completion Event is set in the ``finally``
         on EVERY exit (success, partial failure, OR an outright raise) so a foreground
         android sequence parked at the device door (:meth:`_await_warm_gate`) is ALWAYS
-        released — warm() never hangs a search. Self-arms too, so a direct ``warm()``
-        call (no app lifespan) still gates correctly.
+        released — warm() never hangs a search. Because the gate is released only in
+        this ``finally`` — AFTER both the clearance ``/solve`` loop AND the page-holder
+        eval-prime loop — the gate waits on BOTH readiness sets (the first post-boot
+        search finds every clearance source solved AND comix parked on its cleared
+        page). Self-arms too, so a direct ``warm()`` call (no app lifespan) still gates.
         """
         self._warm_gate_armed = True
         failed: list[str] = []
         try:
-            # Page-holders last; stable within each group (Bug 5 warm-ordering).
-            ordered = [k for k in self._challenge_urls if k not in self._warm_last_keys]
-            ordered += [k for k in self._challenge_urls if k in self._warm_last_keys]
-            for key in ordered:
-                if key in self._on_demand_keys:
-                    # On-demand source: never eager-warm — it solves only when a live
-                    # challenge is detected (debug pooltimeout-recurrence).
+            # (A2 part 1) /solve ONLY the cf_clearance sources (mangadot/kagane/
+            # mangaball) — the page-holders (comix) are EXCLUDED here and eval-primed
+            # below. ``challenge_urls`` order preserved.
+            for key in self._challenge_urls:
+                if key in self._warm_last_keys or key in self._on_demand_keys:
+                    # Page-holder (eval-primed below) or on-demand source (never
+                    # eager-warm — it solves only when a live challenge is detected,
+                    # debug pooltimeout-recurrence): skip the eager /solve.
                     continue
                 try:
                     await self.get_clearance(key, defer_if_foreground=True)
@@ -475,11 +498,78 @@ class AndroidSolver:
                         exc_info=True,
                     )
                     failed.append(key)
+            # (A2 part 2) EVAL-PRIME the page-holders (comix) LAST via the eval path —
+            # NO /solve, NO pm clear. Best-effort: a failed prime is logged and skipped,
+            # NEVER force-disabled (the first real /search clears it via the same eval
+            # path). Page-holders order preserved within the group.
+            for key in self._challenge_urls:
+                if key not in self._warm_last_keys or key in self._on_demand_keys:
+                    continue
+                await self._prime_webview_page(key)
         finally:
             # Bug 5 Fix #2: release the gate on EVERY exit so a parked foreground
             # sequence proceeds whether warm succeeded, partially failed, or raised.
             self._warm_complete.set()
         return failed
+
+    async def _prime_webview_page(self, source_key: str) -> None:
+        """EVAL-PRIME a page-holding source (comix) via the eval path (Bug 5 A2).
+
+        Runs a NO-OP eval (:data:`_WEBVIEW_PRIME_JS`) over the warm WebView so the
+        sidecar's ``_drive_eval`` warm-navigates → clears-if-challenged (the interactive
+        Turnstile tap, NO ``pm clear``) → hydrates the page, leaving the single redroid
+        parked on a CLEARED + hydrated comix page at the end of startup — so even the
+        first post-boot search is fast (no first-search re-clear). It does NOT mint a
+        ``cf_clearance`` cookie (comix's "cleared" state IS the warm hydrated page + the
+        in-page signed env-module API, not a replayable cookie) and does NOT run an
+        extractor or mint a downloadHandle.
+
+        Proxy parity is automatic: this calls :meth:`eval_in_webview`, which forwards
+        ``self._proxy`` into the ``/eval`` body EXACTLY as a real comix ``/search`` eval
+        does (both go through the same method), so the prime nav egresses the SAME
+        residential sticky IP the eval-path clearance is bound to — no egress-verify
+        mismatch. ``wait_for=None`` so the prime relies only on the solver's
+        ``env-*.js`` hydration signal (instant on the warm page), never a DOM probe.
+
+        Deadlock-free: :meth:`eval_in_webview` takes only the per-op ``_device_lock``
+        (via :meth:`_device_op`, ``defer_if_foreground=False``) and NEVER awaits the
+        warm gate (:meth:`_await_warm_gate` is entered only by :meth:`device_session`,
+        which the prime does NOT use) — so a prime that is itself PART of ``warm()``
+        cannot block on the gate ``warm()`` must satisfy. During warm() the gate holds
+        every foreground search at the device door (``_foreground_inflight == 0``), so
+        the prime acquires the device lock uncontended.
+
+        Best-effort: bounded by ``warm_gate_timeout_s`` (so a CF-flaky prime cannot run
+        the full eval op-budget and hold the device past the startup readiness window),
+        and ANY failure is logged + swallowed — the source is NOT marked failed / never
+        force-disabled. The first real ``/search`` then clears comix via the same eval
+        path within its own budget.
+        """
+        challenge_url = self._challenge_urls[source_key]
+        try:
+            await self.eval_in_webview(
+                challenge_url,
+                _WEBVIEW_PRIME_JS,
+                wait_for=None,
+                # Cap the prime at the startup readiness window so a hung/flaky prime
+                # gives up + frees the device before the warm gate falls through (it
+                # never runs the full ~180s eval op-budget as a startup zombie).
+                timeout=self._warm_gate_timeout_s,
+            )
+            _log.info(
+                "AndroidSolver eval-primed page-holding source %r — warm WebView "
+                "parked on its cleared, hydrated page (no first-search re-clear)",
+                source_key,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort prime; never hang/disable
+            _log.warning(
+                "AndroidSolver eval-prime failed for page-holding source %r: %r — "
+                "leaving it to clear on the first /search via the same eval path "
+                "(NOT disabled)",
+                source_key,
+                exc,
+                exc_info=True,
+            )
 
     async def aclose(self) -> None:
         """Cancel the refresh loop and close the owned httpx client (idempotent)."""
