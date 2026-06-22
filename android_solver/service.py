@@ -676,41 +676,52 @@ class AndroidSolvePipeline:
         return self._frame_tree_has_cf(tree.get("frameTree"))
 
     def _await_cf_challenge_or_clean(
-        self, ws: WebSocketLike, host: str, cancel: Event | None
+        self,
+        ws: WebSocketLike,
+        cancel: Event | None,
+        *,
+        is_clean: Callable[[], bool],
     ) -> bool:
         """Poll a freshly-navigated page until it resolves, returning WHICH state:
 
           * ``True``  — a Cloudflare challenge interstitial appeared (the
             ``challenges.cloudflare.com`` OOPIF is in the frame tree) and must be
             tapped to clear.
-          * ``False`` — the page came up CLEAN: already a hydrated, non-challenged
-            ``host`` comix page (the warm ``cf_clearance`` cookie still passed the
-            load), so there is NOTHING to clear.
+          * ``False`` — the page came up CLEAN (``is_clean()`` reports the target is
+            already in its terminal good state), so there is NOTHING to clear.
 
-        Bug 5 collision-recovery: when a foreign background solve steals the shared
-        device mid comix sequence, comix's recovery re-navigates — but its warm
-        clearance is usually still valid, so the re-nav loads CLEAN and the CF OOPIF
-        NEVER appears. The old ``_wait_for_cf_frame`` blocked the FULL
-        ``_frame_poll_timeout_s`` (~20s) on every such clean re-nav (the
-        "cloudflare OOPIF did not appear before frame-poll deadline" warning), blowing
-        the per-source budget (~25s collision recovery). This poll short-circuits the
-        instant the page is hydrated-and-CF-free — reusing the SAME
-        ``_cf_frame_present`` / ``_is_hydrated_comix_page`` primitives the fast path
-        uses — cutting collision recovery to a few seconds, and only spends the long
-        deadline when a challenge genuinely renders. The CF frame is checked FIRST each
-        iteration so a real interstitial is never mistaken for a clean page.
+        ONE clean-vs-challenge resolver shared by BOTH the eval path and the solve
+        path (DRY — no per-path copy of the poll-to-deadline loop to lurk and rot).
+        The clean signal differs per path, so it is injected as ``is_clean``:
+
+          * eval path (``_clear_challenge_if_present``): clean = a hydrated,
+            non-challenged ``host`` comix page (``_is_hydrated_comix_page``).
+          * solve path (``_wait_for_cf_frame``): clean = a host-scoped ``cf_clearance``
+            is ALREADY present (``_host_already_cleared``) — host-agnostic, so it serves
+            every solve host (mangadot/kagane/mangaball/comix), not just comix.
+
+        Bug 5 / collision + solve-path parity: when the navigated page is already
+        cleared (a warm ``cf_clearance`` still passed the load, or CF's managed
+        challenge auto-issued clearance with no interactive widget), the CF OOPIF
+        NEVER appears. The old per-path waits blocked the FULL ``_frame_poll_timeout_s``
+        (~20s) on every such clean load (the "cloudflare OOPIF did not appear before
+        frame-poll deadline" warning), blowing the per-source / startup-warm budget.
+        This poll short-circuits the instant ``is_clean()`` holds — only spending the
+        long deadline when a challenge genuinely renders. The CF frame is checked FIRST
+        each iteration so a real interstitial is never mistaken for a clean page (the
+        genuine-challenge path is unchanged).
         """
         deadline = time.monotonic() + self._frame_poll_timeout_s
         while time.monotonic() < deadline:
             _raise_if_cancelled(cancel)  # issue #207: don't poll past a cancel
             if self._cf_frame_present(ws):
                 return True
-            if self._is_hydrated_comix_page(ws, host):
+            if is_clean():
                 return False
             time.sleep(self._frame_poll_interval_s)
-        # Neither a challenge frame nor a confirmed-clean hydrated page within the
-        # deadline — fall back to a final CF-frame read (preserving the old behaviour:
-        # clear a challenge if one is present, else there is nothing to clear).
+        # Neither a challenge frame nor a confirmed-clean page within the deadline —
+        # fall back to a final CF-frame read (preserving the old behaviour: clear a
+        # challenge if one is present, else there is nothing to clear).
         _log.warning("cloudflare OOPIF did not appear before frame-poll deadline")
         return self._cf_frame_present(ws)
 
@@ -739,7 +750,9 @@ class AndroidSolvePipeline:
         here is NEVER logged or returned (T-14-04) — clearing is the only goal; the eval
         returns just the JS value.
         """
-        if not self._await_cf_challenge_or_clean(ws, host, cancel):
+        if not self._await_cf_challenge_or_clean(
+            ws, cancel, is_clean=lambda: self._is_hydrated_comix_page(ws, host)
+        ):
             return
         x_scale, y_scale = self._compute_scales(ws)
         minted = self._tap_until_cleared(
@@ -919,9 +932,12 @@ class AndroidSolvePipeline:
                         {"url": challenge_url},
                         command_id=_CHALLENGE_RENAV_CMD_ID,
                     )
-                # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
-                # after load) — the real readiness gate, not the fixed settle above.
-                self._wait_for_cf_frame(ws, cancel)
+                # Wait for the page to resolve — the cross-origin Cloudflare OOPIF
+                # renders (a few seconds after load) OR the host is already cleared (a
+                # warm/auto-issued cf_clearance, no widget). Short-circuits on either,
+                # never burning the full frame-poll deadline on an already-cleared load
+                # (bug 5 solve-path parity). The real readiness gate, not the settle.
+                self._wait_for_cf_frame(ws, ws_url, host, cancel)
                 # Page ws, DOM/Page enable, frame readiness, and the viewport scales
                 # are computed ONCE; only locate+tap+poll repeats inside the loop.
                 x_scale, y_scale = self._compute_scales(ws)
@@ -1195,25 +1211,55 @@ class AndroidSolvePipeline:
             return False
         return bool(result.get("result", {}).get("value"))
 
-    def _wait_for_cf_frame(
-        self, ws: WebSocketLike, cancel: Event | None = None
-    ) -> None:
-        """Poll Page.getFrameTree until the challenges.cloudflare.com OOPIF appears.
+    def _host_already_cleared(self, ws_url: str, host: str) -> bool:
+        """Host-agnostic clean check for the solve path: True when a host-scoped
+        ``cf_clearance`` is ALREADY present.
 
-        The Turnstile widget renders in a cross-origin child frame a few seconds
-        after the page loads. Returns once present; returns anyway on timeout so
-        locate_checkbox can still try the secondary/screenshot paths.
+        The solve serves EVERY allowlisted host, so unlike the comix-specific
+        ``_is_hydrated_comix_page`` this asks the host-agnostic question the solve
+        actually cares about: "is there anything left to clear?". A present
+        host-scoped ``cf_clearance`` means the load auto-passed CF's managed challenge
+        (no interactive Turnstile rendered) or a warm clearance still held — either
+        way the solve is effectively done and ``_tap_until_cleared`` will read the SAME
+        cookie on its first poll. This mirrors how ``_drive_solve`` confirms success
+        today (``extract_clearance``). Any extract error ⇒ ``False`` (keep polling /
+        fall through to the long deadline + tap path; never a token-bearing decision).
         """
-        deadline = time.monotonic() + self._frame_poll_timeout_s
-        command_id = 20
-        while time.monotonic() < deadline:
-            _raise_if_cancelled(cancel)  # issue #207: don't poll past a cancel
-            tree = cdp_call(ws, "Page.getFrameTree", command_id=command_id)
-            command_id += 1
-            if self._frame_tree_has_cf(tree.get("frameTree")):
-                return
-            time.sleep(self._frame_poll_interval_s)
-        _log.warning("cloudflare OOPIF did not appear before frame-poll deadline")
+        try:
+            return extract_clearance(ws_url, host) is not None
+        except Exception:  # noqa: BLE001 — a clean-check probe must not abort the solve
+            return False
+
+    def _wait_for_cf_frame(
+        self,
+        ws: WebSocketLike,
+        ws_url: str,
+        host: str,
+        cancel: Event | None = None,
+    ) -> None:
+        """Wait until the page resolves to ONE of two states before tapping.
+
+        The Turnstile widget renders in a cross-origin ``challenges.cloudflare.com``
+        child frame a few seconds after the page loads. The solve polls until EITHER
+        that OOPIF appears (a genuine challenge — return so ``_tap_until_cleared`` can
+        clear it, the unchanged cold-solve behaviour) OR ``host`` is already cleared (a
+        host-scoped ``cf_clearance`` is present — the load auto-passed CF's managed
+        challenge with no widget, or a warm clearance still held — so there is nothing
+        to tap and ``_tap_until_cleared`` reads the existing cookie immediately).
+
+        Bug 5 / solve-path parity with the eval path: a clean already-cleared load used
+        to burn the FULL ``_frame_poll_timeout_s`` (~20s) here waiting for an OOPIF that
+        would NEVER appear ("cloudflare OOPIF did not appear before frame-poll
+        deadline"), which on a gateway-restart ``warm()`` re-solve of an already-cleared
+        host blew the startup-warm gate. This now short-circuits via the SHARED
+        ``_await_cf_challenge_or_clean`` resolver the instant either state is reached;
+        the genuine-challenge path is detected FIRST and is byte-for-byte unchanged.
+        Returns either way so ``_tap_until_cleared`` (which can still try the
+        secondary/screenshot locate paths) always runs next.
+        """
+        self._await_cf_challenge_or_clean(
+            ws, cancel, is_clean=lambda: self._host_already_cleared(ws_url, host)
+        )
 
     @staticmethod
     def _frame_tree_has_cf(frame_tree: Any) -> bool:

@@ -207,7 +207,9 @@ def _eval_pipeline(
 
         monkeypatch.setattr(service, "extract_clearance", fake_extract)
         monkeypatch.setattr(
-            pipeline, "_wait_for_cf_frame", lambda ws, cancel=None: None
+            pipeline,
+            "_wait_for_cf_frame",
+            lambda ws, ws_url, host, cancel=None: None,
         )
         monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
     if proxy:

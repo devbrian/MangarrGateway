@@ -178,7 +178,9 @@ def _build_pipeline(
     monkeypatch.setattr(service.socket, "gethostbyname", lambda host: _RESOLVED_HOP_IP)
 
     # Collapse the pre-tap readiness/scale steps (covered by their own units).
-    monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws, cancel=None: None)
+    monkeypatch.setattr(
+        pipeline, "_wait_for_cf_frame", lambda ws, ws_url, host, cancel=None: None
+    )
     monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
     return pipeline
 

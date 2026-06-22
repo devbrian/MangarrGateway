@@ -1205,9 +1205,128 @@ def _build_pipeline(
     monkeypatch.setattr(service, "webview_user_agent", lambda url, **kwargs: "UA-wv")
     # Pre-loop readiness/scale steps are covered by their own units; collapse them
     # to constants here so the loop under test runs deterministically.
-    monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws, cancel=None: None)
+    monkeypatch.setattr(
+        pipeline, "_wait_for_cf_frame", lambda ws, ws_url, host, cancel=None: None
+    )
     monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
     return pipeline
+
+
+# ── BUG 5 solve-path parity: a clean already-cleared load must NOT burn the deadline ─
+
+
+class _FrameTreeCdp:
+    """``cdp_call`` stub for the REAL ``_wait_for_cf_frame``: answers Page.getFrameTree.
+
+    The ``challenges.cloudflare.com`` OOPIF child frame is absent until the poll count
+    reaches ``cf_after`` (``cf_after`` huge ⇒ it never renders — a clean already-cleared
+    load; ``cf_after=N`` ⇒ a genuine challenge that renders on the Nth poll).
+    """
+
+    def __init__(self, cf_after: int) -> None:
+        self._cf_after = cf_after
+        self.calls = 0
+
+    def __call__(self, ws, method, params=None, *, command_id):  # type: ignore[no-untyped-def]
+        if method == "Page.getFrameTree":
+            self.calls += 1
+            tree: dict[str, object] = {
+                "frame": {"url": "https://mangadot.net/", "id": "main"},
+                "childFrames": [],
+            }
+            if self.calls >= self._cf_after:
+                tree["childFrames"] = [
+                    {
+                        "frame": {
+                            "url": "https://challenges.cloudflare.com/cdn-cgi/x",
+                            "id": "cf",
+                        },
+                        "childFrames": [],
+                    }
+                ]
+            return {"frameTree": tree}
+        return {}
+
+
+def _frame_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    clock: FakeClock,
+    cdp: _FrameTreeCdp,
+    extract: object,
+) -> AndroidSolvePipeline:
+    # A pipeline that runs the REAL _wait_for_cf_frame (NOT the _build_pipeline stub):
+    # service.time → FakeClock, service.cdp_call → the frame-tree stub, and
+    # service.extract_clearance → the solve-path clean-check cookie stub.
+    page_targets = b'[{"type":"page","webSocketDebuggerUrl":"ws://localhost:9222/p"}]'
+    pipeline = AndroidSolvePipeline(
+        FakeDevice(),  # type: ignore[arg-type]
+        timeout_s=60.0,
+        ws_factory=lambda url, *, timeout: FakeWs(),  # type: ignore[arg-type,return-value]
+        http_get=lambda url, *, timeout: page_targets,
+        launch_settle_s=0.0,
+        poll_interval_s=1.0,
+    )
+    monkeypatch.setattr(service, "time", clock)
+    monkeypatch.setattr(service, "cdp_call", cdp)
+    monkeypatch.setattr(service, "extract_clearance", extract)
+    return pipeline
+
+
+def test_clean_solve_short_circuits_frame_poll_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bug 5 / solve-path parity: a gateway-restart warm() re-solve of an
+    # ALREADY-cleared host loads CLEAN (a warm/auto-issued cf_clearance, no
+    # interactive Turnstile), so the challenges.cloudflare.com OOPIF NEVER appears.
+    # _wait_for_cf_frame must NOT grind the full ~20s frame-poll deadline waiting for
+    # a widget that won't come — it short-circuits the instant a host-scoped
+    # cf_clearance is observed (nothing to tap; _tap_until_cleared reads it next).
+    clock = FakeClock()
+    cdp = _FrameTreeCdp(cf_after=10**9)  # CF OOPIF never renders (clean load)
+    pipeline = _frame_pipeline(
+        monkeypatch,
+        clock=clock,
+        cdp=cdp,
+        extract=lambda ws_url, host: ClearanceCookie(
+            value="WARM", expires=_STUB_EXPIRES
+        ),
+    )
+
+    start = clock.now
+    pipeline._wait_for_cf_frame(FakeWs(), "ws://localhost:9222/p", "mangadot.net")  # type: ignore[arg-type]
+    elapsed = clock.now - start
+
+    # Did NOT grind the full ~20s frame-poll deadline (the old vestigial wait).
+    assert elapsed < service._FRAME_POLL_TIMEOUT_S
+    # Short-circuited on the first poll (no sleep) — the warm re-solve is now fast.
+    assert elapsed <= pipeline._frame_poll_interval_s
+
+
+def test_genuine_challenge_solve_still_detects_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The short-circuit must NOT regress the genuine cold solve: when a real CF
+    # challenge renders a few polls after load (cookie NOT yet minted),
+    # _wait_for_cf_frame still detects the OOPIF and returns so the tap machinery can
+    # clear it — and a clean page is never mistaken for it (the CF frame is checked
+    # FIRST and no cf_clearance exists yet).
+    clock = FakeClock()
+    cdp = _FrameTreeCdp(cf_after=3)  # OOPIF renders on the 3rd poll (mangadot-style)
+    pipeline = _frame_pipeline(
+        monkeypatch,
+        clock=clock,
+        cdp=cdp,
+        extract=lambda ws_url, host: None,  # challenge not cleared yet → no cookie
+    )
+
+    start = clock.now
+    pipeline._wait_for_cf_frame(FakeWs(), "ws://localhost:9222/p", "mangadot.net")  # type: ignore[arg-type]
+    elapsed = clock.now - start
+
+    assert cdp.calls >= 3  # polled until the genuine challenge frame appeared
+    # Returned ON the frame, not after grinding the full deadline.
+    assert elapsed < service._FRAME_POLL_TIMEOUT_S
 
 
 def test_solve_retaps_until_clearance_appears(
