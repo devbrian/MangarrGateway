@@ -243,8 +243,8 @@ class Settings(BaseSettings):
     android_solver_timeout_s: float = Field(default=180.0, gt=0)
     # Bug 5 Lever A (per-source proactive-refresh horizon, MEASURE-FIRST knob). The
     # android proactive-refresh loop re-mints a held clearance ahead of its COOKIE
-    # expiry. But for kagane.to / mangadot.net the captured cf_clearance cookie carries a
-    # ~1yr nominal expiry that is a LIE — Cloudflare re-challenges far sooner (debug
+    # expiry. But for kagane.to / mangadot.net the captured cf_clearance cookie carries
+    # a ~1yr nominal expiry that is a LIE — Cloudflare re-challenges far sooner (debug
     # ``cf-clearance-cookie-expiry-is-not-lapse-time``), so the expiry-driven loop never
     # proactively re-mints inside its lead window and a search occasionally pays a COLD
     # (~11s) sidecar re-solve on the hot path. The measured re-challenge lifetime is
@@ -263,12 +263,12 @@ class Settings(BaseSettings):
     # ≈ 248 min (alive 247.9) → 14400s (240 min / 4 h) re-mints at 238 min, ~10 min
     # before death. Env-overridable as a JSON object
     # (``GATEWAY_ANDROID_CLEARANCE_LIFETIME_S='{"kagane":1680,"mangadot":14400}'``) and
-    # rides the load_settings TOML→kwargs merge exactly like ``metrics_cors_origins`` (a
-    # dict value, same machinery). The VALUE must be TUNED from a live measurement window
-    # — read each source's real re-challenge cadence from the solve metric
+    # rides the load_settings TOML→kwargs merge exactly like ``metrics_cors_origins``
+    # (a dict value, same machinery). The VALUE must be TUNED from a live measurement
+    # window — read each source's real re-challenge cadence from the solve metric
     # (``GET /metrics/per-source-endpoint`` / ``/metrics/recent``, ``op="solve"`` rows)
-    # and the sidecar ``captured clearance`` log timestamps, then set BELOW that interval
-    # (minus the ~120s lead). Do NOT guess.
+    # and the sidecar ``captured clearance`` log timestamps, then set BELOW that
+    # interval (minus the ~120s lead). Do NOT guess.
     android_clearance_lifetime_s: dict[str, int] = Field(
         default_factory=lambda: {"kagane": 1680, "mangadot": 14400}
     )

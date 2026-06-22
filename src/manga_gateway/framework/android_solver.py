@@ -283,12 +283,12 @@ class AndroidSolver:
         # Bug 5 Lever A (#298): a PER-SOURCE ``source_key -> lifetime_seconds`` map that
         # clamps the tracked proactive-refresh time to ``min(cookie_expires, now +
         # lifetime)`` ONLY for the keys it carries — so kagane/mangadot are re-minted
-        # ahead of CF's real re-challenge cadence (their ~1yr cookie expiry is a lie) and
-        # a search never pays a cold clear, WITHOUT a single global horizon over-
-        # refreshing the longer-lived source on the one shared redroid. A key ABSENT from
-        # the map (comix, mangafire, any future source) keeps the historic cookie-expiry
-        # behavior byte-for-byte. ``None``/empty ⇒ no clamp for any source. Non-positive
-        # per-key values are dropped (that source disabled unambiguously). The VALUES are
+        # ahead of CF's real re-challenge cadence (their ~1yr cookie expiry is a lie)
+        # and a search never pays a cold clear, WITHOUT a single global horizon over-
+        # refreshing the longer-lived source on the one shared redroid. A key ABSENT
+        # from the map (comix, mangafire, any future source) keeps the historic cookie-
+        # expiry behavior byte-for-byte. ``None``/empty ⇒ no clamp for any source. Non-
+        # positive per-key values are dropped (that source disabled). The VALUES are
         # tuned from a live measurement window (see
         # ``Settings.android_clearance_lifetime_s``).
         clearance_lifetime_s: Mapping[str, float] | None = None,
@@ -603,13 +603,13 @@ class AndroidSolver:
         ``_clearance_lifetime_s``, cap the tracked expiry at ``now + lifetime`` whenever
         that is SOONER than the real cookie expiry (or whenever the cookie carries no
         usable expiry at all) — ``min(cookie_expires, now + lifetime)``. This drives the
-        EXISTING ``_expires_at``-based proactive-refresh loop to re-mint the clearance on
-        each source's empirical re-challenge cadence rather than the meaningless ~1yr
+        EXISTING ``_expires_at``-based proactive-refresh loop to re-mint the clearance
+        on each source's empirical re-challenge cadence rather than the meaningless ~1yr
         cookie ``expires`` (debug ``cf-clearance-cookie-expiry-is-not-lapse-time``), so
         kagane/mangadot are re-cleared off the request hot path. A source with NO
-        configured lifetime keeps the historic cookie-expiry-only behavior, byte-for-byte
-        unchanged. The clamp only ever pulls the tracked time EARLIER, never later (the
-        cookie expiry always wins when it is sooner than the configured horizon).
+        configured lifetime keeps the historic cookie-expiry-only behavior, byte-for-
+        byte unchanged. The clamp only ever pulls the tracked time EARLIER, never later
+        (the cookie expiry always wins when it is sooner than the configured horizon).
         """
         effective = expires_at
         lifetime = self._clearance_lifetime_s.get(source_key)
