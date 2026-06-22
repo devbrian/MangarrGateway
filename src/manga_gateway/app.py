@@ -402,9 +402,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # android key (comix) is EXCLUDED from the eager /solve and EVAL-PRIMED last by
         # warm() instead, so the redroid ends startup parked on its cleared page.
         warm_last_keys=webview_page_keys,
-        # Bug 5 Lever A: proactive-refresh-by-age cap (None ⇒ disabled — the default;
-        # the operator tunes the VALUE from the measured comix re-challenge cadence).
-        refresh_max_age_s=settings.android_refresh_max_age_s,
+        # Bug 5 Lever A (#298): per-source proactive-refresh horizon map (seeded
+        # kagane=1680s, mangadot=14400s — measured re-challenge cadences). Sources absent
+        # from the map keep the historic cookie-expiry behavior; operator-tunable per
+        # source via GATEWAY_ANDROID_CLEARANCE_LIFETIME_S.
+        clearance_lifetime_s=settings.android_clearance_lifetime_s,
         # Bug 5 Fix #2: how long an android foreground search waits at the device door
         # for the startup warm() to finish before proceeding (armed below, just before
         # the non-blocking warm task is created). Bounded so a slow/hung warm still lets

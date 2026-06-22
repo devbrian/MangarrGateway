@@ -562,7 +562,7 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
     playwright_proxy, _ = build_proxy(settings)
     # Lockstep with app.py's lifespan ``AndroidSolver(...)`` build: EVERY kwarg app.py
     # passes must appear here (``test_android_solver_kwargs_lockstep`` AST-asserts the
-    # two sets are equal). ``refresh_max_age_s`` (Lever A) + ``warm_gate_timeout_s``
+    # two sets are equal). ``clearance_lifetime_s`` (Lever A) + ``warm_gate_timeout_s``
     # (Fix #2) default-resolve from the SAME Settings fields app.py reads, so the
     # session-shared solver behaves identically to production. The ``client`` kwarg is
     # the one exception neither passes (the solver lazily builds its own).
@@ -572,7 +572,7 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
         "challenge_urls": android_challenge_urls,
         "on_demand_keys": on_demand_keys,
         "warm_last_keys": warm_last_keys,
-        "refresh_max_age_s": settings.android_refresh_max_age_s,
+        "clearance_lifetime_s": settings.android_clearance_lifetime_s,
         "warm_gate_timeout_s": settings.android_warm_gate_timeout_s,
         "timeout_s": settings.android_solver_timeout_s,
         "proxy": playwright_proxy,
