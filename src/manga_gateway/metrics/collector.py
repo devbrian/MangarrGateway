@@ -207,6 +207,58 @@ class Collector:
             error=error,
         )
 
+    def emit_eval(
+        self,
+        *,
+        source_key: str | None = None,
+        op: str = "eval",
+        outcome: str,
+        duration_ms: float,
+        attempt: int = 1,
+        error: str | None = None,
+    ) -> None:
+        """Emit an in-WebView eval event (kind=``eval``) — the eval analog of
+        ``emit_solve``, with a REAL (non-zero) ``duration_ms``.
+
+        For comix's android-WebView ``/eval`` path (search / recent / chapter-list /
+        chapter-pages all hit comix.to through the sidecar ``/eval``). Mirrors
+        ``emit_solve`` for source attribution: ``source_key`` normally rides
+        ``current_source``, but the eval call site may run outside a source_scope, so
+        the explicit arg is wrapped in ``source_scope`` as a fallback.
+
+        D-06 / T-10-04 / T-14-04 redaction: ``url=None`` — same posture as
+        ``emit_solve`` / ``emit_cache`` — so the eval js, the eval result, and any
+        cf_clearance/token are STRUCTURALLY impossible to record. Source attribution
+        (comix) rides ``source_key``; the host (comix.to) is implied by the source.
+        """
+        if source_key is not None and current_source.get() is None:
+            from .context import source_scope
+
+            with source_scope(source_key):
+                self._ingest(
+                    kind="eval",
+                    op=op,
+                    method=None,
+                    url=None,
+                    status=None,
+                    outcome=outcome,
+                    duration_ms=duration_ms,
+                    attempt=attempt,
+                    error=error,
+                )
+            return
+        self._ingest(
+            kind="eval",
+            op=op,
+            method=None,
+            url=None,
+            status=None,
+            outcome=outcome,
+            duration_ms=duration_ms,
+            attempt=attempt,
+            error=error,
+        )
+
     def emit_package(
         self,
         *,
