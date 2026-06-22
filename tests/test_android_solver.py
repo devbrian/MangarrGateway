@@ -1707,49 +1707,122 @@ async def test_warm_gate_released_only_after_page_holder_prime() -> None:
         await solver.aclose()
 
 
-# ── bug 5 Lever A: proactive-refresh-by-AGE cap (cf_clearance cookie expiry lies) ──
+# ── bug 5 Lever A (#298): per-source clearance-lifetime clamp (cookie expiry lies) ──
 
 
 @pytest.mark.asyncio
-async def test_refresh_max_age_caps_tracked_expiry() -> None:
-    """Lever A: with ``refresh_max_age_s`` set, the tracked expiry that drives the
-    proactive-refresh loop is capped at ``now + max_age`` whenever that is SOONER than
-    the (meaningless ~1yr) cookie expiry — and is applied even when the cookie carries
-    NO expiry. A cookie expiry that is already sooner than the cap is kept as-is."""
-    solver = _solver(refresh_max_age_s=300.0)
+async def test_clearance_lifetime_clamps_configured_source_to_now_plus_lifetime() -> (
+    None
+):
+    """(a) A CONFIGURED source clamps the tracked expiry to ``now + lifetime`` whenever
+    that is SOONER than the (meaningless ~1yr) cookie expiry — and is applied even when
+    the cookie carries NO expiry (tracked at the age cap, not dropped)."""
+    solver = _solver(clearance_lifetime_s={"kagane": 1680, "mangadot": 14400})
     try:
-        # Far-future cookie expiry → capped down to ~now + 300s.
+        # Far-future cookie expiry → capped down to ~now + 1680s.
         before = time.time()
-        solver._record_expiry("mangadot", before + 99_999_999.0)
-        capped = solver._expires_at["mangadot"]
-        assert before + 300.0 <= capped <= time.time() + 300.0
+        solver._record_expiry("kagane", before + 99_999_999.0)
+        capped = solver._expires_at["kagane"]
+        assert before + 1680 <= capped <= time.time() + 1680
         # No cookie expiry at all → still tracked at the age cap (not dropped).
         solver._record_expiry("kagane", None)
         assert "kagane" in solver._expires_at
-        # A cookie expiry SOONER than the cap is kept verbatim (min wins).
-        soon = time.time() + 60.0
-        solver._record_expiry("mangadot", soon)
-        assert solver._expires_at["mangadot"] == soon
     finally:
         await solver.aclose()
 
 
 @pytest.mark.asyncio
-async def test_refresh_max_age_disabled_by_default_keeps_cookie_expiry_only() -> None:
-    """Lever A is OFF by default (and for a non-positive value): a None cookie expiry
-    clears the tracked entry and a real cookie expiry is tracked verbatim — the historic
-    cookie-expiry-only behavior, byte-for-byte unchanged."""
-    for over in ({}, {"refresh_max_age_s": 0.0}, {"refresh_max_age_s": -5.0}):
-        solver = _solver(**over)
-        try:
-            assert solver._refresh_max_age_s is None
-            solver._record_expiry("mangadot", None)
-            assert "mangadot" not in solver._expires_at
-            future = time.time() + 1234.0
-            solver._record_expiry("kagane", future)
-            assert solver._expires_at["kagane"] == future
-        finally:
-            await solver.aclose()
+async def test_clearance_lifetime_unconfigured_source_keeps_cookie_expiry() -> None:
+    """(b) An UNCONFIGURED source keeps the historic cookie-expiry behavior byte-for-
+    byte: a real cookie expiry is tracked verbatim and a None cookie expiry pops the key
+    — both on a solver that DOES clamp other sources, and on an empty/no-arg solver."""
+    # comix is absent from the configured map → unclamped even though kagane is clamped.
+    solver = _solver(clearance_lifetime_s={"kagane": 1680, "mangadot": 14400})
+    try:
+        future = time.time() + 1234.0
+        solver._record_expiry("comix", future)
+        assert solver._expires_at["comix"] == future
+        solver._record_expiry("comix", None)
+        assert "comix" not in solver._expires_at
+    finally:
+        await solver.aclose()
+    # The no-arg solver carries an empty map → every source rides cookie-expiry.
+    bare = _solver()
+    try:
+        assert bare._clearance_lifetime_s == {}
+        future = time.time() + 1234.0
+        bare._record_expiry("kagane", future)
+        assert bare._expires_at["kagane"] == future
+        bare._record_expiry("kagane", None)
+        assert "kagane" not in bare._expires_at
+    finally:
+        await bare.aclose()
+
+
+@pytest.mark.asyncio
+async def test_clearance_lifetime_min_never_exceeds_cookie_expires() -> None:
+    """(c) The clamp only ever pulls the tracked time EARLIER, never later: a cookie
+    expiry SOONER than the configured cap is kept verbatim (min() — cookie wins)."""
+    solver = _solver(clearance_lifetime_s={"kagane": 1680})
+    try:
+        soon = time.time() + 60.0
+        solver._record_expiry("kagane", soon)
+        assert solver._expires_at["kagane"] == soon
+    finally:
+        await solver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_clearance_lifetime_is_per_source_independent() -> None:
+    """(d) Per-source independence: mangadot's clamp uses 14400s while kagane uses 1680s
+    on the SAME solver — distinct horizons, no cross-bleed."""
+    solver = _solver(clearance_lifetime_s={"kagane": 1680, "mangadot": 14400})
+    try:
+        far = time.time() + 99_999_999.0
+        before = time.time()
+        solver._record_expiry("kagane", far)
+        solver._record_expiry("mangadot", far)
+        kagane_cap = solver._expires_at["kagane"]
+        mangadot_cap = solver._expires_at["mangadot"]
+        assert before + 1680 <= kagane_cap <= time.time() + 1680
+        assert before + 14400 <= mangadot_cap <= time.time() + 14400
+        # mangadot's horizon is ~12720s farther out than kagane's (no shared cap).
+        assert mangadot_cap - kagane_cap > 10000
+    finally:
+        await solver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_clearance_lifetime_nonpositive_per_key_disables_that_source() -> None:
+    """A non-positive per-key lifetime is DROPPED so that one source falls back to
+    cookie-expiry (the per-key analog of the old None-normalisation)."""
+    solver = _solver(clearance_lifetime_s={"kagane": 0, "mangadot": -5})
+    try:
+        assert solver._clearance_lifetime_s == {}
+        solver._record_expiry("kagane", None)
+        assert "kagane" not in solver._expires_at
+        future = time.time() + 1234.0
+        solver._record_expiry("mangadot", future)
+        assert solver._expires_at["mangadot"] == future
+    finally:
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_clearance_lifetime_does_not_suppress_reactive_force_resolve() -> None:
+    """(d) Reactive fallback intact: a configured lifetime does NOT suppress the 403
+    self-heal — ``force_resolve=True`` still discards the held clearance and re-/solve/s
+    via the mocked sidecar, the backstop for a clearance that lapses early."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(clearance_lifetime_s={"mangadot": 14400})
+    try:
+        await solver.get_clearance("mangadot")
+        await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    # The clamp is orthogonal to force_resolve: the held value is still re-minted.
+    assert route.call_count == 2
 
 
 # ── bug 5 Fix #2: gate a foreground search on startup warm() completion ─────────
