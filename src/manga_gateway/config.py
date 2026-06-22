@@ -369,6 +369,16 @@ class Settings(BaseSettings):
     # `_enum_cache_ttl_within_handle_ttl` model validator below fails fast above
     # 3600 (mirrors _reject_camoufox_parallel).
     enum_cache_ttl_seconds: int = Field(default=1800, ge=1)
+    # Mode-E (debug comix-warm-hydration-wait): the SHORT negative-cache TTL applied
+    # to a SUCCESSFUL-but-EMPTY result (an empty candidate list / an Enumeration with
+    # no items). Empties are still cached (a genuine no-match search must not re-hammer
+    # upstream on every poll — 260606-lyb Change 3), but only for THIS short window
+    # rather than the full ``enum_cache_ttl_seconds``, so a transient/wrong zero (a
+    # one-off upstream blip or — pre-sidecar-fix — a swallowed in-page eval throw)
+    # clears within a minute instead of sticking for the whole TTL. Env-overridable knob
+    # (GATEWAY_ENUM_CACHE_EMPTY_TTL_SECONDS, default 60s). Field(ge=1): a 0/negative
+    # would break the TLRUCache ttu; the validator below keeps it ≤ the full TTL.
+    enum_cache_empty_ttl_seconds: int = Field(default=60, ge=1)
     # 260606-lyb Change 2 / 260620 backoff rework: per-source failure cooldown
     # (negative cache for FAILURES, distinct from the enum cache above which caches
     # successes). When a source's fan-out branch hits a hard failure (timeout /
@@ -536,6 +546,28 @@ class Settings(BaseSettings):
                 "not out-live the handle it serves. Fix via env: set "
                 "GATEWAY_ENUM_CACHE_TTL_SECONDS <= GATEWAY_HANDLE_TTL_SECONDS "
                 f"(currently {self.handle_ttl_seconds})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _empty_ttl_within_enum_ttl(self) -> Settings:
+        """Fail fast when the empty (negative-cache) TTL exceeds the full TTL (Mode-E).
+
+        The negative cache exists to make a transient/wrong empty result EXPIRE
+        SOONER than a real one, so an ``enum_cache_empty_ttl_seconds`` above the full
+        ``enum_cache_ttl_seconds`` would be self-defeating (an empty would out-live a
+        populated entry). Reject it at construction — mirroring
+        ``_enum_cache_ttl_within_handle_ttl`` — so the misconfiguration surfaces loudly
+        at startup rather than silently making empties stickier than successes.
+        """
+        if self.enum_cache_empty_ttl_seconds > self.enum_cache_ttl_seconds:
+            raise ValueError(
+                "enum_cache_empty_ttl_seconds="
+                f"{self.enum_cache_empty_ttl_seconds} exceeds enum_cache_ttl_seconds="
+                f"{self.enum_cache_ttl_seconds}: the empty (negative-cache) TTL must "
+                "stay <= the full TTL so a transient empty expires SOONER than a real "
+                "result. Fix via env: set GATEWAY_ENUM_CACHE_EMPTY_TTL_SECONDS <= "
+                "GATEWAY_ENUM_CACHE_TTL_SECONDS."
             )
         return self
 

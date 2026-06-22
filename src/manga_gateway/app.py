@@ -507,6 +507,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # the live handle_ttl_seconds, not the legacy hard-coded 3600 (debug session
         # release-no-longer-resolvable, so a raised handle TTL is not silently clamped).
         max_ttl=settings.handle_ttl_seconds,
+        # Mode-E (debug comix-warm-hydration-wait): the SHORT negative-cache TTL for a
+        # successful-but-EMPTY result, so a transient/wrong zero (an upstream blip, or —
+        # before the sidecar exceptionDetails fix — a swallowed in-page eval throw)
+        # self-heals within ~a minute instead of sticking for the full enum-cache TTL.
+        empty_ttl=settings.enum_cache_empty_ttl_seconds,
     )
     # 260606-lyb Change 2 / 260620 backoff rework: ONE process-wide per-source failure
     # cooldown for the whole lifespan (R1), mirroring the enum_cache construction. The

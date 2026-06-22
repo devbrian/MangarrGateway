@@ -330,6 +330,77 @@ async def test_per_source_ttl_override_and_clamp() -> None:
     assert calls == 5
 
 
+async def test_empty_value_uses_short_negative_ttl_and_expires_first() -> None:
+    """Mode-E (debug comix-warm-hydration-wait): with an ``is_empty`` predicate a
+    SUCCESSFUL-but-EMPTY value is cached only for the short ``empty_ttl`` while a
+    populated value keeps the full ttl — so a transient/wrong zero self-heals fast
+    instead of sticking for the whole TTL, but a genuine no-match still short-circuits
+    upstream for that brief window."""
+    now = [0.0]
+    fetches = {"empty": 0, "full": 0}
+    cache: SingleFlightCache[list[str]] = SingleFlightCache(
+        ttl=1800,
+        maxsize=16,
+        empty_ttl=60,
+        is_empty=lambda v: len(v) == 0,
+        clock=lambda: now[0],
+    )
+
+    async def empty_fetch() -> list[str]:
+        fetches["empty"] += 1
+        return []
+
+    async def full_fetch() -> list[str]:
+        fetches["full"] += 1
+        return ["x"]
+
+    empty_key = ("src", "empty", ())
+    full_key = ("src", "full", ())
+    await cache.get_or_fetch(empty_key, empty_fetch)
+    await cache.get_or_fetch(full_key, full_fetch)
+    assert fetches == {"empty": 1, "full": 1}
+
+    # Within the short empty window BOTH are still warm — a genuine no-match does NOT
+    # re-hammer upstream on a quick repeat.
+    now[0] = 59.0
+    await cache.get_or_fetch(empty_key, empty_fetch)
+    await cache.get_or_fetch(full_key, full_fetch)
+    assert fetches == {"empty": 1, "full": 1}
+
+    # Past the empty TTL: the empty expired (re-fetch → self-heal) but the populated
+    # value survives on the full ttl.
+    now[0] = 61.0
+    await cache.get_or_fetch(empty_key, empty_fetch)
+    assert fetches["empty"] == 2  # transient zero re-resolved
+    await cache.get_or_fetch(full_key, full_fetch)
+    assert fetches["full"] == 1  # populated result still cached on the full TTL
+
+
+async def test_enumeration_cache_empty_resolve_uses_negative_ttl() -> None:
+    """Mode-E (integration): ``EnumerationCache`` wires a per-layer ``is_empty`` so an
+    empty RESOLVED candidate list expires on the short ``empty_ttl`` — a transient
+    comix zero-result search no longer sticks (and re-fires zero upstream calls) for
+    the full TTL."""
+    now = [0.0]
+    cache = EnumerationCache(ttl=1800, maxsize=16, empty_ttl=60, clock=lambda: now[0])
+    calls = 0
+
+    async def resolve_fetch() -> list[str]:
+        nonlocal calls
+        calls += 1
+        return []  # the transient/wrong zero
+
+    key = EnumerationCache.resolve_key("comix", "lookism", [])
+    await cache.cached_resolve(key, resolve_fetch)
+    assert calls == 1
+    now[0] = 30.0
+    await cache.cached_resolve(key, resolve_fetch)
+    assert calls == 1  # within the short window — served from cache
+    now[0] = 61.0
+    await cache.cached_resolve(key, resolve_fetch)
+    assert calls == 2  # expired on empty_ttl → re-resolved (self-heal)
+
+
 # ───────────────────── EnumerationCache two-layer + emit ──────────────────────
 
 
