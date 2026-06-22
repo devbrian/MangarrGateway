@@ -241,6 +241,24 @@ class Settings(BaseSettings):
     # (Phase 10 live-verify). Default 180 = the 120s cap + 60s margin, so a clean
     # out-of-the-box run does not trip the coupling. Raise it if you raise the cap.
     android_solver_timeout_s: float = Field(default=180.0, gt=0)
+    # Bug 5 Lever A (proactive-refresh-by-AGE, MEASURE-FIRST knob). The android
+    # proactive-refresh loop re-mints a held clearance ahead of its COOKIE expiry. But
+    # for comix the cf_clearance cookie carries a ~1yr nominal expiry that is a LIE —
+    # Cloudflare re-challenges far sooner (debug ``cf-clearance-cookie-expiry-is-not-
+    # lapse-time``), so the expiry-driven loop never proactively re-mints comix inside
+    # its lead window and a comix search occasionally pays a COLD (~5-10s) Turnstile
+    # re-clear on the hot path. This knob caps the effective refresh interval: when set
+    # (> 0, SECONDS) the loop treats every held android clearance as due for re-mint at
+    # ``minted_at + this`` whenever that is sooner than the cookie expiry, so a fresh
+    # clearance is always waiting before the empirical re-challenge interval. ``None``
+    # (default) = DISABLED → the historic cookie-expiry-only behavior, byte-for-byte
+    # unchanged (no behavior change ships until an operator sets a value). The VALUE
+    # must be TUNED from a live measurement window — read comix's real re-challenge
+    # cadence from the solve metric (``GET /metrics/per-source-endpoint`` /
+    # ``/metrics/recent``, ``op="solve"`` rows for comix) and the sidecar
+    # ``captured clearance for host comix.to`` log timestamps — then set this BELOW that
+    # interval (minus the ~120s lead) so a search never hits a cold clear. Do NOT guess.
+    android_refresh_max_age_s: float | None = Field(default=None)
     # ── Source enable/disable (reversible ops knob; #198/#202) ─────────────────
     # Comma-separated source keys to SKIP registering at startup, e.g.
     # GATEWAY_DISABLED_SOURCES="kagane,mangadot". A disabled source is dropped

@@ -1149,3 +1149,48 @@ async def test_warm_orders_page_holding_keys_last() -> None:
         "https://kagane.to/",
         "https://comix.to/",
     ]
+
+
+# ── bug 5 Lever A: proactive-refresh-by-AGE cap (cf_clearance cookie expiry lies) ──
+
+
+@pytest.mark.asyncio
+async def test_refresh_max_age_caps_tracked_expiry() -> None:
+    """Lever A: with ``refresh_max_age_s`` set, the tracked expiry that drives the
+    proactive-refresh loop is capped at ``now + max_age`` whenever that is SOONER than
+    the (meaningless ~1yr) cookie expiry — and is applied even when the cookie carries
+    NO expiry. A cookie expiry that is already sooner than the cap is kept as-is."""
+    solver = _solver(refresh_max_age_s=300.0)
+    try:
+        # Far-future cookie expiry → capped down to ~now + 300s.
+        before = time.time()
+        solver._record_expiry("mangadot", before + 99_999_999.0)
+        capped = solver._expires_at["mangadot"]
+        assert before + 300.0 <= capped <= time.time() + 300.0
+        # No cookie expiry at all → still tracked at the age cap (not dropped).
+        solver._record_expiry("kagane", None)
+        assert "kagane" in solver._expires_at
+        # A cookie expiry SOONER than the cap is kept verbatim (min wins).
+        soon = time.time() + 60.0
+        solver._record_expiry("mangadot", soon)
+        assert solver._expires_at["mangadot"] == soon
+    finally:
+        await solver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_refresh_max_age_disabled_by_default_keeps_cookie_expiry_only() -> None:
+    """Lever A is OFF by default (and for a non-positive value): a None cookie expiry
+    clears the tracked entry and a real cookie expiry is tracked verbatim — the historic
+    cookie-expiry-only behavior, byte-for-byte unchanged."""
+    for over in ({}, {"refresh_max_age_s": 0.0}, {"refresh_max_age_s": -5.0}):
+        solver = _solver(**over)
+        try:
+            assert solver._refresh_max_age_s is None
+            solver._record_expiry("mangadot", None)
+            assert "mangadot" not in solver._expires_at
+            future = time.time() + 1234.0
+            solver._record_expiry("kagane", future)
+            assert solver._expires_at["kagane"] == future
+        finally:
+            await solver.aclose()

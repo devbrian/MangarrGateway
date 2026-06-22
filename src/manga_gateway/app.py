@@ -399,6 +399,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Bug 5 perf (warm-ordering): eager-warm the page-holding android key (comix)
         # LAST so the redroid ends startup parked on its cleared page (see above).
         warm_last_keys=webview_page_keys,
+        # Bug 5 Lever A: proactive-refresh-by-age cap (None ⇒ disabled — the default;
+        # the operator tunes the VALUE from the measured comix re-challenge cadence).
+        refresh_max_age_s=settings.android_refresh_max_age_s,
         timeout_s=settings.android_solver_timeout_s,
         # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
         # the CloudflareSolver (no second build_proxy call, no new setting). The

@@ -165,6 +165,13 @@ class AndroidSolver:
         # refresh then has nothing due that would navigate the WebView away mid-search).
         # Empty (default) ⇒ challenge_urls order is preserved exactly (unchanged).
         warm_last_keys: Iterable[str] = (),
+        # Bug 5 Lever A: cap the proactive-refresh interval at ``minted_at + this`` for
+        # EVERY held android clearance whenever that is sooner than the (meaningless,
+        # ~1yr) cookie expiry — so comix is re-minted ahead of CF's real re-challenge
+        # cadence and a search never pays a cold clear. ``None`` / non-positive ⇒
+        # DISABLED (cookie-expiry-only, byte-for-byte unchanged). The VALUE is tuned
+        # from a live measurement window (see ``Settings.android_refresh_max_age_s``).
+        refresh_max_age_s: float | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
@@ -174,6 +181,13 @@ class AndroidSolver:
         self._on_demand_keys = frozenset(on_demand_keys)
         # Bug 5 perf (warm-ordering): page-holding keys eager-warmed LAST (ctor doc).
         self._warm_last_keys = frozenset(warm_last_keys)
+        # Bug 5 Lever A: effective proactive-refresh age cap (None ⇒ disabled). A
+        # non-positive value is normalised to None so "0 / -1 disables" is unambiguous.
+        self._refresh_max_age_s = (
+            refresh_max_age_s
+            if refresh_max_age_s is not None and refresh_max_age_s > 0
+            else None
+        )
         self._timeout_s = timeout_s
         self._proxy = proxy
         self._client = client
@@ -315,9 +329,23 @@ class AndroidSolver:
         return await asyncio.shield(task)
 
     def _record_expiry(self, source_key: str, expires_at: float | None) -> None:
-        """Track (or clear) the held clearance's epoch expiry for the refresh loop."""
-        if expires_at is not None:
-            self._expires_at[source_key] = expires_at
+        """Track (or clear) the held clearance's epoch expiry for the refresh loop.
+
+        Bug 5 Lever A: when ``refresh_max_age_s`` is configured, cap the tracked expiry
+        at ``now + refresh_max_age_s`` whenever that is SOONER than the real cookie
+        expiry (or whenever the cookie carries no usable expiry at all). This drives the
+        EXISTING ``_expires_at``-based proactive-refresh loop to re-mint the clearance
+        on the empirical re-challenge cadence rather than the meaningless ~1yr cookie
+        ``expires`` (debug ``cf-clearance-cookie-expiry-is-not-lapse-time``), so comix
+        is re-cleared off the request hot path. Disabled (``None``) ⇒ the historic
+        cookie-expiry-only behavior, byte-for-byte unchanged.
+        """
+        effective = expires_at
+        if self._refresh_max_age_s is not None:
+            age_cap = time.time() + self._refresh_max_age_s
+            effective = age_cap if effective is None else min(effective, age_cap)
+        if effective is not None:
+            self._expires_at[source_key] = effective
         else:
             self._expires_at.pop(source_key, None)
 
