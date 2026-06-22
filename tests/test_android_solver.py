@@ -934,10 +934,16 @@ async def test_coalesced_failed_solve_propagates_and_leaves_no_hold() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_refresh_and_reactive_force_resolve_coalesce() -> None:
-    """A proactive refresh tick (a held key inside the lead window) and a concurrent
-    reactive ``force_resolve`` for the SAME key share ONE sidecar /solve — both funnel
-    through the per-key single-flight task."""
+async def test_refresh_and_reactive_do_not_share_deferrable_task() -> None:
+    """A proactive refresh tick (deferrable, ``defer_if_foreground=True``) and a
+    concurrent reactive ``force_resolve`` (non-deferrable) for the SAME key run as
+    SEPARATE sidecar /solves — they must NOT share one single-flight task. A deferrable
+    refresh task can raise ``_RefreshDeferred`` (a control-flow signal only warm/refresh
+    understand); were a non-deferrable foreground caller to await that shared task it
+    would receive the ``_RefreshDeferred`` and violate the get_clearance contract that
+    foreground calls never defer (CodeRabbit). Deferrable solves therefore bypass the
+    coalesce slot; the device lock still serializes the two /solves (no concurrent herd
+    on the one device)."""
     entered = asyncio.Event()
     gate = asyncio.Event()
 
@@ -954,8 +960,9 @@ async def test_refresh_and_reactive_force_resolve_coalesce() -> None:
     )
     solver._expires_at["mangadot"] = time.time() + 30.0  # inside lead → expiring
     try:
-        # Refresh first so it enters the shared solve before the reactive caller pops
-        # the held entry; the reactive force_resolve then attaches to the SAME task.
+        # Refresh first so its deferrable /solve acquires the device lock; the reactive
+        # force_resolve then runs its OWN /solve, serialized behind the device lock (it
+        # does NOT attach to the deferrable refresh task).
         refresh = asyncio.create_task(solver._refresh_tick())
         reactive = asyncio.create_task(
             solver.get_clearance("mangadot", force_resolve=True)
@@ -965,7 +972,10 @@ async def test_refresh_and_reactive_force_resolve_coalesce() -> None:
         await asyncio.gather(refresh, reactive)
     finally:
         await solver.aclose()
-    assert route.call_count == 1  # refresh + reactive coalesced onto one /solve
+    # Separate /solves: the deferrable refresh task is NOT shared with the
+    # non-deferrable reactive caller (so _RefreshDeferred can never escape to it); the
+    # device lock serializes them, so it is two sequential mints, not a concurrent herd.
+    assert route.call_count == 2
 
 
 @respx.mock

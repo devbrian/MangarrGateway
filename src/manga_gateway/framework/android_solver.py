@@ -508,9 +508,20 @@ class AndroidSolver:
         same exception to all awaiters and leaves the per-caller post-solve swap
         un-run, so no clearance is held for that key (WR-05).
         """
+        if defer_if_foreground:
+            # Deferrable background solves (warm/refresh) must NOT share the
+            # single-flight slot with request-path callers: ``_coalesce`` keys only by
+            # ``source_key``, so a foreground caller (``defer_if_foreground=False``)
+            # awaiting a shared deferrable task would receive its ``_RefreshDeferred``
+            # — a control-flow signal only warm/refresh understand — violating the
+            # get_clearance contract that foreground calls NEVER defer (CodeRabbit).
+            # Run deferrable solves on their own task; the background herd for one key
+            # is rare (warm solves a key once; the refresh loop one at a time) so the
+            # lost coalescing is immaterial.
+            return await self._solve(source_key, defer_if_foreground=True)
         return await self._coalesce(
             source_key,
-            lambda: self._solve(source_key, defer_if_foreground=defer_if_foreground),
+            lambda: self._solve(source_key, defer_if_foreground=False),
         )
 
     async def _coalesce(

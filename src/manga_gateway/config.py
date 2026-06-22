@@ -258,7 +258,7 @@ class Settings(BaseSettings):
     # ``/metrics/recent``, ``op="solve"`` rows for comix) and the sidecar
     # ``captured clearance for host comix.to`` log timestamps — then set this BELOW that
     # interval (minus the ~120s lead) so a search never hits a cold clear. Do NOT guess.
-    android_refresh_max_age_s: float | None = Field(default=None)
+    android_refresh_max_age_s: float | None = Field(default=None, gt=0)
     # Bug 5 Fix #2 (startup-warm gate). The startup eager warm() is fired NON-BLOCKING,
     # so a comix /search that arrives DURING the warm storm races the in-flight foreign
     # solves: a queued warm/refresh solve can navigate the single shared WebView away

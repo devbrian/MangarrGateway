@@ -196,12 +196,17 @@ async def test_fixture_drift(
         chapter_pages_js = _CHAPTER_PAGES_API_EXTRACT_JS.replace(
             "__COMIX_CHAPTER_ID__", json.dumps(chapter_numeric_id)
         )
-        captured = await solver.eval_in_webview(
-            chapter_url,
-            chapter_pages_js,
-            wait_for=None,
-            timeout=60.0,
-        )
+        # Hold the foreground device lease around the eval, mirroring production's
+        # ``fetch_manifest`` (the proactive-refresh loop + startup warm defer while a
+        # ``device_session`` is held) so the live drift capture is not exposed to a
+        # background-refresh/warm race the production path avoids (CodeRabbit).
+        async with solver.device_session():
+            captured = await solver.eval_in_webview(
+                chapter_url,
+                chapter_pages_js,
+                wait_for=None,
+                timeout=60.0,
+            )
 
         assert isinstance(captured, list) and captured, (
             f"{source_key}: solver.eval_in_webview returned no URLs "

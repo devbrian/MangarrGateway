@@ -70,6 +70,7 @@ class FakePipeline:
         # Records whether each eval requested clearance extraction (so a test can assert
         # the flag threaded through ``_run_eval`` → the pipeline).
         self.eval_with_clearance: list[bool] = []
+        self.eval_wait_for: list[str | None] = []
         self._delay = delay
         self._healthy = healthy
         self._error = error
@@ -150,6 +151,7 @@ class FakePipeline:
             self.eval_js.append(js)
             self.eval_proxies.append(proxy)
             self.eval_with_clearance.append(with_clearance)
+            self.eval_wait_for.append(wait_for)
             if self._started is not None:
                 self._started.set()
             if self._release is not None:
@@ -845,6 +847,8 @@ def test_eval_forwards_wait_for_predicate_to_pipeline() -> None:
         ),
     )
     assert ok == 200
+    # The predicate must actually reach the pipeline, not just yield a 200.
+    assert pipeline.eval_wait_for == ["window.ready === true"]
 
     pipeline2 = FakePipeline()
     bad, payload = _service(pipeline2).eval(

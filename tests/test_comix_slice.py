@@ -367,11 +367,16 @@ async def test_comix_outbound_request_carries_clearance_and_ua(
     job = await _poll_until(comix_client, submit.json()["jobId"])
     assert job["status"] == "completed", job
 
-    # D-40: every image-CDN request carried the cf_clearance cookie + captured UA.
+    # D-40: EVERY image-CDN request carried the cf_clearance cookie + captured UA —
+    # assert on every call across every route, not just the first (CodeRabbit: a
+    # regression dropping headers on a later image fetch must not pass).
     assert all(r.called for r in image_routes)
-    request = image_routes[0].calls.last.request
-    assert request.headers["user-agent"] == _CF_UA
-    assert "cf_clearance=CF-CLEAR-TOKEN" in request.headers.get("cookie", "")
+    for route in image_routes:
+        for call in route.calls:
+            assert call.request.headers["user-agent"] == _CF_UA
+            assert "cf_clearance=CF-CLEAR-TOKEN" in call.request.headers.get(
+                "cookie", ""
+            )
 
 
 # ─────────────────────── (4) single Comix failure → warning, others flow ──────
