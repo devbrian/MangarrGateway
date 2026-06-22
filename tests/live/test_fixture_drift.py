@@ -161,12 +161,13 @@ async def test_fixture_drift(
     # MangaDex skips above).
     from manga_gateway.sources.comix import (
         _CHAPTER_PAGES_API_EXTRACT_JS,
-        _CHAPTER_PAGES_WAIT_FOR,
         ComixSource,
     )
 
+    chapter_numeric_id = "9001596"
     chapter_url = (
-        f"{ComixSource.base_url}/title/mr3m0-the-forgotten-field/9001596-chapter-20"
+        f"{ComixSource.base_url}/title/mr3m0-the-forgotten-field"
+        f"/{chapter_numeric_id}-chapter-20"
     )
 
     async with live_client_for(profile, tmp_path=tmp_path) as client:
@@ -179,14 +180,19 @@ async def test_fixture_drift(
         # there is no public httpx accessor in this version.
         solver = client._transport.app.state.solver
 
-        # Spike 019: mirror ``ComixSource.fetch_manifest`` exactly — the internal
-        # ``chapters/{id}`` API extractor + the reader-scaffold ``wait_for`` + the
-        # 60s ceiling. Any deviation between this call site and production
-        # reintroduces the harness-vs-prod divergence #32 chased.
+        # Spike 019 / Bug 5b: mirror ``ComixSource.fetch_manifest`` exactly — the
+        # internal ``chapters/{id}`` API extractor with the chapter id INTERPOLATED
+        # (json.dumps — page-agnostic, NOT read from location.pathname), ``wait_for``
+        # None (the DOM reader-scaffold gate was vestigial — see bug 5b), and the 60s
+        # ceiling. Any deviation between this call site and production reintroduces
+        # the harness-vs-prod divergence #32 chased.
+        chapter_pages_js = _CHAPTER_PAGES_API_EXTRACT_JS.replace(
+            "__COMIX_CHAPTER_ID__", json.dumps(chapter_numeric_id)
+        )
         captured = await solver.fetch_via_browser(
             chapter_url,
-            extract=_CHAPTER_PAGES_API_EXTRACT_JS,
-            wait_for=_CHAPTER_PAGES_WAIT_FOR,
+            extract=chapter_pages_js,
+            wait_for=None,
             timeout=60.0,
         )
 

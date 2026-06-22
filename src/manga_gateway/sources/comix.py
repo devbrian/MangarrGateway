@@ -706,9 +706,16 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""(async () => {
   const ax = findAxios(mod) || findAxios(mod.default);
   if (!ax) throw new Error('comix: axios instance not found in env module');
 
-  // (3) Chapter numeric id from the path: /title/{hid}-{slug}/{id}-chapter-{number}.
-  const idm = location.pathname.match(/\/(\d+)-chapter-/);
-  if (!idm) throw new Error('comix: no chapter id in ' + location.pathname);
+  // (3) Chapter numeric id — interpolated by the Python call site as a JSON string
+  // literal (json.dumps; data never code, SEC T-14-06), NOT read from
+  // location.pathname. Bug 5b: this makes the extract PAGE-AGNOSTIC — the in-page
+  // fast-path runs the eval on whatever warm comix page is already loaded (e.g. the
+  // homepage a prior search/chapter-list eval left us on), which is NOT the
+  // chapter-reader page, so reading the id from the path would throw there. The
+  // env-module axios is a page-independent cached singleton, so /chapters/{id} signs
+  // + decrypts regardless of which comix page is loaded (spike 019/021).
+  const chapterId = __COMIX_CHAPTER_ID__;
+  if (!chapterId) throw new Error('comix: empty chapter id');
 
   // Timeout-only retry: comix's OWN axios instance bakes in a 15s timeout we
   // can't set. An intermittently-slow comix backend (>15s) throws AxiosError
@@ -737,7 +744,7 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""(async () => {
   // (4) GET /chapters/{id} (axios baseURL is /api/v1) -> the decrypted chapter
   // with pages:{baseUrl, items:[{url}]}. A thrown request fails closed (the extract
   // throws → fetch_manifest raises → SourceError), never a partial manifest.
-  const res = await withTimeoutRetry(() => ax.get('/chapters/' + idm[1]));
+  const res = await withTimeoutRetry(() => ax.get('/chapters/' + chapterId));
   const data = (res && res.data !== undefined) ? res.data : res;
   const pages = data && data.pages;
   const items = (pages && Array.isArray(pages.items)) ? pages.items
@@ -759,17 +766,15 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""(async () => {
 })()
 """
 
-# JS boolean predicate the sidecar ``/eval`` waits for before the chapter-pages
-# extract runs (Plan 01: ``wait_for`` is a JS predicate string, NOT a CSS selector).
-# The reader scaffolds `<div class="rpage-page" data-page="N">` once it has fetched +
-# decrypted the page list — which means the SPA's API ES module is loaded and its
-# axios interceptors are wired, exactly what ``_CHAPTER_PAGES_API_EXTRACT_JS`` needs
-# before it ``import()``s the module and calls ``/chapters/{id}`` itself. (The
-# sidecar ALSO does a built-in env-*.js hydration wait; this predicate is the
-# reader-render readiness signal on top of it.)
-_CHAPTER_PAGES_WAIT_FOR = (
-    "() => document.querySelector('.rpage-page[data-page]') !== null"
-)
+# Bug 5b: the chapter-pages eval no longer passes a DOM ``wait_for``. The prior
+# predicate gated on the reader scaffold ``<div class="rpage-page" data-page="N">``,
+# which renders ONLY on a navigated chapter-reader page. The in-page fast-path runs
+# the eval on whatever warm comix page is already loaded (NOT the reader page), so
+# that predicate never went truthy there and ``_wait_for_hydration`` burned the full
+# ~20s budget. The extract is API-based (it ``import()``s the env module and calls
+# ``ax.get('/chapters/{id}')`` directly — it never touches the reader DOM), so the
+# DOM readiness gate was vestigial. The sidecar's built-in env-*.js hydration signal
+# (satisfied instantly on a warm page) is the real readiness gate.
 
 # Issue #171: how many times fetch_manifest navigates the chapter page before
 # giving up on an EMPTY capture. A cold Patchright context (right after a restart
@@ -835,10 +840,16 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""(async () => {
   const api = findApi(mod) || findApi(mod.default);
   if (!api) throw new Error('comix: chapters() API not found in env module');
 
-  // (4) Series hid from the path (/title/{hid}-{slug}); hids carry no hyphen.
-  const hm = location.pathname.match(/\/title\/([^/-]+)/);
-  if (!hm) throw new Error('comix: could not read hid from ' + location.pathname);
-  const hid = hm[1];
+  // (4) Series hid — interpolated by the Python call site as a JSON string literal
+  // (json.dumps; data never code, SEC T-14-06), NOT read from location.pathname.
+  // Bug 5b: this makes the extract PAGE-AGNOSTIC — the in-page fast-path runs the
+  // eval on whatever warm comix page is already loaded (the homepage after the
+  // search eval), which is NOT the /title/{hid} page, so reading the hid from the
+  // path would throw there. The env-module axios is a page-independent cached
+  // singleton, so chapters(hid) signs + decrypts regardless of the loaded page
+  // (spike 019/021).
+  const hid = __COMIX_SERIES_HID__;
+  if (!hid) throw new Error('comix: empty series hid');
 
   // Timeout-only retry: comix's OWN axios instance bakes in a 15s timeout we
   // can't set. When comix's backend is intermittently slow (>15s for one page)
@@ -954,16 +965,16 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""(async () => {
 })()
 """
 
-# JS boolean predicate the sidecar ``/eval`` waits for before running the chapter-
-# list extract — gated on the series-page chapter anchors having rendered (so the
-# SPA's API ES module is loaded + interceptors wired before the extract import()s
-# it). chapter anchors carry class ``mchap-row__primary`` once the live recon
-# confirmed the series-page reader rendered them. We poll DOM attachment (not
-# visibility) because some anchors render off-screen / inside scroll containers.
-# JS predicate string (Plan 01: ``wait_for`` is a JS boolean expression, not CSS).
-_CHAPTER_LIST_WAIT_FOR = (
-    "() => document.querySelectorAll('a.mchap-row__primary').length > 0"
-)
+# Bug 5b: the chapter-list eval no longer passes a DOM ``wait_for``. The prior
+# predicate gated on the series-page chapter anchors ``a.mchap-row__primary``, which
+# render ONLY on a navigated /title/{hid} page. The in-page fast-path runs the eval
+# on whatever warm comix page is already loaded (the homepage after the search eval),
+# so that predicate never went truthy there and ``_wait_for_hydration`` burned the
+# full ~20s budget (live 2026-06-22 01:01Z). The extract is API-based (it
+# ``import()``s the env module and calls ``chapters(hid)`` directly — it never reads
+# the series DOM), so the DOM readiness gate was vestigial. The sidecar's built-in
+# env-*.js hydration signal (satisfied instantly on a warm page — proven: the
+# ``_search_series`` eval with ``wait_for=None`` hydrates in 0.0s) is the real gate.
 
 
 def _title_to_slug(title: str) -> str:
@@ -1522,6 +1533,20 @@ class ComixSource(Source):
             # SPA module load + interceptors wire); a genuinely empty chapter returns
             # [] again and falls through to the malformed-manifest raise, while a
             # populated-but-invalid manifest is a real fault that does NOT retry.
+            # Bug 5b: interpolate the numeric chapter id as a JSON string literal
+            # (json.dumps — data, never code; SEC T-14-06) so the extract reads it
+            # from Python, NOT from location.pathname → PAGE-AGNOSTIC, exactly like
+            # the chapter-list extract. The in-page fast-path runs this on whatever
+            # warm comix page a prior eval left loaded (NOT the chapter-reader page),
+            # so a path read would fail there. wait_for is None: the prior
+            # ``.rpage-page[data-page]`` reader-scaffold predicate is a reader-page-
+            # only DOM signal that never renders on a non-reader warm page and would
+            # burn the ~20s hydration budget; the extract calls the env-module API
+            # directly and never touches the reader DOM. The sidecar's built-in
+            # env-*.js hydration signal is the real readiness gate.
+            chapter_pages_js = _CHAPTER_PAGES_API_EXTRACT_JS.replace(
+                "__COMIX_CHAPTER_ID__", json.dumps(str(numeric_id))
+            )
             urls: Any = None
             for attempt in range(_MANIFEST_COLD_RACE_ATTEMPTS):
                 try:
@@ -1533,16 +1558,12 @@ class ComixSource(Source):
                         # image-CDN URL-scheme rotation that broke the old lazy-DOM
                         # scrape (debug comix-cdn-scheme-rotation). Image BYTES still
                         # fetch over httpx.
-                        _CHAPTER_PAGES_API_EXTRACT_JS,
-                        # Wait for the reader scaffold so the SPA has fetched+decrypted
-                        # the page list — which guarantees the API ES module is loaded
-                        # and its axios interceptors are wired before the extract
-                        # ``import()``s it and calls ``/chapters/{id}`` itself.
-                        wait_for=_CHAPTER_PAGES_WAIT_FOR,
+                        chapter_pages_js,
+                        wait_for=None,
                         # The in-page API call is a couple of decrypted requests, not
                         # an O(pages) DOM walk; 60s stays a generous margin for the
-                        # scaffold wait + Cloudflare/first-paint tail. The per-source
-                        # rate limiter bounds outer cadence.
+                        # Cloudflare/first-paint tail. The per-source rate limiter
+                        # bounds outer cadence.
                         timeout=60.0,
                     )
                 except Exception as exc:  # noqa: BLE001 — typed source failure
@@ -1887,9 +1908,9 @@ class ComixSource(Source):
             if not hid:
                 continue
             # Skip series that have no published chapters yet (``hasChapters: false``
-            # in the search response) — navigating their series page would hang the
-            # chapter-list extractor's wait_for since ``a.mchap-row__primary`` never
-            # renders. Real production case: e.g. announced-but-not-yet-released
+            # in the search response) — their ``chapters(hid)`` enumeration would
+            # return an empty list, so the per-candidate chapter-list eval is wasted
+            # device time. Real production case: e.g. announced-but-not-yet-released
             # series surface in keyword matches.
             if item.get("hasChapters") is False:
                 continue
@@ -1946,14 +1967,16 @@ class ComixSource(Source):
         """The RAW, newest-first, COMPLETE chapter list off the warm series page
         (no filter, no slice).
 
-        This is the EXPENSIVE unit (one warm-tab browser navigation that ALWAYS
+        This is the EXPENSIVE unit (one warm-tab browser eval that ALWAYS
         enumerates the FULL chapter list, #146) and so the unit the Layer-2
-        enumeration cache stores: it navigates ``{base_url}/title/{hid}-{slug}`` in
-        the warm Patchright browser, waits for the chapter-list anchors to hydrate
-        (so the SPA's API module is loaded + interceptors warm), runs comix's OWN
-        internal ``chapters(hid, {limit:100})`` loader in-page to enumerate every
-        chapter, normalizes the rows to the dict shape ``_to_release`` consumes, and
-        sorts newest-first by chapter number. It applies NEITHER the
+        enumeration cache stores: it runs comix's OWN internal
+        ``chapters(hid, {limit:100})`` loader in the warm cleared WebView to
+        enumerate every chapter. Bug 5b: the hid is interpolated into the extract
+        (not read from ``location.pathname``), so the eval is PAGE-AGNOSTIC and takes
+        the in-page fast-path on whatever warm comix page is loaded — no DOM
+        ``wait_for``; the sidecar's built-in env-*.js hydration signal is the
+        readiness gate. It normalizes the rows to the dict shape ``_to_release``
+        consumes, and sorts newest-first by chapter number. It applies NEITHER the
         ``chapter_matches`` floor filter NOR the offset/limit slice — those live one
         level up (``_series_chapters`` for the ``fetch_manifest`` path; ``search()``
         for the cached search path) so the cached enumeration is the complete,
@@ -1989,6 +2012,19 @@ class ComixSource(Source):
         """
         solver = self._solver_from_ctx(ctx)
         series_url = f"{self.base_url}/title/{series_hid}-{series_slug}"
+        # Bug 5b: interpolate the hid as a JSON string literal (json.dumps — data,
+        # never code; SEC T-14-06) so the extract reads it from Python, NOT from
+        # location.pathname → PAGE-AGNOSTIC. The in-page fast-path runs this on the
+        # warm comix page a prior eval left loaded (the homepage after search), which
+        # is NOT the /title/{hid} page; a path read would fail there. wait_for is None
+        # for the same reason: the prior ``a.mchap-row__primary`` predicate is a
+        # series-page-only DOM signal that never renders on the warm homepage and
+        # burned the full ~20s hydration budget (live 2026-06-22 01:01Z). The extract
+        # calls the env-module API directly and never touches the DOM; the sidecar's
+        # built-in env-*.js hydration signal is the real readiness gate.
+        chapter_list_js = _CHAPTER_LIST_API_EXTRACT_JS.replace(
+            "__COMIX_SERIES_HID__", json.dumps(series_hid)
+        )
         try:
             raw = await solver.eval_in_webview(
                 series_url,
@@ -1998,10 +2034,8 @@ class ComixSource(Source):
                 # crack. The in-page ``Promise.all`` fan-out enumerates the WHOLE
                 # series in ONE eval / one device round-trip (PERF-01; spike 021 D1:
                 # One Piece 4,716 chapters in one eval).
-                _CHAPTER_LIST_API_EXTRACT_JS,
-                # Wait for the chapter-list anchors so the SPA has booted and the
-                # API ES module is loaded with its interceptors wired before import.
-                wait_for=_CHAPTER_LIST_WAIT_FOR,
+                chapter_list_js,
+                wait_for=None,
                 timeout=30.0,
             )
         except Exception as exc:  # noqa: BLE001 — surface as typed source failure

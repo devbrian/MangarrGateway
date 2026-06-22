@@ -495,21 +495,25 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert ".get(" in extract_body
     assert "pages" in extract_body
     assert "items" in extract_body
-    # The chapter numeric id is read from the URL path /{id}-chapter-{number}.
-    assert "-chapter-" in extract_body
+    # Bug 5b: the chapter numeric id is INTERPOLATED into the extract (json.dumps —
+    # a JSON string literal), NOT read from location.pathname, so the API-based
+    # extract is page-agnostic and the in-page fast-path can run it on whatever warm
+    # comix page is loaded (not only the navigated chapter-reader page).
+    assert f'"{_CHAPTER_ID}"' in extract_body
+    assert "location.pathname.match" not in extract_body
     # The retired lazy-DOM scrape markers must be gone (no scrollIntoView walk, no
     # filename-number synthesis, no scaffold-counter heuristic) — comix's per-page
     # opaque-token CDN URLs broke all three (debug comix-cdn-scheme-rotation).
     assert ".scrollIntoView(" not in extract_body
     assert "padStart" not in extract_body
     assert "authTotal" not in extract_body
-    # wait_for is a JS boolean predicate (Plan 01 contract — NOT a CSS selector)
-    # gated on the reader scaffold: it guarantees the SPA's API module is loaded +
-    # interceptors wired before the extract import()s it (the extract reads the API,
-    # not the rendered <img>s).
-    assert wait_for is not None
-    assert wait_for.startswith("() =>")
-    assert ".rpage-page[data-page]" in wait_for
+    # Bug 5b: wait_for is None. The prior ``.rpage-page[data-page]`` reader-scaffold
+    # predicate renders ONLY on a navigated chapter-reader page, so on whatever warm
+    # page the in-page fast-path leaves loaded it never went truthy and burned the
+    # full ~20s hydration budget. The extract is API-based (it import()s the env
+    # module and calls /chapters/{id} directly — never the reader DOM), so the DOM
+    # gate was vestigial; the sidecar's env-*.js hydration signal is the real gate.
+    assert wait_for is None
 
     # The series-page chapter-list enumeration runs comix's OWN internal
     # ``chapters(hid, {limit:100})`` loader in-WebView (spike 019/021), so it rides
@@ -520,13 +524,15 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert len(series_calls) == 1
     series_url, series_extract, series_wait = series_calls[0]
     assert series_url == f"{_COMIX}/title/{_SERIES_ID}-cipher-tales"
-    # JS predicate (not CSS selector) — routes to page.wait_for_function and polls
-    # DOM attachment of `a.mchap-row__primary`, which guarantees the SPA has booted
-    # and its API ES module is loaded (interceptors wired) before the extract
-    # ``import()``s it.
-    assert series_wait is not None
-    assert "mchap-row__primary" in series_wait
-    assert series_wait.startswith("() =>")
+    # Bug 5b: series_wait is None. The prior ``a.mchap-row__primary`` predicate
+    # renders ONLY on a navigated /title/{hid} page, so on the warm homepage the
+    # in-page fast-path leaves loaded it never went truthy and burned the full ~20s
+    # hydration budget (live 2026-06-22 01:01Z). The extract is API-based and the hid
+    # is INTERPOLATED (json.dumps — a JSON string literal), NOT read from
+    # location.pathname, so the eval is page-agnostic and needs no DOM gate.
+    assert series_wait is None
+    assert f'"{_SERIES_ID}"' in series_extract
+    assert "location.pathname.match" not in series_extract
     # The comix-side spike-019 literals live in the extract JS (the framework stays
     # source-agnostic): runtime env-*.js discovery, the dynamic import, and the
     # internal ``chapters()`` call at ``LIMIT = 100``.
@@ -589,6 +595,55 @@ def test_chapter_pages_api_extract_js_retries_only_axios_timeouts() -> None:
     assert "withTimeoutRetry(() => ax.get(" in js
     assert "MAX_RETRIES" in js
     assert "throw e" in js
+
+
+# ─── (5b) bug 5b: API extractors are page-agnostic; no series-DOM wait_for ─────
+
+
+def test_chapter_extractors_are_page_agnostic_no_location_pathname_read() -> None:
+    """Bug 5b regression: BOTH the chapter-list and chapter-pages extractors must
+    take their series id / chapter id from a Python-interpolated placeholder, NOT
+    from ``location.pathname``.
+
+    Why this is load-bearing: the sidecar's in-page fast-path runs the eval on
+    whatever warm comix page is already loaded (the homepage after the search eval),
+    which is NOT the ``/title/{hid}`` series page nor the ``{id}-chapter-{n}`` reader
+    page. An extractor that read its id from ``location.pathname`` would throw there
+    (``could not read hid from /``). The env-module axios is a page-independent
+    cached singleton, so interpolating the id keeps the API read correct regardless
+    of the loaded page. A regression back to a path read would resurrect bug 5b's
+    30s timeout under any future fast-path edit, so it is pinned offline here."""
+    from manga_gateway.sources.comix import (
+        _CHAPTER_LIST_API_EXTRACT_JS,
+        _CHAPTER_PAGES_API_EXTRACT_JS,
+    )
+
+    # The id placeholders are present (filled by the call sites via json.dumps).
+    assert "__COMIX_SERIES_HID__" in _CHAPTER_LIST_API_EXTRACT_JS
+    assert "__COMIX_CHAPTER_ID__" in _CHAPTER_PAGES_API_EXTRACT_JS
+    # Neither extractor may derive its id by matching the current URL path — that is
+    # the exact page-specific read that strands the eval on the wrong warm page. (The
+    # ``location.pathname`` substring still appears in the explanatory comments, so we
+    # pin the load-bearing ``.match(`` read, not the prose.)
+    assert "location.pathname.match" not in _CHAPTER_LIST_API_EXTRACT_JS
+    assert "location.pathname.match" not in _CHAPTER_PAGES_API_EXTRACT_JS
+
+
+def test_chapter_extract_wait_for_constants_removed() -> None:
+    """Bug 5b regression: the series-DOM ``wait_for`` predicates are gone.
+
+    ``_CHAPTER_LIST_WAIT_FOR`` (``a.mchap-row__primary``) and
+    ``_CHAPTER_PAGES_WAIT_FOR`` (``.rpage-page[data-page]``) were series-page- /
+    reader-page-only DOM signals. On the warm page the in-page fast-path leaves
+    loaded they never went truthy, so ``_wait_for_hydration`` burned the full ~20s
+    hydration budget and blew the 30s per-source budget (live 2026-06-22 01:01Z).
+    The extracts are API-based and never touch that DOM, so the predicates were
+    vestigial and removed. Asserting their absence keeps a future edit from
+    reintroducing a DOM gate (and the timeout) on either eval."""
+    import manga_gateway.sources.comix as comix_mod
+
+    assert not hasattr(comix_mod, "_CHAPTER_LIST_WAIT_FOR")
+    assert not hasattr(comix_mod, "_CHAPTER_PAGES_WAIT_FOR")
 
 
 # ─── (6) scanlation group comes from the DOM extractor ────────────────────────
