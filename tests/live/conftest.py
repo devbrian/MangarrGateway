@@ -542,16 +542,38 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
         for key, cls in android_sources.items()
         if getattr(cls, "cloudflare_challenge_optional", False)
     )
+    # Bug 5 follow-on #3 (A2): page-holding android sources (``holds_webview_page`` —
+    # comix) are EXCLUDED from the eager ``cf_clearance`` ``/solve`` and EVAL-PRIMED
+    # instead — ``/solve`` runs ``pm clear``, cold-wiping the warm WebView (cf_clearance
+    # + __cf_bm + cached env-*.js) comix depends on, so a comix ``/solve`` mints no
+    # clearance and burns its deadline → 503/504 → D-33 force-disable → every comix live
+    # test fails. MUST mirror app.py's lifespan ``warm_last_keys=webview_page_keys`` —
+    # the same "silent drift breaks the live android leg" hazard that bit on_demand_keys
+    # (``test_android_solver_kwargs_lockstep`` now AST-guards exactly this drift).
+    warm_last_keys = frozenset(
+        key
+        for key, cls in android_sources.items()
+        if getattr(cls, "holds_webview_page", False)
+    )
     # PROXY-01 / Req 7: mirror the lifespan's proxy wiring so the session-shared
     # AndroidSolver's /solve egress matches the per-test httpx-fetch egress (one
     # IP — cf_clearance is IP-bound). app.py passes ``proxy=playwright_proxy``
     # UNCONDITIONALLY (None when unconfigured), so do the same here.
     playwright_proxy, _ = build_proxy(settings)
+    # Lockstep with app.py's lifespan ``AndroidSolver(...)`` build: EVERY kwarg app.py
+    # passes must appear here (``test_android_solver_kwargs_lockstep`` AST-asserts the
+    # two sets are equal). ``refresh_max_age_s`` (Lever A) + ``warm_gate_timeout_s``
+    # (Fix #2) default-resolve from the SAME Settings fields app.py reads, so the
+    # session-shared solver behaves identically to production. The ``client`` kwarg is
+    # the one exception neither passes (the solver lazily builds its own).
     return {
         "base_url": settings.android_solver_url,
         "api_key": settings.android_solver_api_key,
         "challenge_urls": android_challenge_urls,
         "on_demand_keys": on_demand_keys,
+        "warm_last_keys": warm_last_keys,
+        "refresh_max_age_s": settings.android_refresh_max_age_s,
+        "warm_gate_timeout_s": settings.android_warm_gate_timeout_s,
         "timeout_s": settings.android_solver_timeout_s,
         "proxy": playwright_proxy,
     }

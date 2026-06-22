@@ -53,9 +53,12 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
     """The kwargs are exactly the fields app.py passes to ``AndroidSolver(...)``.
 
     app.py builds ``AndroidSolver(base_url=..., api_key=..., challenge_urls=...,
-    on_demand_keys=..., timeout_s=..., proxy=playwright_proxy)`` — ``proxy`` passed
-    UNCONDITIONALLY (None when unconfigured). The mirror must carry the same keys so
-    the shared instance is constructed identically to production.
+    on_demand_keys=..., warm_last_keys=..., refresh_max_age_s=..., warm_gate_timeout_s=
+    ..., timeout_s=..., proxy=playwright_proxy)`` — ``proxy`` passed UNCONDITIONALLY
+    (None when unconfigured). The mirror must carry the same keys so the shared instance
+    is constructed identically to production. (``test_live_conftest_lockstep``
+    AST-guards this against app.py directly, so a future app.py kwarg is caught even if
+    this hardcoded set is not updated — but keep it accurate too.)
     """
     kwargs = _build_session_android_solver_kwargs()
     assert set(kwargs) == {
@@ -63,6 +66,9 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
         "api_key",
         "challenge_urls",
         "on_demand_keys",
+        "warm_last_keys",
+        "refresh_max_age_s",
+        "warm_gate_timeout_s",
         "timeout_s",
         "proxy",
     }
