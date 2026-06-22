@@ -218,6 +218,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     android_keys: frozenset[str] = frozenset(
         key for key, engine in engine_by_source.items() if engine == "android"
     )
+    # Bug 5 perf (warm-ordering): the android source(s) that run their whole sequence
+    # as in-page evals and HOLD the warm cleared WebView page (``holds_webview_page`` —
+    # comix). Threaded to AndroidSolver as ``warm_last_keys`` so the startup eager
+    # warm() solves them LAST: the single redroid ends startup parked on the holder's
+    # cleared page (no first-search re-nav) with mangadot/kagane already cleared, so
+    # their proactive refresh won't navigate the shared WebView away during a comix
+    # search. Derived from the class attr exactly like engine_by_source above.
+    webview_page_keys: frozenset[str] = frozenset(
+        key
+        for key, cls in cf_sources.items()
+        if key in android_keys and getattr(cls, "holds_webview_page", False)
+    )
     # On-demand keys (debug pooltimeout-recurrence): cloudflare sources whose CF
     # managed challenge is INTERMITTENT (``cloudflare_challenge_optional=True``,
     # mangaball). Both solver legs SKIP these in ``warm()`` (no eager startup solve of
@@ -384,6 +396,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # warm() skips on-demand android sources (mangaball) — they solve on-demand,
         # never eager (debug pooltimeout-recurrence).
         on_demand_keys=on_demand_keys & android_keys,
+        # Bug 5 perf (warm-ordering): eager-warm the page-holding android key (comix)
+        # LAST so the redroid ends startup parked on its cleared page (see above).
+        warm_last_keys=webview_page_keys,
         timeout_s=settings.android_solver_timeout_s,
         # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
         # the CloudflareSolver (no second build_proxy call, no new setting). The

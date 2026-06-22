@@ -1038,6 +1038,15 @@ class ComixSource(Source):
     # engine switch needs — app.py's ``engine_by_source`` partition, the router's
     # ``_backend_for``, and the live-conftest ``_ANDROID_KEYS`` all derive from it.
     solver_engine = "android"
+    # Bug 5 perf (warm-ordering): comix runs ALL of its logic as in-page evals inside
+    # the shared redroid WebView (search ``c.list``, chapter-list, chapter-pages — it
+    # navigates to comix.to once and STAYS there for every ``eval_in_webview`` call),
+    # so it is the android source that HOLDS the warm cleared page. The app wiring
+    # passes this key to ``AndroidSolver`` as a ``warm_last_keys`` member so startup
+    # ``warm()`` solves comix LAST — the single redroid ends startup parked on comix's
+    # cleared page (no first-search re-nav) with mangadot/kagane already cleared, so
+    # their proactive refresh won't steal the shared WebView during a comix search.
+    holds_webview_page = True
     # caps.AntibotLevel already carries this literal (CAPS-02). The framework injects
     # clearance (D-40) + reconciles a challenge 403 (D-35) for any cloudflare* source.
     antibot = "cloudflare+encrypted"

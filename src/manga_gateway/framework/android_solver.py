@@ -157,6 +157,14 @@ class AndroidSolver:
         # solve on-demand via ``get_clearance(force_resolve=True)`` when a request
         # actually hits a challenge.
         on_demand_keys: Iterable[str] = (),
+        # Bug 5 perf (warm-ordering): the page-HOLDING android keys (comix) — sources
+        # that run their whole sequence as in-page evals and keep the shared redroid
+        # WebView parked on their cleared page. ``warm()`` eager-solves these LAST so
+        # the device ends startup on the holder's page and the lighter clearance-only
+        # keys are already cleared before the holder takes the page (their proactive
+        # refresh then has nothing due that would navigate the WebView away mid-search).
+        # Empty (default) ⇒ challenge_urls order is preserved exactly (unchanged).
+        warm_last_keys: Iterable[str] = (),
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
@@ -164,6 +172,8 @@ class AndroidSolver:
         self._api_key = api_key
         self._challenge_urls = dict(challenge_urls)
         self._on_demand_keys = frozenset(on_demand_keys)
+        # Bug 5 perf (warm-ordering): page-holding keys eager-warmed LAST (ctor doc).
+        self._warm_last_keys = frozenset(warm_last_keys)
         self._timeout_s = timeout_s
         self._proxy = proxy
         self._client = client
@@ -207,6 +217,7 @@ class AndroidSolver:
         *,
         force_resolve: bool = False,
         solve_if_missing: bool = True,
+        defer_if_foreground: bool = False,
     ) -> Clearance | None:
         """Return clearance for ``source_key`` (``None`` for non-android keys).
 
@@ -216,6 +227,16 @@ class AndroidSolver:
         FRESH sidecar solve (D-35, the 403 self-heal). ``force_resolve`` is a declared
         keyword so context.py's ``_call_solver`` ``inspect.signature`` detection passes
         it through (D-41).
+
+        ``defer_if_foreground`` (Bug 5 Lever B) is for BACKGROUND/eager callers only —
+        the sole user is :meth:`warm`. When ``True`` and the solve has to actually run,
+        it is threaded into the device op so the solve BAILS (raises
+        :class:`_RefreshDeferred`) if a FOREGROUND lease (a comix sequence inside
+        :meth:`device_session`) is claimed while it queues on the device lock — the
+        eager warm never navigates the shared WebView away from a request that arrived
+        DURING startup warm(). It defaults ``False`` so EVERY foreground caller (the
+        request path, the D-35 force-resolve self-heal, the csrf-bootstrap peek) is
+        byte-for-byte unchanged and NEVER defers itself.
 
         ``solve_if_missing=False`` (the on-demand peek, debug pooltimeout-recurrence):
         serve the held clearance if present but return ``None`` instead of running a
@@ -241,7 +262,9 @@ class AndroidSolver:
             if not solve_if_missing:
                 # On-demand peek with nothing held — do NOT block on a sidecar solve.
                 return None
-        clearance, expires_at = await self._coalesced_solve(source_key)
+        clearance, expires_at = await self._coalesced_solve(
+            source_key, defer_if_foreground=defer_if_foreground
+        )
         self._held[source_key] = clearance
         self._record_expiry(source_key, expires_at)
         return clearance
@@ -308,15 +331,42 @@ class AndroidSolver:
         local box without redroid stays green. Each key's solve is isolated in its own
         try/except; the underlying exception is logged with ``exc_info`` (NEVER the
         clearance value).
+
+        Bug 5 perf (warm-ordering): the page-HOLDING keys (``warm_last_keys`` — comix)
+        are solved LAST so the single redroid ends startup parked on the holder's
+        cleared page (no first-search re-nav) with the clearance-only keys already
+        cleared. ``challenge_urls`` order is preserved WITHIN each group, so the only
+        change when ``warm_last_keys`` is empty is none.
+
+        Bug 5 Lever B: each eager solve passes ``defer_if_foreground=True`` so a request
+        that arrives DURING startup warm() (claiming a :meth:`device_session` foreground
+        lease) is never robbed of the shared WebView by a queued warm solve — the warm
+        solve BAILS (:class:`_RefreshDeferred`) instead. A deferred key is NOT a fail:
+        it is left unwarmed and solves on-demand on first use (the request that holds
+        the lease) or via the next proactive refresh, so it must NOT be force-disabled.
         """
         failed: list[str] = []
-        for key in self._challenge_urls:
+        # Page-holders last; stable within each group (Bug 5 warm-ordering).
+        ordered = [k for k in self._challenge_urls if k not in self._warm_last_keys]
+        ordered += [k for k in self._challenge_urls if k in self._warm_last_keys]
+        for key in ordered:
             if key in self._on_demand_keys:
                 # On-demand source: never eager-warm — it solves only when a live
                 # challenge is detected (debug pooltimeout-recurrence).
                 continue
             try:
-                await self.get_clearance(key)
+                await self.get_clearance(key, defer_if_foreground=True)
+            except _RefreshDeferred:
+                # Bug 5 Lever B: a foreground lease was held while this eager warm
+                # queued on the device lock — skip it WITHOUT marking it failed (it is
+                # not a solve failure, so it must not be force-disabled). It solves
+                # on-demand on first use or via the next proactive refresh.
+                _log.info(
+                    "AndroidSolver warm deferred for source %r — a foreground lease "
+                    "held the device; will solve on-demand / next refresh (NOT "
+                    "disabled)",
+                    key,
+                )
             except Exception as exc:  # noqa: BLE001 — isolate per-key warm failures
                 _log.warning(
                     "AndroidSolver warm failed for source %r: %r "

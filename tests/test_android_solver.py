@@ -1067,3 +1067,85 @@ async def test_comix_cold_solve_eval_runs_with_foreground_lease_held() -> None:
     finally:
         await solver.aclose()
     assert seen == [1]  # the cold-clear-triggering eval ran with the lease held
+
+
+# ── bug 5 Lever B: extend the foreground-lease deferral to the STARTUP warm() path ──
+# The startup eager warm() solves used defer_if_foreground=False, so a comix search that
+# arrived DURING warm() (while warm() was solving / had queued a solve for ANOTHER
+# android source) could have its warm cleared WebView page navigated away by the queued
+# warm solve — the same steal class as the 5a refresh race, but on the eager warm()
+# path. Lever B threads defer_if_foreground=True through warm()'s solves; a key is
+# skipped, NOT failed (never force-disabled — it solves on-demand / next refresh).
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_warm_solve_defers_when_foreground_lease_held() -> None:
+    """Lever B: a startup ``warm()`` eager solve that queued on the device lock while
+    ``_foreground_inflight == 0`` does NOT issue its sidecar /solve once a
+    ``device_session`` foreground lease (a comix search) is entered before the lock
+    frees — the post-acquire re-check in ``_device_op`` makes it BAIL. The deferred key
+    is NOT reported failed (so the lifespan never force-disables it) and stays unheld
+    (it solves on-demand / via the next proactive refresh)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    # One android key isolates the deferral path deterministically.
+    solver = _solver(challenge_urls={"mangadot": "https://mangadot.net/"})
+    warm_task: asyncio.Task[list[str]] | None = None
+    # Hold the device lock so warm()'s solve QUEUES behind it — standing in for an
+    # in-flight device op holding the single redroid as warm() fires.
+    await solver._device_lock.acquire()
+    try:
+        warm_task = asyncio.create_task(solver.warm())
+        await asyncio.sleep(0.05)
+        assert not route.called  # warm's solve is queued on the lock — no /solve yet
+        # A comix search NOW claims the foreground lease while the warm solve is queued.
+        async with solver.device_session():
+            solver._device_lock.release()  # free the device → warm's solve re-checks
+            failed = await warm_task
+        assert not route.called  # the warm solve BAILED — never navigated the WebView
+        assert failed == []  # a deferral is NOT a failure → key not force-disabled
+        assert solver._held == {}  # nothing warmed (it solves on-demand later)
+        assert solver._foreground_inflight == 0  # lease unwound cleanly
+        assert not solver._device_lock.locked()  # the bail released the lock
+    finally:
+        if warm_task is not None and not warm_task.done():
+            warm_task.cancel()
+        if solver._device_lock.locked():
+            solver._device_lock.release()
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_warm_orders_page_holding_keys_last() -> None:
+    """Lever B (warm-ordering): ``warm()`` eager-solves the page-HOLDING keys
+    (``warm_last_keys`` — comix) LAST, preserving ``challenge_urls`` order within each
+    group, so the single redroid ends startup parked on the holder's cleared page with
+    the clearance-only sources already cleared."""
+    order: list[str] = []
+
+    async def _record(request: httpx.Request) -> httpx.Response:
+        order.append(json.loads(request.content)["challenge_url"])
+        return _solve_response()
+
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_record)
+    solver = _solver(
+        challenge_urls={
+            "comix": "https://comix.to/",
+            "mangadot": "https://mangadot.net/",
+            "kagane": "https://kagane.to/",
+        },
+        warm_last_keys={"comix"},
+    )
+    try:
+        failed = await solver.warm()
+    finally:
+        await solver.aclose()
+    assert failed == []
+    # comix (the page holder) is solved LAST; the clearance-only keys keep their
+    # challenge_urls order ahead of it.
+    assert order == [
+        "https://mangadot.net/",
+        "https://kagane.to/",
+        "https://comix.to/",
+    ]
