@@ -184,6 +184,38 @@ def _emit_solve(
         pass
 
 
+def _emit_eval(
+    key: str | None,
+    *,
+    outcome: str,
+    duration_ms: float,
+    error: str | None,
+) -> None:
+    """No-op-safe, failure-isolated ``emit_eval`` for the android-WebView ``/eval``.
+
+    comix's real upstream work (search / recent / chapter-list / chapter-pages) all
+    rides :meth:`AndroidSolver.eval_in_webview`, which emitted NOTHING — so Search
+    showed only 0ms CACHE rows and Recent showed nothing. This mirrors
+    :func:`_emit_solve` so each outer ``eval`` shows as a labeled, REAL-timed row. A
+    ``None`` collector is a clean no-op; a collector error never breaks the eval. The
+    eval ``js``, the eval result, and any ``cf_clearance`` token are NEVER passed here
+    (T-14-04) — redaction is structural (``emit_eval`` records ``url=None``)."""
+    from ..metrics.collector import get_collector
+
+    collector = get_collector()
+    if collector is None:
+        return
+    try:
+        collector.emit_eval(
+            source_key=key,
+            outcome=outcome,
+            duration_ms=duration_ms,
+            error=error,
+        )
+    except Exception:  # noqa: BLE001 — a metric failure must never break an eval
+        pass
+
+
 def _parse_expiry(raw: object) -> float | None:
     """Coerce the sidecar's ``cf_clearance_expires`` → a positive epoch float | None.
 
@@ -1025,25 +1057,50 @@ class AndroidSolver:
         non-origin/CF/hydration throw, or a timeout/cancel — those re-raise on the first
         failure.
         """
-        attempts = self._eval_origin_5xx_retry_attempts
-        for attempt in range(attempts + 1):
-            try:
-                payload = await self._post_eval(
-                    challenge_url, js, wait_for=wait_for, timeout=timeout
+        # Reverse-map the challenge_url → source key for comix attribution, the same
+        # dict _solve indexes. Emit ONCE per OUTER eval_in_webview call (not per inner
+        # 5xx retry attempt) via try/finally, so a comix /eval shows as one real-timed
+        # row regardless of the bounded origin-5xx retry. OBSERVABILITY ONLY — the
+        # return value and the retry semantics below are untouched.
+        source_key = next(
+            (k for k, v in self._challenge_urls.items() if v == challenge_url), None
+        )
+        start = time.perf_counter()
+        try:
+            attempts = self._eval_origin_5xx_retry_attempts
+            for attempt in range(attempts + 1):
+                try:
+                    payload = await self._post_eval(
+                        challenge_url, js, wait_for=wait_for, timeout=timeout
+                    )
+                except httpx.HTTPStatusError as exc:
+                    if attempt < attempts and _is_origin_5xx_eval_throw(exc.response):
+                        # Transient comix-origin 5xx — back off briefly and re-eval
+                        # ONCE on the warm device (the busy-503 retry inside _post_eval
+                        # still applies to each attempt). A persistent 5xx exhausts the
+                        # bounded attempts and re-raises on the final pass → a
+                        # per-source warning.
+                        await asyncio.sleep(self._eval_origin_5xx_retry_backoff_s)
+                        continue
+                    raise
+                _emit_eval(
+                    source_key,
+                    outcome="ok",
+                    duration_ms=(time.perf_counter() - start) * 1000.0,
+                    error=None,
                 )
-            except httpx.HTTPStatusError as exc:
-                if attempt < attempts and _is_origin_5xx_eval_throw(exc.response):
-                    # Transient comix-origin 5xx — back off briefly and re-eval ONCE on
-                    # the warm device (the busy-503 retry inside _post_eval still
-                    # applies to each attempt). A persistent 5xx exhausts the bounded
-                    # attempts and re-raises on the final pass → a per-source warning.
-                    await asyncio.sleep(self._eval_origin_5xx_retry_backoff_s)
-                    continue
-                raise
-            return payload["value"]
-        # Unreachable: the loop always returns a value or re-raises on the final attempt
-        # (the `attempt < attempts` guard is False on the last pass). Satisfies mypy.
-        raise AssertionError("eval_in_webview retry loop exited without returning")
+                return payload["value"]
+            # Unreachable: the loop always returns a value or re-raises on the final
+            # attempt (`attempt < attempts` is False on the last pass). Satisfies mypy.
+            raise AssertionError("eval_in_webview retry loop exited without returning")
+        except Exception as exc:
+            _emit_eval(
+                source_key,
+                outcome="error",
+                duration_ms=(time.perf_counter() - start) * 1000.0,
+                error=type(exc).__name__,
+            )
+            raise
 
     async def _post_eval(
         self,
