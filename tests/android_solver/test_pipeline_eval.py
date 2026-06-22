@@ -313,6 +313,65 @@ def test_wrong_host_eval_navigates_then_evals(
     assert device.taps == []  # not challenged ⇒ no tap
 
 
+# ── BUG 5 collision-recovery: a clean re-nav must NOT burn the frame-poll deadline ─
+
+
+def test_clean_renav_short_circuits_frame_poll_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bug 5 collision-recovery: when a foreign background solve steals the shared device
+    # mid comix sequence, comix's recovery re-navigates — but its warm cf_clearance is
+    # usually still valid, so the re-nav loads a CLEAN hydrated comix page and the CF
+    # OOPIF NEVER appears. _clear_challenge_if_present must NOT block the full ~20s
+    # frame-poll deadline waiting for a frame that won't come; it short-circuits the
+    # instant the page is hydrated-and-CF-free (nothing to clear, no tap).
+    device = FakeDevice()
+    clock = FakeClock()
+    fake = FakeCdp(location_host="comix.to", env_ready=True, cf_present=False)
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=clock, fake=fake)
+    ws = FakeWs()
+
+    start = clock.now
+    pipeline._clear_challenge_if_present(
+        ws,  # type: ignore[arg-type]
+        "ws://localhost:9222/p",
+        "comix.to",
+        None,
+        clock.now + 60.0,
+    )
+    elapsed = clock.now - start
+
+    assert device.taps == []  # clean page ⇒ nothing to clear, no tap
+    # Did NOT grind the full ~20s frame-poll deadline (the old vestigial wait).
+    assert elapsed < service._FRAME_POLL_TIMEOUT_S
+    # Short-circuited on the first poll (no sleep) — collision recovery is now fast.
+    assert elapsed <= pipeline._frame_poll_interval_s
+
+
+def test_challenged_renav_still_detects_and_clears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The short-circuit must NOT skip a REAL challenge: a CF interstitial after the
+    # re-nav is still detected and cleared with the /solve tap machinery.
+    device = FakeDevice()
+    clock = FakeClock()
+    fake = FakeCdp(location_host="comix.to", env_ready=True, cf_present=True)
+    pipeline = _eval_pipeline(
+        monkeypatch, device=device, clock=clock, fake=fake, tap=True
+    )
+    ws = FakeWs()
+
+    pipeline._clear_challenge_if_present(
+        ws,  # type: ignore[arg-type]
+        "ws://localhost:9222/p",
+        "comix.to",
+        None,
+        clock.now + 60.0,
+    )
+
+    assert device.taps == [(50, 100)]  # the genuine challenge was cleared via the tap
+
+
 # ── PROXY PARITY: egress-verify nav-away → re-establish cleared page → eval ────
 
 

@@ -675,6 +675,45 @@ class AndroidSolvePipeline:
             return False
         return self._frame_tree_has_cf(tree.get("frameTree"))
 
+    def _await_cf_challenge_or_clean(
+        self, ws: WebSocketLike, host: str, cancel: Event | None
+    ) -> bool:
+        """Poll a freshly-navigated page until it resolves, returning WHICH state:
+
+          * ``True``  — a Cloudflare challenge interstitial appeared (the
+            ``challenges.cloudflare.com`` OOPIF is in the frame tree) and must be
+            tapped to clear.
+          * ``False`` — the page came up CLEAN: already a hydrated, non-challenged
+            ``host`` comix page (the warm ``cf_clearance`` cookie still passed the
+            load), so there is NOTHING to clear.
+
+        Bug 5 collision-recovery: when a foreign background solve steals the shared
+        device mid comix sequence, comix's recovery re-navigates — but its warm
+        clearance is usually still valid, so the re-nav loads CLEAN and the CF OOPIF
+        NEVER appears. The old ``_wait_for_cf_frame`` blocked the FULL
+        ``_frame_poll_timeout_s`` (~20s) on every such clean re-nav (the
+        "cloudflare OOPIF did not appear before frame-poll deadline" warning), blowing
+        the per-source budget (~25s collision recovery). This poll short-circuits the
+        instant the page is hydrated-and-CF-free — reusing the SAME
+        ``_cf_frame_present`` / ``_is_hydrated_comix_page`` primitives the fast path
+        uses — cutting collision recovery to a few seconds, and only spends the long
+        deadline when a challenge genuinely renders. The CF frame is checked FIRST each
+        iteration so a real interstitial is never mistaken for a clean page.
+        """
+        deadline = time.monotonic() + self._frame_poll_timeout_s
+        while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel)  # issue #207: don't poll past a cancel
+            if self._cf_frame_present(ws):
+                return True
+            if self._is_hydrated_comix_page(ws, host):
+                return False
+            time.sleep(self._frame_poll_interval_s)
+        # Neither a challenge frame nor a confirmed-clean hydrated page within the
+        # deadline — fall back to a final CF-frame read (preserving the old behaviour:
+        # clear a challenge if one is present, else there is nothing to clear).
+        _log.warning("cloudflare OOPIF did not appear before frame-poll deadline")
+        return self._cf_frame_present(ws)
+
     def _clear_challenge_if_present(
         self,
         ws: WebSocketLike,
@@ -687,16 +726,20 @@ class AndroidSolvePipeline:
 
         comix re-challenges a fresh top-level load (the cf_clearance COOKIE alone does
         NOT pass a reload — bug 3), and on the proxied path the egress-verify navigates
-        the page away, so a re-nav is always freshly challenged. Wait for the Cloudflare
-        OOPIF (the solve path's ``_wait_for_cf_frame``); if it is a CF interstitial,
-        drive the SAME tap machinery ``/solve`` uses (``_compute_scales`` +
-        ``_tap_until_cleared`` — NOT a forked implementation) to clear it. If no
-        challenge frame appears (the warm clearance still passed the nav) there is
-        nothing to clear. The clearance minted/observed here is NEVER logged or returned
-        (T-14-04) — clearing is the only goal; the eval returns just the JS value.
+        the page away, so a re-nav may be freshly challenged. Poll for the page to
+        resolve to ONE of two terminal states (``_await_cf_challenge_or_clean``): a CF
+        interstitial — drive the SAME tap machinery ``/solve`` uses (``_compute_scales``
+        + ``_tap_until_cleared`` — NOT a forked implementation) to clear it — or a CLEAN
+        hydrated comix page (the warm clearance still passed the nav), in which case
+        there is nothing to clear.
+
+        Bug 5 collision-recovery: a clean re-nav short-circuits the instant the page is
+        hydrated-and-CF-free, so it no longer blocks the full ~20s frame-poll deadline
+        waiting for a CF OOPIF that will never appear. The clearance minted/observed
+        here is NEVER logged or returned (T-14-04) — clearing is the only goal; the eval
+        returns just the JS value.
         """
-        self._wait_for_cf_frame(ws, cancel)
-        if not self._cf_frame_present(ws):
+        if not self._await_cf_challenge_or_clean(ws, host, cancel):
             return
         x_scale, y_scale = self._compute_scales(ws)
         minted = self._tap_until_cleared(
