@@ -1194,3 +1194,123 @@ async def test_refresh_max_age_disabled_by_default_keeps_cookie_expiry_only() ->
             assert solver._expires_at["kagane"] == future
         finally:
             await solver.aclose()
+
+
+# ── bug 5 Fix #2: gate a foreground search on startup warm() completion ─────────
+# The startup eager warm() is fired NON-BLOCKING, so a comix /search that arrives during
+# the warm storm races the in-flight foreign solves: a queued warm/refresh solve can
+# steal the single shared WebView mid-sequence and comix's recovery re-nav burns the
+# budget (the collision spike). Fix #2 makes an android FOREGROUND sequence WAIT at the
+# device door (device_session) for warm() to finish before it claims the device.
+
+
+@pytest.mark.asyncio
+async def test_device_session_no_gate_until_armed() -> None:
+    """Fix #2: until the app arms the gate, ``device_session`` enters IMMEDIATELY even
+    though ``_warm_complete`` is unset — a solver that never warms (tests / unconfigured
+    sidecar / CI) is byte-for-byte unchanged and NEVER waits."""
+    solver = _solver()
+    try:
+        assert not solver._warm_gate_armed
+        assert not solver._warm_complete.is_set()
+        async with solver.device_session():  # must NOT block on the unset event
+            assert solver._foreground_inflight == 1
+        assert solver._foreground_inflight == 0
+    finally:
+        await solver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_device_session_waits_for_warm_then_proceeds() -> None:
+    """Fix #2: once armed, a foreground sequence PARKS at the device door (does NOT
+    claim the device — ``_foreground_inflight`` stays 0) until warm() sets the
+    completion event, then proceeds."""
+    solver = _solver()
+    solver.arm_warm_gate()  # armed; _warm_complete cleared
+    entered = asyncio.Event()
+
+    async def _seq() -> None:
+        async with solver.device_session():
+            entered.set()
+
+    task = asyncio.create_task(_seq())
+    try:
+        await asyncio.sleep(0.05)
+        assert not entered.is_set()  # parked at the gate
+        assert solver._foreground_inflight == 0  # has NOT claimed the device yet
+        solver._warm_complete.set()  # warm() finished → release the gate
+        await asyncio.wait_for(task, timeout=1.0)
+        assert entered.is_set()
+        assert solver._foreground_inflight == 0  # entered then unwound cleanly
+    finally:
+        if not task.done():
+            task.cancel()
+        await solver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_device_session_warm_gate_falls_through_on_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fix #2: a slow/hung warm() must NOT hang the search forever — the gate falls
+    THROUGH on timeout (and the search proceeds; Lever B defers any straggler warm
+    solve)."""
+    solver = _solver(warm_gate_timeout_s=0.05)
+    solver.arm_warm_gate()  # armed but warm() never completes (event never set)
+    try:
+        with caplog.at_level("WARNING", logger="manga_gateway"):
+            async with solver.device_session():  # must fall through, NOT hang
+                assert solver._foreground_inflight == 1
+        assert solver._foreground_inflight == 0
+    finally:
+        await solver.aclose()
+    assert any("warm gate timed out" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_warm_sets_completion_gate_even_when_every_key_fails() -> None:
+    """Fix #2: warm() releases the gate on EVERY exit. An unconfigured sidecar fails
+    every key, yet the completion event is still set (and warm() self-armed) so a parked
+    foreground sequence is never stranded."""
+    solver = _solver(base_url=None)  # unconfigured → every key fails
+    try:
+        assert not solver._warm_complete.is_set()
+        failed = await solver.warm()
+        assert set(failed) == set(_CHALLENGE_URLS)  # all failed (boot-disabled)
+        assert solver._warm_complete.is_set()  # gate released regardless
+        assert solver._warm_gate_armed  # warm() self-arms
+    finally:
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_warm_completes_while_foreground_search_waits_at_gate() -> None:
+    """Fix #2 × Lever B: because the search PARKS at the gate (``_foreground_inflight``
+    stays 0 during warm), warm()'s own eager solves (defer_if_foreground=True) do NOT
+    bail — warm clears every source FIRST, then the search proceeds against a
+    fully-cleared device. This is the whole point: gate the search instead of letting it
+    steal the device mid-warm."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    solver.arm_warm_gate()
+    entered = asyncio.Event()
+
+    async def _search() -> None:
+        async with solver.device_session():
+            entered.set()
+
+    search = asyncio.create_task(_search())
+    try:
+        await asyncio.sleep(0.05)
+        assert not entered.is_set()  # parked at the gate while warm runs
+        assert solver._foreground_inflight == 0  # 0 ⇒ warm's solves never bail
+        failed = await solver.warm()  # warm runs with inflight 0 → no deferral
+        assert failed == []  # both keys solved (none deferred, none failed)
+        assert route.call_count == len(_CHALLENGE_URLS)
+        await asyncio.wait_for(search, timeout=1.0)
+        assert entered.is_set()  # search proceeds once warm released the gate
+    finally:
+        if not search.done():
+            search.cancel()
+        await solver.aclose()

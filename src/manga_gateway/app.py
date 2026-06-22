@@ -402,6 +402,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Bug 5 Lever A: proactive-refresh-by-age cap (None ⇒ disabled — the default;
         # the operator tunes the VALUE from the measured comix re-challenge cadence).
         refresh_max_age_s=settings.android_refresh_max_age_s,
+        # Bug 5 Fix #2: how long an android foreground search waits at the device door
+        # for the startup warm() to finish before proceeding (armed below, just before
+        # the non-blocking warm task is created). Bounded so a slow/hung warm still lets
+        # the search attempt within the per-source fan-out budget.
+        warm_gate_timeout_s=settings.android_warm_gate_timeout_s,
         timeout_s=settings.android_solver_timeout_s,
         # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
         # the CloudflareSolver (no second build_proxy call, no new setting). The
@@ -453,6 +458,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ", ".join(sorted(failed)),
             )
 
+    # Bug 5 Fix #2 (startup-warm gate): arm the gate SYNCHRONOUSLY before the warm task
+    # is created — so by the time the server accepts any request, an android foreground
+    # search (a comix solve+eval inside device_session) WAITS for warm() to finish
+    # before claiming the shared device. This prevents a search that arrives during the
+    # startup warm storm from racing the in-flight foreign solves (the collision spike).
+    # No-op on the patchright-only / unconfigured-sidecar path (android_solver.warm()
+    # still sets the completion event in its finally). Arming here (not inside warm())
+    # closes the create_task scheduling race: the gate is armed before the lifespan
+    # yields.
+    android_solver.arm_warm_gate()
     warm_task = asyncio.create_task(_warm_solver())  # non-blocking (Pitfall 3)
     # (app.state.ratelimiter is created earlier, before CsrfBootstrap, so the
     # bootstrap GET shares the per-source limiter — see above.)

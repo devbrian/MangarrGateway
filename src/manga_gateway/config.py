@@ -259,6 +259,21 @@ class Settings(BaseSettings):
     # ``captured clearance for host comix.to`` log timestamps — then set this BELOW that
     # interval (minus the ~120s lead) so a search never hits a cold clear. Do NOT guess.
     android_refresh_max_age_s: float | None = Field(default=None)
+    # Bug 5 Fix #2 (startup-warm gate). The startup eager warm() is fired NON-BLOCKING,
+    # so a comix /search that arrives DURING the warm storm races the in-flight foreign
+    # solves: a queued warm/refresh solve can navigate the single shared WebView away
+    # from comix's page mid-sequence, and comix's recovery re-nav burns the budget
+    # (collision spike). When set (> 0, SECONDS) an android-routed foreground sequence
+    # (a comix solve+eval inside ``device_session``) WAITS at the device door for warm()
+    # to finish before claiming the device — so the first post-boot search finds every
+    # android source already cleared and the shared page parked on the holder (comix),
+    # with NO startup-warm steal. The wait FALLS THROUGH on timeout (warm slow/hung)
+    # rather than hanging the search forever — Lever B then defers any straggler warm
+    # solve. Sized below the 30s per-source fan-out budget so a pathological warm still
+    # lets the search attempt within budget. Only android searches wait (non-android
+    # sources never enter ``device_session``); the gate is a no-op until the app arms it
+    # at startup, so the gate / CI / a solver that never warms stays unchanged.
+    android_warm_gate_timeout_s: float = Field(default=25.0, gt=0)
     # ── Source enable/disable (reversible ops knob; #198/#202) ─────────────────
     # Comma-separated source keys to SKIP registering at startup, e.g.
     # GATEWAY_DISABLED_SOURCES="kagane,mangadot". A disabled source is dropped

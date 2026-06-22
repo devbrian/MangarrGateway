@@ -172,6 +172,15 @@ class AndroidSolver:
         # DISABLED (cookie-expiry-only, byte-for-byte unchanged). The VALUE is tuned
         # from a live measurement window (see ``Settings.android_refresh_max_age_s``).
         refresh_max_age_s: float | None = None,
+        # Bug 5 Fix #2 (startup-warm gate): the bounded wait an android FOREGROUND
+        # sequence (a comix solve+eval inside :meth:`device_session`) spends at the
+        # device door for the startup :meth:`warm` to finish BEFORE it claims the
+        # device, so the first post-boot search finds every android source cleared and
+        # the shared WebView parked on the page-holder (no startup-warm steal). The wait
+        # falls THROUGH on timeout (warm slow/hung) rather than hanging the search; it
+        # is a no-op until :meth:`arm_warm_gate` is called (the app lifespan), so a
+        # solver that never warms (tests / unconfigured sidecar / CI) never waits.
+        warm_gate_timeout_s: float = 25.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
@@ -224,6 +233,60 @@ class AndroidSolver:
         # (nesting-safe) holding NO lock — the gathered evals inside still serialize
         # per-op on _device_lock.
         self._foreground_inflight = 0
+        # Bug 5 Fix #2 (startup-warm gate). ``_warm_complete`` is set by :meth:`warm`'s
+        # finally (on EVERY exit — success, partial failure, raise) so a foreground
+        # sequence parked at the device door is always released. ``_warm_gate_armed``
+        # gates the wait: False until :meth:`arm_warm_gate` (the app lifespan,
+        # synchronously before the non-blocking warm task is created) so a solver that
+        # never warms (tests / unconfigured / CI) never waits. The wait takes NO lock —
+        # it only awaits an Event — and warm()/the refresh loop NEVER enter
+        # :meth:`device_session`, so awaiting warm here cannot deadlock with the
+        # foreground lease or the per-op ``_device_lock``.
+        self._warm_gate_timeout_s = warm_gate_timeout_s
+        self._warm_complete = asyncio.Event()
+        self._warm_gate_armed = False
+
+    def arm_warm_gate(self) -> None:
+        """Arm the startup-warm gate (Bug 5 Fix #2; app lifespan, synchronous).
+
+        Called by the app lifespan BEFORE the non-blocking warm task is created — so by
+        the time the server accepts any request the gate is armed and a foreground
+        android sequence (a comix solve+eval inside :meth:`device_session`) WAITS for
+        :meth:`warm` to finish before claiming the shared device. Synchronous +
+        race-free (runs in lifespan startup, before the lifespan yields). Idempotent;
+        clearing the completion is :meth:`warm`'s job (its finally sets
+        ``_warm_complete``)."""
+        self._warm_gate_armed = True
+        self._warm_complete.clear()
+
+    async def _await_warm_gate(self) -> None:
+        """Block a FOREGROUND sequence at the device door until startup warm() finishes.
+
+        Bug 5 Fix #2: a comix /search that arrives DURING the startup warm storm would
+        otherwise race the in-flight foreign solves — a queued warm/refresh solve can
+        steal the single shared WebView mid-sequence, and comix's recovery re-nav burns
+        the per-source budget (the collision spike). Gating the foreground sequence here
+        lets warm() (others-first, comix-last per :meth:`warm`'s ordering) complete
+        first, so the first post-boot search finds every source cleared and the page
+        parked on comix. No-op unless armed (:meth:`arm_warm_gate`, the app lifespan) —
+        a solver that never warms (tests / unconfigured sidecar / CI) never waits. FALLS
+        THROUGH on timeout (warm slow/hung) rather than hanging the search forever;
+        Lever B then defers any straggler warm solve. Deadlock-free: it awaits ONLY an
+        Event (no lock) and warm()/the refresh loop NEVER enter :meth:`device_session`,
+        so this can never wait on a holder of the lease or the per-op
+        ``_device_lock``."""
+        if not self._warm_gate_armed or self._warm_complete.is_set():
+            return
+        try:
+            async with asyncio.timeout(self._warm_gate_timeout_s):
+                await self._warm_complete.wait()
+        except TimeoutError:
+            _log.warning(
+                "AndroidSolver startup-warm gate timed out after %.0fs — proceeding "
+                "with the foreground sequence (warm slow/incomplete; Lever B defers "
+                "any straggler warm solve)",
+                self._warm_gate_timeout_s,
+            )
 
     async def get_clearance(
         self,
@@ -372,38 +435,50 @@ class AndroidSolver:
         solve BAILS (:class:`_RefreshDeferred`) instead. A deferred key is NOT a fail:
         it is left unwarmed and solves on-demand on first use (the request that holds
         the lease) or via the next proactive refresh, so it must NOT be force-disabled.
+
+        Bug 5 Fix #2 (startup-warm gate): the completion Event is set in the ``finally``
+        on EVERY exit (success, partial failure, OR an outright raise) so a foreground
+        android sequence parked at the device door (:meth:`_await_warm_gate`) is ALWAYS
+        released — warm() never hangs a search. Self-arms too, so a direct ``warm()``
+        call (no app lifespan) still gates correctly.
         """
+        self._warm_gate_armed = True
         failed: list[str] = []
-        # Page-holders last; stable within each group (Bug 5 warm-ordering).
-        ordered = [k for k in self._challenge_urls if k not in self._warm_last_keys]
-        ordered += [k for k in self._challenge_urls if k in self._warm_last_keys]
-        for key in ordered:
-            if key in self._on_demand_keys:
-                # On-demand source: never eager-warm — it solves only when a live
-                # challenge is detected (debug pooltimeout-recurrence).
-                continue
-            try:
-                await self.get_clearance(key, defer_if_foreground=True)
-            except _RefreshDeferred:
-                # Bug 5 Lever B: a foreground lease was held while this eager warm
-                # queued on the device lock — skip it WITHOUT marking it failed (it is
-                # not a solve failure, so it must not be force-disabled). It solves
-                # on-demand on first use or via the next proactive refresh.
-                _log.info(
-                    "AndroidSolver warm deferred for source %r — a foreground lease "
-                    "held the device; will solve on-demand / next refresh (NOT "
-                    "disabled)",
-                    key,
-                )
-            except Exception as exc:  # noqa: BLE001 — isolate per-key warm failures
-                _log.warning(
-                    "AndroidSolver warm failed for source %r: %r "
-                    "(boots disabled — D-33)",
-                    key,
-                    exc,
-                    exc_info=True,
-                )
-                failed.append(key)
+        try:
+            # Page-holders last; stable within each group (Bug 5 warm-ordering).
+            ordered = [k for k in self._challenge_urls if k not in self._warm_last_keys]
+            ordered += [k for k in self._challenge_urls if k in self._warm_last_keys]
+            for key in ordered:
+                if key in self._on_demand_keys:
+                    # On-demand source: never eager-warm — it solves only when a live
+                    # challenge is detected (debug pooltimeout-recurrence).
+                    continue
+                try:
+                    await self.get_clearance(key, defer_if_foreground=True)
+                except _RefreshDeferred:
+                    # Bug 5 Lever B: a foreground lease was held while this eager warm
+                    # queued on the device lock — skip it WITHOUT marking it failed (it
+                    # is not a solve failure, so it must not be force-disabled). It
+                    # solves on-demand on first use or via the next proactive refresh.
+                    _log.info(
+                        "AndroidSolver warm deferred for source %r — a foreground "
+                        "lease held the device; will solve on-demand / next refresh "
+                        "(NOT disabled)",
+                        key,
+                    )
+                except Exception as exc:  # noqa: BLE001 — isolate per-key warm failures
+                    _log.warning(
+                        "AndroidSolver warm failed for source %r: %r "
+                        "(boots disabled — D-33)",
+                        key,
+                        exc,
+                        exc_info=True,
+                    )
+                    failed.append(key)
+        finally:
+            # Bug 5 Fix #2: release the gate on EVERY exit so a parked foreground
+            # sequence proceeds whether warm succeeded, partially failed, or raised.
+            self._warm_complete.set()
         return failed
 
     async def aclose(self) -> None:
@@ -504,7 +579,17 @@ class AndroidSolver:
         :meth:`_device_op`) and serialize; holding a lock ACROSS the gather would
         deadlock. Deferral is safe — the held clearance keeps serving and the reactive
         D-35 403 self-heal still backstops an expired clearance.
+
+        Bug 5 Fix #2 (startup-warm gate): BEFORE claiming the lease, the sequence WAITS
+        for the startup :meth:`warm` to finish (:meth:`_await_warm_gate`, bounded), so a
+        search that arrives during the warm storm does not race the in-flight foreign
+        solves. Waiting BEFORE the increment keeps ``_foreground_inflight == 0`` during
+        warm, so warm()'s own solves (defer_if_foreground=True) do NOT bail — warm
+        completes fully, then the search proceeds against a fully-cleared device parked
+        on the page-holder. The wait is a no-op until the app arms the gate, so every
+        offline test enters the lease immediately exactly as before.
         """
+        await self._await_warm_gate()
         self._foreground_inflight += 1
         try:
             yield
