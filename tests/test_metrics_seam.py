@@ -328,6 +328,48 @@ async def test_failed_solve_emits_error_then_reraises(
 
 
 @pytest.mark.asyncio
+async def test_emit_eval_ingests_redacted_eval_event(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """``emit_eval`` ingests ONE ``kind="eval"`` event with the passed (real)
+    ``duration_ms``, op=``eval``, comix attribution via the source-scope fallback,
+    and ``url=None`` (the eval js / result / token can NEVER cross into the store)."""
+    c, store = collector
+    c.emit_eval(source_key="comix", outcome="ok", duration_ms=123.4)
+
+    evals = [e for e in store.iter_recent() if e.kind == "eval"]
+    assert len(evals) == 1
+    ev = evals[0]
+    assert ev.op == "eval"
+    assert ev.duration_ms == 123.4
+    assert ev.source_key == "comix"  # bound via emit_eval's source_scope fallback
+    assert ev.url is None  # redaction guarantee — no js/result/token recorded
+    assert ev.method is None
+    assert ev.status is None
+
+
+@pytest.mark.asyncio
+async def test_emit_eval_error_is_a_failure(
+    collector: tuple[Collector, CapturingRingWriter],
+) -> None:
+    """``emit_eval`` with ``outcome="error"`` lands in the failures ring
+    (``is_failure`` keys on outcome, not kind)."""
+    c, store = collector
+    c.emit_eval(
+        source_key="comix",
+        outcome="error",
+        duration_ms=42.0,
+        error="TimeoutException",
+    )
+
+    failures = store.latest_failures(10)
+    eval_failures = [e for e in failures if e["kind"] == "eval"]
+    assert len(eval_failures) == 1
+    assert eval_failures[0]["outcome"] == "error"
+    assert eval_failures[0]["error"] == "TimeoutException"
+
+
+@pytest.mark.asyncio
 async def test_job_transition_and_fail_emit_job_events(
     collector: tuple[Collector, CapturingRingWriter],
 ) -> None:

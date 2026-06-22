@@ -83,6 +83,12 @@ RING_SLOW = "slow"
 # treated as a non-failure: "ok", the enumeration-cache STATE labels
 # "hit"/"miss"/"refetch" (kind="cache"), and the reserved transient labels
 # "retry"/"cf_resolve". ``client_error`` is CONDITIONAL — see :func:`is_failure`.
+# NB: ``classify``/``is_failure`` key ONLY on (surface, source_key, endpoint, op)
+# and ``outcome`` — never on ``kind`` — so every kind flows through identically.
+# Kinds seen here: "http"|"solve"|"eval"|"package"|"limiter-wait"|"job"|"request"|
+# "source-result"|"cache"|"browser" (kind="eval" is comix's android-WebView /eval
+# call, emitted by Collector.emit_eval with a real duration_ms; outcome="error"
+# counts toward the failures ring exactly like any other kind).
 _FAILURE_OUTCOMES = frozenset({"error", "timeout"})
 
 

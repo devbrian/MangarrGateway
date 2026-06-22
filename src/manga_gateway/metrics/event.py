@@ -26,7 +26,7 @@ class MetricEvent:
     """
 
     ts: float
-    kind: str  # "http" | "solve" | "package" | "limiter-wait" | "job" | "request"
+    kind: str  # "http"|"solve"|"eval"|"package"|"limiter-wait"|"job"|"request"
     request_id: int | None
     surface: str | None  # "search" | "download" | ...
     endpoint: str | None  # logical route, e.g. "GET /search"
