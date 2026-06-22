@@ -149,11 +149,13 @@ def _mock_one_series_with_links(
     links: dict[str, Any] | None,
     *,
     n_chapters: int,
-) -> respx.Route:
-    """Mock ``/api/v1/manga`` to return ONE series carrying ``links`` + stage its
-    series-page browser result with ``n_chapters`` chapters.
+) -> None:
+    """Stage ONE search candidate carrying ``links`` (the homepage ``c.list`` eval)
+    + its series-page chapter-list eval with ``n_chapters`` chapters.
 
-    Returns the respx route so the caller can assert the search XHR call count.
+    Phase 14: search runs in-WebView, so the candidates envelope is staged on the
+    solver's homepage eval (not an httpx route). The caller asserts the search
+    eval count via ``solver.search_evals``.
     """
     item: dict[str, Any] = {
         "id": 1000,
@@ -166,9 +168,7 @@ def _mock_one_series_with_links(
     }
     if links is not None:
         item["links"] = links
-    route = respx.get(f"{_COMIX}/api/v1/manga").mock(
-        return_value=httpx.Response(200, json=_candidates_json([item]))
-    )
+    solver.stage(f"{_COMIX}/", result=_candidates_json([item]))
     chapters = [
         {
             "id": f"chap-{n}",
@@ -179,7 +179,6 @@ def _mock_one_series_with_links(
         for n in range(1, n_chapters + 1)
     ]
     solver.stage(f"{_COMIX}/title/hid0-slug0", result=chapters)
-    return route
 
 
 @respx.mock
@@ -187,7 +186,7 @@ def _mock_one_series_with_links(
 async def test_search_stamps_identical_links_with_one_search_xhr(
     comix_client: httpx.AsyncClient, slow_solver: _SlowComixSolver
 ) -> None:
-    route = _mock_one_series_with_links(slow_solver, dict(_RAW_LINKS), n_chapters=3)
+    _mock_one_series_with_links(slow_solver, dict(_RAW_LINKS), n_chapters=3)
 
     resp = await comix_client.post(
         "/search",
@@ -204,9 +203,9 @@ async def test_search_stamps_identical_links_with_one_search_xhr(
         for value in rel["externalLinks"].values():
             assert "http" not in value
 
-    # The links rode the cached Layer-1 candidate — the search XHR fired at most once
-    # (R5: zero added HTTP for external links).
-    assert route.call_count <= 1, route.call_count
+    # The links rode the cached Layer-1 candidate — the search token-mint eval fired
+    # at most once (R5: zero added work for external links).
+    assert slow_solver.search_evals <= 1, slow_solver.search_evals
 
 
 @respx.mock

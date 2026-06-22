@@ -1,26 +1,26 @@
 """Plan 09-05 proof: Comix opted into both enum-cache layers (CACHE-02..06).
 
-Comix's chapter enumeration is a browser-DOM read of the warm series page — the
-SINGLE biggest cost on this source (7-18s/nav). The headline win is that a repeat
-same-series chapter search skips that navigation entirely (Layer-2 HIT) AND skips
-the plaintext ``/api/v1/manga`` title call (Layer-1 HIT).
+Comix's chapter enumeration is an in-WebView eval of the warm series page — the
+SINGLE biggest cost on this source. The headline win is that a repeat same-series
+chapter search skips that eval entirely (Layer-2 HIT) AND skips the search
+token-mint eval (Layer-1 HIT).
 
-Three assertions, all network-free (respx for the plaintext call) + browser-free
-(a fake solver that COUNTS ``fetch_via_browser`` invocations):
+Phase 14: comix runs BOTH its search token-mint and its chapter-list enumeration
+through ``solver.eval_in_webview`` (the redroid WebView), so the witnesses are now
+solver-eval counters, not httpx calls. All assertions stay network-free + browser-
+free (a fake solver that COUNTS its evals by kind):
 
 * **zero-cost repeat** — a type=manga search then a same-(query, languages)
   type=chapter search through ONE ``SourceContext`` + ``EnumerationCache`` issues
-  zero ``fetch_via_browser`` calls AND zero ``/api/v1/manga`` calls on the second
-  search (both layers HIT) — and the second search still returns the correct
-  floor-family releases (the ``chapter_matches`` filter is applied post-cache, in
-  ``search()``).
+  zero chapter-list evals AND zero search token-mint evals on the second search
+  (both layers HIT) — and the second search still returns the correct floor-family
+  releases (the ``chapter_matches`` filter is applied post-cache, in ``search()``).
 * **kill-switch** — ``EnumerationCache(enabled=False)`` restores the pre-Phase-9
-  re-navigation: the repeat chapter search re-fires the browser nav (delta > 0).
+  re-enumeration: the repeat chapter search re-fires both evals (delta > 0).
 """
 
 from __future__ import annotations
 
-import httpx
 import pytest
 import respx
 
@@ -43,23 +43,26 @@ _SERIES_URL = f"{_COMIX}/title/{_SERIES_ID}-{_SLUG}"
 
 
 class _CountingComixSolver:
-    """Fake AntiBotSolver: a canned ``Clearance`` + browser-fetch primitives that
-    COUNT their invocations and return a staged per-URL result (no real browser).
+    """Fake AntiBotSolver: a canned ``Clearance`` + an ``eval_in_webview`` seam that
+    COUNTS its invocations per kind and returns a staged per-URL result (no browser).
 
-    ``fetch_calls`` is the cross-search witness the headline assertion reads: a
-    Layer-2 cache HIT must never reach the browser, so the delta across the second
-    search is exactly 0. The search path enumerates the FULL chapter list by running
-    comix's OWN internal ``chapters(hid, {limit:100})`` loader on the one-shot
-    ``fetch_via_browser`` (spike 019) — that is the method the source actually calls
-    now (``_fetch_series_chapters_raw``), so it increments ``fetch_calls``. The
-    retired ``fetch_via_browser_paginated`` is kept on the fake (sharing the same
-    ``browser_results`` registry + counter) only for back-compat; the source no
-    longer calls it and ``_solver_from_ctx`` no longer requires it.
+    Phase 14: comix runs BOTH its search token-mint (one eval on the homepage) and
+    its chapter-list enumeration (one eval per series page) through
+    ``eval_in_webview``. The fake routes by nav target:
+
+    * ``search_evals`` counts the homepage search ``c.list`` evals — the Layer-1
+      resolve-cache witness (a repeat (query, languages) search must skip it).
+    * ``fetch_calls`` counts the per-series chapter-list evals — the Layer-2
+      enum-cache witness (a same-series repeat must skip it; delta 0 on HIT).
+
+    Both are network-free; the staged candidates envelope (homepage) and the staged
+    chapter rows (series URL) live in ``browser_results``.
     """
 
     def __init__(self) -> None:
         self.browser_results: dict[str, object] = {}
         self.fetch_calls = 0
+        self.search_evals = 0
 
     def stage_browser_fetch(self, url: str, result: object) -> None:
         self.browser_results[url] = result
@@ -67,59 +70,24 @@ class _CountingComixSolver:
     async def get_clearance(self, source_key: str) -> Clearance:
         return Clearance(cookies={"cf_clearance": "CF"}, user_agent="UA")
 
-    async def fetch_via_browser(
+    async def eval_in_webview(
         self,
-        url: str,
+        challenge_url: str,
+        js: str,
         *,
-        extract: str,
         wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the seam contract
     ) -> object:
-        _ = (extract, wait_for, timeout)
-        self.fetch_calls += 1
-        if url not in self.browser_results:
-            raise AssertionError(f"unmocked fetch_via_browser({url!r})")
-        return self.browser_results[url]
-
-    async def fetch_via_browser_typed(
-        self,
-        url: str,
-        *,
-        type_selector: str,
-        type_text: str,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
-    ) -> object:
-        # Search mints a `_=` token by typing into the SPA box (debug
-        # comix-search-api-403). This is the SEARCH-token nav, distinct from the
-        # chapter-enumeration navs ``fetch_calls`` witnesses — so it deliberately
-        # does NOT bump ``fetch_calls`` (and the Layer-1 resolve cache skips it on
-        # repeat anyway). Returns the tokenized /api/v1/manga URL the source then
-        # replays verbatim into the respx mock (matched by path, query ignored).
-        _ = (url, type_selector, extract, wait_for, timeout)
-        return (
-            f"{_COMIX}/api/v1/manga?keyword={type_text}"
-            "&limit=6&content_rating=suggestive&_=faketoken"
-        )
-
-    async def fetch_via_browser_paginated(
-        self,
-        url: str,
-        *,
-        extract: str,
-        wait_for: str | None = None,
-        next_selector: str,
-        route_limit_rewrite: tuple[str, int] | None = None,
-        max_pages: int = 200,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
-    ) -> object:
-        _ = (extract, wait_for, next_selector, route_limit_rewrite)
-        _ = (max_pages, timeout)
-        self.fetch_calls += 1
-        if url not in self.browser_results:
-            raise AssertionError(f"unmocked fetch_via_browser_paginated({url!r})")
-        return self.browser_results[url]
+        _ = (js, wait_for, timeout)
+        # The homepage eval is the search token-mint (Layer-1 witness); a series-page
+        # eval is the chapter-list enumeration (Layer-2 witness).
+        if "/title/" in challenge_url:
+            self.fetch_calls += 1
+        else:
+            self.search_evals += 1
+        if challenge_url not in self.browser_results:
+            raise AssertionError(f"unmocked eval_in_webview({challenge_url!r})")
+        return self.browser_results[challenge_url]
 
 
 def _build_ctx(
@@ -178,12 +146,10 @@ def _chapter_rows() -> list[dict]:
 @respx.mock
 @pytest.mark.asyncio
 async def test_repeat_same_series_chapter_search_zero_browser_navs() -> None:
-    """A manga search then a same-series chapter search → 0 browser navs AND 0
-    ``/api/v1/manga`` calls on the second search; the served floor family is right."""
-    manga_route = respx.get(f"{_COMIX}/api/v1/manga").mock(
-        return_value=httpx.Response(200, json=_candidates_payload())
-    )
+    """A manga search then a same-series chapter search → 0 chapter-list evals AND 0
+    search token-mint evals on the second search; the served floor family is right."""
     solver = _CountingComixSolver()
+    solver.stage_browser_fetch(f"{_COMIX}/", _candidates_payload())
     solver.stage_browser_fetch(_SERIES_URL, _chapter_rows())
 
     src = ComixSource()
@@ -191,19 +157,19 @@ async def test_repeat_same_series_chapter_search_zero_browser_navs() -> None:
     try:
         first = await src.search(SearchRequest(type="manga", query="Cipher"), ctx)
         assert first  # the first search populated both layers
-        manga_after_first = manga_route.call_count
+        search_after_first = solver.search_evals
         navs_after_first = solver.fetch_calls
-        assert navs_after_first == 1  # exactly one series-page navigation
+        assert navs_after_first == 1  # exactly one series-page chapter-list eval
 
         # Same (query, languages); the floor query selects the 10.x family.
         second = await src.search(
             SearchRequest(type="chapter", query="Cipher", chapter=10), ctx
         )
 
-        # The headline win: the second same-series search touches neither the
-        # browser nor the plaintext title endpoint (both layers HIT).
+        # The headline win: the second same-series search runs neither the
+        # chapter-list eval (Layer-2) nor the search token-mint eval (Layer-1).
         assert solver.fetch_calls - navs_after_first == 0
-        assert manga_route.call_count - manga_after_first == 0
+        assert solver.search_evals - search_after_first == 0
 
         # The floor filter is applied post-cache (in search()): chapter=10 keeps
         # the whole-number/floor family (10 and 10.5), nothing else.
@@ -226,14 +192,12 @@ async def test_mode_flip_is_resolve_hit_zero_new_manga_calls() -> None:
 
     A non-interactive ``type=manga`` search warms (query, languages); a SUBSEQUENT
     ``interactive=True`` search of the SAME (query, languages) makes ZERO additional
-    ``/api/v1/manga`` resolve calls — a Layer-1 resolve HIT across the mode flip.
-    Pre-#162 the ``extra=count`` discriminator (15 interactive vs 5 default) forced a
-    deliberate MISS here.
+    search token-mint evals — a Layer-1 resolve HIT across the mode flip. Pre-#162 the
+    ``extra=count`` discriminator (15 interactive vs 5 default) forced a deliberate
+    MISS here.
     """
-    manga_route = respx.get(f"{_COMIX}/api/v1/manga").mock(
-        return_value=httpx.Response(200, json=_candidates_payload())
-    )
     solver = _CountingComixSolver()
+    solver.stage_browser_fetch(f"{_COMIX}/", _candidates_payload())
     solver.stage_browser_fetch(_SERIES_URL, _chapter_rows())
 
     src = ComixSource()
@@ -242,13 +206,13 @@ async def test_mode_flip_is_resolve_hit_zero_new_manga_calls() -> None:
         await src.search(
             SearchRequest(type="manga", query="Cipher", interactive=False), ctx
         )
-        manga_after_first = manga_route.call_count
+        search_after_first = solver.search_evals
 
         await src.search(
             SearchRequest(type="chapter", query="Cipher", interactive=True), ctx
         )
-        # The mode flip is a resolve HIT: zero additional /api/v1/manga calls.
-        assert manga_route.call_count - manga_after_first == 0
+        # The mode flip is a resolve HIT: zero additional search token-mint evals.
+        assert solver.search_evals - search_after_first == 0
     finally:
         await transport.aclose()
 
@@ -260,22 +224,20 @@ async def test_mode_flip_is_resolve_hit_zero_new_manga_calls() -> None:
 @pytest.mark.asyncio
 async def test_kill_switch_reissues_browser_nav_and_title_call() -> None:
     """``enabled=False`` (D-08): the repeat chapter search re-navigates + re-calls."""
-    manga_route = respx.get(f"{_COMIX}/api/v1/manga").mock(
-        return_value=httpx.Response(200, json=_candidates_payload())
-    )
     solver = _CountingComixSolver()
+    solver.stage_browser_fetch(f"{_COMIX}/", _candidates_payload())
     solver.stage_browser_fetch(_SERIES_URL, _chapter_rows())
 
     src = ComixSource()
     ctx, transport = _build_ctx(EnumerationCache(enabled=False), solver)
     try:
         await src.search(SearchRequest(type="manga", query="Cipher"), ctx)
-        manga_after = manga_route.call_count
+        search_after = solver.search_evals
         navs_after = solver.fetch_calls
 
         await src.search(SearchRequest(type="chapter", query="Cipher", chapter=10), ctx)
         # No caching → both layers re-issue their upstream work (delta > 0).
         assert solver.fetch_calls - navs_after > 0
-        assert manga_route.call_count - manga_after > 0
+        assert solver.search_evals - search_after > 0
     finally:
         await transport.aclose()

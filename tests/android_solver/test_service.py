@@ -8,7 +8,9 @@ solves + timeout (T-10-11), and that the token value never reaches the logs
 
 from __future__ import annotations
 
+import contextlib
 import http.client
+import json
 import threading
 import time
 from collections.abc import Iterator
@@ -45,10 +47,30 @@ class FakePipeline:
         error: Exception | None = None,
         started: threading.Event | None = None,
         release: threading.Event | None = None,
+        eval_result: object = None,
+        eval_clearance: SolveResult | None = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.proxies: list[dict[str, object] | None] = []
+        # /eval call recording (Phase 14): the js of each eval, so tests can assert
+        # the pipeline was (or was NOT) driven without leaking it elsewhere.
+        self.eval_js: list[str] = []
+        # The proxy each /eval was driven with (Req 7 parity with ``solve`` →
+        # ``self.proxies``): a separate list so the eval-vs-solve serialization test's
+        # shared counters never conflate solve-proxy and eval-proxy assertions.
+        self.eval_proxies: list[dict[str, object] | None] = []
         self._result = result
+        # The value /eval marshals back; parametrizable to a large list for the A4
+        # no-truncation regression. Defaults to a small dict.
+        self._eval_result = eval_result if eval_result is not None else {"ok": True}
+        # Bug 5 follow-on #3: the SolveResult the eval-with-clearance path returns
+        # alongside the value (``(value, clearance)``). ``None`` models a clean clear
+        # that deposited no host-scoped cookie.
+        self._eval_clearance = eval_clearance
+        # Records whether each eval requested clearance extraction (so a test can assert
+        # the flag threaded through ``_run_eval`` → the pipeline).
+        self.eval_with_clearance: list[bool] = []
+        self.eval_wait_for: list[str | None] = []
         self._delay = delay
         self._healthy = healthy
         self._error = error
@@ -107,6 +129,54 @@ class FakePipeline:
             with self._counter_lock:
                 self._active -= 1
 
+    def eval_in_webview(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: threading.Event | None = None,
+        *,
+        wait_for: str | None = None,
+        deadline: float | None = None,
+        proxy: dict[str, object] | None = None,
+        with_clearance: bool = False,
+    ) -> object:
+        # Mirrors ``solve``'s recording + gating (shared counters/events) so the
+        # eval-vs-solve serialization test can hold the lock with EITHER endpoint.
+        with self._counter_lock:
+            self._active += 1
+            self.max_concurrent = max(self.max_concurrent, self._active)
+        try:
+            self.calls.append((challenge_url, host))
+            self.eval_js.append(js)
+            self.eval_proxies.append(proxy)
+            self.eval_with_clearance.append(with_clearance)
+            self.eval_wait_for.append(wait_for)
+            if self._started is not None:
+                self._started.set()
+            if self._release is not None:
+                while not self._release.wait(timeout=0.02):
+                    if cancel is not None and cancel.is_set():
+                        self.cancelled = True
+                        raise SolveCancelled("cancelled after timeout")
+            if self._delay:
+                waited = 0.0
+                step = 0.02
+                while waited < self._delay:
+                    if cancel is not None and cancel.is_set():
+                        self.cancelled = True
+                        raise SolveCancelled("cancelled after timeout")
+                    time.sleep(step)
+                    waited += step
+            if self._error is not None:
+                raise self._error
+            if with_clearance:
+                return (self._eval_result, self._eval_clearance)
+            return self._eval_result
+        finally:
+            with self._counter_lock:
+                self._active -= 1
+
     def health(self) -> bool:
         return self._healthy
 
@@ -124,6 +194,25 @@ def _config(**overrides: object) -> SidecarConfig:
 
 def _service(pipeline: FakePipeline, **cfg: object) -> SolverService:
     return SolverService(_config(**cfg), pipeline)
+
+
+@contextlib.contextmanager
+def _running_server(pipeline: FakePipeline) -> Iterator[int]:
+    """Serve ``pipeline`` over the real stdlib ``_Handler`` on an ephemeral port.
+
+    Yields the bound port so a test can drive the actual HTTP transport (the
+    ``do_POST`` pre-auth + body-cap rails and the JSON response writer), then
+    shuts the server down. Used by the /eval transport + A4 large-result tests.
+    """
+    srv = _SolverHTTPServer(("127.0.0.1", 0), _Handler, service=_service(pipeline))
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv.server_address[1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
 
 
 # ── auth (T-10-08) ───────────────────────────────────────────────────────────
@@ -509,6 +598,466 @@ def test_next_solve_not_starved_by_timed_out_orphan() -> None:
     assert elapsed < 5.0  # not queued behind the cancelled orphan
 
 
+# ── /eval (Phase 14: EVAL-01 / SEC-01) ───────────────────────────────────────
+#
+# /eval reuses /solve's rails verbatim — X-Solver-Key auth before any device
+# action (T-14-01), the scheme-pinned-then-host-allowlisted SSRF guard before any
+# device action (T-14-02) — and adds a js parse (T-14-03). These assert each
+# rejection path takes NO device action (pipeline.calls == []), that an eval and a
+# solve are mutually exclusive against the one device, and that a large result
+# round-trips intact (A4). The fake pipeline records the js but the tests never
+# assert it reaches a log (secret discipline, T-14-04).
+
+
+def test_eval_rejects_missing_key() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(api_key=None, body=b"{}")
+    assert status == 401
+    assert pipeline.calls == []  # no device action on an unauthenticated /eval
+
+
+def test_eval_rejects_non_allowlisted_host() -> None:
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://evil.example/", "js": "1+1"}',
+    )
+    assert status == 422
+    assert pipeline.calls == []  # the device pipeline is NEVER invoked
+    assert "allowlist" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"challenge_url": "file://mangadot.net/etc/passwd", "js": "1+1"}',
+        b'{"challenge_url": "intent://mangadot.net/#Intent;end", "js": "1+1"}',
+        b'{"challenge_url": "content://mangadot.net/data", "js": "1+1"}',
+    ],
+)
+def test_eval_rejects_non_http_scheme_even_for_allowlisted_host(body: bytes) -> None:
+    # T-14-02: an allowlisted HOST with a non-http(s) SCHEME is still rejected
+    # before any device action — the scheme is pinned ahead of the host check.
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # never navigates
+    assert "scheme" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"challenge_url": "https://mangadot.net/"}',  # js absent
+        b'{"challenge_url": "https://mangadot.net/", "js": ""}',  # js empty
+        b'{"challenge_url": "https://mangadot.net/", "js": 5}',  # js not a str
+    ],
+)
+def test_eval_rejects_missing_or_empty_js(body: bytes) -> None:
+    # T-14-03: js is required — a missing/empty/non-str js is a pre-device 422.
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # never reaches the device
+    assert "js" in payload["error"]
+
+
+def test_eval_requires_challenge_url() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key", body=b'{"js": "1+1"}'
+    )
+    assert status == 422
+    assert pipeline.calls == []
+
+
+def test_eval_rejects_malformed_body() -> None:
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(api_key="s3cret-solver-key", body=b"not json")
+    assert status == 400
+    assert pipeline.calls == []
+
+
+def test_eval_returns_marshalled_value_on_success() -> None:
+    pipeline = FakePipeline(eval_result={"chapters": [1, 2, 3]})
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 200
+    assert payload == {"value": {"chapters": [1, 2, 3]}}
+    assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
+    assert pipeline.eval_js == ["extract()"]
+
+
+def test_eval_throw_surfaces_detail_in_body() -> None:
+    # Mode-E follow-up: a rejected in-page promise (an ``EvalError``, e.g. a
+    # comix-origin 5xx surfaced by axios) returns 504 with the bounded, token-free
+    # summary under ``detail`` — so the GATEWAY can distinguish a transient origin 5xx
+    # (retryable) from a generic failure / timeout. The detail carries the axios status
+    # code, never the js.
+    pipeline = FakePipeline(
+        error=service.EvalError(
+            "in-page eval threw: AxiosError: Request failed with status code 521"
+        )
+    )
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 504
+    assert payload["error"] == "eval threw"
+    assert "status code 521" in payload["detail"]
+
+
+def test_eval_non_throw_failure_stays_generic_eval_failed() -> None:
+    # A NON-EvalError pipeline failure (a device/CDP fault, not an in-page throw) keeps
+    # the generic ``{"error": "eval failed"}`` 504 with NO ``detail`` — the gateway must
+    # NOT retry it as an origin 5xx.
+    pipeline = FakePipeline(error=RuntimeError("adb forward collapsed"))
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 504
+    assert payload == {"error": "eval failed"}
+
+
+# ── Bug 5 follow-on #3: /eval extract_clearance (mint comix's cf_clearance) ──────
+# comix is a page-holder cleared ONLY via the eval path (never the destructive
+# /solve). When the gateway asks (``extract_clearance: true``) the sidecar ALSO reads
+# the host-scoped cf_clearance it auto-issued during the clear and returns it under a
+# ``clearance`` block, so the gateway can mint+hold comix's replayable clearance.
+
+_CLEARANCE_HOST = "mangadot.net"  # the FakePipeline config's lone allowlisted host
+_EVAL_CLEARANCE = SolveResult(
+    cf_clearance="EVAL-MINTED-COMIX-TOKEN",
+    user_agent="Mozilla/5.0 (Android 11) WebView wv",
+    host=_CLEARANCE_HOST,
+    egress_ip="203.0.113.9",
+    cf_clearance_expires=2_000_000_000.0,
+)
+
+
+def test_eval_extract_clearance_returns_value_and_clearance() -> None:
+    """``extract_clearance: true`` threads ``with_clearance`` to the pipeline and
+    returns ``{"value", "clearance": {cf_clearance, user_agent, cf_clearance_expires,
+    egress_ip}}`` so the gateway can mint+hold comix's clearance with no ``/solve``."""
+    pipeline = FakePipeline(eval_result={"ok": 1}, eval_clearance=_EVAL_CLEARANCE)
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=json.dumps(
+            {
+                "challenge_url": "https://mangadot.net/",
+                "js": "(async () => true)()",
+                "extract_clearance": True,
+            }
+        ).encode(),
+    )
+    assert status == 200
+    assert payload["value"] == {"ok": 1}
+    assert payload["clearance"] == {
+        "cf_clearance": "EVAL-MINTED-COMIX-TOKEN",
+        "user_agent": "Mozilla/5.0 (Android 11) WebView wv",
+        "cf_clearance_expires": 2_000_000_000.0,
+        "egress_ip": "203.0.113.9",
+    }
+    assert pipeline.eval_with_clearance == [True]  # the flag threaded to the pipeline
+
+
+def test_eval_extract_clearance_null_when_no_cookie() -> None:
+    """A clean clear that deposited NO host-scoped cookie returns ``clearance: null``
+    (the gateway then treats the mint as not-ready and retries) — NOT a 504."""
+    pipeline = FakePipeline(eval_result=True, eval_clearance=None)
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=json.dumps(
+            {
+                "challenge_url": "https://mangadot.net/",
+                "js": "(async () => true)()",
+                "extract_clearance": True,
+            }
+        ).encode(),
+    )
+    assert status == 200
+    assert payload == {"value": True, "clearance": None}
+
+
+def test_eval_without_extract_clearance_omits_clearance_and_flag() -> None:
+    """D-08 parity: an ordinary eval (no ``extract_clearance``) returns the bare
+    ``{"value": ...}`` with NO ``clearance`` key, and the pipeline is called WITHOUT
+    ``with_clearance`` (byte-for-byte unchanged from before follow-on #3)."""
+    pipeline = FakePipeline(
+        eval_result={"chapters": [1]}, eval_clearance=_EVAL_CLEARANCE
+    )
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 200
+    assert payload == {"value": {"chapters": [1]}}
+    assert "clearance" not in payload
+    assert pipeline.eval_with_clearance == [False]
+
+
+def test_eval_rejects_non_bool_extract_clearance() -> None:
+    """A non-bool ``extract_clearance`` is a pre-device 422 (no device action)."""
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "extract_clearance": "yes"}',
+    )
+    assert status == 422
+    assert pipeline.calls == []
+    assert "extract_clearance" in payload["error"]
+
+
+def test_eval_extract_clearance_does_not_log_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-14-04: the minted cf_clearance token never appears in any log record — it rides
+    only the response body."""
+    pipeline = FakePipeline(eval_result=True, eval_clearance=_EVAL_CLEARANCE)
+    with caplog.at_level("DEBUG"):
+        status, payload = _service(pipeline).eval(
+            api_key="s3cret-solver-key",
+            body=json.dumps(
+                {
+                    "challenge_url": "https://mangadot.net/",
+                    "js": "(async () => true)()",
+                    "extract_clearance": True,
+                }
+            ).encode(),
+        )
+    assert status == 200
+    assert payload["clearance"]["cf_clearance"] == "EVAL-MINTED-COMIX-TOKEN"
+    for record in caplog.records:
+        assert "EVAL-MINTED-COMIX-TOKEN" not in record.getMessage()
+
+
+def test_eval_forwards_wait_for_predicate_to_pipeline() -> None:
+    # wait_for is an optional JS boolean predicate string; a non-str is a 422.
+    pipeline = FakePipeline()
+    ok, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+            b' "wait_for": "window.ready === true"}'
+        ),
+    )
+    assert ok == 200
+    # The predicate must actually reach the pipeline, not just yield a 200.
+    assert pipeline.eval_wait_for == ["window.ready === true"]
+
+    pipeline2 = FakePipeline()
+    bad, payload = _service(pipeline2).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()", "wait_for": 5}',
+    )
+    assert bad == 422
+    assert pipeline2.calls == []
+    assert "wait_for" in payload["error"]
+
+
+def test_eval_pipeline_failure_is_504() -> None:
+    pipeline = FakePipeline(error=RuntimeError("env module import failed"))
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "boom()"}',
+    )
+    assert status == 504
+
+
+# ── /eval per-eval proxy parity with /solve (Req 7) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Same malformed-proxy matrix as /solve — every shape is a PRE-device 422.
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()", "proxy": 5}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()", "proxy": {}}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "proxy": {"server": "socks5://p:1"}}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "proxy": {"server": "http://host:99999"}}',
+        b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "proxy": {"server": "http://p:1", "username": "u"}}',
+    ],
+)
+def test_eval_rejects_malformed_proxy_before_any_device_action(body: bytes) -> None:
+    # Req 7 / T-11-06 parity: a malformed eval proxy is a PRE-action 422 — the
+    # device pipeline is never invoked (no hop repoint, no global http_proxy set).
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(api_key="s3cret-solver-key", body=body)
+    assert status == 422
+    assert pipeline.calls == []  # never reaches the device
+    assert "proxy" in payload["error"]
+
+
+def test_eval_forwards_wellformed_proxy_to_pipeline() -> None:
+    # Req 7 parity with test_solve_forwards_wellformed_proxy_to_pipeline: a valid
+    # proxy rides the /eval body verbatim into the pipeline so the eval navigation
+    # egresses the clearance's residential IP.
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+            b' "proxy": {"server": "http://up.example:8080",'
+            b' "username": "u", "password": "p"}}'
+        ),
+    )
+    assert status == 200
+    assert pipeline.eval_proxies == [
+        {"server": "http://up.example:8080", "username": "u", "password": "p"}
+    ]
+
+
+def test_eval_without_proxy_passes_none_to_pipeline() -> None:
+    # D-08: a no-proxy /eval drives the pipeline with proxy=None (byte-for-byte the
+    # pre-Phase-14 eval body).
+    pipeline = FakePipeline()
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()"}',
+    )
+    assert status == 200
+    assert pipeline.eval_proxies == [None]
+
+
+def test_proxied_eval_uses_proxy_timeout_not_base() -> None:
+    # Req 7 parity with test_proxied_solve_uses_proxy_timeout_not_base: with a proxy
+    # present the eval's outer future is bounded by the LONGER proxy_solve_timeout_s
+    # (it adds the hop + egress-verify overhead), so a delay between the base (tiny)
+    # and proxy (generous) timeout completes (200) where a base-timeout eval 504s.
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+            b' "proxy": {"server": "http://up.example:8080"}}'
+        ),
+    )
+    assert status == 200
+
+
+def test_no_proxy_eval_uses_base_timeout_and_times_out() -> None:
+    # The same delay under the base (tiny) timeout and NO proxy must 504 — proving
+    # the eval timeout selection keys off proxy-presence, not a constant (D-08).
+    pipeline = FakePipeline(delay=0.3)
+    service = _service(
+        pipeline,
+        solve_timeout_s=0.05,
+        proxy_solve_timeout_s=5.0,
+        cancel_grace_s=2.0,
+    )
+    status, _ = service.eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()"}',
+    )
+    assert status == 504
+
+
+def test_eval_and_solve_are_serialized() -> None:
+    # PERF-01 / T-14-05: /eval shares /solve's Lock + single-worker executor, so an
+    # eval arriving while a solve is in flight is rejected 503 (and vice-versa) —
+    # the two can never run concurrently against the one redroid.
+    started = threading.Event()
+    release = threading.Event()
+    pipeline = FakePipeline(started=started, release=release)
+    service = _service(pipeline, solve_timeout_s=5.0)
+    first_status: dict[str, int] = {}
+
+    def first() -> None:
+        status, _ = service.solve(
+            api_key="s3cret-solver-key",
+            body=b'{"challenge_url": "https://mangadot.net/"}',
+        )
+        first_status["status"] = status
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    try:
+        assert started.wait(timeout=5)  # the solve is in flight under the lock
+        # An /eval arriving now is rejected 503 — not queued behind the device.
+        second, payload = service.eval(
+            api_key="s3cret-solver-key",
+            body=b'{"challenge_url": "https://mangadot.net/", "js": "1+1"}',
+        )
+        assert second == 503
+        assert "busy" in payload["error"]
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert first_status["status"] == 200
+    assert pipeline.max_concurrent == 1  # the single device was never doubly driven
+
+
+def test_eval_large_result_round_trips() -> None:
+    # A4 (research §6): a chapter-list-sized result (thousands of rows) marshals
+    # back through eval → do_POST → the JSON response writer with len() preserved.
+    # The _MAX_BODY_BYTES cap is INBOUND-only and must not truncate the outbound
+    # result. Driven over the real HTTP transport to prove no frame/body truncation.
+    big = [{"i": i} for i in range(5000)]
+    pipeline = FakePipeline(eval_result=big)
+    with _running_server(pipeline) as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request(
+            "POST",
+            "/eval",
+            body=b'{"challenge_url": "https://mangadot.net/", "js": "listAll()"}',
+            headers={"X-Solver-Key": "s3cret-solver-key"},
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+    assert resp.status == 200
+    payload = json.loads(data)
+    assert len(payload["value"]) == 5000  # nothing dropped on the outbound side
+    assert payload["value"][-1] == {"i": 4999}  # the tail survived intact
+
+
+def test_http_eval_rejects_oversized_body_before_reading() -> None:
+    # The /eval branch shares /solve's pre-auth body cap: a multi-GB declared body
+    # is rejected 413 on the Content-Length alone, before a byte is read.
+    pipeline = FakePipeline()
+    with _running_server(pipeline) as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/eval", skip_host=True, skip_accept_encoding=True)
+        conn.putheader("X-Solver-Key", "s3cret-solver-key")
+        conn.putheader("Content-Length", str(10_000_000_000))
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+    assert resp.status == 413
+    assert pipeline.calls == []  # body never read → pipeline never invoked
+
+
+def test_http_eval_rejects_unauthenticated_before_reading_body() -> None:
+    # T-14-01: auth fails FIRST on /eval, before any attempt to read the body.
+    pipeline = FakePipeline()
+    with _running_server(pipeline) as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/eval", skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Content-Length", str(10_000_000_000))
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+    assert resp.status == 401
+    assert pipeline.calls == []
+
+
 # ── healthz ──────────────────────────────────────────────────────────────────
 
 
@@ -818,9 +1367,128 @@ def _build_pipeline(
     monkeypatch.setattr(service, "webview_user_agent", lambda url, **kwargs: "UA-wv")
     # Pre-loop readiness/scale steps are covered by their own units; collapse them
     # to constants here so the loop under test runs deterministically.
-    monkeypatch.setattr(pipeline, "_wait_for_cf_frame", lambda ws, cancel=None: None)
+    monkeypatch.setattr(
+        pipeline, "_wait_for_cf_frame", lambda ws, ws_url, host, cancel=None: None
+    )
     monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
     return pipeline
+
+
+# ── BUG 5 solve-path parity: a clean already-cleared load must NOT burn the deadline ─
+
+
+class _FrameTreeCdp:
+    """``cdp_call`` stub for the REAL ``_wait_for_cf_frame``: answers Page.getFrameTree.
+
+    The ``challenges.cloudflare.com`` OOPIF child frame is absent until the poll count
+    reaches ``cf_after`` (``cf_after`` huge ⇒ it never renders — a clean already-cleared
+    load; ``cf_after=N`` ⇒ a genuine challenge that renders on the Nth poll).
+    """
+
+    def __init__(self, cf_after: int) -> None:
+        self._cf_after = cf_after
+        self.calls = 0
+
+    def __call__(self, ws, method, params=None, *, command_id):  # type: ignore[no-untyped-def]
+        if method == "Page.getFrameTree":
+            self.calls += 1
+            tree: dict[str, object] = {
+                "frame": {"url": "https://mangadot.net/", "id": "main"},
+                "childFrames": [],
+            }
+            if self.calls >= self._cf_after:
+                tree["childFrames"] = [
+                    {
+                        "frame": {
+                            "url": "https://challenges.cloudflare.com/cdn-cgi/x",
+                            "id": "cf",
+                        },
+                        "childFrames": [],
+                    }
+                ]
+            return {"frameTree": tree}
+        return {}
+
+
+def _frame_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    clock: FakeClock,
+    cdp: _FrameTreeCdp,
+    extract: object,
+) -> AndroidSolvePipeline:
+    # A pipeline that runs the REAL _wait_for_cf_frame (NOT the _build_pipeline stub):
+    # service.time → FakeClock, service.cdp_call → the frame-tree stub, and
+    # service.extract_clearance → the solve-path clean-check cookie stub.
+    page_targets = b'[{"type":"page","webSocketDebuggerUrl":"ws://localhost:9222/p"}]'
+    pipeline = AndroidSolvePipeline(
+        FakeDevice(),  # type: ignore[arg-type]
+        timeout_s=60.0,
+        ws_factory=lambda url, *, timeout: FakeWs(),  # type: ignore[arg-type,return-value]
+        http_get=lambda url, *, timeout: page_targets,
+        launch_settle_s=0.0,
+        poll_interval_s=1.0,
+    )
+    monkeypatch.setattr(service, "time", clock)
+    monkeypatch.setattr(service, "cdp_call", cdp)
+    monkeypatch.setattr(service, "extract_clearance", extract)
+    return pipeline
+
+
+def test_clean_solve_short_circuits_frame_poll_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bug 5 / solve-path parity: a gateway-restart warm() re-solve of an
+    # ALREADY-cleared host loads CLEAN (a warm/auto-issued cf_clearance, no
+    # interactive Turnstile), so the challenges.cloudflare.com OOPIF NEVER appears.
+    # _wait_for_cf_frame must NOT grind the full ~20s frame-poll deadline waiting for
+    # a widget that won't come — it short-circuits the instant a host-scoped
+    # cf_clearance is observed (nothing to tap; _tap_until_cleared reads it next).
+    clock = FakeClock()
+    cdp = _FrameTreeCdp(cf_after=10**9)  # CF OOPIF never renders (clean load)
+    pipeline = _frame_pipeline(
+        monkeypatch,
+        clock=clock,
+        cdp=cdp,
+        extract=lambda ws_url, host: ClearanceCookie(
+            value="WARM", expires=_STUB_EXPIRES
+        ),
+    )
+
+    start = clock.now
+    pipeline._wait_for_cf_frame(FakeWs(), "ws://localhost:9222/p", "mangadot.net")  # type: ignore[arg-type]
+    elapsed = clock.now - start
+
+    # Did NOT grind the full ~20s frame-poll deadline (the old vestigial wait).
+    assert elapsed < service._FRAME_POLL_TIMEOUT_S
+    # Short-circuited on the first poll (no sleep) — the warm re-solve is now fast.
+    assert elapsed <= pipeline._frame_poll_interval_s
+
+
+def test_genuine_challenge_solve_still_detects_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The short-circuit must NOT regress the genuine cold solve: when a real CF
+    # challenge renders a few polls after load (cookie NOT yet minted),
+    # _wait_for_cf_frame still detects the OOPIF and returns so the tap machinery can
+    # clear it — and a clean page is never mistaken for it (the CF frame is checked
+    # FIRST and no cf_clearance exists yet).
+    clock = FakeClock()
+    cdp = _FrameTreeCdp(cf_after=3)  # OOPIF renders on the 3rd poll (mangadot-style)
+    pipeline = _frame_pipeline(
+        monkeypatch,
+        clock=clock,
+        cdp=cdp,
+        extract=lambda ws_url, host: None,  # challenge not cleared yet → no cookie
+    )
+
+    start = clock.now
+    pipeline._wait_for_cf_frame(FakeWs(), "ws://localhost:9222/p", "mangadot.net")  # type: ignore[arg-type]
+    elapsed = clock.now - start
+
+    assert cdp.calls >= 3  # polled until the genuine challenge frame appeared
+    # Returned ON the frame, not after grinding the full deadline.
+    assert elapsed < service._FRAME_POLL_TIMEOUT_S
 
 
 def test_solve_retaps_until_clearance_appears(
@@ -1208,3 +1876,175 @@ def test_boot_defensive_clear_gives_up_after_retries(
     assert ok is False
     assert attempts["connect"] == 3
     assert attempts["cleared"] == 0
+
+
+# ── Fix A (bug 4 cause #1): non-destructive in-page egress-verify for /eval ────
+#
+# The proxied eval's egress-verify must NOT navigate the main WebView away to the
+# IP echo (that defeated the bug-3 fast path → every eval re-cleared comix's
+# managed Cloudflare challenge). It now verifies the egress with an IN-PAGE fetch
+# (no Page.navigate), keeping the byte-equal T-11-01 assertion on every eval, and
+# only falls back to the destructive nav-away probe when the in-page probe is
+# unavailable (CSP/CORS/transient). These drive the real ``_drive_eval`` with a
+# recording cdp_call so the no-nav / mismatch / fallback behaviour is asserted.
+
+_EVAL_HOST = "comix.to"
+_EVAL_URL = "https://comix.to/"
+_EVAL_JS = "(async()=>{return {marker:'EVAL_JS_MARKER'};})()"
+
+
+class _DriveEvalCdp:
+    """Records every cdp_call; returns scripted ``result.value`` by command id.
+
+    Page/DOM.enable, Page.navigate, and any unscripted id return an empty value;
+    ``Page.getFrameTree`` carries no ``frameTree`` so the CF-interstitial probe
+    reads "not a challenge" (fail-open to the fast path).
+    """
+
+    def __init__(self, values: dict[int, object]) -> None:
+        self.values = values
+        self.calls: list[tuple[str, dict[str, object], int]] = []
+
+    def __call__(self, ws, method, params=None, *, command_id):  # type: ignore[no-untyped-def]
+        self.calls.append((method, params or {}, command_id))
+        return {"result": {"value": self.values.get(command_id)}}
+
+    def navigated_to(self, url: str) -> bool:
+        return any(
+            m == "Page.navigate" and p.get("url") == url for m, p, _ in self.calls
+        )
+
+    def ran_command(self, command_id: int) -> bool:
+        return any(c == command_id for _, _, c in self.calls)
+
+
+def _eval_pipeline(
+    monkeypatch: pytest.MonkeyPatch, cdp: _DriveEvalCdp
+) -> AndroidSolvePipeline:
+    page_targets = b'[{"type":"page","webSocketDebuggerUrl":"ws://localhost:9222/p"}]'
+    pipeline = AndroidSolvePipeline(
+        FakeDevice(),  # type: ignore[arg-type]
+        timeout_s=60.0,
+        ws_factory=lambda url, *, timeout: FakeWs(),  # type: ignore[arg-type,return-value]
+        http_get=lambda url, *, timeout: page_targets,
+        launch_settle_s=0.0,
+        poll_interval_s=0.0,
+        egress_read_timeout_s=1.0,
+    )
+    monkeypatch.setattr(service, "cdp_call", cdp)
+    return pipeline
+
+
+def _drive(pipeline: AndroidSolvePipeline, expected_egress_ip: str):  # type: ignore[no-untyped-def]
+    return pipeline._drive_eval(
+        _EVAL_URL,
+        _EVAL_HOST,
+        _EVAL_JS,
+        None,
+        wait_for=None,
+        deadline=time.monotonic() + 60.0,
+        expected_egress_ip=expected_egress_ip,
+    )
+
+
+def test_proxied_eval_inpage_probe_matches_does_not_navigate_away(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # In-page probe returns the EXPECTED egress IP → the eval runs and the WebView
+    # is NEVER navigated to the IP echo (the warm comix page survives → fast path).
+    cdp = _DriveEvalCdp(
+        {
+            service._EGRESS_IN_PAGE_CMD_ID: "1.2.3.4",
+            service._EVAL_LOCATION_CMD_ID: _EVAL_HOST,  # fast-path: on the comix page
+            service._EVAL_HYDRATION_CMD_ID: True,  # SPA hydrated
+            service._EVAL_CMD_ID: {"items": [1, 2, 3]},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+
+    with caplog.at_level("INFO", logger="android_solver.service"):
+        result = _drive(pipeline, expected_egress_ip="1.2.3.4")
+
+    assert result == {"items": [1, 2, 3]}
+    # The in-page probe ran (id 43) and verified egress WITHOUT navigating away.
+    assert cdp.ran_command(service._EGRESS_IN_PAGE_CMD_ID)
+    assert not cdp.navigated_to(service._EGRESS_ECHO_URL)
+    assert not cdp.navigated_to(_EVAL_URL)  # fast path: no re-nav of the main page
+    assert cdp.ran_command(service._EVAL_CMD_ID)  # the gateway js DID run
+    # Logged the in-page verification; NEVER the eval js or the marshalled result.
+    assert "(in-page)" in caplog.text
+    assert "EVAL_JS_MARKER" not in caplog.text
+    assert "items" not in caplog.text
+
+
+def test_proxied_eval_inpage_probe_mismatch_raises_and_runs_no_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In-page probe returns a DIFFERENT IP → the rotating/non-sticky-proxy SolveError
+    # is raised and the gateway js is NEVER evaluated (no wrong-IP eval).
+    cdp = _DriveEvalCdp(
+        {
+            service._EGRESS_IN_PAGE_CMD_ID: "9.9.9.9",
+            service._EVAL_CMD_ID: {"items": [1]},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+
+    with pytest.raises(SolveError, match="rotating/non-sticky proxy"):
+        _drive(pipeline, expected_egress_ip="1.2.3.4")
+
+    assert not cdp.ran_command(service._EVAL_CMD_ID)  # no eval on a mismatch
+    assert not cdp.navigated_to(service._EGRESS_ECHO_URL)  # in-page, no nav-away
+
+
+def test_proxied_eval_inpage_probe_unavailable_falls_back_to_destructive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # In-page probe unavailable (returns None — CSP/CORS) → fall back to the
+    # destructive nav-away verify (a Page.navigate to the IP echo IS recorded), then
+    # the eval still runs verified — NEVER an unverified eval.
+    cdp = _DriveEvalCdp(
+        {
+            service._EGRESS_IN_PAGE_CMD_ID: None,  # IIFE returned null ⇒ unavailable
+            service._EGRESS_READ_CMD_ID: "1.2.3.4",  # destructive innerText read
+            service._EVAL_HYDRATION_CMD_ID: True,
+            service._EVAL_CMD_ID: {"ok": True},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+    # The re-nav clear machinery is exercised by its own units; collapse it here so
+    # the fallback-then-eval flow runs deterministically.
+    monkeypatch.setattr(
+        pipeline,
+        "_clear_challenge_if_present",
+        lambda ws, ws_url, host, cancel, deadline: None,
+    )
+
+    result = _drive(pipeline, expected_egress_ip="1.2.3.4")
+
+    assert result == {"ok": True}
+    # The destructive fallback navigated the main page AWAY to the IP echo.
+    assert cdp.navigated_to(service._EGRESS_ECHO_URL)
+    assert cdp.ran_command(service._EVAL_CMD_ID)  # still verified, eval still ran
+
+
+def test_no_proxy_eval_runs_no_egress_probe_of_either_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No-proxy path (expected_egress_ip == "") → NEITHER the in-page probe NOR the
+    # destructive nav-away runs; byte-for-byte the prior no-proxy eval (D-08).
+    cdp = _DriveEvalCdp(
+        {
+            service._EVAL_LOCATION_CMD_ID: _EVAL_HOST,
+            service._EVAL_HYDRATION_CMD_ID: True,
+            service._EVAL_CMD_ID: {"x": 1},
+        }
+    )
+    pipeline = _eval_pipeline(monkeypatch, cdp)
+
+    result = _drive(pipeline, expected_egress_ip="")
+
+    assert result == {"x": 1}
+    assert not cdp.ran_command(service._EGRESS_IN_PAGE_CMD_ID)  # no in-page probe
+    assert not cdp.navigated_to(service._EGRESS_ECHO_URL)  # no destructive nav

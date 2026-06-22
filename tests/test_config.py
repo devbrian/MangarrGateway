@@ -293,6 +293,28 @@ def test_handle_ttl_default_is_six_hours() -> None:
     assert settings.handle_ttl_seconds == 21600
 
 
+def test_enum_cache_empty_ttl_default_and_ceiling() -> None:
+    """Mode-E (debug comix-warm-hydration-wait): the empty (negative-cache) TTL
+    defaults to 60s and MUST stay <= the full enum-cache TTL so a transient empty
+    expires SOONER than a real result."""
+    settings = Settings(api_key=_DUMMY_KEY)
+    assert settings.enum_cache_empty_ttl_seconds == 60
+    # Equal to the full TTL is allowed (the boundary)...
+    ok = Settings(
+        api_key=_DUMMY_KEY,
+        enum_cache_ttl_seconds=1800,
+        enum_cache_empty_ttl_seconds=1800,
+    )
+    assert ok.enum_cache_empty_ttl_seconds == 1800
+    # ...one second above the full TTL is rejected at construction (self-defeating).
+    with pytest.raises(ValidationError, match="enum_cache_empty_ttl_seconds"):
+        Settings(
+            api_key=_DUMMY_KEY,
+            enum_cache_ttl_seconds=1800,
+            enum_cache_empty_ttl_seconds=1801,
+        )
+
+
 def test_handle_ttl_rejects_below_floor() -> None:
     """HDL-02: ge=1800 — the TTL must stay >= the 30-min Mangarr floor."""
     with pytest.raises(ValidationError):

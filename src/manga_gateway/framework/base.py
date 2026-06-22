@@ -74,6 +74,21 @@ class Source(ABC):
     # for a clearance it could never mint, hanging every download). Keep ``antibot``,
     # ``solver_engine``, and any ``session_prep`` as-is — this only defers the SOLVE.
     cloudflare_challenge_optional: bool = False
+    # Bug 5 perf (warm-ordering): an ``android`` source that runs ALL of its logic as
+    # in-page evals inside the shared redroid WebView and therefore HOLDS the warm,
+    # cleared page across a whole search/download sequence (comix — it navigates to
+    # comix.to once and stays there for every ``eval_in_webview`` call). ``False``
+    # (default) = a clearance-only android source (mangadot/kagane) that mints a
+    # ``cf_clearance`` and lets the httpx leg fetch — it does NOT keep the WebView
+    # parked on its page. The app wiring passes the page-HOLDING android keys to
+    # ``AndroidSolver`` as ``warm_last_keys``. Bug 5 follow-on #3 (Option A2): these
+    # keys are EXCLUDED from the eager ``cf_clearance`` ``/solve`` (which would
+    # ``pm clear`` + cold-launch and poison the warm page they depend on) and instead
+    # EVAL-PRIMED LAST in ``warm()`` — a no-op warm-navigate eval that leaves the single
+    # redroid parked on the holder's CLEARED + hydrated page, with the lighter
+    # clearance-only sources already solved first, so the first post-boot search is
+    # fast.
+    holds_webview_page: bool = False
     # D-01: the httpx session-prep style the framework resolves into a SessionPrep
     # provider (framework/session_prep.py). ``None`` = no bootstrap (MangaDex/Comix
     # byte-for-byte unchanged); ``"csrf-bootstrap"`` = GET an HTML page, harvest the

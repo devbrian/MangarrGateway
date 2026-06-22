@@ -218,6 +218,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     android_keys: frozenset[str] = frozenset(
         key for key, engine in engine_by_source.items() if engine == "android"
     )
+    # Bug 5 perf (warm-ordering): the android source(s) that run their whole sequence
+    # as in-page evals and HOLD the warm cleared WebView page (``holds_webview_page`` —
+    # comix). Threaded to AndroidSolver as ``warm_last_keys``. Bug 5 follow-on #3
+    # (Option A2): warm() EXCLUDES these keys from the eager cf_clearance /solve (which
+    # would pm clear + cold-launch and poison the warm page they need) and instead
+    # EVAL-PRIMES them LAST via a no-op warm-navigate eval — so the single redroid ends
+    # startup parked on the holder's CLEARED + hydrated page with mangadot/kagane
+    # already solved, and the first post-boot search is fast (no startup-warm steal).
+    # Derived from the class attr exactly like engine_by_source above.
+    webview_page_keys: frozenset[str] = frozenset(
+        key
+        for key, cls in cf_sources.items()
+        if key in android_keys and getattr(cls, "holds_webview_page", False)
+    )
     # On-demand keys (debug pooltimeout-recurrence): cloudflare sources whose CF
     # managed challenge is INTERMITTENT (``cloudflare_challenge_optional=True``,
     # mangaball). Both solver legs SKIP these in ``warm()`` (no eager startup solve of
@@ -384,6 +398,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # warm() skips on-demand android sources (mangaball) — they solve on-demand,
         # never eager (debug pooltimeout-recurrence).
         on_demand_keys=on_demand_keys & android_keys,
+        # Bug 5 perf (warm-ordering) + follow-on #3 (Option A2): the page-holding
+        # android key (comix) is EXCLUDED from the eager /solve and EVAL-PRIMED last by
+        # warm() instead, so the redroid ends startup parked on its cleared page.
+        warm_last_keys=webview_page_keys,
+        # Bug 5 Lever A: proactive-refresh-by-age cap (None ⇒ disabled — the default;
+        # the operator tunes the VALUE from the measured comix re-challenge cadence).
+        refresh_max_age_s=settings.android_refresh_max_age_s,
+        # Bug 5 Fix #2: how long an android foreground search waits at the device door
+        # for the startup warm() to finish before proceeding (armed below, just before
+        # the non-blocking warm task is created). Bounded so a slow/hung warm still lets
+        # the search attempt within the per-source fan-out budget.
+        warm_gate_timeout_s=settings.android_warm_gate_timeout_s,
         timeout_s=settings.android_solver_timeout_s,
         # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
         # the CloudflareSolver (no second build_proxy call, no new setting). The
@@ -435,6 +461,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ", ".join(sorted(failed)),
             )
 
+    # Bug 5 Fix #2 (startup-warm gate): arm the gate SYNCHRONOUSLY before the warm task
+    # is created — so by the time the server accepts any request, an android foreground
+    # search (a comix solve+eval inside device_session) WAITS for warm() to finish
+    # before claiming the shared device. This prevents a search that arrives during the
+    # startup warm storm from racing the in-flight foreign solves (the collision spike).
+    # No-op on the patchright-only / unconfigured-sidecar path (android_solver.warm()
+    # still sets the completion event in its finally). Arming here (not inside warm())
+    # closes the create_task scheduling race: the gate is armed before the lifespan
+    # yields.
+    android_solver.arm_warm_gate()
     warm_task = asyncio.create_task(_warm_solver())  # non-blocking (Pitfall 3)
     # (app.state.ratelimiter is created earlier, before CsrfBootstrap, so the
     # bootstrap GET shares the per-source limiter — see above.)
@@ -471,6 +507,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # the live handle_ttl_seconds, not the legacy hard-coded 3600 (debug session
         # release-no-longer-resolvable, so a raised handle TTL is not silently clamped).
         max_ttl=settings.handle_ttl_seconds,
+        # Mode-E (debug comix-warm-hydration-wait): the SHORT negative-cache TTL for a
+        # successful-but-EMPTY result, so a transient/wrong zero (an upstream blip, or —
+        # before the sidecar exceptionDetails fix — a swallowed in-page eval throw)
+        # self-heals within ~a minute instead of sticking for the full enum-cache TTL.
+        empty_ttl=settings.enum_cache_empty_ttl_seconds,
     )
     # 260606-lyb Change 2 / 260620 backoff rework: ONE process-wide per-source failure
     # cooldown for the whole lifespan (R1), mirroring the enum_cache construction. The

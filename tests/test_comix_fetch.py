@@ -18,6 +18,8 @@ Exercises the load-bearing ``SourceContext`` refactor (Plan 04-02) with the in-r
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -656,13 +658,12 @@ _COMIX_COMPOSITE = ComixSource._make_composite_chapter_id(
 
 
 class _ManifestSequenceSolver:
-    """Fake solver whose ``fetch_via_browser`` returns queued results in order.
+    """Fake solver whose ``eval_in_webview`` returns queued results in order.
 
     Backs the Issue #171 cold-race test: stage e.g. ``[[], [url]]`` and assert
     ``fetch_manifest`` re-navigates once and resolves the warm second capture.
-    ``fetch_via_browser_paginated`` is retired on the comix path (spike 019) and
-    kept here only for back-compat — the resolved (non-DEFERRED) composite never
-    walks the series, and ``_solver_from_ctx`` no longer requires it.
+    Phase 14: comix's manifest read runs the in-page chapter-pages extractor via
+    ``eval_in_webview`` (the redroid WebView), not the desktop browser fetch.
     """
 
     def __init__(self, results: list[object]) -> None:
@@ -674,21 +675,16 @@ class _ManifestSequenceSolver:
     ) -> Clearance:
         return Clearance(cookies={"cf_clearance": "X"}, user_agent="UA")
 
-    async def fetch_via_browser(
+    async def eval_in_webview(
         self,
-        url: str,
+        challenge_url: str,
+        js: str,
         *,
-        extract: str,
         wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches the primitive contract
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the seam contract
     ) -> object:
         self.browser_calls += 1
         return self._results.pop(0)
-
-    async def fetch_via_browser_paginated(  # pragma: no cover — never called
-        self, url: str, **kwargs: object
-    ) -> object:
-        raise AssertionError("resolved composite must not walk the series list")
 
 
 @pytest.mark.asyncio
@@ -728,3 +724,26 @@ async def test_populated_but_invalid_manifest_does_not_consume_retry() -> None:
     with pytest.raises(SourceError, match="malformed chapter manifest"):
         await ComixSource().fetch_manifest(_COMIX_COMPOSITE, ctx)
     assert solver.browser_calls == 1  # no retry — only the empty signature retries
+
+
+# ─────────── Phase 14: the gate now requires the eval_in_webview seam ───────────
+
+
+def test_solver_from_ctx_requires_eval_in_webview() -> None:
+    # EVAL-03: comix runs ALL in-page logic through ``eval_in_webview`` (the redroid
+    # WebView). A solver missing that seam — OR no solver at all — is a wiring bug
+    # that must surface as a typed ``source_unavailable`` SourceError naming the
+    # required primitive, never a raw AttributeError at the call site (WR-06).
+    class _NoEvalSolver:
+        async def get_clearance(
+            self, source_key: str, *, force_resolve: bool = False
+        ) -> Clearance:
+            return Clearance(cookies={}, user_agent="UA")
+
+    with pytest.raises(SourceError, match="eval_in_webview") as no_seam:
+        ComixSource._solver_from_ctx(SimpleNamespace(_solver=_NoEvalSolver()))  # type: ignore[arg-type]
+    assert no_seam.value.code == "source_unavailable"
+
+    with pytest.raises(SourceError, match="eval_in_webview") as no_solver:
+        ComixSource._solver_from_ctx(SimpleNamespace(_solver=None))  # type: ignore[arg-type]
+    assert no_solver.value.code == "source_unavailable"

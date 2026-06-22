@@ -19,7 +19,27 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from manga_gateway.framework.android_solver import AndroidSolver
 from manga_gateway.sources.comix import ComixSource
+
+
+@pytest.fixture(autouse=True)
+def _no_real_android_warm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op ``AndroidSolver.warm`` for the caps assertions (the comix sibling of
+    conftest's ``CloudflareSolver`` no-op).
+
+    Phase 14 flipped comix to ``solver_engine = "android"``, so its lifespan warm
+    routes through the AndroidSolver sidecar. In the deterministic suite no sidecar
+    is configured, so the real warm raises (D-33) and the lifespan force-disables
+    comix — which would flip ``/caps`` ``enabled`` to False here. Production HAS the
+    sidecar (comix warms → enabled), so wipe warm to a no-op to assert the
+    production-correct caps shape without touching the network.
+    """
+
+    async def _noop_warm(self: AndroidSolver) -> list[str]:
+        return []
+
+    monkeypatch.setattr(AndroidSolver, "warm", _noop_warm)
 
 
 def test_comix_class_declares_encrypted_antibot() -> None:

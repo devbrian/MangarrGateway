@@ -33,15 +33,19 @@ def test_kwargs_challenge_urls_are_exactly_the_android_sources() -> None:
     Guards the builder against drift from app.py's lifespan partition (the same
     invariant ``_build_session_solver_kwargs`` upholds for the patchright leg):
     the AndroidSolver's challenge-url map must be EXACTLY the android source keys
-    (mangadot/kagane/mangaball) derived from the real registry — never a
-    patchright source (comix). A drift would make the session-shared AndroidSolver
-    warm/solve a different set than the per-test lifespan, defeating the share.
+    (comix/mangadot/kagane/mangaball — comix joined in Phase 14) derived from the
+    real registry — never the patchright source (mangafire). A drift would make the
+    session-shared AndroidSolver warm/solve a different set than the per-test
+    lifespan, defeating the share.
     """
     challenge_urls = _build_session_android_solver_kwargs()["challenge_urls"]
     assert set(challenge_urls) == set(_ANDROID_KEYS)
-    # The android partition must never leak the patchright comix source.
-    assert "comix" not in challenge_urls
-    # Sanity: the set is non-empty (the three android sources are registered).
+    # Phase 14: comix is now an android-engine source (its in-page eval + clearance
+    # both route to the redroid sidecar), so it MUST be in the android partition.
+    assert "comix" in challenge_urls
+    # The android partition must never leak the patchright mangafire source.
+    assert "mangafire" not in challenge_urls
+    # Sanity: the set is non-empty (the android sources are registered).
     assert challenge_urls
 
 
@@ -49,9 +53,12 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
     """The kwargs are exactly the fields app.py passes to ``AndroidSolver(...)``.
 
     app.py builds ``AndroidSolver(base_url=..., api_key=..., challenge_urls=...,
-    on_demand_keys=..., timeout_s=..., proxy=playwright_proxy)`` — ``proxy`` passed
-    UNCONDITIONALLY (None when unconfigured). The mirror must carry the same keys so
-    the shared instance is constructed identically to production.
+    on_demand_keys=..., warm_last_keys=..., refresh_max_age_s=..., warm_gate_timeout_s=
+    ..., timeout_s=..., proxy=playwright_proxy)`` — ``proxy`` passed UNCONDITIONALLY
+    (None when unconfigured). The mirror must carry the same keys so the shared instance
+    is constructed identically to production. (``test_live_conftest_lockstep``
+    AST-guards this against app.py directly, so a future app.py kwarg is caught even if
+    this hardcoded set is not updated — but keep it accurate too.)
     """
     kwargs = _build_session_android_solver_kwargs()
     assert set(kwargs) == {
@@ -59,6 +66,9 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
         "api_key",
         "challenge_urls",
         "on_demand_keys",
+        "warm_last_keys",
+        "refresh_max_age_s",
+        "warm_gate_timeout_s",
         "timeout_s",
         "proxy",
     }

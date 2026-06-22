@@ -171,6 +171,60 @@ _CHALLENGE_RENAV_CMD_ID = 42
 _EGRESS_READ_TIMEOUT_S = 15.0
 _EGRESS_READ_JS = "document.body.innerText"
 
+# Phase 14 bug 4 / Fix A: a NON-DESTRUCTIVE in-page egress probe for the proxied
+# /eval path. The destructive ``_observe_webview_egress`` above navigates the main
+# WebView AWAY to the IP echo, which defeats the bug-3 fast path (the cleared+
+# hydrated comix page is gone, so every eval re-navigates → re-clears comix's
+# managed Cloudflare challenge — the ~10-15s per-eval cost behind bug 4). This probe
+# instead reads the egress with an IN-PAGE ``fetch`` of the SAME ``_EGRESS_ECHO_URL``
+# (NO ``Page.navigate``), so the warm comix page survives and the fast path engages.
+# The byte-equal egress assertion (T-11-01) still runs on EVERY proxied eval; only
+# the transport changes (destructive nav-away → same-device-proxy XHR). The fetch
+# runs in comix's origin, so a CSP/CORS block or a transient network error makes the
+# IIFE return ``null`` → the caller treats it as "probe unavailable" and FALLS BACK
+# to the destructive probe (an eval is NEVER run unverified). ``_EGRESS_IN_PAGE_CMD_ID``
+# is a fresh id distinct from every ``_EGRESS_*`` / ``_EVAL_*`` id so its response
+# never aliases another in-flight frame.
+_EGRESS_IN_PAGE_CMD_ID = 43
+_EGRESS_IN_PAGE_JS = (
+    "(async () => {"
+    "  try {"
+    f"    const r = await fetch({_EGRESS_ECHO_URL!r}, {{cache: 'no-store'}});"
+    "    return (await r.text()).trim();"
+    "  } catch (e) { return null; }"
+    "})()"
+)
+
+# ── /eval (Phase 14): run gateway-supplied JS in the warm cleared WebView ─────
+# The /eval endpoint re-composes the existing navigate + Runtime.evaluate
+# primitives so comix's in-page token-mint / chapter-list / manifest logic runs
+# inside the only fingerprint that clears comix.to's Cloudflare. The ONE new CDP
+# option over the three existing Runtime.evaluate sites is ``awaitPromise:true``
+# (comix's extractors are async; spike 021 A2). ``_EVAL_CMD_ID`` is a fresh
+# command id distinct from the solve path's ``_*_CMD_ID`` values above so the
+# eval's Runtime.evaluate response never aliases an in-flight solve frame.
+_EVAL_CMD_ID = 400
+_EVAL_NAV_CMD_ID = 401  # Page.navigate to the challenge_url before the eval runs
+_EVAL_HYDRATION_CMD_ID = 402  # env-*.js Resource-Timing SPA-readiness probe
+_EVAL_WAIT_FOR_CMD_ID = 403  # the optional caller-supplied wait_for JS predicate
+_EVAL_LOCATION_CMD_ID = 404  # location.host probe for the already-hydrated fast path
+_EVAL_FRAME_TREE_CMD_ID = 405  # Page.getFrameTree CF-interstitial probe (bug 3)
+# Bound on the in-page eval-throw summary surfaced by ``EvalError`` (Mode-E). The
+# summary is the JS error's first description line only — never the ``js`` or the
+# marshalled value (T-14-04); the cap keeps a hostile/verbose stack from bloating a
+# log line.
+_EVAL_EXC_SUMMARY_MAX = 300
+# SPA-ready signal (spike 021 A1): comix's ``env-*.js`` module appears in the
+# Resource-Timing buffer once the SPA has hydrated enough to run the in-page
+# extractors. Polled (bounded by the eval deadline) before running the gateway js.
+_EVAL_HYDRATION_JS = (
+    "performance.getEntriesByType('resource')"
+    ".some(function(e){return /env-.*\\.js/.test(e.name);})"
+)
+# Settle floor before the env-*.js readiness poll, mirroring the solve path's
+# launch-settle before the devtools socket is driven.
+_EVAL_HYDRATION_TIMEOUT_S = 20.0
+
 
 class SolveError(RuntimeError):
     """The solve pipeline could not mint a clearance (surfaces as 504)."""
@@ -182,6 +236,27 @@ class SolveCancelled(RuntimeError):
     Raised by the pipeline when it observes the cancel signal at one of its
     adb/CDP checkpoints. The pipeline resets the device on its way out so the next
     solve starts clean; the service treats it as a (clean) post-timeout exit.
+    """
+
+
+class EvalError(RuntimeError):
+    """An in-page ``/eval`` JS expression THREW (its promise rejected).
+
+    ``Runtime.evaluate(awaitPromise:true)`` returns a successful CDP response with
+    an ``exceptionDetails`` block (and NO ``result.value``) when the evaluated
+    promise rejects. Without this the sidecar marshalled the absent value as
+    ``None`` and returned ``200 {"value": null}`` — which the gateway's tolerant
+    extractors (``_result_items`` / ``_chapter_list``) silently coerce to ``[]``,
+    so a transient in-page failure (a hydration race where ``env-*.js`` is not yet
+    importable, a momentary CF re-challenge, or an ``api.list`` network blip)
+    became a FAST, WARNING-LESS zero-result search that was then cached as a sticky
+    negative (Mode-E, debug ``comix-warm-hydration-wait``). Raising instead surfaces
+    the throw as a ``504`` the gateway propagates → the per-source fan-out emits a
+    warning, the empty is NEVER cached (``SingleFlightCache`` never caches a raise),
+    and the next search self-heals. A GENUINE empty (the promise RESOLVES with an
+    empty envelope, no ``exceptionDetails``) is unaffected — it returns ``[]`` as
+    before. The summary message is bounded + first-line-only and NEVER carries the
+    evaluated ``js`` or the marshalled value (T-14-04).
     """
 
 
@@ -251,6 +326,19 @@ class SolvePipeline(Protocol):
         *,
         proxy: dict[str, Any] | None = None,
     ) -> SolveResult: ...
+
+    def eval_in_webview(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: Event | None = None,
+        *,
+        wait_for: str | None = None,
+        deadline: float | None = None,
+        proxy: dict[str, Any] | None = None,
+        with_clearance: bool = False,
+    ) -> Any: ...
 
     def health(self) -> bool: ...
 
@@ -355,6 +443,522 @@ class AndroidSolvePipeline:
             self._device.force_stop_and_clear()
         except Exception:  # noqa: BLE001 — cleanup must not mask the cancellation
             _log.warning("device reset after cancellation failed", exc_info=True)
+
+    def eval_in_webview(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: Event | None = None,
+        *,
+        wait_for: str | None = None,
+        deadline: float | None = None,
+        proxy: dict[str, Any] | None = None,
+        with_clearance: bool = False,
+    ) -> Any:
+        """Run ``js`` in the warm cleared WebView and return its marshalled value.
+
+        Bug 5 follow-on #3 (comix clearance via the EVAL path, never ``/solve``): when
+        ``with_clearance`` is set, the eval ALSO extracts the host-scoped
+        ``cf_clearance`` (+ the WebView UA + the cookie's epoch expiry) from the WebView
+        cookie jar AFTER the page is cleared+hydrated, and returns
+        ``(value, SolveResult | None)`` instead of the bare value. This lets the gateway
+        MINT + HOLD a page-holding source's (comix's) replayable ``cf_clearance`` for
+        the httpx image leg WITHOUT a ``/solve`` (whose ``pm clear`` would cold-wipe the
+        warm WebView comix's managed challenge + cached ``env-*.js`` depend on). The
+        eval path's warm ``Page.navigate`` + interactive-OOPIF clear leaves comix's
+        managed challenge auto-issuing the cookie (it is then read by
+        :func:`extract_clearance` from the same jar ``_tap_until_cleared`` reads). The
+        token is NEVER logged (T-14-04). ``with_clearance`` defaults ``False`` so every
+        existing comix extractor eval returns the bare value byte-for-byte unchanged.
+
+        Re-uses the already-Turnstile-cleared WebView from the prior ``/solve`` — it
+        deliberately does NOT ``force_stop_and_clear`` (that would wipe the cookie
+        jar and re-trigger the challenge). Re-forwards devtools (torn down in a
+        ``finally`` on EVERY exit, #275), then guarantees the WebView is on a
+        CF-cleared, HYDRATED comix page BEFORE ``Runtime.evaluate``:
+
+          * FAST PATH (spike 021, the common case — a comix ``/solve`` runs right
+            before each comix eval and leaves the page cleared): when the warm WebView
+            is ALREADY on a hydrated, non-challenged comix page for ``host``, eval
+            DIRECTLY with NO ``Page.navigate`` and NO tap. A re-navigation reloads the
+            page and re-triggers comix's MANAGED Cloudflare challenge (bug 3: the
+            cf_clearance COOKIE alone does NOT pass a fresh top-level load), so the
+            needless re-nav is skipped.
+          * CLEAR-IF-CHALLENGED (fallback — wrong page/host, or the proxied path's
+            egress-verify navigated the page away): ``Page.navigate`` the
+            ``challenge_url``, and if comix re-challenges, clear the interstitial with
+            the SAME Turnstile tap machinery ``/solve`` uses (``_wait_for_cf_frame`` +
+            ``_compute_scales`` + ``_tap_until_cleared``) before proceeding.
+
+        Then polls for SPA hydration (``env-*.js`` in Resource-Timing + an optional
+        ``wait_for`` JS boolean predicate, returning anyway on the deadline) →
+        ``Runtime.evaluate(awaitPromise:true, returnByValue:true)`` → marshal
+        ``result.result.value``. ``awaitPromise:true`` is the ONE new CDP option over
+        the three existing eval sites (comix's extractors are async; spike 021 A2).
+        The clearance minted/observed during a clear-if-challenged is NEVER logged or
+        returned (T-14-04) — the eval returns only the JS value.
+
+        When ``proxy`` is supplied the eval navigation egresses through the SAME
+        per-solve authenticated hop + egress-verify the proxied ``/solve`` uses, so
+        the eval runs under the EXACT residential IP the proxied clearance was minted
+        on (Req 7 parity — a different egress IP makes the cleared cookie invalid and
+        CF re-challenges the eval nav). When ``None`` today's direct-egress eval runs
+        byte-for-byte unchanged (D-08).
+
+        A4 (research §6): the marshalled value (e.g. a 4,716-row chapter list) is
+        NOT subject to the inbound ``_MAX_BODY_BYTES`` cap — that cap is inbound-only.
+        The CDP ``ws.recv`` reassembles fragmented frames and the stdlib JSON
+        response writer streams the full Content-Length body, so a large result
+        round-trips intact with no transport truncation (offline-proven in the
+        service tests); no in-eval pagination is required.
+
+        ``wait_for`` is a JS boolean EXPRESSION string (NOT a CSS selector) so Plan
+        03 can pass readiness predicates. The ``js`` and the marshalled value are
+        NEVER logged (T-14-04).
+        """
+        if deadline is None:
+            deadline = time.monotonic() + self._timeout_s
+        # Re-use the warm cleared WebView — connect only (NO force_stop_and_clear).
+        self._device.connect()
+        _raise_if_cancelled(cancel)
+
+        if proxy is None:
+            # D-08: no-proxy evals run the direct-egress flow byte-for-byte unchanged
+            # — no hop repoint, no global http_proxy, no egress-verify.
+            return self._drive_eval(
+                challenge_url,
+                host,
+                js,
+                cancel,
+                wait_for=wait_for,
+                deadline=deadline,
+                expected_egress_ip="",
+                with_clearance=with_clearance,
+            )
+
+        # Proxied eval (Req 7 parity with ``_solve``): set the device-wide proxy and
+        # ALWAYS clear it in finally — even on a mid-flight raise (mirroring
+        # ``_solve``'s discipline). The hop is repointed to the per-solve
+        # authenticated upstream BEFORE the eval navigation so the warm WebView picks
+        # the proxy up on its next load. The credential-bearing upstream URI is never
+        # logged (T-14-04 / T-11-02).
+        upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
+        try:
+            # WR-01 parity: the hop repoint AND the device-proxy set both live INSIDE
+            # the try so ``finally: self._clear_proxy_quietly()`` ALWAYS idles the hop
+            # + clears the device, even if either step raises an AdbError mid-flight.
+            repoint(self._hop_control_host, self._hop_control_port, upstream)
+            self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
+            _raise_if_cancelled(cancel)
+            # Learn the egress this SAME upstream should present (stdlib self-probe,
+            # D-05); the WebView's observed egress is asserted against it pre-eval.
+            expected = expected_egress(up_host, up_port, user, pw)
+            return self._drive_eval(
+                challenge_url,
+                host,
+                js,
+                cancel,
+                wait_for=wait_for,
+                deadline=deadline,
+                expected_egress_ip=expected,
+                with_clearance=with_clearance,
+            )
+        finally:
+            self._clear_proxy_quietly()
+
+    @staticmethod
+    def _raise_if_eval_threw(result: dict[str, Any]) -> None:
+        """Raise :class:`EvalError` if a ``Runtime.evaluate`` response shows a throw.
+
+        ``Runtime.evaluate(awaitPromise:true)`` reports a rejected in-page promise via
+        an ``exceptionDetails`` block on an otherwise-200 response (Mode-E root cause).
+        The summary is built from the JS error's first description line (or its class /
+        the top-level ``text``), bounded to ``_EVAL_EXC_SUMMARY_MAX`` chars — CDP does
+        NOT echo the evaluated ``expression`` in ``exceptionDetails``, and the gateway's
+        own extractor throws are token-free, so the summary carries neither the ``js``
+        nor the marshalled value (T-14-04). A response with no ``exceptionDetails`` (the
+        common case, INCLUDING a promise that resolved with an empty envelope) is a
+        no-op.
+        """
+        details = result.get("exceptionDetails")
+        if not details:
+            return
+        exception = details.get("exception") if isinstance(details, dict) else None
+        summary = ""
+        if isinstance(exception, dict):
+            description = exception.get("description")
+            if isinstance(description, str) and description:
+                summary = description.splitlines()[0]
+            elif isinstance(exception.get("className"), str):
+                summary = str(exception["className"])
+        if not summary and isinstance(details, dict):
+            text = details.get("text")
+            if isinstance(text, str):
+                summary = text
+        summary = (summary or "in-page promise rejected")[:_EVAL_EXC_SUMMARY_MAX]
+        raise EvalError(f"in-page eval threw: {summary}")
+
+    def _drive_eval(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        cancel: Event | None,
+        *,
+        wait_for: str | None,
+        deadline: float,
+        expected_egress_ip: str,
+        with_clearance: bool = False,
+    ) -> Any:
+        """Forward devtools → (egress-verify) → ensure cleared+hydrated → eval.
+
+        When ``expected_egress_ip`` is non-empty (proxied path) the WebView's observed
+        egress is read in-browser and asserted to equal it BEFORE the eval runs (Req 3
+        / T-11-01 parity with ``_drive_solve``); a mismatch or transient echo failure
+        raises with NO eval result — a silently-bypassed proxy must NOT eval against a
+        wrong-IP (re-challenged) session. When it is ``""`` (no-proxy path) the
+        egress-verify is skipped (D-08). The device is already connected by the caller.
+
+        Bug 3: comix re-challenges a fresh top-level load, so the eval does NOT blindly
+        re-navigate. If the warm WebView is already on a cleared, hydrated comix page
+        (the spike-021 fast path the prior /solve leaves alive) the eval runs DIRECTLY
+        with no re-nav and no tap. Otherwise — wrong page/host, or the egress-verify
+        navigated the page AWAY to the ip echo — it navigates to ``challenge_url`` and,
+        if comix re-challenges, clears the interstitial with ``/solve``'s tap machinery
+        BEFORE waiting for hydration. The clear/hydrate therefore always happens AFTER
+        any egress-verify nav-away, so the eval never runs against a re-challenged page.
+        """
+        pid = self._device.pidof()
+        _raise_if_cancelled(cancel)
+        port = self._device.forward_devtools(pid)
+        # #275: from the moment the adb/CDP forward exists, tear it down in a finally
+        # on EVERY exit — success, failure, timeout, AND cancellation.
+        try:
+            _raise_if_cancelled(cancel)
+            ws_url = self._discover_page_ws(port)
+            _raise_if_cancelled(cancel)
+            ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
+            try:
+                cdp_call(ws, "Page.enable", command_id=10)
+                cdp_call(ws, "DOM.enable", command_id=11)
+                navigated_away = False
+                if expected_egress_ip:
+                    # Req 3 / T-11-01 parity: prove the WebView egresses through the
+                    # verified proxy IP BEFORE running the eval. Fix A (bug 4 cause #1):
+                    # verify NON-DESTRUCTIVELY first — an IN-PAGE fetch of the IP echo
+                    # (NO Page.navigate), so the cleared+hydrated comix page survives
+                    # and the bug-3 fast path below can engage (NO per-eval re-clear).
+                    # Only when the in-page probe is unavailable (CSP/CORS/transient ⇒
+                    # ``None``) do we FALL BACK to the destructive nav-away probe — an
+                    # eval is NEVER run unverified, and the worst case is today's
+                    # behaviour (re-nav + clear). The byte-equal assertion runs on EVERY
+                    # eval whichever transport observed the egress.
+                    observed = self._observe_webview_egress_in_page(ws, cancel)
+                    if observed is None:
+                        # Probe unavailable — the destructive verify navigates the page
+                        # AWAY to the ip echo, so the fast path can no longer engage and
+                        # the eval must re-establish the cleared+hydrated comix page.
+                        observed = self._observe_webview_egress(ws, cancel)
+                        navigated_away = True
+                    if observed != expected_egress_ip:
+                        # WR-02 parity: byte-equal egress assertion REQUIRES a STICKY
+                        # upstream that holds one exit IP across the self-probe CONNECT
+                        # and the WebView's separate connection. A ROTATING residential
+                        # proxy mismatches on nearly every call — name the cause so it
+                        # is not mistaken for a Cloudflare failure.
+                        raise self._egress_mismatch_error(expected_egress_ip, observed)
+                    _log.info(
+                        "verified proxied WebView egress %s for eval%s",
+                        observed,
+                        "" if navigated_away else " (in-page)",
+                    )
+                # Bug 3: a fresh Page.navigate reloads the page and re-triggers comix's
+                # MANAGED Cloudflare challenge (the cf_clearance COOKIE alone does NOT
+                # pass a top-level reload), and /eval — unlike /solve — never taps to
+                # clear it, so a blind re-nav left every comix eval running against the
+                # "Just a moment..." interstitial (empty result). FAST PATH: when the
+                # warm WebView is ALREADY on the cleared, hydrated comix page the prior
+                # /solve left alive, eval directly with NO re-nav and NO tap.
+                if not navigated_away and self._is_hydrated_comix_page(ws, host):
+                    self._wait_for_hydration(ws, wait_for, cancel, deadline)
+                else:
+                    # Re-navigation required (wrong page/host, or the egress-verify
+                    # navigated the page away). comix re-challenges the fresh load,
+                    # so clear it with /solve's tap machinery before hydrating.
+                    cdp_call(
+                        ws,
+                        "Page.navigate",
+                        {"url": challenge_url},
+                        command_id=_EVAL_NAV_CMD_ID,
+                    )
+                    self._clear_challenge_if_present(ws, ws_url, host, cancel, deadline)
+                    self._wait_for_hydration(ws, wait_for, cancel, deadline)
+                _raise_if_cancelled(cancel)
+                # awaitPromise:true is the ONLY new option over the existing eval
+                # sites — comix's extractors wrap an async ``import()`` IIFE.
+                result = cdp_call(
+                    ws,
+                    "Runtime.evaluate",
+                    {
+                        "expression": js,
+                        "returnByValue": True,
+                        "awaitPromise": True,
+                    },
+                    command_id=_EVAL_CMD_ID,
+                )
+                # Mode-E (debug comix-warm-hydration-wait): a REJECTED in-page promise
+                # comes back as a successful CDP response carrying ``exceptionDetails``
+                # and NO ``result.value``. Detect it and RAISE — otherwise the absent
+                # value marshals to ``None`` and the gateway silently coerces it to an
+                # empty (warning-less, sticky-cached) zero-result search. A throw is a
+                # transient failure, not a genuine empty.
+                self._raise_if_eval_threw(result)
+                value = result.get("result", {}).get("value")
+                if not with_clearance:
+                    return value
+                # Bug 5 follow-on #3: the page is now cleared+hydrated, so comix's
+                # managed challenge has auto-issued the host-scoped cf_clearance into
+                # this WebView's cookie jar — read it back (+ the bound UA) and return
+                # it alongside the value so the gateway can MINT + HOLD comix's
+                # replayable clearance with NO /solve. The forward + ws are still alive
+                # here (their teardown is the finally blocks below). Token NEVER logged.
+                clearance = self._extract_clearance_after_eval(
+                    ws_url, host, port, expected_egress_ip
+                )
+                return (value, clearance)
+            finally:
+                ws.close()
+        finally:
+            self._remove_forward_quietly(port)
+
+    def _extract_clearance_after_eval(
+        self,
+        ws_url: str,
+        host: str,
+        port: int,
+        expected_egress_ip: str,
+    ) -> SolveResult | None:
+        """Read the host-scoped ``cf_clearance`` from the WebView jar after clear+eval.
+
+        Bug 5 follow-on #3: the eval path's warm ``Page.navigate`` + interactive-OOPIF
+        clear leaves comix's managed challenge auto-issuing a host-scoped
+        ``cf_clearance`` (the SAME cookie ``_tap_until_cleared`` reads on the solve
+        path), so a page-holding source can mint a replayable clearance for the httpx
+        image leg WITHOUT the destructive ``/solve`` (``pm clear``). Returns ``None``
+        (NOT a raise) when no
+        host-scoped cookie is present yet or a transient CDP hiccup hits — the gateway
+        treats a missing clearance as "mint not ready" and retries on the next call. The
+        UA is fetched exactly as ``_drive_solve`` does (a hiccup ⇒ empty UA, never a
+        discard). The token value is NEVER logged (T-14-04)."""
+        try:
+            minted = extract_clearance(ws_url, host)
+        except Exception:  # noqa: BLE001 — a post-eval cookie read must not abort the eval
+            _log.warning(
+                "post-eval clearance extract failed transiently for host %s; "
+                "returning no clearance",
+                host,
+                exc_info=True,
+            )
+            return None
+        if minted is None:
+            return None
+        try:
+            user_agent = (
+                webview_user_agent(
+                    f"http://localhost:{port}/json/version",
+                    http_get=self._http_get,
+                )
+                or ""
+            )
+        except Exception:  # noqa: BLE001 — a UA hiccup must not discard a minted token
+            _log.warning(
+                "webview UA fetch failed after eval clearance extract; using empty UA",
+                exc_info=True,
+            )
+            user_agent = ""
+        return SolveResult(
+            cf_clearance=minted.value,
+            user_agent=user_agent,
+            host=host,
+            egress_ip=expected_egress_ip,
+            cf_clearance_expires=minted.expires,
+        )
+
+    def _is_hydrated_comix_page(self, ws: WebSocketLike, host: str) -> bool:
+        """True when the warm WebView is ALREADY on a cleared, hydrated ``host`` page.
+
+        The spike-021 fast path: the prior ``/solve`` leaves the WebView alive on the
+        cleared comix page (``env-*.js`` in Resource-Timing, NO CF interstitial). When
+        ALL three hold — current ``location.host`` == ``host`` AND ``env-*.js`` present
+        AND NOT a CF interstitial — the eval runs with NO ``Page.navigate`` and NO tap,
+        avoiding the reload that re-triggers comix's managed challenge (bug 3). Any
+        probe failure ⇒ ``False`` (take the safe re-nav + clear-if-challenged path).
+        """
+        try:
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {"expression": "location.host", "returnByValue": True},
+                command_id=_EVAL_LOCATION_CMD_ID,
+            )
+        except Exception:  # noqa: BLE001 — a probe error ⇒ take the safe re-nav path
+            return False
+        current = result.get("result", {}).get("value")
+        if not isinstance(current, str) or current.lower() != host.lower():
+            return False
+        if self._cf_frame_present(ws):
+            return False
+        return self._eval_bool(ws, _EVAL_HYDRATION_JS, _EVAL_HYDRATION_CMD_ID)
+
+    def _cf_frame_present(self, ws: WebSocketLike) -> bool:
+        """True when the page is a CF interstitial — the ``challenges.cloudflare.com``
+        OOPIF is in the frame tree (the SAME ``_CF_FRAME_URL_MARKER`` /
+        ``_frame_tree_has_cf`` the solve path's ``_wait_for_cf_frame`` uses, not a new
+        detector). Any CDP error is treated as 'not a CF interstitial' (fail-open to
+        the safe re-nav path; never a token-bearing decision).
+        """
+        try:
+            tree = cdp_call(ws, "Page.getFrameTree", command_id=_EVAL_FRAME_TREE_CMD_ID)
+        except Exception:  # noqa: BLE001 — a probe error must not abort the eval
+            return False
+        return self._frame_tree_has_cf(tree.get("frameTree"))
+
+    def _await_cf_challenge_or_clean(
+        self,
+        ws: WebSocketLike,
+        cancel: Event | None,
+        *,
+        is_clean: Callable[[], bool],
+    ) -> bool:
+        """Poll a freshly-navigated page until it resolves, returning WHICH state:
+
+          * ``True``  — a Cloudflare challenge interstitial appeared (the
+            ``challenges.cloudflare.com`` OOPIF is in the frame tree) and must be
+            tapped to clear.
+          * ``False`` — the page came up CLEAN (``is_clean()`` reports the target is
+            already in its terminal good state), so there is NOTHING to clear.
+
+        ONE clean-vs-challenge resolver shared by BOTH the eval path and the solve
+        path (DRY — no per-path copy of the poll-to-deadline loop to lurk and rot).
+        The clean signal differs per path, so it is injected as ``is_clean``:
+
+          * eval path (``_clear_challenge_if_present``): clean = a hydrated,
+            non-challenged ``host`` comix page (``_is_hydrated_comix_page``).
+          * solve path (``_wait_for_cf_frame``): clean = a host-scoped ``cf_clearance``
+            is ALREADY present (``_host_already_cleared``) — host-agnostic, so it serves
+            every solve host (mangadot/kagane/mangaball/comix), not just comix.
+
+        Bug 5 / collision + solve-path parity: when the navigated page is already
+        cleared (a warm ``cf_clearance`` still passed the load, or CF's managed
+        challenge auto-issued clearance with no interactive widget), the CF OOPIF
+        NEVER appears. The old per-path waits blocked the FULL ``_frame_poll_timeout_s``
+        (~20s) on every such clean load (the "cloudflare OOPIF did not appear before
+        frame-poll deadline" warning), blowing the per-source / startup-warm budget.
+        This poll short-circuits the instant ``is_clean()`` holds — only spending the
+        long deadline when a challenge genuinely renders. The CF frame is checked FIRST
+        each iteration so a real interstitial is never mistaken for a clean page (the
+        genuine-challenge path is unchanged).
+        """
+        deadline = time.monotonic() + self._frame_poll_timeout_s
+        while time.monotonic() < deadline:
+            _raise_if_cancelled(cancel)  # issue #207: don't poll past a cancel
+            if self._cf_frame_present(ws):
+                return True
+            if is_clean():
+                return False
+            time.sleep(self._frame_poll_interval_s)
+        # Neither a challenge frame nor a confirmed-clean page within the deadline —
+        # fall back to a final CF-frame read (preserving the old behaviour: clear a
+        # challenge if one is present, else there is nothing to clear).
+        _log.warning("cloudflare OOPIF did not appear before frame-poll deadline")
+        return self._cf_frame_present(ws)
+
+    def _clear_challenge_if_present(
+        self,
+        ws: WebSocketLike,
+        ws_url: str,
+        host: str,
+        cancel: Event | None,
+        deadline: float,
+    ) -> None:
+        """Clear the CF interstitial after a fresh eval nav, if comix re-challenged.
+
+        comix re-challenges a fresh top-level load (the cf_clearance COOKIE alone does
+        NOT pass a reload — bug 3), and on the proxied path the egress-verify navigates
+        the page away, so a re-nav may be freshly challenged. Poll for the page to
+        resolve to ONE of two terminal states (``_await_cf_challenge_or_clean``): a CF
+        interstitial — drive the SAME tap machinery ``/solve`` uses (``_compute_scales``
+        + ``_tap_until_cleared`` — NOT a forked implementation) to clear it — or a CLEAN
+        hydrated comix page (the warm clearance still passed the nav), in which case
+        there is nothing to clear.
+
+        Bug 5 collision-recovery: a clean re-nav short-circuits the instant the page is
+        hydrated-and-CF-free, so it no longer blocks the full ~20s frame-poll deadline
+        waiting for a CF OOPIF that will never appear. The clearance minted/observed
+        here is NEVER logged or returned (T-14-04) — clearing is the only goal; the eval
+        returns just the JS value.
+        """
+        if not self._await_cf_challenge_or_clean(
+            ws, cancel, is_clean=lambda: self._is_hydrated_comix_page(ws, host)
+        ):
+            return
+        x_scale, y_scale = self._compute_scales(ws)
+        minted = self._tap_until_cleared(
+            ws, ws_url, host, x_scale, y_scale, deadline, cancel
+        )
+        if minted is None:
+            raise SolveError(
+                f"could not clear CF challenge for {host} before the eval deadline"
+            )
+
+    def _wait_for_hydration(
+        self,
+        ws: WebSocketLike,
+        wait_for: str | None,
+        cancel: Event | None,
+        deadline: float,
+    ) -> None:
+        """Poll until the comix SPA has hydrated, bounded by ``deadline``.
+
+        Readiness = ``env-*.js`` present in the Resource-Timing buffer (the SPA-ready
+        signal, spike 021 A1) AND, when ``wait_for`` is supplied, that JS boolean
+        predicate is truthy. Returns anyway on the deadline (does NOT hard-fail) —
+        comix routes by hid and the slug is cosmetic, so a cosmetic-readiness miss
+        must not abort an otherwise-runnable eval (spike 021). The wait is also
+        bounded by ``_EVAL_HYDRATION_TIMEOUT_S`` so it never consumes the whole eval
+        budget waiting on a signal that will not appear.
+        """
+        hydration_deadline = min(deadline, time.monotonic() + _EVAL_HYDRATION_TIMEOUT_S)
+        while time.monotonic() < hydration_deadline:
+            _raise_if_cancelled(cancel)
+            ready = self._eval_bool(ws, _EVAL_HYDRATION_JS, _EVAL_HYDRATION_CMD_ID)
+            if ready and (
+                wait_for is None or self._eval_bool(ws, wait_for, _EVAL_WAIT_FOR_CMD_ID)
+            ):
+                return
+            time.sleep(self._poll_interval_s)
+        _log.warning(
+            "comix SPA hydration signal not seen before eval deadline; "
+            "running the eval anyway"
+        )
+
+    def _eval_bool(self, ws: WebSocketLike, expression: str, command_id: int) -> bool:
+        """Evaluate a JS boolean predicate; any CDP/eval error is treated as False.
+
+        Fail-open like ``_in_verification`` — a transient CDP hiccup on a readiness
+        probe must never abort the eval; it just means "not ready yet, keep polling".
+        """
+        try:
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {"expression": expression, "returnByValue": True},
+                command_id=command_id,
+            )
+        except Exception:  # noqa: BLE001 — a readiness probe must never abort the eval
+            return False
+        return bool(result.get("result", {}).get("value"))
 
     def _solve(
         self,
@@ -477,9 +1081,12 @@ class AndroidSolvePipeline:
                         {"url": challenge_url},
                         command_id=_CHALLENGE_RENAV_CMD_ID,
                     )
-                # Wait for the cross-origin Cloudflare OOPIF to render (a few seconds
-                # after load) — the real readiness gate, not the fixed settle above.
-                self._wait_for_cf_frame(ws, cancel)
+                # Wait for the page to resolve — the cross-origin Cloudflare OOPIF
+                # renders (a few seconds after load) OR the host is already cleared (a
+                # warm/auto-issued cf_clearance, no widget). Short-circuits on either,
+                # never burning the full frame-poll deadline on an already-cleared load
+                # (bug 5 solve-path parity). The real readiness gate, not the settle.
+                self._wait_for_cf_frame(ws, ws_url, host, cancel)
                 # Page ws, DOM/Page enable, frame readiness, and the viewport scales
                 # are computed ONCE; only locate+tap+poll repeats inside the loop.
                 x_scale, y_scale = self._compute_scales(ws)
@@ -567,6 +1174,63 @@ class AndroidSolvePipeline:
                 last_err = exc
                 continue
         raise SolveError(f"could not read a valid WebView egress IP: {last_err}")
+
+    def _observe_webview_egress_in_page(
+        self, ws: WebSocketLike, cancel: Event | None
+    ) -> str | None:
+        """Read the WebView egress via an IN-PAGE ``fetch`` (no nav-away); Fix A.
+
+        The non-destructive counterpart to :meth:`_observe_webview_egress`: it runs
+        ``_EGRESS_IN_PAGE_JS`` (an async IIFE that ``fetch``es the SAME
+        ``_EGRESS_ECHO_URL`` with ``cache:'no-store'``, ``awaitPromise:true``) in the
+        CURRENT page instead of navigating away, so the cleared+hydrated comix page
+        survives and the bug-3 fast path can engage. Returns the normalized egress IP
+        on success, or ``None`` when the probe is unavailable — the IIFE returned
+        ``null`` (CSP/CORS/network block in comix's origin), the body is not an IP, or
+        the CDP call itself errored — so the caller can FALL BACK to the destructive
+        probe rather than run an eval unverified. The observed IP is loggable; no token
+        is involved here.
+        """
+        _raise_if_cancelled(cancel)
+        try:
+            result = cdp_call(
+                ws,
+                "Runtime.evaluate",
+                {
+                    "expression": _EGRESS_IN_PAGE_JS,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                },
+                command_id=_EGRESS_IN_PAGE_CMD_ID,
+            )
+        except SolveCancelled:
+            raise
+        except Exception:  # noqa: BLE001 — a probe error ⇒ unavailable, fall back
+            return None
+        value = result.get("result", {}).get("value")
+        if value is None:
+            return None
+        try:
+            return str(ipaddress.ip_address(str(value).strip()))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _egress_mismatch_error(expected: str, observed: str | None) -> SolveError:
+        """The SAME rotating/non-sticky-proxy ``SolveError`` both egress paths raise.
+
+        Shared by the in-page and destructive-fallback verify in ``_drive_eval`` so a
+        mismatch surfaces an identical, byte-equal T-11-01 failure whichever transport
+        observed the egress (the message names the rotating-proxy cause so a config
+        mismatch is not mistaken for a Cloudflare failure).
+        """
+        return SolveError(
+            f"proxied egress IP differed "
+            f"(expected {expected}, observed {observed}) — "
+            f"is the upstream a rotating/non-sticky proxy? "
+            f"egress-verify needs a sticky-session upstream that holds "
+            f"one exit IP across connections"
+        )
 
     def _device_hop_host(self) -> str:
         """The hop host the DEVICE routes ``global http_proxy`` through, as an IP.
@@ -696,25 +1360,55 @@ class AndroidSolvePipeline:
             return False
         return bool(result.get("result", {}).get("value"))
 
-    def _wait_for_cf_frame(
-        self, ws: WebSocketLike, cancel: Event | None = None
-    ) -> None:
-        """Poll Page.getFrameTree until the challenges.cloudflare.com OOPIF appears.
+    def _host_already_cleared(self, ws_url: str, host: str) -> bool:
+        """Host-agnostic clean check for the solve path: True when a host-scoped
+        ``cf_clearance`` is ALREADY present.
 
-        The Turnstile widget renders in a cross-origin child frame a few seconds
-        after the page loads. Returns once present; returns anyway on timeout so
-        locate_checkbox can still try the secondary/screenshot paths.
+        The solve serves EVERY allowlisted host, so unlike the comix-specific
+        ``_is_hydrated_comix_page`` this asks the host-agnostic question the solve
+        actually cares about: "is there anything left to clear?". A present
+        host-scoped ``cf_clearance`` means the load auto-passed CF's managed challenge
+        (no interactive Turnstile rendered) or a warm clearance still held — either
+        way the solve is effectively done and ``_tap_until_cleared`` will read the SAME
+        cookie on its first poll. This mirrors how ``_drive_solve`` confirms success
+        today (``extract_clearance``). Any extract error ⇒ ``False`` (keep polling /
+        fall through to the long deadline + tap path; never a token-bearing decision).
         """
-        deadline = time.monotonic() + self._frame_poll_timeout_s
-        command_id = 20
-        while time.monotonic() < deadline:
-            _raise_if_cancelled(cancel)  # issue #207: don't poll past a cancel
-            tree = cdp_call(ws, "Page.getFrameTree", command_id=command_id)
-            command_id += 1
-            if self._frame_tree_has_cf(tree.get("frameTree")):
-                return
-            time.sleep(self._frame_poll_interval_s)
-        _log.warning("cloudflare OOPIF did not appear before frame-poll deadline")
+        try:
+            return extract_clearance(ws_url, host) is not None
+        except Exception:  # noqa: BLE001 — a clean-check probe must not abort the solve
+            return False
+
+    def _wait_for_cf_frame(
+        self,
+        ws: WebSocketLike,
+        ws_url: str,
+        host: str,
+        cancel: Event | None = None,
+    ) -> None:
+        """Wait until the page resolves to ONE of two states before tapping.
+
+        The Turnstile widget renders in a cross-origin ``challenges.cloudflare.com``
+        child frame a few seconds after the page loads. The solve polls until EITHER
+        that OOPIF appears (a genuine challenge — return so ``_tap_until_cleared`` can
+        clear it, the unchanged cold-solve behaviour) OR ``host`` is already cleared (a
+        host-scoped ``cf_clearance`` is present — the load auto-passed CF's managed
+        challenge with no widget, or a warm clearance still held — so there is nothing
+        to tap and ``_tap_until_cleared`` reads the existing cookie immediately).
+
+        Bug 5 / solve-path parity with the eval path: a clean already-cleared load used
+        to burn the FULL ``_frame_poll_timeout_s`` (~20s) here waiting for an OOPIF that
+        would NEVER appear ("cloudflare OOPIF did not appear before frame-poll
+        deadline"), which on a gateway-restart ``warm()`` re-solve of an already-cleared
+        host blew the startup-warm gate. This now short-circuits via the SHARED
+        ``_await_cf_challenge_or_clean`` resolver the instant either state is reached;
+        the genuine-challenge path is detected FIRST and is byte-for-byte unchanged.
+        Returns either way so ``_tap_until_cleared`` (which can still try the
+        secondary/screenshot locate paths) always runs next.
+        """
+        self._await_cf_challenge_or_clean(
+            ws, cancel, is_clean=lambda: self._host_already_cleared(ws_url, host)
+        )
 
     @staticmethod
     def _frame_tree_has_cf(frame_tree: Any) -> bool:
@@ -878,6 +1572,101 @@ class SolverService:
 
         return self._run_solve(challenge_url, host, proxy, disconnected)
 
+    def eval(
+        self,
+        *,
+        api_key: str | None,
+        body: bytes,
+        disconnected: Callable[[], bool] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Run gateway-supplied JS in the warm cleared WebView (EVAL-01 / SEC-01).
+
+        Replicates ``/solve``'s rails verbatim — ``X-Solver-Key`` auth BEFORE any
+        body read or device action (T-14-01), the ``urlsplit`` scheme-pinned-then-
+        host-allowlisted SSRF guard BEFORE any device action (T-14-02) — then adds a
+        ``js`` parse. ``js`` is sidecar-trusted (gateway-authored, sent over the
+        authenticated control channel with no published host port, T-14-03) but
+        STILL requires the key + allowlist. The ``js`` and the eval result are NEVER
+        logged (T-14-04).
+        """
+        if not self._authenticate(api_key):
+            # T-14-01: no device action without a valid key.
+            return int(HTTPStatus.UNAUTHORIZED), {
+                "error": "invalid or missing X-Solver-Key"
+            }
+
+        try:
+            payload = json.loads(body or b"{}")
+        except (ValueError, TypeError):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "malformed JSON body"}
+        if not isinstance(payload, dict):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "body must be a JSON object"}
+
+        challenge_url = payload.get("challenge_url")
+        if not isinstance(challenge_url, str) or not challenge_url:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge_url is required"
+            }
+
+        split = urlsplit(challenge_url)
+        host = (split.hostname or "").lower()
+        if split.scheme not in ("http", "https"):
+            # T-14-02 SSRF guard: pin the scheme BEFORE the host check (mirrors
+            # /solve) so a non-http(s) URL with an allowlisted host never navigates.
+            _log.warning("rejected non-http(s) eval challenge scheme %r", split.scheme)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge url scheme not allowed"
+            }
+        if host not in self._config.allowed_hosts:
+            # T-14-02 SSRF guard: reject BEFORE any device action.
+            _log.warning("rejected non-allowlisted eval challenge host %r", host)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge host not allowlisted"
+            }
+
+        # The gateway-authored JS to run in-page. Sidecar-trusted, but the request
+        # still had to pass the key + allowlist above (T-14-03). NEVER logged.
+        js = payload.get("js")
+        if not isinstance(js, str) or not js:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {"error": "js is required"}
+        # Optional SPA-readiness predicate: a JS boolean EXPRESSION string (NOT a
+        # CSS selector) the eval polls until truthy before running ``js``.
+        wait_for = payload.get("wait_for")
+        if wait_for is not None and not isinstance(wait_for, str):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "wait_for must be a string"
+            }
+        # Bug 5 follow-on #3: when set, ALSO extract the host-scoped cf_clearance from
+        # the WebView jar after the clear+eval and return it under a ``clearance`` key,
+        # so the gateway can mint+hold a page-holding source's (comix's) replayable
+        # clearance without a destructive ``/solve``. Optional bool; default False keeps
+        # every existing comix extractor eval's response shape byte-for-byte unchanged.
+        with_clearance = payload.get("extract_clearance", False)
+        if not isinstance(with_clearance, bool):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "extract_clearance must be a boolean"
+            }
+
+        # Req 7 parity with /solve: validate the optional per-eval proxy SHAPE BEFORE
+        # any device action — a malformed proxy is a pre-action 422 (no hop repoint,
+        # no global http_proxy set). Same validator as /solve (T-11-06: the only
+        # caller-supplied URL is the upstream proxy server, validated for scheme +
+        # hostname, never blindly fetched). The credentials are never logged.
+        proxy_err = self._validate_proxy(payload.get("proxy"))
+        if proxy_err is not None:
+            return proxy_err
+        proxy = payload.get("proxy")
+
+        return self._run_eval(
+            challenge_url,
+            host,
+            js,
+            wait_for,
+            proxy,
+            disconnected,
+            with_clearance=with_clearance,
+        )
+
     @staticmethod
     def _validate_proxy(
         proxy: Any,
@@ -1017,6 +1806,120 @@ class SolverService:
         finally:
             self._lock.release()
 
+    def _run_eval(
+        self,
+        challenge_url: str,
+        host: str,
+        js: str,
+        wait_for: str | None = None,
+        proxy: dict[str, Any] | None = None,
+        disconnected: Callable[[], bool] | None = None,
+        *,
+        with_clearance: bool = False,
+    ) -> tuple[int, dict[str, Any]]:
+        """Serialize + timeout-bound one in-WebView eval (mirrors ``_run_solve``).
+
+        Shares the SAME ``self._lock`` + single-worker ``self._executor`` as
+        ``_run_solve`` (never a second executor), so an eval and a solve can never
+        run concurrently against the one redroid (PERF-01 / R1). NON-blocking lock
+        acquire → 503 busy; short-poll the worker future bounded by the solve
+        timeout, cancelling-and-draining on timeout / caller disconnect. On success
+        returns ``(200, {"value": <marshalled eval result>})``. The ``js`` and the
+        result value are NEVER logged (T-14-04) — the success event carries only the
+        host.
+
+        When ``proxy`` is supplied the eval adds the cross-container CONNECT hop +
+        egress-verify before the eval nav (Req 7 parity with ``_run_solve``), so the
+        outer future wait is bounded by the LONGER ``proxy_solve_timeout_s`` to absorb
+        that overhead. A no-proxy eval keeps the base ``solve_timeout_s`` (D-08).
+        """
+        cancel = Event()
+        timeout_s = (
+            self._config.proxy_solve_timeout_s
+            if proxy is not None
+            else self._config.solve_timeout_s
+        )
+        # T-14-05 / PERF-01: NON-blocking acquire — an eval (or solve) arriving while
+        # one is already in flight is rejected 503 immediately rather than queuing
+        # behind the single device.
+        if not self._lock.acquire(blocking=False):
+            _log.info("solver busy; rejecting concurrent /eval for host %s", host)
+            return int(HTTPStatus.SERVICE_UNAVAILABLE), {"error": "solver busy"}
+        try:
+            # Bug 5 follow-on #3: thread ``with_clearance`` ONLY when requested so an
+            # ordinary eval calls the pipeline (and any test fake) with the
+            # byte-for-byte unchanged kwargs; clearance evals return ``(value, clr)``.
+            eval_kwargs: dict[str, Any] = {"wait_for": wait_for, "proxy": proxy}
+            if with_clearance:
+                eval_kwargs["with_clearance"] = True
+            future = self._executor.submit(
+                self._pipeline.eval_in_webview,
+                challenge_url,
+                host,
+                js,
+                cancel,
+                **eval_kwargs,
+            )
+            deadline = time.monotonic() + timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _log.warning("eval timed out for host %s", host)
+                    self._cancel_and_drain(future, cancel, host)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "eval timed out"}
+                try:
+                    outcome = future.result(timeout=min(_DISCONNECT_POLL_S, remaining))
+                except FuturesTimeout:
+                    if disconnected is not None and disconnected():
+                        _log.info(
+                            "caller disconnected mid-eval for host %s; cancelling",
+                            host,
+                        )
+                        self._cancel_and_drain(future, cancel, host)
+                        return _CLIENT_CLOSED_REQUEST, {"error": "client disconnected"}
+                    continue
+                except EvalError as exc:
+                    # Mode-E follow-up: the in-page promise REJECTED — most often a
+                    # comix-origin 5xx (Cloudflare "origin down/unreachable" 521/520/522
+                    # surfaced by the env-module axios as "Request failed with status
+                    # code 5xx"). Surface the bounded, token-free summary in the body
+                    # under ``detail`` so the gateway can distinguish a TRANSIENT origin
+                    # 5xx (worth one bounded retry) from a 4xx / non-origin throw (not).
+                    # The summary is built by ``_raise_if_eval_threw`` from the JS
+                    # error's first description line only — it carries NEITHER the
+                    # evaluated ``js`` NOR the marshalled value NOR any token (T-14-04).
+                    # Keep the redacted warning + trace for field diagnosis.
+                    _log.warning("eval failed for host %s", host, exc_info=True)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {
+                        "error": "eval threw",
+                        "detail": str(exc),
+                    }
+                except Exception:  # noqa: BLE001 — any other pipeline failure ⇒ 504
+                    # Never logs the js or the result (the value isn't in the
+                    # traceback message) — keep the trace for field diagnosis.
+                    _log.warning("eval failed for host %s", host, exc_info=True)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "eval failed"}
+                # Redacted success event ONLY (T-14-04) — never the js or the result.
+                _log.info("evaluated in webview for host %s", host)
+                if not with_clearance:
+                    return int(HTTPStatus.OK), {"value": outcome}
+                # ``with_clearance``: the pipeline returned ``(value, SolveResult |
+                # None)``. Carry the cf_clearance back under a ``clearance`` key (null
+                # when none was minted) so the gateway can hold it for the httpx image
+                # leg. The token rides only the response body — NEVER a log (T-14-04).
+                value, clearance = outcome
+                clearance_body: dict[str, Any] | None = None
+                if clearance is not None:
+                    clearance_body = {
+                        "cf_clearance": clearance.cf_clearance,
+                        "user_agent": clearance.user_agent,
+                        "cf_clearance_expires": clearance.cf_clearance_expires,
+                        "egress_ip": clearance.egress_ip,
+                    }
+                return int(HTTPStatus.OK), {"value": value, "clearance": clearance_body}
+        finally:
+            self._lock.release()
+
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
         """Signal cancellation and wait (bounded) for the orphan to unwind (#207).
 
@@ -1093,7 +1996,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
-        if self.path != "/solve":
+        # Phase 14: /eval shares /solve's pre-auth + body-cap rails verbatim — only
+        # the service method dispatched at the end differs.
+        if self.path not in ("/solve", "/eval"):
             self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
             return
         # CR-01: authenticate BEFORE reading the body. An unauthenticated caller
@@ -1115,7 +2020,9 @@ class _Handler(BaseHTTPRequestHandler):
                 int(HTTPStatus.BAD_REQUEST), {"error": "invalid Content-Length"}
             )
             return
-        # CR-01: cap the declared body size BEFORE reading a single byte.
+        # CR-01 / T-14-05: cap the declared INBOUND body size BEFORE reading a single
+        # byte. (The cap is inbound-only; a large chapter-list eval RESULT travels on
+        # the outbound side and is NOT capped — research A4.)
         if length > _MAX_BODY_BYTES:
             self.close_connection = True
             self._send_json(
@@ -1123,20 +2030,27 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
         body = self.rfile.read(length) if length > 0 else b""
-        # #275 req 1: let the service detect a mid-solve caller disconnect (peek the
-        # socket for EOF) so an abandoned /solve cancels its device work promptly.
-        status, payload = self.server.service.solve(
-            api_key=api_key,
-            body=body,
-            disconnected=lambda: _peer_disconnected(self.connection),
-        )
+        # #275 req 1: let the service detect a mid-call caller disconnect (peek the
+        # socket for EOF) so an abandoned /solve or /eval cancels its device work.
+        if self.path == "/solve":
+            status, payload = self.server.service.solve(
+                api_key=api_key,
+                body=body,
+                disconnected=lambda: _peer_disconnected(self.connection),
+            )
+        else:  # /eval
+            status, payload = self.server.service.eval(
+                api_key=api_key,
+                body=body,
+                disconnected=lambda: _peer_disconnected(self.connection),
+            )
         # #275 cleanup: the client may already be gone (CLOSE_WAIT / BrokenPipe). A
         # write to a dead peer must not crash the daemon worker thread — swallow it
         # (OSError covers BrokenPipeError/ConnectionError, its subclasses).
         try:
             self._send_json(status, payload)
         except OSError:
-            _log.info("client gone before /solve response could be sent for host")
+            _log.info("client gone before %s response could be sent", self.path)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Silence the default access log (keeps request lines — and any header

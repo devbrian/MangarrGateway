@@ -241,6 +241,39 @@ class Settings(BaseSettings):
     # (Phase 10 live-verify). Default 180 = the 120s cap + 60s margin, so a clean
     # out-of-the-box run does not trip the coupling. Raise it if you raise the cap.
     android_solver_timeout_s: float = Field(default=180.0, gt=0)
+    # Bug 5 Lever A (proactive-refresh-by-AGE, MEASURE-FIRST knob). The android
+    # proactive-refresh loop re-mints a held clearance ahead of its COOKIE expiry. But
+    # for comix the cf_clearance cookie carries a ~1yr nominal expiry that is a LIE —
+    # Cloudflare re-challenges far sooner (debug ``cf-clearance-cookie-expiry-is-not-
+    # lapse-time``), so the expiry-driven loop never proactively re-mints comix inside
+    # its lead window and a comix search occasionally pays a COLD (~5-10s) Turnstile
+    # re-clear on the hot path. This knob caps the effective refresh interval: when set
+    # (> 0, SECONDS) the loop treats every held android clearance as due for re-mint at
+    # ``minted_at + this`` whenever that is sooner than the cookie expiry, so a fresh
+    # clearance is always waiting before the empirical re-challenge interval. ``None``
+    # (default) = DISABLED → the historic cookie-expiry-only behavior, byte-for-byte
+    # unchanged (no behavior change ships until an operator sets a value). The VALUE
+    # must be TUNED from a live measurement window — read comix's real re-challenge
+    # cadence from the solve metric (``GET /metrics/per-source-endpoint`` /
+    # ``/metrics/recent``, ``op="solve"`` rows for comix) and the sidecar
+    # ``captured clearance for host comix.to`` log timestamps — then set this BELOW that
+    # interval (minus the ~120s lead) so a search never hits a cold clear. Do NOT guess.
+    android_refresh_max_age_s: float | None = Field(default=None, gt=0)
+    # Bug 5 Fix #2 (startup-warm gate). The startup eager warm() is fired NON-BLOCKING,
+    # so a comix /search that arrives DURING the warm storm races the in-flight foreign
+    # solves: a queued warm/refresh solve can navigate the single shared WebView away
+    # from comix's page mid-sequence, and comix's recovery re-nav burns the budget
+    # (collision spike). When set (> 0, SECONDS) an android-routed foreground sequence
+    # (a comix solve+eval inside ``device_session``) WAITS at the device door for warm()
+    # to finish before claiming the device — so the first post-boot search finds every
+    # android source already cleared and the shared page parked on the holder (comix),
+    # with NO startup-warm steal. The wait FALLS THROUGH on timeout (warm slow/hung)
+    # rather than hanging the search forever — Lever B then defers any straggler warm
+    # solve. Sized below the 30s per-source fan-out budget so a pathological warm still
+    # lets the search attempt within budget. Only android searches wait (non-android
+    # sources never enter ``device_session``); the gate is a no-op until the app arms it
+    # at startup, so the gate / CI / a solver that never warms stays unchanged.
+    android_warm_gate_timeout_s: float = Field(default=25.0, gt=0)
     # ── Source enable/disable (reversible ops knob; #198/#202) ─────────────────
     # Comma-separated source keys to SKIP registering at startup, e.g.
     # GATEWAY_DISABLED_SOURCES="kagane,mangadot". A disabled source is dropped
@@ -336,6 +369,16 @@ class Settings(BaseSettings):
     # `_enum_cache_ttl_within_handle_ttl` model validator below fails fast above
     # 3600 (mirrors _reject_camoufox_parallel).
     enum_cache_ttl_seconds: int = Field(default=1800, ge=1)
+    # Mode-E (debug comix-warm-hydration-wait): the SHORT negative-cache TTL applied
+    # to a SUCCESSFUL-but-EMPTY result (an empty candidate list / an Enumeration with
+    # no items). Empties are still cached (a genuine no-match search must not re-hammer
+    # upstream on every poll — 260606-lyb Change 3), but only for THIS short window
+    # rather than the full ``enum_cache_ttl_seconds``, so a transient/wrong zero (a
+    # one-off upstream blip or — pre-sidecar-fix — a swallowed in-page eval throw)
+    # clears within a minute instead of sticking for the whole TTL. Env-overridable knob
+    # (GATEWAY_ENUM_CACHE_EMPTY_TTL_SECONDS, default 60s). Field(ge=1): a 0/negative
+    # would break the TLRUCache ttu; the validator below keeps it ≤ the full TTL.
+    enum_cache_empty_ttl_seconds: int = Field(default=60, ge=1)
     # 260606-lyb Change 2 / 260620 backoff rework: per-source failure cooldown
     # (negative cache for FAILURES, distinct from the enum cache above which caches
     # successes). When a source's fan-out branch hits a hard failure (timeout /
@@ -503,6 +546,28 @@ class Settings(BaseSettings):
                 "not out-live the handle it serves. Fix via env: set "
                 "GATEWAY_ENUM_CACHE_TTL_SECONDS <= GATEWAY_HANDLE_TTL_SECONDS "
                 f"(currently {self.handle_ttl_seconds})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _empty_ttl_within_enum_ttl(self) -> Settings:
+        """Fail fast when the empty (negative-cache) TTL exceeds the full TTL (Mode-E).
+
+        The negative cache exists to make a transient/wrong empty result EXPIRE
+        SOONER than a real one, so an ``enum_cache_empty_ttl_seconds`` above the full
+        ``enum_cache_ttl_seconds`` would be self-defeating (an empty would out-live a
+        populated entry). Reject it at construction — mirroring
+        ``_enum_cache_ttl_within_handle_ttl`` — so the misconfiguration surfaces loudly
+        at startup rather than silently making empties stickier than successes.
+        """
+        if self.enum_cache_empty_ttl_seconds > self.enum_cache_ttl_seconds:
+            raise ValueError(
+                "enum_cache_empty_ttl_seconds="
+                f"{self.enum_cache_empty_ttl_seconds} exceeds enum_cache_ttl_seconds="
+                f"{self.enum_cache_ttl_seconds}: the empty (negative-cache) TTL must "
+                "stay <= the full TTL so a transient empty expires SOONER than a real "
+                "result. Fix via env: set GATEWAY_ENUM_CACHE_EMPTY_TTL_SECONDS <= "
+                "GATEWAY_ENUM_CACHE_TTL_SECONDS."
             )
         return self
 

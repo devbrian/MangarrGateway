@@ -57,6 +57,15 @@ _DEFAULT_MAXSIZE = 512  # D-07 memory bound
 # pass a ceiling (tests / direct construction).
 _MAX_TTL = 3600
 
+# Mode-E (debug comix-warm-hydration-wait): the default SHORT negative-cache TTL for a
+# successful-but-EMPTY value. Empties ARE still cached (a genuine no-match must not
+# re-hammer upstream every poll, 260606-lyb Change 3) but expire on THIS short window
+# instead of the full TTL, so a transient/wrong zero (an upstream blip, or — before the
+# sidecar exceptionDetails fix — a swallowed in-page eval throw) self-heals within a
+# minute rather than sticking for the whole TTL. INJECTABLE (``empty_ttl``); the
+# lifespan passes the configured ``enum_cache_empty_ttl_seconds``.
+_DEFAULT_EMPTY_TTL = 60
+
 # IN-01: distinct absence sentinel. ``self._cache.get(key)`` defaults to ``None``,
 # but ``None`` is a value a future ``fetch_fn`` could legitimately return — under an
 # ``is not None`` presence check that value would be indistinguishable from absence
@@ -127,12 +136,20 @@ class SingleFlightCache[V]:
         enabled: bool = True,
         ttl_overrides: dict[str, int] | None = None,
         max_ttl: int = _MAX_TTL,
+        empty_ttl: int = _DEFAULT_EMPTY_TTL,
+        is_empty: Callable[[V], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._default_ttl = ttl
         self._enabled = enabled
         self._ttl_overrides = ttl_overrides or {}
         self._max_ttl = max_ttl
+        # Mode-E: the short negative-cache TTL + the "is this value empty?" predicate.
+        # When ``is_empty`` is ``None`` (the default / tests) every value gets the full
+        # TTL — byte-for-byte unchanged. ``EnumerationCache`` supplies a per-layer
+        # predicate so an empty candidate list / item-less Enumeration expires sooner.
+        self._empty_ttl = empty_ttl
+        self._is_empty = is_empty
         self._cache: TLRUCache[CacheKey, V] = TLRUCache(
             maxsize=maxsize, ttu=self._ttu, timer=clock
         )
@@ -144,8 +161,16 @@ class SingleFlightCache[V]:
         The per-source override is keyed on ``key[0]`` (the ``source_key``); absent
         → the default ttl. Every TTL is clamped to ``self._max_ttl`` (the configured
         handle TTL, D-09) so no entry outlives the handle it serves.
+
+        Mode-E: a SUCCESSFUL-but-EMPTY value (per ``is_empty``) uses the short
+        ``empty_ttl`` instead — a transient/wrong zero self-heals quickly while a
+        genuine no-match still skips upstream for that brief window. The empty TTL is
+        ALSO clamped to ``max_ttl`` (it is always ≤ the full TTL in practice, but the
+        clamp keeps the invariant explicit).
         """
         source_key = key[0]
+        if self._is_empty is not None and self._is_empty(value):
+            return now + min(self._empty_ttl, self._max_ttl)
         ttl = self._ttl_overrides.get(source_key, self._default_ttl)
         return now + min(ttl, self._max_ttl)
 
@@ -195,12 +220,16 @@ class SingleFlightCache[V]:
         else:
             # 260606-lyb Change 3 (deliberate WR-03 reversal, commit aef08ce):
             # successful results — INCLUDING empties (an empty candidate list or an
-            # Enumeration with no items) — ARE cached for the full TTL. A repeat
-            # NO-MATCH search now short-circuits with zero upstream calls. Hard
-            # failures are STILL never cached (the ``except`` branch above is
-            # untouched), and a DOWN source never reaches this success branch (it
-            # raises → handled by the per-source failure cooldown), so we only ever
-            # cache GENUINE successful empties — not a transient upstream outage.
+            # Enumeration with no items) — ARE cached so a repeat NO-MATCH search
+            # short-circuits with zero upstream calls. Hard failures are STILL never
+            # cached (the ``except`` branch above is untouched), and a DOWN source never
+            # reaches this success branch (it raises → handled by the per-source failure
+            # cooldown). Mode-E refinement (debug comix-warm-hydration-wait): an empty
+            # is cached only for the SHORT ``empty_ttl`` (see ``_ttu`` + ``is_empty``),
+            # not the full TTL — a SUCCESSFUL empty can still be a transient/wrong zero
+            # (an upstream blip, or — before the sidecar exceptionDetails fix — a
+            # swallowed in-page eval throw), so it must self-heal in ~a minute instead
+            # of sticking for the whole TTL. A genuinely-populated result is unaffected.
             self._cache[key] = value
             if not future.done():
                 future.set_result(value)
@@ -257,15 +286,22 @@ class EnumerationCache:
         enabled: bool = True,
         ttl_overrides: dict[str, int] | None = None,
         max_ttl: int = _MAX_TTL,
+        empty_ttl: int = _DEFAULT_EMPTY_TTL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._enabled = enabled
+        # Mode-E: each layer gets a per-layer "is this value empty?" predicate so a
+        # SUCCESSFUL-but-EMPTY result (an item-less Enumeration on Layer 2, an empty
+        # candidate list on Layer 1) is cached only for the short ``empty_ttl`` — a
+        # transient/wrong zero self-heals fast instead of sticking the full TTL.
         self._enum: SingleFlightCache[Enumeration] = SingleFlightCache(
             ttl=ttl,
             maxsize=maxsize,
             enabled=enabled,
             ttl_overrides=ttl_overrides,
             max_ttl=max_ttl,
+            empty_ttl=empty_ttl,
+            is_empty=lambda enum: not enum.items,
             clock=clock,
         )
         self._resolve: SingleFlightCache[Any] = SingleFlightCache(
@@ -274,6 +310,12 @@ class EnumerationCache:
             enabled=enabled,
             ttl_overrides=ttl_overrides,
             max_ttl=max_ttl,
+            empty_ttl=empty_ttl,
+            # A resolved candidate list is "empty" when it has no candidates; guard the
+            # rare non-sized value defensively (only sized lists are ever stored here).
+            is_empty=lambda candidates: (
+                hasattr(candidates, "__len__") and len(candidates) == 0
+            ),
             clock=clock,
         )
 

@@ -11,6 +11,9 @@ Protocol. Also asserts the source ``solver_engine`` class-attrs (mangadot/kagane
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+
 import pytest
 
 from manga_gateway.framework.antibot import AntiBotSolver, Clearance
@@ -268,12 +271,114 @@ async def test_aclose_closes_both_even_if_one_raises() -> None:
 
 def test_router_exposes_comix_browser_primitives() -> None:
     """Exactly comix ``_solver_from_ctx``'s gate: the router must expose BOTH
-    off-Protocol browser primitives so it is a faithful superset of CloudflareSolver."""
+    off-Protocol browser primitives so it is a faithful superset of CloudflareSolver.
+    Plan 14-02 adds the inverse ``eval_in_webview`` primitive (routed to android)."""
     router, _, _ = _router()
     assert hasattr(router, "fetch_via_browser")
     assert hasattr(router, "fetch_via_browser_paginated")
     assert hasattr(router, "fetch_via_browser_parallel_pages")
     assert hasattr(router, "fetch_via_browser_typed")
+    assert hasattr(router, "eval_in_webview")
+
+
+# ─────────────── off-Protocol in-WebView eval (EVAL-02, comix gate) ─────────────
+
+
+class _FakeEvalBackend:
+    """A backend recording ``eval_in_webview`` calls so the router's INVERSE
+    delegation (→ android, NOT patchright) can be pinned. Both fakes record, so the
+    test proves the android fake was hit and the patchright fake was NOT."""
+
+    def __init__(self, *, tag: str) -> None:
+        self._tag = tag
+        self.eval_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def eval_in_webview(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 — mirrors the backend's op-budget kwarg
+    ) -> object:
+        self.eval_calls.append(
+            (challenge_url, js, {"wait_for": wait_for, "timeout": timeout})
+        )
+        return f"{self._tag}-eval"
+
+
+@pytest.mark.asyncio
+async def test_eval_in_webview_delegates_to_android() -> None:
+    """The INVERSE of the browser passthroughs: ``eval_in_webview`` routes to the
+    ANDROID backend (the one with the cleared WebView), never patchright."""
+    patchright = _FakeEvalBackend(tag="pw")
+    android = _FakeEvalBackend(tag="droid")
+    router = SolverRouter(
+        patchright=patchright,  # type: ignore[arg-type]
+        android=android,  # type: ignore[arg-type]
+        engine_by_source={},
+    )
+    result = await router.eval_in_webview(
+        "https://comix.to/",
+        "return await c.list({})",
+        wait_for="() => true",
+        timeout=42.0,
+    )
+    assert result == "droid-eval"
+    assert android.eval_calls == [
+        (
+            "https://comix.to/",
+            "return await c.list({})",
+            {"wait_for": "() => true", "timeout": 42.0},
+        )
+    ]
+    assert patchright.eval_calls == []  # patchright (browser engine) NEVER consulted
+
+
+# ───────────── off-Protocol device_session lease (bug 4 Fix C, comix) ───────────
+
+
+class _FakeDeviceSessionBackend:
+    """A backend recording ``device_session`` enter/exit so the router's INVERSE
+    delegation (→ android, NOT patchright) can be pinned — like _FakeEvalBackend."""
+
+    def __init__(self, *, tag: str) -> None:
+        self._tag = tag
+        self.entered = 0
+        self.exited = 0
+        self.depth = 0
+        self.max_depth = 0
+
+    @contextlib.asynccontextmanager
+    async def device_session(self) -> AsyncIterator[None]:
+        self.entered += 1
+        self.depth += 1
+        self.max_depth = max(self.max_depth, self.depth)
+        try:
+            yield
+        finally:
+            self.depth -= 1
+            self.exited += 1
+
+
+@pytest.mark.asyncio
+async def test_device_session_delegates_to_android() -> None:
+    """The INVERSE of the browser passthroughs (like ``eval_in_webview``):
+    ``device_session`` routes to the ANDROID backend — the engine that owns the single
+    redroid — never patchright. Usable directly as ``async with``."""
+    patchright = _FakeDeviceSessionBackend(tag="pw")
+    android = _FakeDeviceSessionBackend(tag="droid")
+    router = SolverRouter(
+        patchright=patchright,  # type: ignore[arg-type]
+        android=android,  # type: ignore[arg-type]
+        engine_by_source={},
+    )
+    async with router.device_session():
+        assert android.entered == 1  # the android lease was taken
+        assert android.depth == 1
+        assert patchright.entered == 0  # browser engine NEVER holds the device lease
+    assert android.exited == 1  # cleanly unwound
+    assert patchright.entered == 0
 
 
 @pytest.mark.asyncio

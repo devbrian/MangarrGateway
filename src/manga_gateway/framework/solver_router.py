@@ -37,6 +37,8 @@ import logging
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
+
     from .antibot import AntiBotSolver, Clearance
 
 _log = logging.getLogger("manga_gateway")
@@ -95,6 +97,39 @@ class _BrowserFetchSolver(Protocol):
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
     ) -> list[Any]: ...
+
+
+class _EvalSolver(Protocol):
+    """The off-Protocol ``eval_in_webview`` primitive the ANDROID backend exposes.
+
+    Declared locally — mirroring :class:`_BrowserFetchSolver` — so the router can
+    ``cast`` ``self._android`` (typed as the engine-agnostic ``AntiBotSolver``
+    Protocol, which intentionally omits it) to a shape that declares it, and
+    delegate mypy-strict-clean with NO ``# type: ignore``. The INVERSE of the four
+    ``fetch_via_browser*`` passthroughs: those cast ``self._patchright`` (the only
+    engine with a real browser); this one casts ``self._android`` (the only engine
+    with the cleared WebView the eval runs inside).
+    """
+
+    async def eval_in_webview(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
+    ) -> Any: ...
+
+    def device_session(self) -> AbstractAsyncContextManager[None]:
+        """The bug-4 Fix C foreground-device lease the android backend exposes.
+
+        comix wraps its whole solve+eval sequence in ``async with
+        solver.device_session():`` so the proactive-refresh loop defers and the warm
+        comix page survives across the sequence's evals. Declared here (not a
+        coroutine — it returns an async context manager) so the router can ``cast``
+        ``self._android`` and delegate mypy-strict-clean.
+        """
+        ...
 
 
 # The android engine name (matches ``Source.solver_engine`` on mangadot/kagane).
@@ -254,6 +289,49 @@ class SolverRouter:
             wait_for=wait_for,
             timeout=timeout,
         )
+
+    # ── off-Protocol in-WebView eval (EVAL-02) — pass-through for comix ──────────
+    # The INVERSE of the four browser passthroughs above: this delegates to the
+    # ANDROID backend, NOT patchright. comix runs its in-page token-mint /
+    # chapter-list / manifest JS inside the redroid WebView (the only fingerprint
+    # that clears comix.to's Cloudflare); only the android backend owns that
+    # cleared WebView. Plan 03 flips comix's ``_solver_from_ctx`` ``hasattr`` gate
+    # to ``eval_in_webview`` and calls it through this router.
+    async def eval_in_webview(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
+    ) -> Any:
+        """Delegate the in-WebView JS eval to the ANDROID backend (EVAL-02).
+
+        Unlike the four ``fetch_via_browser*`` passthroughs (which route to
+        ``self._patchright``), this routes to ``self._android`` — the engine that
+        owns the Turnstile-cleared redroid WebView the eval runs inside.
+        """
+        backend = cast("_EvalSolver", self._android)
+        return await backend.eval_in_webview(
+            challenge_url, js, wait_for=wait_for, timeout=timeout
+        )
+
+    def device_session(self) -> AbstractAsyncContextManager[None]:
+        """Delegate the foreground-device lease to the ANDROID backend (bug 4 Fix C).
+
+        Like :meth:`eval_in_webview` (and unlike the four ``fetch_via_browser*``
+        passthroughs), this routes to ``self._android`` — the engine that owns the
+        single redroid. comix wraps its solve+eval sequence in ``async with
+        self._solver_from_ctx(ctx).device_session():`` so the android backend's
+        proactive-refresh loop defers and the warm comix page survives across the
+        sequence. It is a no-op-safe CM even when the android backend is unconfigured
+        (``base_url is None``): the lease is just a counter, so a local box / CI /
+        the gate without a redroid enters+exits it cleanly (the evals inside raise
+        ``RuntimeError`` anyway). Returns the CM (not a coroutine) so callers use it
+        directly as ``async with``.
+        """
+        backend = cast("_EvalSolver", self._android)
+        return backend.device_session()
 
     async def warm(self) -> list[str]:
         """Warm BOTH backends; return the UNION of their failed keys (deduped).

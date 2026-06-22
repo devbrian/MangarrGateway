@@ -142,10 +142,11 @@ async def test_fixture_drift(
     """Capture the live page-URL list and structurally compare to the fixture.
 
     * No-op skip when ``profile.fixture_drift_paths`` is empty (MangaDex).
-    * For Comix: drive ``solver.fetch_via_browser`` through the SAME
-      ``live_client_for`` harness ``test_download_smoke.py`` uses so the
-      autouse ``_restore_real_cloudflare_warm`` interacts with ONE solver
-      per test (W-03 lock).
+    * For Comix: drive ``solver.eval_in_webview`` (the android-WebView sidecar
+      path production ``fetch_manifest`` uses since Phase 14 — NOT the patchright
+      ``fetch_via_browser``, which is CF-blocked for comix) through the SAME
+      ``live_client_for`` harness ``test_download_smoke.py`` uses so the autouse
+      ``_restore_real_cloudflare_warm`` interacts with ONE solver per test (W-03 lock).
     * Compare SET equality on the captured URL list against each declared
       fixture (Pitfall 6 — transient ordinal jitter is NOT drift).
     * Issue #166/#181: both sides are passed through ``_normalize_comix_cdn_url``
@@ -161,12 +162,13 @@ async def test_fixture_drift(
     # MangaDex skips above).
     from manga_gateway.sources.comix import (
         _CHAPTER_PAGES_API_EXTRACT_JS,
-        _CHAPTER_PAGES_WAIT_FOR,
         ComixSource,
     )
 
+    chapter_numeric_id = "9001596"
     chapter_url = (
-        f"{ComixSource.base_url}/title/mr3m0-the-forgotten-field/9001596-chapter-20"
+        f"{ComixSource.base_url}/title/mr3m0-the-forgotten-field"
+        f"/{chapter_numeric_id}-chapter-20"
     )
 
     async with live_client_for(profile, tmp_path=tmp_path) as client:
@@ -179,19 +181,35 @@ async def test_fixture_drift(
         # there is no public httpx accessor in this version.
         solver = client._transport.app.state.solver
 
-        # Spike 019: mirror ``ComixSource.fetch_manifest`` exactly — the internal
-        # ``chapters/{id}`` API extractor + the reader-scaffold ``wait_for`` + the
-        # 60s ceiling. Any deviation between this call site and production
-        # reintroduces the harness-vs-prod divergence #32 chased.
-        captured = await solver.fetch_via_browser(
-            chapter_url,
-            extract=_CHAPTER_PAGES_API_EXTRACT_JS,
-            wait_for=_CHAPTER_PAGES_WAIT_FOR,
-            timeout=60.0,
+        # Spike 019 / Bug 5b: mirror ``ComixSource.fetch_manifest`` exactly — the
+        # internal ``chapters/{id}`` API extractor with the chapter id INTERPOLATED
+        # (json.dumps — page-agnostic, NOT read from location.pathname), ``wait_for``
+        # None (the DOM reader-scaffold gate was vestigial — see bug 5b), and the 60s
+        # ceiling. Any deviation between this call site and production reintroduces
+        # the harness-vs-prod divergence #32 chased.
+        #
+        # Phase 14: comix runs its extractors in-page via the android-WebView sidecar
+        # ``eval_in_webview`` (the ONLY fingerprint that clears comix.to — patchright/
+        # Chromium is CF-blocked), NOT ``fetch_via_browser``. Mirror that: the old
+        # ``fetch_via_browser`` here routed to the patchright backend, which CANNOT
+        # clear comix and returned no URLs (a stale pre-Phase-14 path).
+        chapter_pages_js = _CHAPTER_PAGES_API_EXTRACT_JS.replace(
+            "__COMIX_CHAPTER_ID__", json.dumps(chapter_numeric_id)
         )
+        # Hold the foreground device lease around the eval, mirroring production's
+        # ``fetch_manifest`` (the proactive-refresh loop + startup warm defer while a
+        # ``device_session`` is held) so the live drift capture is not exposed to a
+        # background-refresh/warm race the production path avoids (CodeRabbit).
+        async with solver.device_session():
+            captured = await solver.eval_in_webview(
+                chapter_url,
+                chapter_pages_js,
+                wait_for=None,
+                timeout=60.0,
+            )
 
         assert isinstance(captured, list) and captured, (
-            f"{source_key}: solver.fetch_via_browser returned no URLs "
+            f"{source_key}: solver.eval_in_webview returned no URLs "
             f"for {chapter_url!r} — either Cloudflare escalated or the "
             f"chapter page structure changed"
         )
