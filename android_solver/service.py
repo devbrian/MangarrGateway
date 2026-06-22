@@ -1878,7 +1878,23 @@ class SolverService:
                         self._cancel_and_drain(future, cancel, host)
                         return _CLIENT_CLOSED_REQUEST, {"error": "client disconnected"}
                     continue
-                except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
+                except EvalError as exc:
+                    # Mode-E follow-up: the in-page promise REJECTED — most often a
+                    # comix-origin 5xx (Cloudflare "origin down/unreachable" 521/520/522
+                    # surfaced by the env-module axios as "Request failed with status
+                    # code 5xx"). Surface the bounded, token-free summary in the body
+                    # under ``detail`` so the gateway can distinguish a TRANSIENT origin
+                    # 5xx (worth one bounded retry) from a 4xx / non-origin throw (not).
+                    # The summary is built by ``_raise_if_eval_threw`` from the JS
+                    # error's first description line only — it carries NEITHER the
+                    # evaluated ``js`` NOR the marshalled value NOR any token (T-14-04).
+                    # Keep the redacted warning + trace for field diagnosis.
+                    _log.warning("eval failed for host %s", host, exc_info=True)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {
+                        "error": "eval threw",
+                        "detail": str(exc),
+                    }
+                except Exception:  # noqa: BLE001 — any other pipeline failure ⇒ 504
                     # Never logs the js or the result (the value isn't in the
                     # traceback message) — keep the trace for field diagnosis.
                     _log.warning("eval failed for host %s", host, exc_info=True)

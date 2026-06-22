@@ -571,6 +571,143 @@ async def test_eval_busy_retry_exhausts_then_raises() -> None:
     assert route.call_count == 3
 
 
+# ── Mode-E follow-up: a TRANSIENT comix-origin 5xx eval-throw is retried ONCE ─────────
+# comix's in-page env-module axios (c.list / chapters) occasionally hits comix's own
+# flaky origin → Cloudflare 521/520/522. The sidecar surfaces that as a 504 with body
+# {"error": "eval threw", "detail": "...Request failed with status code 5xx..."}. A
+# single bounded retry self-recovers a one-off origin blip WITHIN the search (so a
+# single-shot caller like external_links[comix] does not return 0). A clean empty (200
+# []), a 4xx throw, a non-origin throw, or a timeout is NEVER retried.
+
+
+def _eval_threw(status_code: int) -> httpx.Response:
+    """A sidecar ``504 eval threw`` carrying the axios origin-status summary."""
+    return httpx.Response(
+        504,
+        json={
+            "error": "eval threw",
+            "detail": (
+                f"in-page eval threw: AxiosError: Request failed with "
+                f"status code {status_code}"
+            ),
+        },
+    )
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_retries_origin_5xx_throw_then_recovers() -> None:
+    """A comix-origin 521 eval-throw then a 200 → the eval RETRIES once and returns the
+    recovered items (the transient origin blip self-heals within the single search)."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        side_effect=[
+            _eval_threw(521),
+            httpx.Response(200, json={"value": [{"hid": "abc", "title": "Recovered"}]}),
+        ]
+    )
+    solver = _solver()
+    solver._eval_origin_5xx_retry_backoff_s = 0.0  # no real sleep in the test
+    try:
+        result = await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert result == [{"hid": "abc", "title": "Recovered"}]
+    assert route.call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_does_not_retry_clean_empty_result() -> None:
+    """A CLEAN empty (a 200 ``[]`` — a genuine no-match, NOT a throw) returns 0 with NO
+    retry (the negative-cache handles a genuine empty; a wasted eval is avoided)."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": []})
+    )
+    solver = _solver()
+    solver._eval_origin_5xx_retry_backoff_s = 0.0
+    try:
+        result = await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert result == []
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_does_not_retry_4xx_throw() -> None:
+    """A 4xx in-page throw (e.g. a 404 — NOT a transient origin blip) raises immediately
+    with NO retry: the retry is scoped strictly to the 5xx origin band."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(return_value=_eval_threw(404))
+    solver = _solver()
+    solver._eval_origin_5xx_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_does_not_retry_non_origin_throw() -> None:
+    """A throw with NO HTTP status code in the summary (a CF/hydration/extractor error,
+    not an origin 5xx) raises immediately — only an identifiable 5xx blip retries."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(
+            504,
+            json={
+                "error": "eval threw",
+                "detail": "in-page eval threw: TypeError: env module not importable",
+            },
+        )
+    )
+    solver = _solver()
+    solver._eval_origin_5xx_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_persistent_origin_5xx_exhausts_retry_then_raises() -> None:
+    """A PERSISTENT origin 5xx exhausts the single bounded retry then raises (no
+    infinite loop) — comix surfaces a per-source warning; the fan-out is never stuck."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(return_value=_eval_threw(521))
+    solver = _solver()
+    solver._eval_origin_5xx_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    # 1 initial + 1 bounded retry = 2 device evals, then it fails loud.
+    assert route.call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_timeout_504_is_not_retried_as_origin_5xx() -> None:
+    """A sidecar ``504 eval timed out`` (a HANG, distinct from an origin throw) is NOT
+    treated as a retryable origin 5xx — it raises on the first failure."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(504, json={"error": "eval timed out"})
+    )
+    solver = _solver()
+    solver._eval_origin_5xx_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_solve_retries_sidecar_503_busy_then_succeeds() -> None:

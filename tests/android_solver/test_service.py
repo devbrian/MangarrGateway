@@ -688,6 +688,39 @@ def test_eval_returns_marshalled_value_on_success() -> None:
     assert pipeline.eval_js == ["extract()"]
 
 
+def test_eval_throw_surfaces_detail_in_body() -> None:
+    # Mode-E follow-up: a rejected in-page promise (an ``EvalError``, e.g. a
+    # comix-origin 5xx surfaced by axios) returns 504 with the bounded, token-free
+    # summary under ``detail`` — so the GATEWAY can distinguish a transient origin 5xx
+    # (retryable) from a generic failure / timeout. The detail carries the axios status
+    # code, never the js.
+    pipeline = FakePipeline(
+        error=service.EvalError(
+            "in-page eval threw: AxiosError: Request failed with status code 521"
+        )
+    )
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 504
+    assert payload["error"] == "eval threw"
+    assert "status code 521" in payload["detail"]
+
+
+def test_eval_non_throw_failure_stays_generic_eval_failed() -> None:
+    # A NON-EvalError pipeline failure (a device/CDP fault, not an in-page throw) keeps
+    # the generic ``{"error": "eval failed"}`` 504 with NO ``detail`` — the gateway must
+    # NOT retry it as an origin 5xx.
+    pipeline = FakePipeline(error=RuntimeError("adb forward collapsed"))
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 504
+    assert payload == {"error": "eval failed"}
+
+
 # ── Bug 5 follow-on #3: /eval extract_clearance (mint comix's cf_clearance) ──────
 # comix is a page-holder cleared ONLY via the eval path (never the destructive
 # /solve). When the gateway asks (``extract_clearance: true``) the sidecar ALSO reads

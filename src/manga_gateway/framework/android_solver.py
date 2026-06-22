@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +74,58 @@ _DEVICE_ACQUIRE_TIMEOUT_S = 90.0
 _SIDECAR_BUSY_RETRY_ATTEMPTS = 8
 _SIDECAR_BUSY_RETRY_BACKOFF_S = 0.75
 _SIDECAR_BUSY_STATUS = 503
+
+# Mode-E follow-up (debug ``comix-warm-hydration-wait``): a SINGLE bounded retry of an
+# ``eval_in_webview`` that THREW a TRANSIENT comix-origin 5xx. comix's in-page
+# env-module axios call (``c.list`` / ``chapters``) occasionally hits comix's own flaky
+# origin and gets a Cloudflare 521/520/522 (or a 5xx) — the sidecar now surfaces that as
+# a ``504`` whose body is ``{"error": "eval threw", "detail": "...status code 5xx..."}``
+# (vs. a generic ``eval failed`` / ``eval timed out``). Without a retry that transient
+# origin blip returns 0 releases within the SINGLE search (it still failed single-shot
+# callers like ``external_links[comix]`` even with the negative-cache self-heal, which
+# only helps the NEXT search). One quick retry is ONE extra device eval, only on the
+# rare origin 5xx, and fits the per-source 30s search budget (a 5xx fails FAST — the
+# axios rejects on the edge response, not a hang to the timeout). It is NOT retried
+# on: a CLEAN empty result (a normal ``200`` ``[]`` — a genuine no-match the
+# negative-cache handles), a 4xx, a non-origin (CF/clearance/hydration) throw, or a
+# timeout/cancel (a distinct ``504`` body). Instance attrs so tests can shrink them.
+_EVAL_ORIGIN_5XX_RETRY_ATTEMPTS = 1
+_EVAL_ORIGIN_5XX_RETRY_BACKOFF_S = 0.5
+_SIDECAR_EVAL_THREW_STATUS = 504
+# The sidecar EvalError detail for an origin failure is the env-module axios message,
+# e.g. ``in-page eval threw: AxiosError: Request failed with status code 521`` — match
+# the 3-digit HTTP status it reports and retry ONLY when it is in the 5xx band.
+_EVAL_THROW_STATUS_RE = re.compile(r"status code (\d{3})")
+
+
+def _is_origin_5xx_eval_throw(response: httpx.Response) -> bool:
+    """True iff a sidecar ``/eval`` response is a TRANSIENT origin-5xx in-page throw.
+
+    The sidecar returns ``504 {"error": "eval threw", "detail": <summary>}`` when the
+    in-page promise rejected (Mode-E). The ``detail`` is the bounded, token-free first
+    line of the JS error (built by the sidecar's ``_raise_if_eval_threw``); for a
+    comix-origin failure it carries the axios ``"Request failed with status code NNN"``.
+    Returns ``True`` ONLY when that ``NNN`` is a 5xx (a transient origin blip worth one
+    retry). Any other 504 (a 4xx throw, a non-origin/CF/hydration throw with no status
+    code, ``eval failed``, or ``eval timed out``) and any non-504 returns ``False`` so
+    the caller re-raises immediately. A malformed / unreadable body is also ``False``
+    (never retry on an ambiguous signal). The ``detail`` is matched, never logged."""
+    if response.status_code != _SIDECAR_EVAL_THREW_STATUS:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(body, dict) or body.get("error") != "eval threw":
+        return False
+    detail = body.get("detail")
+    if not isinstance(detail, str):
+        return False
+    match = _EVAL_THROW_STATUS_RE.search(detail)
+    if match is None:
+        return False
+    return 500 <= int(match.group(1)) <= 599
+
 
 # Bug 5 follow-on #3 (Option A2): the NO-OP JS expression used to EVAL-PRIME a
 # page-holding source (comix) during ``warm()`` via the EVAL path. The sidecar's
@@ -253,6 +306,11 @@ class AndroidSolver:
         # Bounded retry of the sidecar's ``503 solver busy`` backpressure (shared dev).
         self._busy_retry_attempts = _SIDECAR_BUSY_RETRY_ATTEMPTS
         self._busy_retry_backoff_s = _SIDECAR_BUSY_RETRY_BACKOFF_S
+        # Mode-E follow-up: a SINGLE bounded retry of an ``eval_in_webview`` that threw
+        # a TRANSIENT comix-origin 5xx (see ``_is_origin_5xx_eval_throw``) so a one-off
+        # origin blip self-recovers WITHIN the single search instead of returning 0.
+        self._eval_origin_5xx_retry_attempts = _EVAL_ORIGIN_5XX_RETRY_ATTEMPTS
+        self._eval_origin_5xx_retry_backoff_s = _EVAL_ORIGIN_5XX_RETRY_BACKOFF_S
         # Bug 4 Fix C: count of in-flight FOREGROUND android sequences (raised by
         # device_session(), read by _refresh_tick). A non-zero count defers the
         # proactive-refresh loop so it never navigates the shared WebView away while a
@@ -940,11 +998,41 @@ class AndroidSolver:
         comix call site evals fresh (the clearance hold stays in
         ``get_clearance`` / ``_coalesced_solve``, untouched). The ``js`` and the
         eval result are NEVER logged (T-14-04).
+
+        Mode-E follow-up: a SINGLE bounded retry of a TRANSIENT comix-origin 5xx
+        in-page throw (``_is_origin_5xx_eval_throw``). comix's in-page env-module axios
+        (``c.list`` / ``chapters``) occasionally hits comix's own flaky origin and gets
+        a Cloudflare 521/520/522; the sidecar now surfaces that as a ``504 eval threw``
+        with the axios ``status code 5xx`` in the body. Without a retry that one-off
+        origin blip returns 0 releases for the WHOLE search (failing single-shot callers
+        — e.g. ``external_links[comix]`` — even with the 60s negative-cache, which only
+        self-heals the NEXT search). The retry is ONE extra full device eval (re-takes
+        the lock, composes with ``_post_sidecar``'s busy-503 retry) and fires ONLY on
+        the rare origin 5xx, which fails FAST (the axios rejects on the edge, never
+        hanging to the eval timeout) → it fits the per-source 30s search budget. It does
+        NOT retry a CLEAN empty (a ``200`` ``[]`` genuine no-match), a 4xx, a
+        non-origin/CF/hydration throw, or a timeout/cancel — those re-raise on the first
+        failure.
         """
-        payload = await self._post_eval(
-            challenge_url, js, wait_for=wait_for, timeout=timeout
-        )
-        return payload["value"]
+        attempts = self._eval_origin_5xx_retry_attempts
+        for attempt in range(attempts + 1):
+            try:
+                payload = await self._post_eval(
+                    challenge_url, js, wait_for=wait_for, timeout=timeout
+                )
+            except httpx.HTTPStatusError as exc:
+                if attempt < attempts and _is_origin_5xx_eval_throw(exc.response):
+                    # Transient comix-origin 5xx — back off briefly and re-eval ONCE on
+                    # the warm device (the busy-503 retry inside _post_eval still
+                    # applies to each attempt). A persistent 5xx exhausts the bounded
+                    # attempts and re-raises on the final pass → a per-source warning.
+                    await asyncio.sleep(self._eval_origin_5xx_retry_backoff_s)
+                    continue
+                raise
+            return payload["value"]
+        # Unreachable: the loop always returns a value or re-raises on the final attempt
+        # (the `attempt < attempts` guard is False on the last pass). Satisfies mypy.
+        raise AssertionError("eval_in_webview retry loop exited without returning")
 
     async def _post_eval(
         self,
