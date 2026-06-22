@@ -62,6 +62,18 @@ _REFRESH_MAX_SLEEP_S = 600.0
 _DEVICE_ACQUIRE_TIMEOUT_S = 90.0
 
 
+class _RefreshDeferred(Exception):  # noqa: N818 — control-flow sentinel, not an error
+    """Bug 5 Fix (a): a background (proactive-refresh) solve bailed under the device
+    lock because a FOREGROUND lease (a comix solve+eval sequence inside
+    :meth:`AndroidSolver.device_session`) was claimed while the solve queued on the
+    lock. Raised by :meth:`AndroidSolver._solve` (so no solve-error metric is emitted)
+    and caught by :meth:`AndroidSolver._refresh_tick`, which skips the solve and
+    reschedules a short re-check. It is NOT a solve failure — the held clearance keeps
+    serving and the reactive D-35 403 self-heal backstops a clearance that lapses while
+    the device stays continuously busy. Never raised on the foreground/get_clearance
+    path (those pass ``defer_if_foreground=False``)."""
+
+
 def _emit_solve(
     key: str,
     *,
@@ -234,8 +246,18 @@ class AndroidSolver:
         self._record_expiry(source_key, expires_at)
         return clearance
 
-    async def _coalesced_solve(self, source_key: str) -> tuple[Clearance, float | None]:
+    async def _coalesced_solve(
+        self, source_key: str, *, defer_if_foreground: bool = False
+    ) -> tuple[Clearance, float | None]:
         """Single-flight the sidecar ``_solve`` per source key (#296).
+
+        ``defer_if_foreground`` (Bug 5 Fix (a)) is threaded into the shared ``_solve``
+        task so a proactive-refresh caller (the sole ``True`` caller, via
+        :meth:`_refresh_tick`) bails under the device lock when comix holds the
+        foreground lease. It is baked into the task at CREATION, so the coalescing
+        contract is unchanged when no foreground lease is held (the common case, and
+        every offline test): the refresh and a concurrent same-key reactive
+        ``force_resolve`` still share ONE /solve.
 
         Concurrent ``force_resolve`` / reactive / proactive-refresh callers for the
         SAME key share ONE in-flight ``_solve`` task against the one redroid device
@@ -253,7 +275,9 @@ class AndroidSolver:
         """
         task = self._inflight.get(source_key)
         if task is None or task.done():
-            task = asyncio.create_task(self._solve(source_key))
+            task = asyncio.create_task(
+                self._solve(source_key, defer_if_foreground=defer_if_foreground)
+            )
             self._inflight[source_key] = task
 
             def _pop(
@@ -330,7 +354,9 @@ class AndroidSolver:
         return self._client
 
     @contextlib.asynccontextmanager
-    async def _device_op(self) -> AsyncIterator[None]:
+    async def _device_op(
+        self, *, defer_if_foreground: bool = False
+    ) -> AsyncIterator[bool]:
         """Serialize ONE sidecar device op behind the single gateway-side lock (Fix B).
 
         Bug 4 cause #2: the one redroid serves all android solves+evals, and the
@@ -345,6 +371,19 @@ class AndroidSolver:
         released ONLY if it was acquired — guarding the timeout-during-acquire race
         (an acquire that completes exactly as the deadline fires is released here, an
         acquire that never completed holds nothing).
+
+        Yields ``True`` when the caller may proceed with its device op (the normal
+        path). Bug 5 Fix (a): a background (proactive-refresh) op passes
+        ``defer_if_foreground=True``; AFTER acquiring the lock it re-checks whether a
+        FOREGROUND lease (``_foreground_inflight > 0`` — a comix sequence inside
+        :meth:`device_session`) was claimed while this op queued on the lock. If so it
+        RELEASES the lock and yields ``False`` (bail) so the caller skips its op rather
+        than navigate the shared WebView away mid comix sequence. The re-check reads the
+        lock-free ``_foreground_inflight`` counter while holding ONLY ``_device_lock``
+        and takes no further lock, so it cannot deadlock with comix's per-eval
+        ``_device_op`` (single lock, lock-free counter — no lock-ordering cycle). The
+        foreground/get_clearance path (``defer_if_foreground=False``, the default) never
+        bails — it always yields ``True`` exactly as before (Fix B unchanged).
         """
         got = False
         try:
@@ -358,8 +397,18 @@ class AndroidSolver:
                 "android device busy — could not acquire the single redroid within "
                 f"{self._device_acquire_timeout_s:.0f}s (device contention)"
             ) from exc
+        # Bug 5 Fix (a): post-acquire foreground re-check. A proactive-refresh solve
+        # may have passed _refresh_tick's tick-top check while the device was FREE
+        # (_foreground_inflight == 0) and then queued here behind comix's in-flight
+        # device op; by the time it acquires the lock comix may hold the foreground
+        # lease. Bail (release + yield False) so the queued refresh never clobbers
+        # comix's warm page. Release BEFORE yielding so the bail path holds nothing.
+        if defer_if_foreground and self._foreground_inflight > 0:
+            self._device_lock.release()
+            yield False
+            return
         try:
-            yield
+            yield True
         finally:
             self._device_lock.release()
 
@@ -384,8 +433,16 @@ class AndroidSolver:
         finally:
             self._foreground_inflight -= 1
 
-    async def _solve(self, source_key: str) -> tuple[Clearance, float | None]:
+    async def _solve(
+        self, source_key: str, *, defer_if_foreground: bool = False
+    ) -> tuple[Clearance, float | None]:
         """POST the sidecar ``/solve`` → ``(Clearance, epoch-expiry|None)`` (BOT-02).
+
+        ``defer_if_foreground`` (Bug 5 Fix (a), set only by the proactive-refresh loop
+        via :meth:`_refresh_tick`) makes the solve BAIL — raising
+        :class:`_RefreshDeferred` without POSTing — when a foreground lease (comix) is
+        claimed while it queues on the device lock. The foreground/get_clearance path
+        leaves it ``False`` and is byte-for-byte unchanged.
 
         Sends ``X-Solver-Key`` (SEC-01) + ``{"challenge_url": <map[key]>}``; a
         non-200 raises (``raise_for_status``) so ``warm()`` reports the key failed and
@@ -420,7 +477,15 @@ class AndroidSolver:
             # Fix B: serialize the sidecar /solve behind the single gateway-side
             # _device_lock so the refresh loop's solves + the comix fan-out's evals
             # QUEUE on the one redroid (no `503 solver busy` from our own calls).
-            async with self._device_op():
+            # Bug 5 Fix (a): a refresh solve passes defer_if_foreground=True — if a
+            # comix foreground lease was claimed while it queued on the lock, _device_op
+            # yields False and we BAIL (no POST) so the shared WebView is never
+            # navigated away mid comix sequence.
+            async with self._device_op(
+                defer_if_foreground=defer_if_foreground
+            ) as acquired:
+                if not acquired:
+                    raise _RefreshDeferred(source_key)
                 resp = await self._ensure_client().post(
                     f"{self._base_url}/solve",
                     json=body,
@@ -431,6 +496,10 @@ class AndroidSolver:
                 payload = resp.json()
                 token = payload["cf_clearance"]
                 user_agent = payload["user_agent"]
+        except _RefreshDeferred:
+            # A deliberate skip, NOT a solve failure — propagate without an error
+            # metric (the deferred refresh must not read as a solve error).
+            raise
         except Exception as exc:
             _emit_solve(
                 source_key,
@@ -568,11 +637,20 @@ class AndroidSolver:
 
         Fix C: while a FOREGROUND android sequence holds the device
         (``_foreground_inflight > 0`` — a comix solve+eval sequence inside
-        :meth:`device_session`) the tick DEFERS — it performs NO solve and returns a
-        short re-check delay — so the background loop never navigates the shared
-        WebView away mid comix sequence. The held clearance keeps serving during the
-        deferral and the reactive D-35 403 self-heal still backstops a clearance that
-        lapses while the device stays continuously busy.
+        :meth:`device_session`) the tick DEFERS at the TICK TOP — it performs NO solve
+        and returns a short re-check delay — so the background loop never navigates the
+        shared WebView away mid comix sequence. The held clearance keeps serving during
+        the deferral and the reactive D-35 403 self-heal still backstops a clearance
+        that lapses while the device stays continuously busy.
+
+        Bug 5 Fix (a): the tick-top check above is RACY — a refresh that passes it
+        while the device is free (``_foreground_inflight == 0``) and then queues on the
+        device lock can run AFTER comix claims the foreground lease, stealing the shared
+        WebView mid comix sequence (the 30s-budget killer). To close that race the solve
+        passes ``defer_if_foreground=True``; :meth:`_device_op` re-checks the counter
+        UNDER the device lock and the solve raises :class:`_RefreshDeferred` (caught
+        here) rather than POSTing. The deferred key is skipped and a SHORT re-check is
+        scheduled so it retries once comix releases.
         """
         if self._foreground_inflight > 0:
             return self._refresh_min_sleep_s
@@ -583,7 +661,17 @@ class AndroidSolver:
             if expiry - now > self._refresh_lead_s:
                 continue
             try:
-                clearance, new_expiry = await self._coalesced_solve(key)
+                clearance, new_expiry = await self._coalesced_solve(
+                    key, defer_if_foreground=True
+                )
+            except _RefreshDeferred:
+                # Bug 5 Fix (a): a comix foreground lease was claimed while this refresh
+                # queued on the device lock — abandon the solve so the shared WebView is
+                # never navigated away mid comix sequence, and reschedule a SHORT
+                # re-check (mirroring the tick-top defer) so the refresh retries once
+                # comix releases. The held clearance keeps serving; the reactive D-35
+                # 403 self-heal backstops a clearance that lapses meanwhile.
+                return self._refresh_min_sleep_s
             except Exception:  # noqa: BLE001 — keep the held clearance; D-35 backstops
                 _log.warning(
                     "AndroidSolver proactive refresh failed for source %r; keeping "

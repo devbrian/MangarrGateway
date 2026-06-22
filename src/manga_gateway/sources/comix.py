@@ -1130,7 +1130,19 @@ class ComixSource(Source):
         # ``_device_lock`` serializes the candidate evals AT the gateway; the
         # ``device_session`` lease only holds the foreground counter. No-op-safe for a
         # non-android solver (a test/fake) — the router always exposes it in prod.
-        async with self._device_session(self._solver_from_ctx(ctx)):
+        #
+        # Bug 5 Fix (b): the lease is entered BEFORE comix's FIRST device touch — the
+        # ``_search_series`` eval, whose sidecar clear-if-challenged IS comix's cold
+        # clear. The solver is resolved synchronously here and NOTHING above this line
+        # awaits (the first ``await`` is ``cached_resolve`` INSIDE the lease), so
+        # ``_foreground_inflight`` rises to 1 before any device op AND before the
+        # background refresh loop can be scheduled — leaving no ``inflight == 0`` window
+        # while comix is mid cold-clear. Paired with the refresh's post-lock re-check
+        # (Fix (a) in ``AndroidSolver._device_op``), a refresh that already queued on
+        # the device lock bails once comix holds this lease, so no foreign-source nav
+        # can steal the warm page mid-sequence.
+        solver = self._solver_from_ctx(ctx)
+        async with self._device_session(solver):
             series = await ctx.cached_resolve(
                 ctx.cached_resolve_key(_normalize(req.query or ""), languages),
                 _resolve_fn,
@@ -1480,6 +1492,13 @@ class ComixSource(Source):
         # refresh loop DEFERS and the cleared comix page stays warm + CONTIGUOUS across
         # both evals (no per-eval re-clear). The lease is no-op-safe for a non-android
         # solver (a test/fake); comix only ever uses the android-routed solver in prod.
+        #
+        # Bug 5 Fix (b): the lease is entered BEFORE the FIRST device touch (the only
+        # code above is the synchronous composite-id parse — no ``await``), so
+        # ``_foreground_inflight`` rises to 1 before any device op AND before the
+        # background refresh loop can be scheduled; combined with the refresh's
+        # post-lock re-check (Fix (a)) no foreign-source nav can clobber this download's
+        # warm page mid cold-clear.
         solver = self._solver_from_ctx(ctx)
         async with self._device_session(solver):
             # Issue #42: recent-feed handles defer chapter-id resolution to download

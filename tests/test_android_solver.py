@@ -984,3 +984,86 @@ async def test_refresh_tick_defers_while_foreground_session_held() -> None:
         await solver.aclose()
     assert route.call_count == 1
     assert solver._held["mangadot"].cookies == {"cf_clearance": "fresh-token"}
+
+
+# ── bug 5 Fix (a)/(b): close the proactive-refresh deferral race ───────────────
+# The bug: the tick-top _foreground_inflight check in _refresh_tick is one-shot and
+# RACY — a refresh that passes it while the device is FREE then queues on _device_lock
+# and runs AFTER comix claims the foreground lease, stealing the shared WebView mid
+# comix sequence (comix's next eval re-navs + pays a ~9s re-clear → 30s budget blown).
+# The FakePipeline gate could not see this coordination bug; these test it directly.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_bails_when_foreground_claimed_after_it_queued() -> None:
+    """Fix (a): a refresh that committed + queued on the device lock while
+    ``_foreground_inflight == 0`` does NOT issue its sidecar /solve once a
+    ``device_session`` is entered before the lock frees — the post-acquire re-check in
+    ``_device_op`` makes the queued solve BAIL rather than navigate the shared WebView
+    away mid comix sequence. This is the exact bug-5 race (a mangadot refresh stealing
+    the device between comix's two evals)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        return_value=_solve_response(token="fresh-token", expires=time.time() + 99999)
+    )
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "stale-token"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() + 30.0  # inside lead → expiring
+    refresh: asyncio.Task[float] | None = None
+    # Hold the device lock so the refresh's solve QUEUES behind it — simulating comix's
+    # in-flight cold-solve / first eval holding the single redroid.
+    await solver._device_lock.acquire()
+    try:
+        # The refresh passes its tick-top check (foreground == 0 right now), commits to
+        # the mangadot solve, and parks on the held device lock.
+        refresh = asyncio.create_task(solver._refresh_tick())
+        await asyncio.sleep(0.05)
+        assert not route.called  # still queued on the lock — no /solve issued yet
+        # comix NOW claims the foreground lease while the refresh is queued.
+        async with solver.device_session():
+            # Free the device → the queued refresh acquires the lock, re-checks the
+            # foreground counter (now 1), and bails.
+            solver._device_lock.release()
+            delay = await refresh
+        assert not route.called  # the refresh BAILED — never navigated the WebView
+        assert delay == solver._refresh_min_sleep_s  # rescheduled a short re-check
+        # The held clearance was untouched — it keeps serving (D-35 backstops a lapse).
+        assert solver._held["mangadot"].cookies == {"cf_clearance": "stale-token"}
+        assert solver._foreground_inflight == 0  # lease unwound cleanly
+        assert not solver._device_lock.locked()  # the bail released the lock
+    finally:
+        if refresh is not None and not refresh.done():
+            refresh.cancel()
+        if solver._device_lock.locked():
+            solver._device_lock.release()
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_comix_cold_solve_eval_runs_with_foreground_lease_held() -> None:
+    """Fix (b) invariant: comix's FIRST device touch — the ``_search_series`` eval whose
+    sidecar clear-if-challenged IS the cold clear — runs INSIDE ``device_session``, so
+    its device op observes ``_foreground_inflight > 0``. There is therefore no
+    ``inflight == 0`` window while comix is mid cold-clear for a background refresh to
+    commit into (it pairs with Fix (a)'s post-lock re-check to close the race)."""
+    seen: list[int] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        # The sidecar handler stands in for the in-WebView eval (+ its cold clear): the
+        # gateway only reaches here while it holds the device op for the eval.
+        seen.append(solver._foreground_inflight)
+        return httpx.Response(200, json={"value": 1})
+
+    respx.post(f"{_SIDECAR}/eval").mock(side_effect=_handler)
+    solver = _solver()
+    try:
+        # comix wraps its solve+eval sequence in device_session (comix.py search()).
+        async with solver.device_session():
+            await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert seen == [1]  # the cold-clear-triggering eval ran with the lease held
