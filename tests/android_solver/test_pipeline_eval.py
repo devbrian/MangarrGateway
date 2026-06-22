@@ -247,6 +247,93 @@ def test_already_hydrated_eval_skips_nav_and_tap(
     assert device.taps == []  # already cleared: NO tap
 
 
+# ── Bug 5 follow-on #3: with_clearance → eval ALSO extracts the cf_clearance ─────
+
+
+def test_eval_with_clearance_returns_value_and_minted_cookie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``with_clearance=True``: after the clear+eval the pipeline reads the host-scoped
+    cf_clearance from the WebView jar (the cookie comix's managed challenge auto-issued)
+    and returns ``(value, SolveResult)`` — so the gateway can mint+hold comix's
+    replayable clearance with NO destructive ``/solve``."""
+    device = FakeDevice()
+    fake = FakeCdp(
+        location_host="comix.to",
+        env_ready=True,
+        cf_present=False,
+        eval_value={"chapters": [1, 2, 3]},
+    )
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=FakeClock(), fake=fake)
+    monkeypatch.setattr(
+        service,
+        "extract_clearance",
+        lambda ws_url, host: ClearanceCookie(value="MINTED-COMIX", expires=2.0e9),
+    )
+    monkeypatch.setattr(
+        service, "webview_user_agent", lambda url, *, http_get: "Android WebView UA"
+    )
+
+    outcome = pipeline.eval_in_webview(
+        "https://comix.to/", "comix.to", "extract()", with_clearance=True
+    )
+
+    value, clearance = outcome
+    assert value == {"chapters": [1, 2, 3]}  # the value is unchanged
+    assert fake.navigations == []  # fast path: no needless re-nav
+    assert clearance is not None
+    assert clearance.cf_clearance == "MINTED-COMIX"
+    assert clearance.user_agent == "Android WebView UA"
+    assert clearance.cf_clearance_expires == 2.0e9
+    assert clearance.host == "comix.to"
+    assert clearance.egress_ip == ""  # no-proxy path
+
+
+def test_eval_with_clearance_returns_none_when_no_host_cookie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean clear that deposited NO host-scoped cookie returns ``(value, None)`` —
+    the gateway treats that as mint-not-ready and retries (never a bogus clearance)."""
+    device = FakeDevice()
+    fake = FakeCdp(
+        location_host="comix.to", env_ready=True, cf_present=False, eval_value="DATA"
+    )
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=FakeClock(), fake=fake)
+    monkeypatch.setattr(service, "extract_clearance", lambda ws_url, host: None)
+
+    outcome = pipeline.eval_in_webview(
+        "https://comix.to/", "comix.to", "x()", with_clearance=True
+    )
+
+    value, clearance = outcome
+    assert value == "DATA"
+    assert clearance is None
+
+
+def test_eval_without_with_clearance_returns_bare_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default (``with_clearance=False``): the eval returns the bare value (no tuple),
+    and ``extract_clearance`` is NEVER consulted — unchanged from before #3."""
+    extract_calls = {"n": 0}
+
+    def _never(ws_url, host):  # type: ignore[no-untyped-def]
+        extract_calls["n"] += 1
+        return None
+
+    device = FakeDevice()
+    fake = FakeCdp(
+        location_host="comix.to", env_ready=True, cf_present=False, eval_value="DATA"
+    )
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=FakeClock(), fake=fake)
+    monkeypatch.setattr(service, "extract_clearance", _never)
+
+    value = pipeline.eval_in_webview("https://comix.to/", "comix.to", "x()")
+
+    assert value == "DATA"
+    assert extract_calls["n"] == 0  # no clearance extract on an ordinary eval
+
+
 # ── CLEAR-IF-CHALLENGED: re-nav lands on the interstitial → tap to clear → eval ─
 
 

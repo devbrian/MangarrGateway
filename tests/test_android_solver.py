@@ -76,6 +76,34 @@ def _solve_response(
     return httpx.Response(200, json=body)
 
 
+def _eval_clearance_response(
+    *,
+    value: object = True,
+    token: str = "comix-eval-minted-token",
+    user_agent: str = _WEBVIEW_UA,
+    expires: object = _DEFAULT_EXPIRES,
+    egress_ip: str = "",
+    clearance: object = _ABSENT,
+) -> httpx.Response:
+    """A sidecar ``/eval`` ``extract_clearance`` response (Bug 5 follow-on #3).
+
+    ``{"value": ..., "clearance": {cf_clearance, user_agent, cf_clearance_expires,
+    egress_ip}}`` — the shape the gateway parses to mint+hold a page-holder's clearance
+    via the EVAL path (never ``/solve``). Pass ``clearance=None`` to model a clean clear
+    that deposited NO host-scoped cookie (the sidecar returns ``"clearance": null``)."""
+    block: object
+    if clearance is _ABSENT:
+        block = {
+            "cf_clearance": token,
+            "user_agent": user_agent,
+            "cf_clearance_expires": expires,
+            "egress_ip": egress_ip,
+        }
+    else:
+        block = clearance
+    return httpx.Response(200, json={"value": value, "clearance": block})
+
+
 class _FakeCollector:
     """Records ``emit_solve`` calls so a test can assert the android solve is now a
     labeled metric event (the gap-mystery fix). Other ``emit_*`` are no-ops."""
@@ -480,6 +508,220 @@ async def test_eval_in_webview_does_not_log_js_or_result(
         assert secret_result not in msg
 
 
+# ── shared-device 503 "solver busy" backpressure is retried (bounded) ─────────────
+# The single redroid is shared; the sidecar rejects a concurrent op with 503 (its
+# non-blocking lock). The gateway's _device_op serializes only ITS calls, so a 503 from
+# another caller's in-flight op is retried (bounded), not surfaced as upstream-503.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_retries_sidecar_503_busy_then_succeeds() -> None:
+    """Two ``503 solver busy`` then a 200 → the eval RETRIES and returns the value (not
+    an upstream-503 failure). 503 is the shared-device backpressure signal, not fail."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "solver busy"}),
+            httpx.Response(503, json={"error": "solver busy"}),
+            httpx.Response(200, json={"value": 42}),
+        ]
+    )
+    solver = _solver()
+    solver._busy_retry_backoff_s = 0.0  # no real sleep in the test
+    try:
+        result = await solver.eval_in_webview(_EVAL_URL, "return 42")
+    finally:
+        await solver.aclose()
+    assert result == 42
+    assert route.call_count == 3
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_does_not_retry_non_503_failure() -> None:
+    """A 504 (a REAL eval failure, not busy backpressure) raises immediately — the
+    retry is scoped strictly to 503 so a genuine failure is never masked/delayed."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._busy_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_busy_retry_exhausts_then_raises() -> None:
+    """A device that stays busy past the retry budget surfaces the LAST 503 (fails loud
+    — a genuinely wedged shared device is never masked forever)."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(503, json={"error": "solver busy"})
+    )
+    solver = _solver()
+    solver._busy_retry_attempts = 3
+    solver._busy_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+    assert route.call_count == 3
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_retries_sidecar_503_busy_then_succeeds() -> None:
+    """The ``/solve`` path retries ``503 solver busy`` too — a 503 then a 200 mints the
+    clearance (a cf_clearance source is robust to shared-device contention)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "solver busy"}),
+            _solve_response(),
+        ]
+    )
+    solver = _solver()
+    solver._busy_retry_backoff_s = 0.0
+    try:
+        clearance = await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert clearance is not None
+    assert clearance.cookies == {"cf_clearance": "android-minted-token"}
+    assert route.call_count == 2
+
+
+# ── Bug 5 follow-on #3: page-holder get_clearance serves held-or-None, never /solve ──
+# comix is antibot=cloudflare+encrypted, so the framework calls get_clearance('comix')
+# on its httpx legs. comix can NEVER be /solve'd — /solve runs `pm clear`, cold-wiping
+# the warm WebView comix's managed challenge + env-*.js depend on → 5xx. And (live-
+# confirmed) comix has NO replayable host-scoped cf_clearance: its data path is the warm
+# cleared eval page + the in-page env-module API; the sidecar logs "no host-scoped
+# clearance cookie found for host comix.to" on every warm eval. So get_clearance(comix)
+# serves held-or-None and NEVER mints on the request hot path; the warm prime
+# opportunistically holds a cookie IF a real Turnstile clear ever deposits one.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_clearance_page_holder_serves_held_or_none_never_solves() -> None:
+    """``get_clearance`` for a page-holder key (``warm_last_keys`` — comix) with nothing
+    held returns ``None`` WITHOUT any device hit (no ``/solve`` — which would cold-wipe
+    the warm page — and no per-request eval). A seeded held clearance is served back."""
+    solve_route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    eval_route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=_eval_clearance_response()
+    )
+    solver = _solver(
+        challenge_urls={
+            "comix": "https://comix.to/",
+            "mangadot": "https://mangadot.net/",
+        },
+        warm_last_keys={"comix"},
+    )
+    try:
+        # Nothing held → None, and NO device hit at all (comix needs no httpx clearance;
+        # its eval data path clears itself on the warm page).
+        none_clearance = await solver.get_clearance("comix")
+        assert none_clearance is None
+        assert not solve_route.called
+        assert not eval_route.called
+        # A held capture (e.g. from the warm prime) is served back, still no device hit.
+        seeded = Clearance(cookies={"cf_clearance": "held-tok"}, user_agent=_WEBVIEW_UA)
+        solver._held["comix"] = seeded
+        assert await solver.get_clearance("comix") is seeded
+        assert not solve_route.called
+        assert not eval_route.called
+    finally:
+        await solver.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_clearance_clearance_only_key_still_solves() -> None:
+    """Non-regression: a clearance-only android key (mangadot — NOT a page-holder)
+    still mints via ``/solve``, never the eval path. The page-holder handling is gated
+    strictly on ``warm_last_keys``."""
+    solve_route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    eval_route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=_eval_clearance_response()
+    )
+    solver = _solver(
+        challenge_urls={
+            "comix": "https://comix.to/",
+            "mangadot": "https://mangadot.net/",
+        },
+        warm_last_keys={"comix"},
+    )
+    try:
+        clearance = await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert clearance is not None
+    assert clearance.cookies == {"cf_clearance": "android-minted-token"}
+    assert solve_route.called
+    assert not eval_route.called
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_clearance_page_holder_force_resolve_captures_via_eval() -> None:
+    """The D-35 403 self-heal (``force_resolve=True``) on a page-holder discards the
+    stale capture and runs ONE opportunistic eval re-clear: when comix re-challenges and
+    the Turnstile clear deposits a host-scoped ``cf_clearance``, it is held + returned —
+    NEVER via ``/solve``."""
+    solve_route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    eval_route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=_eval_clearance_response(token="reclear-token")
+    )
+    solver = _solver(
+        challenge_urls={"comix": "https://comix.to/"},
+        warm_last_keys={"comix"},
+    )
+    try:
+        captured = await solver.get_clearance("comix", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert captured is not None
+    assert captured.cookies == {"cf_clearance": "reclear-token"}
+    assert solver._held["comix"] is captured
+    assert eval_route.call_count == 1
+    assert not solve_route.called
+    body = json.loads(eval_route.calls.last.request.content)
+    assert body["js"] == _WEBVIEW_PRIME_JS
+    assert body["extract_clearance"] is True
+    assert "wait_for" not in body
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_get_clearance_page_holder_force_resolve_no_cookie_returns_none() -> None:
+    """A force-resolve re-clear that extracts NO host-scoped cookie (``clearance: null``
+    — the COMMON comix case) returns ``None`` and holds nothing: NOT a failure (the eval
+    re-cleared the warm page; the open image CDN serves bytes with no cookie)."""
+    solve_route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    eval_route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=_eval_clearance_response(clearance=None)
+    )
+    solver = _solver(
+        challenge_urls={"comix": "https://comix.to/"},
+        warm_last_keys={"comix"},
+    )
+    solver._held["comix"] = Clearance(
+        cookies={"cf_clearance": "stale"}, user_agent=_WEBVIEW_UA
+    )
+    try:
+        result = await solver.get_clearance("comix", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert result is None  # NOT a raise — a missing cookie is the norm for comix
+    assert "comix" not in solver._held  # the stale capture was discarded, none re-held
+    assert eval_route.called
+    assert not solve_route.called
+
+
 # ── #296: per-source-key single-flight coalescing around _solve ───────────────
 
 
@@ -737,6 +979,50 @@ async def test_refresh_tick_remints_expiring_key_and_swaps_atomically() -> None:
     assert route.call_count == 1  # re-minted
     assert solver._held["mangadot"].cookies == {"cf_clearance": "fresh-token"}
     assert solver._expires_at["mangadot"] > time.time() + 9000  # expiry advanced
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_skips_page_holders_never_solve_or_eval() -> None:
+    """Bug 5 follow-on #3: the proactive tick NEVER touches a PAGE-HOLDER (comix) — not
+    via ``/solve`` (``pm clear`` would cold-wipe its warm page) and not via the eval
+    path (comix has no replayable cf_clearance to re-mint). It is re-captured
+    reactively on a 403 self-heal instead. A within-lead comix expiry is left untouched
+    (no device hit), and only a real cf_clearance key (mangadot) is re-minted."""
+    solve_route = respx.post(f"{_SIDECAR}/solve").mock(
+        return_value=_solve_response(
+            token="fresh-mangadot", expires=time.time() + 99999
+        )
+    )
+    eval_route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=_eval_clearance_response()
+    )
+    solver = _solver(
+        challenge_urls={
+            "comix": "https://comix.to/",
+            "mangadot": "https://mangadot.net/",
+        },
+        warm_last_keys={"comix"},
+    )
+    solver._refresh_lead_s = 120.0
+    solver._held["comix"] = Clearance(
+        cookies={"cf_clearance": "comix-cap"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["comix"] = time.time() + 30.0  # inside lead, but a page-holder
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "stale-mangadot"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() + 30.0  # inside lead → refreshed
+    try:
+        await solver._refresh_tick()
+    finally:
+        await solver.aclose()
+    # comix (page-holder) was NOT touched by either path.
+    assert not eval_route.called
+    assert solver._held["comix"].cookies == {"cf_clearance": "comix-cap"}
+    # mangadot (a real cf_clearance key) WAS proactively re-minted via /solve.
+    assert solve_route.called
+    assert solver._held["mangadot"].cookies == {"cf_clearance": "fresh-mangadot"}
 
 
 @respx.mock
@@ -1142,7 +1428,7 @@ async def test_warm_eval_primes_page_holder_instead_of_solving_it() -> None:
 
     async def _record_eval(request: httpx.Request) -> httpx.Response:
         evaled.append(json.loads(request.content))
-        return httpx.Response(200, json={"value": True})
+        return _eval_clearance_response(token="comix-prime-token")
 
     respx.post(f"{_SIDECAR}/solve").mock(side_effect=_record_solve)
     respx.post(f"{_SIDECAR}/eval").mock(side_effect=_record_eval)
@@ -1162,12 +1448,18 @@ async def test_warm_eval_primes_page_holder_instead_of_solving_it() -> None:
     # The page-holder (comix) is NEVER /solve'd — only the clearance-only keys are,
     # in challenge_urls order.
     assert solved == ["https://mangadot.net/", "https://kagane.to/"]
-    # comix is eval-primed exactly once, with the no-op prime JS and NO wait_for (it
-    # relies only on the solver's env-*.js hydration signal, never a DOM predicate).
+    # comix is eval-primed exactly once, with the no-op prime JS, NO wait_for (it relies
+    # only on the solver's env-*.js hydration signal, never a DOM predicate), and
+    # ``extract_clearance`` so the prime ALSO mints+holds comix's clearance (Bug 5 #3).
     assert len(evaled) == 1
     assert evaled[0]["challenge_url"] == "https://comix.to/"
     assert evaled[0]["js"] == _WEBVIEW_PRIME_JS
+    assert evaled[0]["extract_clearance"] is True
     assert "wait_for" not in evaled[0]
+    # The prime HELD comix's eval-minted clearance — the first httpx image leg has a
+    # valid cookie + UA with no /solve.
+    assert solver._held["comix"].cookies == {"cf_clearance": "comix-prime-token"}
+    assert solver._held["comix"].user_agent == _WEBVIEW_UA
 
 
 @respx.mock
@@ -1200,6 +1492,35 @@ async def test_warm_eval_prime_failure_is_best_effort_not_disabled() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_warm_prime_with_no_cookie_leaves_held_empty_not_failed() -> None:
+    """Follow-on #3 (the COMMON comix case): a SUCCESSFUL prime that extracts NO
+    host-scoped cookie (``clearance: null`` — warm fast-path eval, no Turnstile) parks
+    the page cleared+hydrated but leaves ``_held`` empty. It is NOT a failure (comix's
+    path is the warm eval page; its image CDN serves bytes with no cookie), the gate is
+    released, and comix is never force-disabled."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=_eval_clearance_response(clearance=None)
+    )
+    solver = _solver(
+        challenge_urls={
+            "comix": "https://comix.to/",
+            "mangadot": "https://mangadot.net/",
+        },
+        warm_last_keys={"comix"},
+    )
+    try:
+        failed = await solver.warm()
+    finally:
+        await solver.aclose()
+    assert failed == []
+    assert "comix" not in solver._held  # nothing to hold — not an error
+    assert "comix" not in solver._expires_at
+    assert solver._warm_complete.is_set()
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_warm_gate_released_only_after_page_holder_prime() -> None:
     """Option A2 × Fix #2: the startup-warm gate (``_warm_complete``) is released ONLY
     after BOTH the clearance ``/solve`` loop AND the page-holder eval-prime complete —
@@ -1210,7 +1531,7 @@ async def test_warm_gate_released_only_after_page_holder_prime() -> None:
 
     async def _gated_eval(request: httpx.Request) -> httpx.Response:
         await release_eval.wait()
-        return httpx.Response(200, json={"value": True})
+        return _eval_clearance_response()
 
     respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
     respx.post(f"{_SIDECAR}/eval").mock(side_effect=_gated_eval)

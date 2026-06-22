@@ -39,7 +39,7 @@ import httpx
 from .antibot import Clearance
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable
+    from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 
     from pydantic import SecretStr
 
@@ -60,6 +60,19 @@ _REFRESH_MAX_SLEEP_S = 600.0
 # guard; a wedged device past this surfaces a clean per-source RuntimeError instead
 # of an unbounded hang. Instance attr (so tests can shrink it).
 _DEVICE_ACQUIRE_TIMEOUT_S = 90.0
+
+# The single redroid sidecar is SHARED (multiple gateways / a hammered dev box / the
+# per-test warm-prime fleet) and rejects a CONCURRENT op with ``503 solver busy`` via
+# its NON-blocking lock — a deliberate backpressure signal, NOT a failure. The gateway's
+# ``_device_op`` only serializes ITS OWN calls, so a 503 from another caller's in-flight
+# op must be RETRIED (bounded), not surfaced as a hard ``upstream 503``. Sized so a
+# normal in-flight op (~1–2s eval / ~10s solve) drains within the budget; past it the
+# last 503 is returned for the caller's ``raise_for_status`` (a genuinely wedged device
+# still fails loud). Instance attrs so tests can shrink them. ``504`` (timeout/failed)
+# and 4xx are NEVER retried — only the ``503`` busy-backpressure is.
+_SIDECAR_BUSY_RETRY_ATTEMPTS = 8
+_SIDECAR_BUSY_RETRY_BACKOFF_S = 0.75
+_SIDECAR_BUSY_STATUS = 503
 
 # Bug 5 follow-on #3 (Option A2): the NO-OP JS expression used to EVAL-PRIME a
 # page-holding source (comix) during ``warm()`` via the EVAL path. The sidecar's
@@ -237,6 +250,9 @@ class AndroidSolver:
         # sidecar with `503 solver busy`. Bounded-acquire via _device_acquire_timeout_s.
         self._device_lock = asyncio.Lock()
         self._device_acquire_timeout_s = _DEVICE_ACQUIRE_TIMEOUT_S
+        # Bounded retry of the sidecar's ``503 solver busy`` backpressure (shared dev).
+        self._busy_retry_attempts = _SIDECAR_BUSY_RETRY_ATTEMPTS
+        self._busy_retry_backoff_s = _SIDECAR_BUSY_RETRY_BACKOFF_S
         # Bug 4 Fix C: count of in-flight FOREGROUND android sequences (raised by
         # device_session(), read by _refresh_tick). A non-zero count defers the
         # proactive-refresh loop so it never navigates the shared WebView away while a
@@ -336,6 +352,17 @@ class AndroidSolver:
         """
         if source_key not in self._challenge_urls:
             return None  # MangaDex et al. — no android clearance needed
+        if source_key in self._warm_last_keys:
+            # Bug 5 follow-on #3 (live-confirmed): a page-HOLDING source (comix) has NO
+            # replayable host-scoped ``cf_clearance`` — its data path is the cleared
+            # WebView page + the in-page signed env-module API, not a cookie replayed
+            # over httpx (the sidecar logs ``no host-scoped clearance cookie found for
+            # host comix.to`` on every warm eval). It MUST NOT be ``/solve``d
+            # (``pm clear`` cold-wipes the warm page it needs → 5xx) and must NOT block
+            # the request hot path on a per-request device eval. So serve held-or-None
+            # and never mint here; the warm prime opportunistically holds a cookie IF a
+            # real Turnstile clear deposits one, else the open CDN uses None.
+            return await self._page_holder_clearance(source_key, force_resolve)
         if force_resolve:
             # WR-05: discard the held entry BEFORE the fresh solve so a FAILED
             # force-resolve (the common 403 self-heal case) cannot leave the known
@@ -355,6 +382,45 @@ class AndroidSolver:
         )
         self._held[source_key] = clearance
         self._record_expiry(source_key, expires_at)
+        return clearance
+
+    async def _page_holder_clearance(
+        self, source_key: str, force_resolve: bool
+    ) -> Clearance | None:
+        """Serve a page-holder's (comix's) clearance: held-or-None, never ``/solve``.
+
+        Bug 5 follow-on #3 (live-confirmed): comix is cleared by its warm hydrated eval
+        page, NOT a replayable ``cf_clearance`` cookie — its search/recent/manifest run
+        in-page via ``eval_in_webview`` (which need NO injected clearance) and its image
+        CDN serves the bulk bytes WITHOUT a Cloudflare cookie. So a normal request
+        serves whatever the warm prime opportunistically captured (``None`` in practice)
+        with NO device hit — never blocking the hot path on a per-request eval, never a
+        ``/solve``.
+
+        ``force_resolve`` (the D-35 403 self-heal — fired only when an httpx leg hit a
+        CF challenge 403) discards the stale capture and runs ONE opportunistic
+        eval re-clear: if comix re-challenged and the interactive Turnstile clear
+        deposited a host-scoped ``cf_clearance`` we hold + return it; otherwise we serve
+        ``None`` (the eval re-cleared the warm page either way). It is LENIENT — a
+        missing cookie is the norm for comix, not a failure (contrast a cf_clearance
+        source, whose force-resolve ``/solve`` must yield a token)."""
+        if not force_resolve:
+            return self._held.get(source_key)
+        self._held.pop(source_key, None)
+        self._expires_at.pop(source_key, None)
+        try:
+            clearance, expires_at = await self._mint_clearance_via_eval(source_key)
+        except Exception:  # noqa: BLE001 — a failed re-clear is best-effort (serve None)
+            _log.warning(
+                "AndroidSolver page-holder %r force-resolve eval re-clear failed; "
+                "serving no clearance (comix clears via its warm eval page)",
+                source_key,
+                exc_info=True,
+            )
+            return None
+        if clearance is not None:
+            self._held[source_key] = clearance
+            self._record_expiry(source_key, expires_at)
         return clearance
 
     async def _coalesced_solve(
@@ -384,18 +450,34 @@ class AndroidSolver:
         same exception to all awaiters and leaves the per-caller post-solve swap
         un-run, so no clearance is held for that key (WR-05).
         """
+        return await self._coalesce(
+            source_key,
+            lambda: self._solve(source_key, defer_if_foreground=defer_if_foreground),
+        )
+
+    async def _coalesce(
+        self,
+        source_key: str,
+        factory: Callable[[], Coroutine[Any, Any, tuple[Clearance, float | None]]],
+    ) -> tuple[Clearance, float | None]:
+        """Per-source-key single-flight around ``factory`` (#296; shared by solve+eval).
+
+        Registers ONE in-flight task per ``source_key`` so a same-key herd shares one
+        device hit; distinct keys get distinct tasks (no global lock). Awaited under
+        :func:`asyncio.shield` so one abandoned awaiter cannot tear the shared task down
+        for the herd. Factored out of :meth:`_coalesced_solve` so the EVAL-path mint
+        reuses the identical de-dup contract.
+        """
         task = self._inflight.get(source_key)
         if task is None or task.done():
-            task = asyncio.create_task(
-                self._solve(source_key, defer_if_foreground=defer_if_foreground)
-            )
+            task = asyncio.create_task(factory())
             self._inflight[source_key] = task
 
             def _pop(
                 completed: asyncio.Task[tuple[Clearance, float | None]],
             ) -> None:
                 # Clear the slot only when it still holds THIS task, so a later
-                # solve's task is never clobbered by an earlier one's callback.
+                # task is never clobbered by an earlier one's callback.
                 if self._inflight.get(source_key) is completed:
                     del self._inflight[source_key]
 
@@ -513,53 +595,49 @@ class AndroidSolver:
         return failed
 
     async def _prime_webview_page(self, source_key: str) -> None:
-        """EVAL-PRIME a page-holding source (comix) via the eval path (Bug 5 A2).
+        """EVAL-PRIME a page-holding source (comix) AND hold its clearance (Bug 5 #3).
 
-        Runs a NO-OP eval (:data:`_WEBVIEW_PRIME_JS`) over the warm WebView so the
+        Runs the no-op prime eval (:data:`_WEBVIEW_PRIME_JS`) with
+        ``extract_clearance=True`` via :meth:`_mint_clearance_via_eval`, so the
         sidecar's ``_drive_eval`` warm-navigates → clears-if-challenged (the interactive
-        Turnstile tap, NO ``pm clear``) → hydrates the page, leaving the single redroid
-        parked on a CLEARED + hydrated comix page at the end of startup — so even the
-        first post-boot search is fast (no first-search re-clear). It does NOT mint a
-        ``cf_clearance`` cookie (comix's "cleared" state IS the warm hydrated page + the
-        in-page signed env-module API, not a replayable cookie) and does NOT run an
-        extractor or mint a downloadHandle.
+        Turnstile tap, NO ``pm clear``) → hydrates the page → reads back the host-scoped
+        ``cf_clearance`` comix's managed challenge auto-issued. This leaves the single
+        redroid parked on a CLEARED + hydrated comix page at the end of startup (so even
+        the first post-boot search is fast — no first-search re-clear) AND populates
+        ``_held``/``_expires_at`` with comix's replayable clearance, so the very first
+        D-40 httpx image leg already has a valid ``cf_clearance`` cookie + bound UA
+        WITHOUT any ``/solve`` (follow-on #3: ``/solve``'s ``pm clear`` would cold-wipe
+        the warm WebView comix depends on).
 
-        Proxy parity is automatic: this calls :meth:`eval_in_webview`, which forwards
-        ``self._proxy`` into the ``/eval`` body EXACTLY as a real comix ``/search`` eval
-        does (both go through the same method), so the prime nav egresses the SAME
-        residential sticky IP the eval-path clearance is bound to — no egress-verify
-        mismatch. ``wait_for=None`` so the prime relies only on the solver's
-        ``env-*.js`` hydration signal (instant on the warm page), never a DOM probe.
+        Proxy parity is automatic: :meth:`_mint_clearance_via_eval` posts through the
+        SAME ``/eval`` transport (forwarding ``self._proxy``) a real comix ``/search``
+        eval uses, so the prime nav egresses the SAME residential sticky IP the
+        eval-path clearance is bound to — no egress-verify mismatch. ``wait_for=None``
+        so the prime relies only on the ``env-*.js`` hydration signal, not a DOM probe.
 
-        Deadlock-free: :meth:`eval_in_webview` takes only the per-op ``_device_lock``
-        (via :meth:`_device_op`, ``defer_if_foreground=False``) and NEVER awaits the
-        warm gate (:meth:`_await_warm_gate` is entered only by :meth:`device_session`,
-        which the prime does NOT use) — so a prime that is itself PART of ``warm()``
-        cannot block on the gate ``warm()`` must satisfy. During warm() the gate holds
-        every foreground search at the device door (``_foreground_inflight == 0``), so
-        the prime acquires the device lock uncontended.
+        Deadlock-free: the eval-mint takes only the per-op ``_device_lock`` (via
+        :meth:`_device_op`, ``defer_if_foreground=False``) and NEVER awaits the warm
+        gate (:meth:`_await_warm_gate` is entered only by :meth:`device_session`, which
+        the prime does NOT use) — so a prime that is itself PART of ``warm()`` cannot
+        block on the gate ``warm()`` must satisfy. During warm() the gate holds every
+        foreground search at the device door (``_foreground_inflight == 0``), so the
+        prime acquires the device lock uncontended.
 
-        Best-effort: bounded by ``warm_gate_timeout_s`` (so a CF-flaky prime cannot run
-        the full eval op-budget and hold the device past the startup readiness window),
-        and ANY failure is logged + swallowed — the source is NOT marked failed / never
-        force-disabled. The first real ``/search`` then clears comix via the same eval
-        path within its own budget.
+        Best-effort + LENIENT: bounded by ``warm_gate_timeout_s`` (so a CF-flaky prime
+        cannot run the full eval op-budget and hold the device past the startup
+        readiness window). The eval FAILING (CF flaky → /eval non-200) is logged +
+        swallowed (the source is NOT marked failed / never force-disabled). A SUCCESSFUL
+        prime that extracts NO host-scoped cookie is the EXPECTED comix case (warm
+        fast-path eval, no Turnstile) — the page is parked cleared+hydrated for the eval
+        data path and ``_held`` is left empty (comix's image CDN needs no cookie).
         """
-        challenge_url = self._challenge_urls[source_key]
         try:
-            await self.eval_in_webview(
-                challenge_url,
-                _WEBVIEW_PRIME_JS,
-                wait_for=None,
+            clearance, expires_at = await self._mint_clearance_via_eval(
+                source_key,
                 # Cap the prime at the startup readiness window so a hung/flaky prime
                 # gives up + frees the device before the warm gate falls through (it
                 # never runs the full ~180s eval op-budget as a startup zombie).
                 timeout=self._warm_gate_timeout_s,
-            )
-            _log.info(
-                "AndroidSolver eval-primed page-holding source %r — warm WebView "
-                "parked on its cleared, hydrated page (no first-search re-clear)",
-                source_key,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort prime; never hang/disable
             _log.warning(
@@ -569,6 +647,22 @@ class AndroidSolver:
                 source_key,
                 exc,
                 exc_info=True,
+            )
+            return
+        if clearance is not None:
+            self._held[source_key] = clearance
+            self._record_expiry(source_key, expires_at)
+            _log.info(
+                "AndroidSolver eval-primed page-holder %r — warm WebView parked "
+                "on its cleared, hydrated page AND opportunistically held a clearance",
+                source_key,
+            )
+        else:
+            _log.info(
+                "AndroidSolver eval-primed page-holder %r — warm WebView parked "
+                "on its cleared, hydrated page (no host-scoped cf_clearance to hold; "
+                "comix clears via its warm eval page, not a replayable cookie)",
+                source_key,
             )
 
     async def aclose(self) -> None:
@@ -595,6 +689,41 @@ class AndroidSolver:
         if self._client is None:
             self._client = httpx.AsyncClient()
         return self._client
+
+    async def _post_sidecar(
+        self,
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: dict[str, str],
+        timeout: float,  # noqa: ASYNC109 — per-call op-budget, mirrors the eval/solve cap
+    ) -> httpx.Response:
+        """POST to the sidecar, RETRYING the ``503 solver busy`` backpressure (bounded).
+
+        The single redroid is shared, so an op can hit the sidecar's non-blocking lock
+        while ANOTHER caller's op is in flight → ``503 solver busy`` (by design, a
+        retryable signal — the gateway's ``_device_op`` only serializes its own calls).
+        Retry that 503 a bounded number of times with a linear backoff so a transient
+        cross-caller collision resolves itself instead of failing the request as
+        ``upstream 503``. A non-503 response (200, or a real ``504``/4xx) returns
+        immediately for the caller's ``raise_for_status``; the LAST 503 is returned once
+        the budget is spent (a genuinely wedged device still fails loud). The body/token
+        is never logged.
+        """
+        resp = await self._ensure_client().post(
+            url, json=json, headers=headers, timeout=timeout
+        )
+        attempt = 1
+        while (
+            resp.status_code == _SIDECAR_BUSY_STATUS
+            and attempt < self._busy_retry_attempts
+        ):
+            await asyncio.sleep(self._busy_retry_backoff_s * attempt)
+            attempt += 1
+            resp = await self._ensure_client().post(
+                url, json=json, headers=headers, timeout=timeout
+            )
+        return resp
 
     @contextlib.asynccontextmanager
     async def _device_op(
@@ -739,7 +868,7 @@ class AndroidSolver:
             ) as acquired:
                 if not acquired:
                     raise _RefreshDeferred(source_key)
-                resp = await self._ensure_client().post(
+                resp = await self._post_sidecar(
                     f"{self._base_url}/solve",
                     json=body,
                     headers=headers,
@@ -812,6 +941,32 @@ class AndroidSolver:
         ``get_clearance`` / ``_coalesced_solve``, untouched). The ``js`` and the
         eval result are NEVER logged (T-14-04).
         """
+        payload = await self._post_eval(
+            challenge_url, js, wait_for=wait_for, timeout=timeout
+        )
+        return payload["value"]
+
+    async def _post_eval(
+        self,
+        challenge_url: str,
+        js: str,
+        *,
+        wait_for: str | None = None,
+        timeout: float | None = None,  # noqa: ASYNC109 — per-call op-budget override
+        extract_clearance: bool = False,
+    ) -> dict[str, Any]:
+        """POST the sidecar ``/eval`` and return the FULL response payload.
+
+        The shared transport for both :meth:`eval_in_webview` (which returns
+        ``payload["value"]``) and the page-holder clearance mint
+        (:meth:`_mint_clearance_via_eval`, ``extract_clearance=True``). When
+        ``extract_clearance`` is set the sidecar ALSO reads the host-scoped
+        ``cf_clearance`` it auto-issued during the eval-path clear and returns it under
+        a ``"clearance"`` block — so the gateway can mint+hold a page-holding source's
+        (comix's) replayable clearance with NO destructive ``/solve`` (Bug 5 follow-on
+        #3). The flag rides the body ONLY when set, so an ordinary eval's body is
+        byte-for-byte unchanged. The returned token rides only the response, not a log.
+        """
         if self._base_url is None:
             raise RuntimeError(
                 "android_solver_url is not configured — cannot eval against "
@@ -823,6 +978,12 @@ class AndroidSolver:
         body: dict[str, object] = {"challenge_url": challenge_url, "js": js}
         if wait_for is not None:
             body["wait_for"] = wait_for
+        # Bug 5 follow-on #3: ask the sidecar to ALSO return the host-scoped
+        # cf_clearance it auto-issued during the eval-path clear, so the gateway can
+        # mint+hold comix's replayable clearance for the httpx image leg with NO /solve.
+        # Present ONLY when requested (an ordinary eval is byte-for-byte unchanged).
+        if extract_clearance:
+            body["extract_clearance"] = True
         # Req 7 parity with ``_solve``: thread the single static proxy into the
         # /eval body so the eval navigation egresses the SAME residential IP the
         # proxied clearance was minted on — a different egress IP makes the
@@ -839,14 +1000,76 @@ class AndroidSolver:
         # concurrently, but each takes the lock per-op so they QUEUE on the one
         # redroid instead of N storming the sidecar into `503 solver busy`.
         async with self._device_op():
-            resp = await self._ensure_client().post(
+            resp = await self._post_sidecar(
                 f"{self._base_url}/eval",
                 json=body,
                 headers=headers,
                 timeout=timeout if timeout is not None else self._timeout_s,
             )
             resp.raise_for_status()
-            return resp.json()["value"]
+            result: dict[str, Any] = resp.json()
+        return result
+
+    async def _mint_clearance_via_eval(
+        self,
+        source_key: str,
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109 — per-call op-budget override
+    ) -> tuple[Clearance | None, float | None]:
+        """Eval-path re-clear a page-holder (comix); capture a ``cf_clearance`` if any.
+
+        Bug 5 follow-on #3 — comix can NEVER be ``/solve``d (``/solve`` runs
+        ``pm clear``, cold-wiping the warm WebView its managed challenge + cached
+        ``env-*.js`` depend on → no clearance, burned deadline → 5xx). Instead run the
+        no-op prime eval (:data:`_WEBVIEW_PRIME_JS`) with ``extract_clearance=True``:
+        the sidecar warm-navigates → clears-if-challenged (interactive Turnstile tap, NO
+        ``pm clear``) → hydrates → reads back the host-scoped ``cf_clearance`` IF the
+        clear deposited one. LIVE REALITY (decisive): on a warm already-hydrated comix
+        page the eval takes the fast path (no Turnstile, no cookie), so the sidecar
+        returns NO host-scoped ``cf_clearance`` — comix's "cleared" state is the warm
+        page + the in-page signed env-module API, not a replayable cookie. So this
+        returns ``(None, None)`` (NOT a raise) when no cookie is present — the warm page
+        is still cleared+hydrated for the eval data path, and comix's open image CDN
+        serves bytes without a CF cookie. When a real Turnstile clear DID deposit
+        a cookie it is returned as the usual ``Clearance`` (cookie + UA). Never logged.
+        """
+        challenge_url = self._challenge_urls[source_key]
+        payload = await self._post_eval(
+            challenge_url,
+            _WEBVIEW_PRIME_JS,
+            wait_for=None,
+            timeout=timeout,
+            extract_clearance=True,
+        )
+        return self._clearance_from_eval_payload(payload)
+
+    @staticmethod
+    def _clearance_from_eval_payload(
+        payload: dict[str, Any],
+    ) -> tuple[Clearance | None, float | None]:
+        """Parse a ``/eval`` ``extract_clearance`` payload → ``(Clearance|None, exp)``.
+
+        Returns ``(None, None)`` when the sidecar extracted no host-scoped
+        ``cf_clearance`` (the common case for comix: a warm fast-path eval, or a clean
+        clear that deposited no cookie) — NOT a failure for a page-holder, whose data
+        path is the warm eval page, not a cookie. A present cookie is returned as a
+        replayable ``Clearance`` (cookie + bound UA). The token is NEVER logged.
+        """
+        clearance_raw = payload.get("clearance")
+        if not isinstance(clearance_raw, dict):
+            return (None, None)
+        token = clearance_raw.get("cf_clearance")
+        if not isinstance(token, str) or not token:
+            return (None, None)
+        user_agent = clearance_raw.get("user_agent")
+        expires_at = _parse_expiry(clearance_raw.get("cf_clearance_expires"))
+        return (
+            Clearance(
+                cookies={"cf_clearance": token},
+                user_agent=user_agent if isinstance(user_agent, str) else "",
+            ),
+            expires_at,
+        )
 
     # ─────────────────────── proactive expiry-driven refresh ──────────────────
 
@@ -909,7 +1132,12 @@ class AndroidSolver:
             return self._refresh_min_sleep_s
         now = time.time()
         for key, expiry in list(self._expires_at.items()):
-            if key in self._on_demand_keys:
+            if key in self._on_demand_keys or key in self._warm_last_keys:
+                # Bug 5 follow-on #3: a page-holder (comix) is NEVER proactively
+                # refreshed via ``/solve`` (``pm clear`` wipes its page) — it has no
+                # replayable cf_clearance to re-mint anyway (its data path is the warm
+                # eval page). Its clearance, IF a Turnstile clear ever deposited one, is
+                # re-captured reactively on a 403 self-heal (force-resolve) instead.
                 continue
             if expiry - now > self._refresh_lead_s:
                 continue
@@ -938,7 +1166,7 @@ class AndroidSolver:
         upcoming = [
             expiry - self._refresh_lead_s
             for key, expiry in self._expires_at.items()
-            if key not in self._on_demand_keys
+            if key not in self._on_demand_keys and key not in self._warm_last_keys
         ]
         if not upcoming:
             return self._refresh_max_sleep_s

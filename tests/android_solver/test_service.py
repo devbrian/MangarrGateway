@@ -48,6 +48,7 @@ class FakePipeline:
         started: threading.Event | None = None,
         release: threading.Event | None = None,
         eval_result: object = None,
+        eval_clearance: SolveResult | None = None,
     ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.proxies: list[dict[str, object] | None] = []
@@ -62,6 +63,13 @@ class FakePipeline:
         # The value /eval marshals back; parametrizable to a large list for the A4
         # no-truncation regression. Defaults to a small dict.
         self._eval_result = eval_result if eval_result is not None else {"ok": True}
+        # Bug 5 follow-on #3: the SolveResult the eval-with-clearance path returns
+        # alongside the value (``(value, clearance)``). ``None`` models a clean clear
+        # that deposited no host-scoped cookie.
+        self._eval_clearance = eval_clearance
+        # Records whether each eval requested clearance extraction (so a test can assert
+        # the flag threaded through ``_run_eval`` → the pipeline).
+        self.eval_with_clearance: list[bool] = []
         self._delay = delay
         self._healthy = healthy
         self._error = error
@@ -130,6 +138,7 @@ class FakePipeline:
         wait_for: str | None = None,
         deadline: float | None = None,
         proxy: dict[str, object] | None = None,
+        with_clearance: bool = False,
     ) -> object:
         # Mirrors ``solve``'s recording + gating (shared counters/events) so the
         # eval-vs-solve serialization test can hold the lock with EITHER endpoint.
@@ -140,6 +149,7 @@ class FakePipeline:
             self.calls.append((challenge_url, host))
             self.eval_js.append(js)
             self.eval_proxies.append(proxy)
+            self.eval_with_clearance.append(with_clearance)
             if self._started is not None:
                 self._started.set()
             if self._release is not None:
@@ -158,6 +168,8 @@ class FakePipeline:
                     waited += step
             if self._error is not None:
                 raise self._error
+            if with_clearance:
+                return (self._eval_result, self._eval_clearance)
             return self._eval_result
         finally:
             with self._counter_lock:
@@ -674,6 +686,119 @@ def test_eval_returns_marshalled_value_on_success() -> None:
     assert payload == {"value": {"chapters": [1, 2, 3]}}
     assert pipeline.calls == [("https://mangadot.net/", "mangadot.net")]
     assert pipeline.eval_js == ["extract()"]
+
+
+# ── Bug 5 follow-on #3: /eval extract_clearance (mint comix's cf_clearance) ──────
+# comix is a page-holder cleared ONLY via the eval path (never the destructive
+# /solve). When the gateway asks (``extract_clearance: true``) the sidecar ALSO reads
+# the host-scoped cf_clearance it auto-issued during the clear and returns it under a
+# ``clearance`` block, so the gateway can mint+hold comix's replayable clearance.
+
+_CLEARANCE_HOST = "mangadot.net"  # the FakePipeline config's lone allowlisted host
+_EVAL_CLEARANCE = SolveResult(
+    cf_clearance="EVAL-MINTED-COMIX-TOKEN",
+    user_agent="Mozilla/5.0 (Android 11) WebView wv",
+    host=_CLEARANCE_HOST,
+    egress_ip="203.0.113.9",
+    cf_clearance_expires=2_000_000_000.0,
+)
+
+
+def test_eval_extract_clearance_returns_value_and_clearance() -> None:
+    """``extract_clearance: true`` threads ``with_clearance`` to the pipeline and
+    returns ``{"value", "clearance": {cf_clearance, user_agent, cf_clearance_expires,
+    egress_ip}}`` so the gateway can mint+hold comix's clearance with no ``/solve``."""
+    pipeline = FakePipeline(eval_result={"ok": 1}, eval_clearance=_EVAL_CLEARANCE)
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=json.dumps(
+            {
+                "challenge_url": "https://mangadot.net/",
+                "js": "(async () => true)()",
+                "extract_clearance": True,
+            }
+        ).encode(),
+    )
+    assert status == 200
+    assert payload["value"] == {"ok": 1}
+    assert payload["clearance"] == {
+        "cf_clearance": "EVAL-MINTED-COMIX-TOKEN",
+        "user_agent": "Mozilla/5.0 (Android 11) WebView wv",
+        "cf_clearance_expires": 2_000_000_000.0,
+        "egress_ip": "203.0.113.9",
+    }
+    assert pipeline.eval_with_clearance == [True]  # the flag threaded to the pipeline
+
+
+def test_eval_extract_clearance_null_when_no_cookie() -> None:
+    """A clean clear that deposited NO host-scoped cookie returns ``clearance: null``
+    (the gateway then treats the mint as not-ready and retries) — NOT a 504."""
+    pipeline = FakePipeline(eval_result=True, eval_clearance=None)
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=json.dumps(
+            {
+                "challenge_url": "https://mangadot.net/",
+                "js": "(async () => true)()",
+                "extract_clearance": True,
+            }
+        ).encode(),
+    )
+    assert status == 200
+    assert payload == {"value": True, "clearance": None}
+
+
+def test_eval_without_extract_clearance_omits_clearance_and_flag() -> None:
+    """D-08 parity: an ordinary eval (no ``extract_clearance``) returns the bare
+    ``{"value": ...}`` with NO ``clearance`` key, and the pipeline is called WITHOUT
+    ``with_clearance`` (byte-for-byte unchanged from before follow-on #3)."""
+    pipeline = FakePipeline(
+        eval_result={"chapters": [1]}, eval_clearance=_EVAL_CLEARANCE
+    )
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "extract()"}',
+    )
+    assert status == 200
+    assert payload == {"value": {"chapters": [1]}}
+    assert "clearance" not in payload
+    assert pipeline.eval_with_clearance == [False]
+
+
+def test_eval_rejects_non_bool_extract_clearance() -> None:
+    """A non-bool ``extract_clearance`` is a pre-device 422 (no device action)."""
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "extract_clearance": "yes"}',
+    )
+    assert status == 422
+    assert pipeline.calls == []
+    assert "extract_clearance" in payload["error"]
+
+
+def test_eval_extract_clearance_does_not_log_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-14-04: the minted cf_clearance token never appears in any log record — it rides
+    only the response body."""
+    pipeline = FakePipeline(eval_result=True, eval_clearance=_EVAL_CLEARANCE)
+    with caplog.at_level("DEBUG"):
+        status, payload = _service(pipeline).eval(
+            api_key="s3cret-solver-key",
+            body=json.dumps(
+                {
+                    "challenge_url": "https://mangadot.net/",
+                    "js": "(async () => true)()",
+                    "extract_clearance": True,
+                }
+            ).encode(),
+        )
+    assert status == 200
+    assert payload["clearance"]["cf_clearance"] == "EVAL-MINTED-COMIX-TOKEN"
+    for record in caplog.records:
+        assert "EVAL-MINTED-COMIX-TOKEN" not in record.getMessage()
 
 
 def test_eval_forwards_wait_for_predicate_to_pipeline() -> None:

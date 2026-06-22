@@ -311,6 +311,7 @@ class SolvePipeline(Protocol):
         wait_for: str | None = None,
         deadline: float | None = None,
         proxy: dict[str, Any] | None = None,
+        with_clearance: bool = False,
     ) -> Any: ...
 
     def health(self) -> bool: ...
@@ -427,8 +428,23 @@ class AndroidSolvePipeline:
         wait_for: str | None = None,
         deadline: float | None = None,
         proxy: dict[str, Any] | None = None,
+        with_clearance: bool = False,
     ) -> Any:
         """Run ``js`` in the warm cleared WebView and return its marshalled value.
+
+        Bug 5 follow-on #3 (comix clearance via the EVAL path, never ``/solve``): when
+        ``with_clearance`` is set, the eval ALSO extracts the host-scoped
+        ``cf_clearance`` (+ the WebView UA + the cookie's epoch expiry) from the WebView
+        cookie jar AFTER the page is cleared+hydrated, and returns
+        ``(value, SolveResult | None)`` instead of the bare value. This lets the gateway
+        MINT + HOLD a page-holding source's (comix's) replayable ``cf_clearance`` for
+        the httpx image leg WITHOUT a ``/solve`` (whose ``pm clear`` would cold-wipe the
+        warm WebView comix's managed challenge + cached ``env-*.js`` depend on). The
+        eval path's warm ``Page.navigate`` + interactive-OOPIF clear leaves comix's
+        managed challenge auto-issuing the cookie (it is then read by
+        :func:`extract_clearance` from the same jar ``_tap_until_cleared`` reads). The
+        token is NEVER logged (T-14-04). ``with_clearance`` defaults ``False`` so every
+        existing comix extractor eval returns the bare value byte-for-byte unchanged.
 
         Re-uses the already-Turnstile-cleared WebView from the prior ``/solve`` — it
         deliberately does NOT ``force_stop_and_clear`` (that would wipe the cookie
@@ -492,6 +508,7 @@ class AndroidSolvePipeline:
                 wait_for=wait_for,
                 deadline=deadline,
                 expected_egress_ip="",
+                with_clearance=with_clearance,
             )
 
         # Proxied eval (Req 7 parity with ``_solve``): set the device-wide proxy and
@@ -519,6 +536,7 @@ class AndroidSolvePipeline:
                 wait_for=wait_for,
                 deadline=deadline,
                 expected_egress_ip=expected,
+                with_clearance=with_clearance,
             )
         finally:
             self._clear_proxy_quietly()
@@ -533,6 +551,7 @@ class AndroidSolvePipeline:
         wait_for: str | None,
         deadline: float,
         expected_egress_ip: str,
+        with_clearance: bool = False,
     ) -> Any:
         """Forward devtools → (egress-verify) → ensure cleared+hydrated → eval.
 
@@ -630,11 +649,76 @@ class AndroidSolvePipeline:
                     },
                     command_id=_EVAL_CMD_ID,
                 )
-                return result.get("result", {}).get("value")
+                value = result.get("result", {}).get("value")
+                if not with_clearance:
+                    return value
+                # Bug 5 follow-on #3: the page is now cleared+hydrated, so comix's
+                # managed challenge has auto-issued the host-scoped cf_clearance into
+                # this WebView's cookie jar — read it back (+ the bound UA) and return
+                # it alongside the value so the gateway can MINT + HOLD comix's
+                # replayable clearance with NO /solve. The forward + ws are still alive
+                # here (their teardown is the finally blocks below). Token NEVER logged.
+                clearance = self._extract_clearance_after_eval(
+                    ws_url, host, port, expected_egress_ip
+                )
+                return (value, clearance)
             finally:
                 ws.close()
         finally:
             self._remove_forward_quietly(port)
+
+    def _extract_clearance_after_eval(
+        self,
+        ws_url: str,
+        host: str,
+        port: int,
+        expected_egress_ip: str,
+    ) -> SolveResult | None:
+        """Read the host-scoped ``cf_clearance`` from the WebView jar after clear+eval.
+
+        Bug 5 follow-on #3: the eval path's warm ``Page.navigate`` + interactive-OOPIF
+        clear leaves comix's managed challenge auto-issuing a host-scoped
+        ``cf_clearance`` (the SAME cookie ``_tap_until_cleared`` reads on the solve
+        path), so a page-holding source can mint a replayable clearance for the httpx
+        image leg WITHOUT the destructive ``/solve`` (``pm clear``). Returns ``None``
+        (NOT a raise) when no
+        host-scoped cookie is present yet or a transient CDP hiccup hits — the gateway
+        treats a missing clearance as "mint not ready" and retries on the next call. The
+        UA is fetched exactly as ``_drive_solve`` does (a hiccup ⇒ empty UA, never a
+        discard). The token value is NEVER logged (T-14-04)."""
+        try:
+            minted = extract_clearance(ws_url, host)
+        except Exception:  # noqa: BLE001 — a post-eval cookie read must not abort the eval
+            _log.warning(
+                "post-eval clearance extract failed transiently for host %s; "
+                "returning no clearance",
+                host,
+                exc_info=True,
+            )
+            return None
+        if minted is None:
+            return None
+        try:
+            user_agent = (
+                webview_user_agent(
+                    f"http://localhost:{port}/json/version",
+                    http_get=self._http_get,
+                )
+                or ""
+            )
+        except Exception:  # noqa: BLE001 — a UA hiccup must not discard a minted token
+            _log.warning(
+                "webview UA fetch failed after eval clearance extract; using empty UA",
+                exc_info=True,
+            )
+            user_agent = ""
+        return SolveResult(
+            cf_clearance=minted.value,
+            user_agent=user_agent,
+            host=host,
+            egress_ip=expected_egress_ip,
+            cf_clearance_expires=minted.expires,
+        )
 
     def _is_hydrated_comix_page(self, ws: WebSocketLike, host: str) -> bool:
         """True when the warm WebView is ALREADY on a cleared, hydrated ``host`` page.
@@ -1487,6 +1571,16 @@ class SolverService:
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "wait_for must be a string"
             }
+        # Bug 5 follow-on #3: when set, ALSO extract the host-scoped cf_clearance from
+        # the WebView jar after the clear+eval and return it under a ``clearance`` key,
+        # so the gateway can mint+hold a page-holding source's (comix's) replayable
+        # clearance without a destructive ``/solve``. Optional bool; default False keeps
+        # every existing comix extractor eval's response shape byte-for-byte unchanged.
+        with_clearance = payload.get("extract_clearance", False)
+        if not isinstance(with_clearance, bool):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "extract_clearance must be a boolean"
+            }
 
         # Req 7 parity with /solve: validate the optional per-eval proxy SHAPE BEFORE
         # any device action — a malformed proxy is a pre-action 422 (no hop repoint,
@@ -1498,7 +1592,15 @@ class SolverService:
             return proxy_err
         proxy = payload.get("proxy")
 
-        return self._run_eval(challenge_url, host, js, wait_for, proxy, disconnected)
+        return self._run_eval(
+            challenge_url,
+            host,
+            js,
+            wait_for,
+            proxy,
+            disconnected,
+            with_clearance=with_clearance,
+        )
 
     @staticmethod
     def _validate_proxy(
@@ -1647,6 +1749,8 @@ class SolverService:
         wait_for: str | None = None,
         proxy: dict[str, Any] | None = None,
         disconnected: Callable[[], bool] | None = None,
+        *,
+        with_clearance: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         """Serialize + timeout-bound one in-WebView eval (mirrors ``_run_solve``).
 
@@ -1677,14 +1781,19 @@ class SolverService:
             _log.info("solver busy; rejecting concurrent /eval for host %s", host)
             return int(HTTPStatus.SERVICE_UNAVAILABLE), {"error": "solver busy"}
         try:
+            # Bug 5 follow-on #3: thread ``with_clearance`` ONLY when requested so an
+            # ordinary eval calls the pipeline (and any test fake) with the
+            # byte-for-byte unchanged kwargs; clearance evals return ``(value, clr)``.
+            eval_kwargs: dict[str, Any] = {"wait_for": wait_for, "proxy": proxy}
+            if with_clearance:
+                eval_kwargs["with_clearance"] = True
             future = self._executor.submit(
                 self._pipeline.eval_in_webview,
                 challenge_url,
                 host,
                 js,
                 cancel,
-                wait_for=wait_for,
-                proxy=proxy,
+                **eval_kwargs,
             )
             deadline = time.monotonic() + timeout_s
             while True:
@@ -1694,7 +1803,7 @@ class SolverService:
                     self._cancel_and_drain(future, cancel, host)
                     return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "eval timed out"}
                 try:
-                    value = future.result(timeout=min(_DISCONNECT_POLL_S, remaining))
+                    outcome = future.result(timeout=min(_DISCONNECT_POLL_S, remaining))
                 except FuturesTimeout:
                     if disconnected is not None and disconnected():
                         _log.info(
@@ -1711,7 +1820,22 @@ class SolverService:
                     return int(HTTPStatus.GATEWAY_TIMEOUT), {"error": "eval failed"}
                 # Redacted success event ONLY (T-14-04) — never the js or the result.
                 _log.info("evaluated in webview for host %s", host)
-                return int(HTTPStatus.OK), {"value": value}
+                if not with_clearance:
+                    return int(HTTPStatus.OK), {"value": outcome}
+                # ``with_clearance``: the pipeline returned ``(value, SolveResult |
+                # None)``. Carry the cf_clearance back under a ``clearance`` key (null
+                # when none was minted) so the gateway can hold it for the httpx image
+                # leg. The token rides only the response body — NEVER a log (T-14-04).
+                value, clearance = outcome
+                clearance_body: dict[str, Any] | None = None
+                if clearance is not None:
+                    clearance_body = {
+                        "cf_clearance": clearance.cf_clearance,
+                        "user_agent": clearance.user_agent,
+                        "cf_clearance_expires": clearance.cf_clearance_expires,
+                        "egress_ip": clearance.egress_ip,
+                    }
+                return int(HTTPStatus.OK), {"value": value, "clearance": clearance_body}
         finally:
             self._lock.release()
 
