@@ -142,10 +142,11 @@ async def test_fixture_drift(
     """Capture the live page-URL list and structurally compare to the fixture.
 
     * No-op skip when ``profile.fixture_drift_paths`` is empty (MangaDex).
-    * For Comix: drive ``solver.fetch_via_browser`` through the SAME
-      ``live_client_for`` harness ``test_download_smoke.py`` uses so the
-      autouse ``_restore_real_cloudflare_warm`` interacts with ONE solver
-      per test (W-03 lock).
+    * For Comix: drive ``solver.eval_in_webview`` (the android-WebView sidecar
+      path production ``fetch_manifest`` uses since Phase 14 — NOT the patchright
+      ``fetch_via_browser``, which is CF-blocked for comix) through the SAME
+      ``live_client_for`` harness ``test_download_smoke.py`` uses so the autouse
+      ``_restore_real_cloudflare_warm`` interacts with ONE solver per test (W-03 lock).
     * Compare SET equality on the captured URL list against each declared
       fixture (Pitfall 6 — transient ordinal jitter is NOT drift).
     * Issue #166/#181: both sides are passed through ``_normalize_comix_cdn_url``
@@ -186,18 +187,24 @@ async def test_fixture_drift(
         # None (the DOM reader-scaffold gate was vestigial — see bug 5b), and the 60s
         # ceiling. Any deviation between this call site and production reintroduces
         # the harness-vs-prod divergence #32 chased.
+        #
+        # Phase 14: comix runs its extractors in-page via the android-WebView sidecar
+        # ``eval_in_webview`` (the ONLY fingerprint that clears comix.to — patchright/
+        # Chromium is CF-blocked), NOT ``fetch_via_browser``. Mirror that: the old
+        # ``fetch_via_browser`` here routed to the patchright backend, which CANNOT
+        # clear comix and returned no URLs (a stale pre-Phase-14 path).
         chapter_pages_js = _CHAPTER_PAGES_API_EXTRACT_JS.replace(
             "__COMIX_CHAPTER_ID__", json.dumps(chapter_numeric_id)
         )
-        captured = await solver.fetch_via_browser(
+        captured = await solver.eval_in_webview(
             chapter_url,
-            extract=chapter_pages_js,
+            chapter_pages_js,
             wait_for=None,
             timeout=60.0,
         )
 
         assert isinstance(captured, list) and captured, (
-            f"{source_key}: solver.fetch_via_browser returned no URLs "
+            f"{source_key}: solver.eval_in_webview returned no URLs "
             f"for {chapter_url!r} — either Cloudflare escalated or the "
             f"chapter page structure changed"
         )

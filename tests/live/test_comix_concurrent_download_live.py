@@ -51,11 +51,12 @@ pytestmark = pytest.mark.live  # excluded from the gate
 # debug comix-concurrent-download-520 (#166): re-pointed off "Forgotten Field" —
 # that query's top releases included the degraded Chapter 23 (CDN origin
 # j24n.wowpic5.store/i4/ fails ~55% of page fetches at ANY concurrency, including
-# width=1, i.e. a genuinely broken upstream origin, not gateway load). "Nevermore"
-# is a verified-healthy series whose newest chapters are served by the first-party
-# WebToon CDN. CDN health is PER-CHAPTER, so if Nevermore's top chapters later
-# rotate to a flaky origin this may need revisiting (override COMIX_CONCURRENT_QUERY).
-_DEFAULT_QUERY = "Nevermore"
+# width=1, i.e. a genuinely broken upstream origin, not gateway load). "Omniscient
+# Reader" is a long-running, verified-healthy series (50 releases on comix as of
+# 2026-06-22; the prior "Nevermore" default has since dropped off comix's catalog →
+# 0 results). CDN health is PER-CHAPTER, so if its top chapters later rotate to a
+# flaky origin this may need revisiting (override COMIX_CONCURRENT_QUERY).
+_DEFAULT_QUERY = "Omniscient Reader"
 _TEST_API_KEY = "test-comix-concurrent-live-key-DO-NOT-LOG-IN-PROD"
 _DEFAULT_TIMEOUT_S = 90.0
 _CONCURRENT_JOBS = 2
