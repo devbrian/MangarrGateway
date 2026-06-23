@@ -19,6 +19,7 @@ import re
 from decimal import Decimal
 from typing import Any
 
+import httpx
 import pytest
 
 from manga_gateway.models.search import SearchRequest
@@ -308,3 +309,110 @@ async def test_external_links_best_effort_failure_leaves_chapters_intact() -> No
     assert len(releases) == 2
     assert all(rel.external_links is None for rel in releases)
     assert ctx.detail_calls == ["berserkk.m2vv"]
+
+
+# ─────────────── real context/transport seam: no eager CF solve ───────────────
+
+
+class _RecordingTransport:
+    """Serves the mangafire search path over a REAL ``SourceContext``/``SessionManager``
+    (no ``_FakeCtx`` shortcut, so ``_clearance_kwargs`` actually runs): GET ``/filter``
+    → cards HTML; GET ``/ajax/manga/{slug}/chapter/{lang}`` → chapter-list JSON; GET
+    ``/manga/{token}`` → a bare detail page (external-links best-effort).
+    """
+
+    def __init__(self, *, filter_html: bytes, chapter_lists: dict[str, str]) -> None:
+        self._filter_html = filter_html
+        self._chapter_lists = chapter_lists
+        self.urls: list[str] = []
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        self.urls.append(url)
+        req = httpx.Request(method, url)
+        if "/ajax/manga/" in url:
+            slug_id = url.split("/ajax/manga/")[1].split("/")[0]
+            body = {"status": 200, "result": self._chapter_lists.get(slug_id, "")}
+            return httpx.Response(200, json=body, request=req)
+        if "/filter" in url:
+            return httpx.Response(200, content=self._filter_html, request=req)
+        if "/manga/" in url:  # detail page (external-links GET, best-effort)
+            return httpx.Response(200, content=b"<html></html>", request=req)
+        raise AssertionError(f"unexpected url: {url}")  # pragma: no cover
+
+    async def aclose(self) -> None:  # pragma: no cover — interface completeness
+        pass
+
+
+class _PeekOnlySolver:
+    """Fails loudly if the real context EAGERLY solves Cloudflare.
+
+    Declares ``solve_if_missing`` so ``SourceContext._call_solver`` forwards the
+    on-demand peek kwarg. Returns ``None`` (no held clearance) so a cold request
+    proceeds over httpx. ``solve_if_missing=True`` (the eager default, reached only if
+    ``cloudflare_challenge_optional`` regresses to ``False``) raises.
+    """
+
+    def __init__(self) -> None:
+        self.solve_if_missing_calls: list[bool] = []
+
+    async def get_clearance(
+        self, source_key: str, *, solve_if_missing: bool = True
+    ) -> None:
+        self.solve_if_missing_calls.append(solve_if_missing)
+        if solve_if_missing:
+            raise AssertionError(
+                "mangafire search must not eager-solve Cloudflare (cold httpx-first)"
+            )
+        return None
+
+    async def fetch_via_browser(self, *args: Any, **kwargs: Any) -> Any:  # gate only
+        raise AssertionError("search must not touch the browser")
+
+
+@pytest.mark.asyncio
+async def test_search_cold_filter_uses_real_seam_without_eager_solve() -> None:
+    """Regression at the REAL clearance seam (260623-m5h): with
+    ``cloudflare_challenge_optional=True``, a cold mangafire search peeks held
+    clearance (``solve_if_missing=False``) and never eager-solves Cloudflare or touches
+    the browser — so search completes over httpx alone. The ``_FakeCtx`` tests above
+    bypass ``_clearance_kwargs`` and would pass even if search still eager-solved.
+    """
+    from manga_gateway.framework.context import SourceContext
+    from manga_gateway.framework.ratelimit import RateLimiter
+    from manga_gateway.framework.session import SessionManager
+    from manga_gateway.handles.store import HandleStore
+
+    chapter_lists = {
+        "kw9j9": _chapter_list_html(
+            [{"number": "346.2", "href": "/read/blue-lockk.kw9j9/en/chapter-346.2"}]
+        )
+    }
+    transport = _RecordingTransport(
+        filter_html=_cards_html([("/manga/blue-lockk.kw9j9", "Blue Lock")]),
+        chapter_lists=chapter_lists,
+    )
+    solver = _PeekOnlySolver()
+    ctx = SourceContext(
+        source_key="mangafire",
+        rate_limit_per_minute=6000,
+        session=SessionManager(transport),  # type: ignore[arg-type]
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+        solver=solver,
+        antibot="cloudflare",
+        cloudflare_challenge_optional=True,
+    )
+
+    releases = await MangaFireSource().search(
+        SearchRequest(type="manga", query="blue lock"), ctx
+    )
+
+    # Cold search completed over httpx and minted a release.
+    assert len(releases) == 1
+    assert releases[0].chapter_number == Decimal("346.2")
+    # The /filter GET carried the in-process vrf.
+    expected_vrf = compute_vrf("blue lock")
+    assert any("/filter" in u and f"vrf={expected_vrf}" in u for u in transport.urls)
+    # The real cf clearance seam ran and ONLY peeked — it never eager-solved.
+    assert solver.solve_if_missing_calls
+    assert all(v is False for v in solver.solve_if_missing_calls)
