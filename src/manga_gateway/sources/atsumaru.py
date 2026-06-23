@@ -44,13 +44,18 @@ ENDPOINT SHAPES (live-recon-pinned, 2026-06-08):
 * manifest: ``GET /api/read/chapter?mangaId=&chapterId=`` →
   ``{readChapter:{id,title,scanlationMangaId,pages:[{image:"/static/pages/{scan}/
   {chapter}/{N}.webp",number,…}]}}``. The page-image paths are read VERBATIM from the
-  ``pages[].image`` field (array order = page order), joined onto ``base_url`` and
-  SSRF-allowlisted — NEVER reconstructed (RECON §4 / CLAUDE.md SSRF). ``read/chapter``
+  ``pages[].image`` field (array order = page order), joined onto the CDN image base
+  (``cdn.atsu.moe`` — #306, NOT ``base_url``/atsu.moe) and SSRF-allowlisted — NEVER
+  reconstructed (RECON §4 / CLAUDE.md SSRF). ``read/chapter``
   Zod-requires a non-empty ``mangaId`` param (the VALUE is not re-validated, but we
   always pass the real one), so the resolve unit is the COMPOSITE ``{mangaId}:
   {chapterId}`` — see :meth:`fetch_manifest`.
-* image: plain httpx ``GET`` of each absolute ``https://atsu.moe/static/pages/...``
-  ``.webp`` (no ``Referer`` needed — a bare GET returns 200, live-verified).
+* image: plain httpx ``GET`` of each absolute ``https://cdn.atsu.moe/static/pages/...``
+  ``.webp`` (no ``Referer`` needed — a bare GET returns 200, live-verified). The page
+  images live on the ``cdn.atsu.moe`` CDN host (atsu.moe 302-redirects there as of the
+  2026-06 CDN migration, #306) while the JSON API stays on ``atsu.moe``; the gateway
+  resolves the CDN host itself rather than following the redirect (SSRF posture — no
+  global ``follow_redirects``).
 
 guid (D-08): ``atsumaru:{mangaId}:ch-{number}:{chapterId}``. Atsumaru is a
 single-language (English) aggregator with one upload per chapter, so — unlike
@@ -123,12 +128,21 @@ _RECENT_TITLE_CAP = 20
 # The content types the recent feed advertises (atsu.moe spells it "Manwha").
 _RECENT_TYPES = "Manga,Manwha,Manhua"
 
+# Page images live on the ``cdn.atsu.moe`` CDN host (the 2026-06 CDN migration, #306):
+# a GET of ``https://atsu.moe/static/pages/...`` now 302-redirects to
+# ``https://cdn.atsu.moe/static/pages/...``. The gateway resolves the CDN host ITSELF
+# (joins the relative path onto this base) rather than following the redirect — the
+# image fetch runs with ``follow_redirects=False`` (SSRF posture per CLAUDE.md / R6),
+# so we must point at the final host directly. The JSON API stays on ``base_url``
+# (atsu.moe); only the page-image host moves here.
+_ATSUMARU_IMAGE_BASE = "https://cdn.atsu.moe"
 # SSRF allowlist for the extracted page-image URLs (T-07-07/T-07-09, CLAUDE.md).
-# Unlike MangaBall the CDN host is FIXED (page images are same-origin
-# ``atsu.moe/static/pages/...``), so the host is pinned. The page path namespace is
-# ``/static/`` and the extension is an image one; both are stable invariants — the
-# per-page filename (``{N}.webp``) is NOT over-pinned beyond the extension.
-_ATSUMARU_IMAGE_HOSTS = frozenset({"atsu.moe", "www.atsu.moe"})
+# The page-image host is the CDN ``cdn.atsu.moe`` (#306); ``atsu.moe``/``www.atsu.moe``
+# are retained (harmless — the API host is unchanged, and a future un-migration stays
+# allowlisted). The page path namespace is ``/static/`` and the extension is an image
+# one; both are stable invariants — the per-page filename (``{N}.webp``) is NOT
+# over-pinned beyond the extension.
+_ATSUMARU_IMAGE_HOSTS = frozenset({"cdn.atsu.moe", "atsu.moe", "www.atsu.moe"})
 _ATSUMARU_IMG_PATH_RE = re.compile(
     r"^/static/[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp)$",
     re.IGNORECASE,
@@ -161,11 +175,12 @@ def _ms_to_iso(raw: Any) -> str | None:
 
 
 def _is_allowed_image_url(url: str) -> bool:
-    """True if ``url`` is an Atsumaru same-origin page image (SSRF allowlist).
+    """True if ``url`` is an Atsumaru page image on an allowlisted host (SSRF allow).
 
     Belt-and-suspenders defence on every extracted manifest URL before the framework
-    fetches it (T-07-07/T-07-09). The page-image host is fixed (``atsu.moe``) and the
-    path namespace is ``/static/`` with an image extension; we reject non-HTTPS
+    fetches it (T-07-07/T-07-09). The page-image host is the CDN ``cdn.atsu.moe`` (#306;
+    ``atsu.moe``/``www.atsu.moe`` retained) and the path namespace is ``/static/`` with
+    an image extension; we reject non-HTTPS
     schemes, off-host URLs, path traversal, and any path outside that namespace. We
     validate the ``posixpath.normpath``-resolved path (httpx normalizes ``..`` before
     issuing the request — CR-01) and reject any literal ``..`` segment outright.
@@ -502,8 +517,11 @@ class AtsumaruSource(Source):
         the ``ResolutionRecord.chapter_id`` because ``read/chapter`` Zod-requires the
         ``mangaId`` param. GETs ``/api/read/chapter?mangaId=&chapterId=``, reads the
         ordered ``readChapter.pages[].image`` paths VERBATIM (array order = page
-        order), joins each onto ``base_url`` and SSRF-allowlists it — the host/path are
-        never reconstructed (RECON §4 / CLAUDE.md SSRF). The extracted count is guarded
+        order), joins each onto the CDN image base (``cdn.atsu.moe`` — #306, NOT
+        ``base_url``/atsu.moe, which now 302-redirects to the CDN) and SSRF-allowlists
+        it — the host/path are never reconstructed (RECON §4 / CLAUDE.md SSRF). The JSON
+        ``read/chapter`` call still targets ``base_url`` (atsu.moe); only the resolved
+        page-image host is the CDN. The extracted count is guarded
         against the chapter's declared ``pages`` when known (``ctx.expected_pages``,
         IN-03, mirror ``mangadex.fetch_manifest``).
         """
@@ -533,7 +551,7 @@ class AtsumaruSource(Source):
                     "source_unavailable",
                     f"read/chapter page missing image for {real_chapter_id}",
                 )
-            url = urljoin(self.base_url + "/", image.lstrip("/"))
+            url = urljoin(_ATSUMARU_IMAGE_BASE + "/", image.lstrip("/"))
             if not _is_allowed_image_url(url):
                 # Never fetch a non-allowlisted (off-host / off-shape) URL (T-07-07).
                 raise SourceError(
