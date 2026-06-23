@@ -259,7 +259,7 @@ class Settings(BaseSettings):
     # measured horizon — leave both unconfigured so they ride the conservative
     # cookie-expiry default; the map is operator-extensible if they are later measured.
     # Margins: kagane measured lapse ≈ 31 min (alive 30.8, dead 31.0) → 1680s (28 min)
-    # re-mints at 1680−120s lead = 26 min, ~5 min before death; mangadot measured lapse
+    # re-mints at 1680-120s lead = 26 min, ~5 min before death; mangadot measured lapse
     # ≈ 248 min (alive 247.9) → 14400s (240 min / 4 h) re-mints at 238 min, ~10 min
     # before death. Env-overridable as a JSON object
     # (``GATEWAY_ANDROID_CLEARANCE_LIFETIME_S='{"kagane":1680,"mangadot":14400}'``) and
