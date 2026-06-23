@@ -65,13 +65,24 @@ _DEAD_DRIVER_MSG = "Connection closed while reading from the driver"
 class _FakeKeyboard:
     """Models ``page.keyboard.type(text, delay=...)`` — records every call."""
 
-    def __init__(self, log: list[str]) -> None:
+    def __init__(self, log: list[str], tracker: _InFlightTracker | None = None) -> None:
         self._log = log
+        self._tracker = tracker
         self.type_calls: list[tuple[str, object]] = []
 
     async def type(self, text: str, *, delay: float | None = None) -> None:
         self.type_calls.append((text, delay))
         self._log.append("type")
+        # ``keyboard.type`` is one half of the focus-sensitive critical section
+        # the lock must serialize: instrument the awaited region here (not only
+        # ``evaluate``) so the test fails if ``_typed_lock`` is ever narrowed to
+        # cover only the post-type read, reintroducing the focus race.
+        if self._tracker is not None:
+            self._tracker.enter()
+            try:
+                await asyncio.sleep(0.02)
+            finally:
+                self._tracker.exit()
 
 
 class _FakeTypedPage:
@@ -97,7 +108,7 @@ class _FakeTypedPage:
         self.evaluate_error = evaluate_error
         self._tracker = tracker
         self.log: list[str] = []
-        self.keyboard = _FakeKeyboard(self.log)
+        self.keyboard = _FakeKeyboard(self.log, tracker)
         self.goto_calls: list[tuple[str, dict[str, object]]] = []
         self.click_calls: list[str] = []
         self.wait_function_calls: list[str] = []
@@ -115,6 +126,16 @@ class _FakeTypedPage:
             raise self.click_error
         self.click_calls.append(selector)
         self.log.append("click")
+        # ``page.click`` is where the real focus race hangs (the loser waits the
+        # full ~30s for an actionable input). Instrument the awaited region here
+        # so the tracker observes overlap at the actual critical section, not
+        # only at the downstream ``evaluate`` read.
+        if self._tracker is not None:
+            self._tracker.enter()
+            try:
+                await asyncio.sleep(0.02)
+            finally:
+                self._tracker.exit()
 
     async def wait_for_function(self, predicate: str, **_: object) -> None:
         self.wait_function_calls.append(predicate)
