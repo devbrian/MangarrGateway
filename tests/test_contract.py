@@ -156,7 +156,6 @@ def _stub_source_hosts(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         return None
 
     monkeypatch.setattr(CloudflareSolver, "fetch_via_browser", _no_browser)
-    monkeypatch.setattr(CloudflareSolver, "fetch_via_browser_typed", _no_browser)
     monkeypatch.setattr(CloudflareSolver, "fetch_via_browser_paginated", _no_browser)
 
     with respx.mock(assert_all_called=False) as mock:
