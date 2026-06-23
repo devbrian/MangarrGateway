@@ -111,13 +111,43 @@ every host. Xvfb is already in the image, so this works with **no image change**
 proxy (`GATEWAY_CLOUDFLARE_PROXY_*`, issue #65) is an alternative/additional
 mitigation on flagged hosts.
 
-### GHCR image
+### Run from GHCR (release images)
+
+You don't need the source tree to run Manga Gateway — grab just
+[`docker-compose.release.yml`](docker-compose.release.yml), which **pulls** the
+published images instead of building:
 
 ```bash
-docker pull ghcr.io/devbrian/mangarrgateway:latest   # or a :<version>
+# latest:
+docker compose -f docker-compose.release.yml up -d
+# pin a specific release (recommended):
+MANGA_GATEWAY_VERSION=v1.0.0 docker compose -f docker-compose.release.yml up -d
 ```
 
-Releases publish automatically on a `v*` git tag (or a manual
+`MANGA_GATEWAY_VERSION` pins both owned images to one release (default `latest`).
+Then read the auto-generated API key and call the API:
+
+```bash
+docker compose -f docker-compose.release.yml exec gateway cat /state/config.toml
+curl -H "X-Api-Key: <key>" http://127.0.0.1:9191/api/v1/version
+```
+
+To also run the Android-WebView Cloudflare solver (mangadot / kagane / mangaball /
+comix), set `COMPOSE_PROFILES=android` + `GATEWAY_ANDROID_SOLVER_API_KEY` in `.env`
+first — see **Android-WebView Cloudflare solver** below for the host prerequisites
+(`binder_linux`/`ashmem_linux` modules, `/dev/dri`). A bare `up` runs the gateway
+alone.
+
+**Images** (the gateway pulls fine on its own; the third is only needed for the
+`android` profile):
+
+| Image | Built from | Published |
+|-------|-----------|-----------|
+| `ghcr.io/devbrian/mangarrgateway` | this repo (`Dockerfile`) | on `v*` tag |
+| `ghcr.io/devbrian/mangarrgateway-android-solver` | `android_solver/` | on `v*` tag |
+| `redroid/redroid:11.0.0-latest` | upstream (Docker Hub) | third-party — pulled as-is |
+
+Both owned images publish automatically on a `v*` git tag (or a manual
 `workflow_dispatch`) via `.github/workflows/docker-publish.yml` — linux/amd64,
 SHA-pinned actions, independent of the `ci.yml` gate.
 

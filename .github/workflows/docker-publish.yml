@@ -1,12 +1,17 @@
-# Build + publish the production container image to GHCR.
+# Build + publish the production container images to GHCR.
 #
-# LD-2 (06-TASKBRIEF, 2026-06-01):
+# LD-2 (06-TASKBRIEF, 2026-06-01) + 260623-qvv (release pipeline):
 #   * Triggers on a `v*` git tag push (release) + `workflow_dispatch` (manual).
-#   * Publishes ghcr.io/devbrian/mangarrgateway:<version> + :latest.
-#   * linux/amd64 ONLY (browser binaries; no arm64).
+#   * Publishes BOTH owned images via a build matrix:
+#       - ghcr.io/devbrian/mangarrgateway                 (gateway,  context .)
+#       - ghcr.io/devbrian/mangarrgateway-android-solver  (sidecar,  context android_solver/)
+#     each tagged :<version> + :<major>.<minor> + :latest.
+#   * linux/amd64 ONLY (Chromium/Playwright + redroid are amd64-bound; no arm64).
+#   * redroid is the THIRD-PARTY public image redroid/redroid:11.0.0-latest — it is
+#     NOT republished here; the release compose pulls it straight from Docker Hub.
 #
 # Sibling to — but INDEPENDENT of — .github/workflows/ci.yml (the deterministic
-# gate). D-12 invariant: this workflow ONLY builds/publishes the image; it NEVER
+# gate). D-12 invariant: this workflow ONLY builds/publishes the images; it NEVER
 # replaces `uv run nox -s gate`.
 #
 # Supply-chain discipline (matches ci.yml / nightly-live-smoke.yml): every
@@ -31,6 +36,17 @@ permissions:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Gateway — main API image (build context = repo root).
+          - image: ghcr.io/devbrian/mangarrgateway
+            context: .
+          # Android-WebView Cloudflare solver sidecar (build context = android_solver/;
+          # its Dockerfile carries adb + the solver package ONLY, never gateway source).
+          - image: ghcr.io/devbrian/mangarrgateway-android-solver
+            context: android_solver
     steps:
       # Same pinned checkout SHA as ci.yml / nightly-live-smoke.yml.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -48,7 +64,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/devbrian/mangarrgateway
+          images: ${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -56,11 +72,12 @@ jobs:
 
       - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
-          context: .
+          context: ${{ matrix.context }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # GitHub Actions layer cache blunts the large Chromium-layer build time.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scope per image so the two matrix legs don't clobber each other's cache.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
