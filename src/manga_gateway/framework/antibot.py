@@ -547,6 +547,24 @@ class CloudflareSolver:
         self._browser_lock: asyncio.Semaphore = asyncio.Semaphore(
             self._browser_concurrency
         )
+        # Typed-search serialization (focus race). Real ``keyboard.type`` (CDP) is
+        # focus-sensitive — only ONE page may hold input focus at a time — so when
+        # ``fetch_concurrency>1`` lets several typed searches drive ``page.click`` +
+        # ``keyboard.type`` on SEPARATE pages of the ONE shared warm context, they
+        # race for focus and the loser's ``page.click`` never finds an actionable
+        # input and hangs the full ~30s (Playwright's default op timeout; no
+        # ``set_default_timeout``), burning the whole per-source fan-out budget
+        # (measured: MangaFire timed out at ~30000ms on 26.4% of searches).
+        # ``fetch_via_browser_typed`` acquires this BEFORE delegating to
+        # ``_browser_call`` (which acquires ``_browser_lock``), establishing the ONE
+        # lock order ``_typed_lock`` → ``_browser_lock``, never the reverse → no
+        # deadlock (nothing else touches ``_typed_lock``). Hardwired to 1 (NOT
+        # ``fetch_concurrency``): at ``fetch_concurrency=1`` it is a harmless no-op
+        # extra gate (``_browser_lock`` is already a 1-semaphore); it only bites at
+        # ``fetch_concurrency>1`` (the patchright default of 3). The one-shot /
+        # paginated / parallel primitives never touch it and stay bounded only by
+        # ``_browser_lock``.
+        self._typed_lock: asyncio.Semaphore = asyncio.Semaphore(1)
 
     # ─────────────────────────── public seam (D-41) ───────────────────────────
 
@@ -972,38 +990,45 @@ class CloudflareSolver:
             BrowserFetchError: navigation/click/type/wait/evaluate failed or the
                 context could not be acquired (after the single dead-driver retry).
         """
-        try:
-            return await self._typed_via_browser_once(
-                url,
-                type_selector=type_selector,
-                type_text=type_text,
-                extract=extract,
-                wait_for=wait_for,
-                timeout=timeout,
-                attempt=1,
-            )
-        except BrowserFetchError as exc:
-            if not _looks_like_dead_driver(exc):
-                raise
-            # Driver died — drop the cached zombie context and retry once against
-            # a freshly launched one. Identical rationale to fetch_via_browser's
-            # dead-driver wrapper (the recycle also clears the held Clearance, so
-            # the next solve runs a fresh CF warm — correct, not a regression).
-            _log.warning(
-                "fetch_via_browser_typed: dead-driver signal detected — recycling "
-                "browser context and retrying once (url=%s)",
-                url,
-            )
-            await self._lifecycle.recycle_now()
-            return await self._typed_via_browser_once(
-                url,
-                type_selector=type_selector,
-                type_text=type_text,
-                extract=extract,
-                wait_for=wait_for,
-                timeout=timeout,
-                attempt=2,
-            )
+        # Serialize the ENTIRE typed interaction (focus race) — outer half of the
+        # ONE lock order ``_typed_lock`` → ``_browser_lock`` (the inner
+        # ``_browser_call`` takes ``_browser_lock``). Wrapping the whole try/except
+        # — both attempts AND the dead-driver recycle — keeps a mid-recovery retry
+        # from releasing the keyboard to a racing typed call.
+        async with self._typed_lock:
+            try:
+                return await self._typed_via_browser_once(
+                    url,
+                    type_selector=type_selector,
+                    type_text=type_text,
+                    extract=extract,
+                    wait_for=wait_for,
+                    timeout=timeout,
+                    attempt=1,
+                )
+            except BrowserFetchError as exc:
+                if not _looks_like_dead_driver(exc):
+                    raise
+                # Driver died — drop the cached zombie context and retry once
+                # against a freshly launched one. Identical rationale to
+                # fetch_via_browser's dead-driver wrapper (the recycle also clears
+                # the held Clearance, so the next solve runs a fresh CF warm —
+                # correct, not a regression).
+                _log.warning(
+                    "fetch_via_browser_typed: dead-driver signal detected — "
+                    "recycling browser context and retrying once (url=%s)",
+                    url,
+                )
+                await self._lifecycle.recycle_now()
+                return await self._typed_via_browser_once(
+                    url,
+                    type_selector=type_selector,
+                    type_text=type_text,
+                    extract=extract,
+                    wait_for=wait_for,
+                    timeout=timeout,
+                    attempt=2,
+                )
 
     async def _typed_via_browser_once(
         self,

@@ -26,6 +26,7 @@ Coverage (plan Task 2 behavior block):
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from typing import Any, cast
 
@@ -88,11 +89,13 @@ class _FakeTypedPage:
         click_error: Exception | None = None,
         type_error: Exception | None = None,
         evaluate_error: Exception | None = None,
+        tracker: _InFlightTracker | None = None,
     ) -> None:
         self.evaluate_result = evaluate_result
         self.click_error = click_error
         self.type_error = type_error
         self.evaluate_error = evaluate_error
+        self._tracker = tracker
         self.log: list[str] = []
         self.keyboard = _FakeKeyboard(self.log)
         self.goto_calls: list[tuple[str, dict[str, object]]] = []
@@ -126,23 +129,68 @@ class _FakeTypedPage:
             raise self.evaluate_error
         self.evaluate_scripts.append(script)
         self.log.append("evaluate")
+        # Instrument the awaited read so concurrent bodies are observable: a
+        # shared tracker brackets the ``await`` point reached only INSIDE the
+        # locked body (after click+type), so its ``max_in_flight`` reveals
+        # whether two calls overlapped here.
+        if self._tracker is not None:
+            self._tracker.enter()
+            try:
+                await asyncio.sleep(0.02)
+                return self.evaluate_result
+            finally:
+                self._tracker.exit()
         return self.evaluate_result
 
     async def close(self) -> None:
         self.closed = True
 
 
+class _InFlightTracker:
+    """Records the peak number of bodies awaiting concurrently (max_in_flight).
+
+    Mirrors ``tests/test_antibot_parallel_pages.py``: an instrumented awaited
+    region calls ``enter()`` / ``await asyncio.sleep(...)`` / ``exit()`` so two
+    overlapping calls push ``max_in_flight`` to 2, while serialized calls keep it
+    at 1.
+    """
+
+    def __init__(self) -> None:
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    def enter(self) -> None:
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+
+    def exit(self) -> None:
+        self.in_flight -= 1
+
+
 class _FakeTypedContext:
     def __init__(
-        self, page: Any | None, *, new_page_error: Exception | None = None
+        self,
+        page: Any | None,
+        *,
+        new_page_error: Exception | None = None,
+        page_factory: Any | None = None,
     ) -> None:
         self._page = page
         self.new_page_error = new_page_error
+        # When set, each ``new_page()`` mints a FRESH page (so two concurrent
+        # calls get separate pages of the one shared warm context), like
+        # ``_ParallelContext`` in test_antibot_parallel_pages.py.
+        self._page_factory = page_factory
+        self.pages: list[Any] = []
         self.closed = False
 
     async def new_page(self) -> Any:
         if self.new_page_error is not None:
             raise self.new_page_error
+        if self._page_factory is not None:
+            page = self._page_factory()
+            self.pages.append(page)
+            return page
         return self._page
 
     async def cookies(self) -> list[dict[str, str]]:  # pragma: no cover — unused
@@ -152,7 +200,9 @@ class _FakeTypedContext:
         self.closed = True
 
 
-def _solver_with(ctx: _FakeTypedContext) -> CloudflareSolver:
+def _solver_with(
+    ctx: _FakeTypedContext, *, fetch_concurrency: int = 1
+) -> CloudflareSolver:
     async def _launch() -> _FakeTypedContext:
         return ctx
 
@@ -160,7 +210,7 @@ def _solver_with(ctx: _FakeTypedContext) -> CloudflareSolver:
         return antibot.Clearance(cookies={}, user_agent="ua")
 
     lc = BrowserLifecycle(launch=_launch, solve=_solve, solve_concurrency=1)
-    return CloudflareSolver(lifecycle=lc)
+    return CloudflareSolver(lifecycle=lc, fetch_concurrency=fetch_concurrency)
 
 
 def _solver_with_contexts(contexts: list[Any]) -> tuple[CloudflareSolver, list[int]]:
@@ -366,6 +416,54 @@ async def test_typed_emits_single_browser_event_error(
     assert evs[0].op == "fetch_via_browser_typed"
     assert evs[0].outcome == "error"
     assert evs[0].error is not None
+    await solver.aclose()
+
+
+# ──────────── (7) typed serialization vs cross-primitive concurrency ──────────
+
+
+async def test_two_concurrent_typed_calls_serialize_at_fetch_concurrency_3() -> None:
+    # fetch_concurrency=3 means _browser_lock alone would permit 2+ overlapping
+    # bodies — so any serialization observed here comes PURELY from _typed_lock.
+    tracker = _InFlightTracker()
+    ctx = _FakeTypedContext(None, page_factory=lambda: _FakeTypedPage(tracker=tracker))
+    solver = _solver_with(ctx, fetch_concurrency=3)
+
+    async def _typed() -> object:
+        return await solver.fetch_via_browser_typed(
+            _HOME, type_selector=_SELECTOR, type_text=_QUERY, extract=_EXTRACT
+        )
+
+    results = await asyncio.gather(_typed(), _typed())
+
+    # _typed_lock forced the two typed bodies sequential despite fetch_concurrency=3.
+    # Without the lock (Semaphore(3) only) this would observe max_in_flight == 2.
+    assert tracker.max_in_flight == 1
+    assert results == [_CAPTURED_VRF, _CAPTURED_VRF]
+    await solver.aclose()
+
+
+async def test_one_shot_fetch_overlaps_a_typed_call_at_fetch_concurrency_3() -> None:
+    # The one-shot fetch_via_browser is NOT gated by _typed_lock — bounded only by
+    # _browser_lock (Semaphore(3) here), it overlaps a concurrent typed call.
+    tracker = _InFlightTracker()
+    ctx = _FakeTypedContext(None, page_factory=lambda: _FakeTypedPage(tracker=tracker))
+    solver = _solver_with(ctx, fetch_concurrency=3)
+
+    async def _typed() -> object:
+        return await solver.fetch_via_browser_typed(
+            _HOME, type_selector=_SELECTOR, type_text=_QUERY, extract=_EXTRACT
+        )
+
+    async def _one_shot() -> object:
+        return await solver.fetch_via_browser(_HOME, extract=_EXTRACT)
+
+    results = await asyncio.gather(_typed(), _one_shot())
+
+    # Both bodies reach the instrumented evaluate at the same time — the one-shot
+    # is free to overlap the typed call (only _browser_lock bounds it).
+    assert tracker.max_in_flight == 2
+    assert results == [_CAPTURED_VRF, _CAPTURED_VRF]
     await solver.aclose()
 
 
