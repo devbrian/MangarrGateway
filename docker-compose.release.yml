@@ -1,0 +1,162 @@
+# Manga Gateway — RELEASE compose (pulls published images; no local build).
+#
+# This is the end-user deployment file. Unlike docker-compose.yml (which BUILDS
+# from local source), this PULLS the published images straight from GHCR + Docker
+# Hub, so you can run the whole stack with just this one file and no source tree:
+#
+#     # latest:
+#     docker compose -f docker-compose.release.yml up -d
+#     # pin a release:
+#     MANGA_GATEWAY_VERSION=v1.0.0 docker compose -f docker-compose.release.yml up -d
+#
+# Images (gateway + android-solver are published by .github/workflows/docker-publish.yml
+# on every `v*` tag; redroid is the upstream third-party Android image):
+#   ghcr.io/devbrian/mangarrgateway:<ver>                — gateway API
+#   ghcr.io/devbrian/mangarrgateway-android-solver:<ver> — Cloudflare solver sidecar
+#   redroid/redroid:11.0.0-latest                        — Android 11 in Docker
+# MANGA_GATEWAY_VERSION pins BOTH owned images to one release (default: latest).
+#
+# State: the auto-generated API key, the SQLite DBs, cf_clearance, the metrics
+# snapshot DB (`/state/metrics.db`), and the JSON-lines logs
+# (`/state/logs/gateway.jsonl`) live on the `/state` mount; CBZ output lives on
+# `/data/manga`. Both default to Docker NAMED volumes (portable). To land them on
+# specific HOST directories, set MANGARR_STATE_DIR / MANGARR_DOWNLOADS_DIR in .env
+# (see .env.example). A bound host path must be writable by the container's
+# non-root uid 10001 (chown 10001:10001 <dir>).
+#
+# Read the auto-generated API key after first start:
+#     docker compose -f docker-compose.release.yml exec gateway cat /state/config.toml
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ANDROID-WEBVIEW CLOUDFLARE SOLVER (mangadot + kagane + mangaball + comix).
+# Those sources serve a STRICT Cloudflare Turnstile that no desktop browser
+# automation clears from Linux. A REAL Android WebView clears it. Two sidecars
+# provide that:
+#   redroid         — Android 11 in Docker (privileged, host iGPU); runs the WebView.
+#   android-solver  — drives redroid over adb+CDP, mints {cf_clearance, user_agent}.
+# The gateway reaches android-solver over the docker-internal network ONLY.
+#
+# OPT-IN via the `android` COMPOSE PROFILE: redroid + android-solver (and their
+# published ports) only start when the `android` profile is active. A bare
+# `docker compose ... up` runs the gateway ALONE — works with NO .env, exposes NO
+# extra ports (secure default), and boots mangadot/kagane/mangaball/comix disabled
+# (D-33). To run the full Android stack, set COMPOSE_PROFILES=android in .env (and
+# GATEWAY_ANDROID_SOLVER_API_KEY — the sidecar fails fast on an empty key) or pass
+# `--profile android`.
+#
+# HOST PREREQUISITE (redroid will NOT boot without it): the host kernel must load
+# the `binder_linux` (+ `ashmem_linux`) modules. Kernel 5.15-generic ships them as
+# loadable modules — no rebuild. Load + persist on the host once:
+#     sudo modprobe binder_linux ashmem_linux
+#     printf 'binder_linux\nashmem_linux\n' | sudo tee /etc/modules-load.d/redroid.conf
+# iGPU passthrough: the host must expose `/dev/dri` — required so Android renders
+# WebGL on REAL hardware and the render-consistency check passes.
+# SHARED EGRESS IP: redroid and the gateway's httpx MUST egress the same public IP
+# (cf_clearance is IP-bound). If a residential proxy is added, redroid must egress
+# the SAME proxy. LANDMINE: do NOT `adb root` against redroid — it wedges adbd; the
+# solver runs UNROOTED. Recover a wedged device by restarting the redroid container.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  gateway:
+    image: ghcr.io/devbrian/mangarrgateway:${MANGA_GATEWAY_VERSION:-latest}
+    ports:
+      - "9191:9191"
+    # Tolerate a missing .env so the stack runs out of the box (the image bakes
+    # safe env defaults). Copy .env.example → .env to set operator knobs.
+    env_file:
+      - path: .env
+        required: false
+    # Point the gateway at the android-solver sidecar (docker-internal name + port).
+    # The URL is not a secret; the api key comes from .env and MUST match the
+    # sidecar's SOLVER_API_KEY (both read the SAME .env value). When unset, the
+    # AndroidSolver leg boots its sources disabled (D-33) and the gateway still runs.
+    environment:
+      GATEWAY_ANDROID_SOLVER_URL: "http://android-solver:8080"
+      GATEWAY_ANDROID_SOLVER_API_KEY: "${GATEWAY_ANDROID_SOLVER_API_KEY:-}"
+    # `required: false` so a bare up (android profile NOT active) starts the gateway
+    # ALONE — it neither waits on nor errors about the profiled android-solver.
+    depends_on:
+      android-solver:
+        condition: service_started
+        required: false
+    volumes:
+      # App data: config.toml (+ the auto-generated API key), gateway.db, the
+      # handles.db downloadHandle store, cf_clearance, metrics.db, and the
+      # JSON-lines logs under logs/gateway.jsonl. Set MANGARR_STATE_DIR to bind a host dir.
+      - ${MANGARR_STATE_DIR:-gateway-state}:/state
+      # CBZ downloads/output. Set MANGARR_DOWNLOADS_DIR to bind a host dir.
+      - ${MANGARR_DOWNLOADS_DIR:-gateway-output}:/data/manga
+    restart: unless-stopped
+    # NOTE: command is intentionally NOT overridden — inherit the image's
+    # single-process `python -m manga_gateway` CMD. NEVER add --workers (R1).
+
+  # ── redroid — Android 11 in Docker (the real WebView that clears the strict
+  # Turnstile). privileged + the host iGPU device are REQUIRED for real-GPU WebGL:
+  # scoped to ONLY /dev/dri, no host network. Needs the host binder_linux/ashmem_linux
+  # modules loaded (see the top-of-file HOST PREREQUISITE).
+  #
+  # adb 5555 is DOCKER-INTERNAL ONLY (no host publish) — adb is full device control,
+  # so it is NEVER reachable from the host/LAN. The android-solver sidecar reaches the
+  # device over the compose network (SOLVER_ADB_TARGET=redroid:5555).
+  redroid:
+    image: redroid/redroid:11.0.0-latest
+    profiles: ["android"]  # opt-in: only starts when COMPOSE_PROFILES=android (or --profile android)
+    privileged: true
+    # Host iGPU passthrough → Android gets REAL GPU WebGL so CF's render-consistency
+    # hash passes. The boot arg below selects host GPU mode.
+    devices:
+      - "/dev/dri:/dev/dri"
+    command:
+      - androidboot.redroid_gpu_mode=host
+    volumes:
+      # Persistent Android /data (the cleared cookie jar / WebView state). Set
+      # MANGARR_REDROID_DIR to bind a host dir.
+      - ${MANGARR_REDROID_DIR:-redroid-data}:/data
+    # Gate readiness on Android finishing boot (sys.boot_completed=1). The redroid
+    # image ships adbd but NOT the adb CLIENT, so read the prop locally instead of
+    # via an adb probe. android-solver depends_on this being healthy.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "[ \"$$(getprop sys.boot_completed 2>/dev/null | tr -d '\\r')\" = \"1\" ]",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── android-solver — thin sidecar (adb + the solver code, no gateway source).
+  # Drives redroid over adb+CDP and serves the authenticated control API (POST /solve).
+  # Every secret arrives via env (never baked); /solve is X-Solver-Key-auth'd +
+  # host-allowlisted (SEC-01).
+  #
+  # 8080 → host 18080 is published ONLY when the `android` profile is active, for
+  # LAN-only solve-path testing (POST http://<host>:18080/solve, X-Solver-Key
+  # required). REMOVE this mapping for any host reachable from an untrusted network.
+  android-solver:
+    image: ghcr.io/devbrian/mangarrgateway-android-solver:${MANGA_GATEWAY_VERSION:-latest}
+    profiles: ["android"]  # opt-in: only starts when COMPOSE_PROFILES=android (or --profile android)
+    ports:
+      - "18080:8080"  # control API /solve — LAN-only; only published when the android profile is active
+    depends_on:
+      redroid:
+        condition: service_healthy
+    environment:
+      # MUST match the gateway's GATEWAY_ANDROID_SOLVER_API_KEY (same .env value).
+      SOLVER_API_KEY: "${GATEWAY_ANDROID_SOLVER_API_KEY:-}"
+      # The redroid adb target on the docker-internal network (service name:5555).
+      SOLVER_ADB_TARGET: "redroid:5555"
+      # SSRF allowlist — the only challenge hosts the sidecar will drive a device
+      # against (the strict-Turnstile sources). Anything else → 422.
+      SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to,mangaball.net,comix.to"
+      # Per-solve wall-clock cap (an Android WebView solve is slower than desktop).
+      SOLVER_SOLVE_TIMEOUT_S: "120"
+    restart: unless-stopped
+
+volumes:
+  gateway-state:
+  gateway-output:
+  redroid-data:
