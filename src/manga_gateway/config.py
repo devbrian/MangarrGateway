@@ -241,24 +241,37 @@ class Settings(BaseSettings):
     # (Phase 10 live-verify). Default 180 = the 120s cap + 60s margin, so a clean
     # out-of-the-box run does not trip the coupling. Raise it if you raise the cap.
     android_solver_timeout_s: float = Field(default=180.0, gt=0)
-    # Bug 5 Lever A (proactive-refresh-by-AGE, MEASURE-FIRST knob). The android
-    # proactive-refresh loop re-mints a held clearance ahead of its COOKIE expiry. But
-    # for comix the cf_clearance cookie carries a ~1yr nominal expiry that is a LIE —
-    # Cloudflare re-challenges far sooner (debug ``cf-clearance-cookie-expiry-is-not-
-    # lapse-time``), so the expiry-driven loop never proactively re-mints comix inside
-    # its lead window and a comix search occasionally pays a COLD (~5-10s) Turnstile
-    # re-clear on the hot path. This knob caps the effective refresh interval: when set
-    # (> 0, SECONDS) the loop treats every held android clearance as due for re-mint at
-    # ``minted_at + this`` whenever that is sooner than the cookie expiry, so a fresh
-    # clearance is always waiting before the empirical re-challenge interval. ``None``
-    # (default) = DISABLED → the historic cookie-expiry-only behavior, byte-for-byte
-    # unchanged (no behavior change ships until an operator sets a value). The VALUE
-    # must be TUNED from a live measurement window — read comix's real re-challenge
-    # cadence from the solve metric (``GET /metrics/per-source-endpoint`` /
-    # ``/metrics/recent``, ``op="solve"`` rows for comix) and the sidecar
-    # ``captured clearance for host comix.to`` log timestamps — then set this BELOW that
-    # interval (minus the ~120s lead) so a search never hits a cold clear. Do NOT guess.
-    android_refresh_max_age_s: float | None = Field(default=None, gt=0)
+    # Bug 5 Lever A (per-source proactive-refresh horizon, MEASURE-FIRST knob). The
+    # android proactive-refresh loop re-mints a held clearance ahead of its COOKIE
+    # expiry. But for kagane.to / mangadot.net the captured cf_clearance cookie carries
+    # a ~1yr nominal expiry that is a LIE — Cloudflare re-challenges far sooner (debug
+    # ``cf-clearance-cookie-expiry-is-not-lapse-time``), so the expiry-driven loop never
+    # proactively re-mints inside its lead window and a search occasionally pays a COLD
+    # (~11s) sidecar re-solve on the hot path. The measured re-challenge lifetime is
+    # PER-SOURCE (kagane ≈ 31 min, mangadot ≈ 248 min / ~4.1 h), so a single GLOBAL
+    # horizon would over-refresh mangadot ~10x and storm the single shared redroid
+    # (#296 single-flight). This map clamps the tracked refresh time to
+    # ``min(cookie_expires, now + lifetime)`` PER source_key — ONLY for sources that
+    # have a configured lifetime; an unconfigured source (comix, mangafire, any future
+    # source) keeps the historic cookie-expiry behavior byte-for-byte. Seed kagane +
+    # mangadot ONLY (#298): comix clears via the WebView eval path (a ``warm_last_key``,
+    # never proactively /solve'd) and mangafire's re-solve is the cheap ~1s path with no
+    # measured horizon — leave both unconfigured so they ride the conservative
+    # cookie-expiry default; the map is operator-extensible if they are later measured.
+    # Margins: kagane measured lapse ≈ 31 min (alive 30.8, dead 31.0) → 1680s (28 min)
+    # re-mints at 1680-120s lead = 26 min, ~5 min before death; mangadot measured lapse
+    # ≈ 248 min (alive 247.9) → 14400s (240 min / 4 h) re-mints at 238 min, ~10 min
+    # before death. Env-overridable as a JSON object
+    # (``GATEWAY_ANDROID_CLEARANCE_LIFETIME_S='{"kagane":1680,"mangadot":14400}'``) and
+    # rides the load_settings TOML→kwargs merge exactly like ``metrics_cors_origins``
+    # (a dict value, same machinery). The VALUE must be TUNED from a live measurement
+    # window — read each source's real re-challenge cadence from the solve metric
+    # (``GET /metrics/per-source-endpoint`` / ``/metrics/recent``, ``op="solve"`` rows)
+    # and the sidecar ``captured clearance`` log timestamps, then set BELOW that
+    # interval (minus the ~120s lead). Do NOT guess.
+    android_clearance_lifetime_s: dict[str, int] = Field(
+        default_factory=lambda: {"kagane": 1680, "mangadot": 14400}
+    )
     # Bug 5 Fix #2 (startup-warm gate). The startup eager warm() is fired NON-BLOCKING,
     # so a comix /search that arrives DURING the warm storm races the in-flight foreign
     # solves: a queued warm/refresh solve can navigate the single shared WebView away
@@ -454,6 +467,27 @@ class Settings(BaseSettings):
                     "remove blank/whitespace-only entries."
                 )
         return origins
+
+    @field_validator("android_clearance_lifetime_s")
+    @classmethod
+    def _reject_nonpositive_clearance_lifetime(
+        cls, lifetimes: dict[str, int]
+    ) -> dict[str, int]:
+        """Reject a non-positive per-source clearance lifetime at construction.
+
+        The map's values are SECOND counts that clamp the proactive-refresh horizon to
+        ``now + lifetime`` (#298). A zero/negative lifetime would clamp the tracked
+        expiry into the past and storm the single shared redroid with back-to-back
+        re-mints, so fail fast at startup (replacing the old single field's ``gt=0``
+        guard at the per-entry level) instead of silently mis-tuning the refresh loop.
+        """
+        for key, lifetime in lifetimes.items():
+            if lifetime <= 0:
+                raise ValueError(
+                    "android_clearance_lifetime_s values must be positive seconds; "
+                    f"source {key!r} has a non-positive lifetime ({lifetime})."
+                )
+        return lifetimes
 
     @field_validator(
         "cloudflare_proxy_server",
