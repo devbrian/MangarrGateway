@@ -101,3 +101,11 @@ docker-compose.dev.yml
 
 .DS_Store
 .playwright-mcp/
+
+# Internal/dev artifacts excluded from the public release (260623-php). These stay
+# on local disk but are NOT published: GSD planning notes (debug sessions, deploy
+# topology, local paths) and the project's Claude dev skills (spike code,
+# source-onboarding + anti-bot/Cloudflare-bypass methodology). Untracked via
+# `git rm -r --cached` in the same change.
+.planning/
+.claude/
