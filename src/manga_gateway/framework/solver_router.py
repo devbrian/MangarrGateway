@@ -269,7 +269,7 @@ class SolverRouter:
     ) -> Any:
         """Delegate the in-WebView JS eval to the ANDROID backend (EVAL-02).
 
-        Unlike the four ``fetch_via_browser*`` passthroughs (which route to
+        Unlike the three ``fetch_via_browser*`` passthroughs (which route to
         ``self._patchright``), this routes to ``self._android`` — the engine that
         owns the Turnstile-cleared redroid WebView the eval runs inside.
         """
@@ -281,7 +281,7 @@ class SolverRouter:
     def device_session(self) -> AbstractAsyncContextManager[None]:
         """Delegate the foreground-device lease to the ANDROID backend (bug 4 Fix C).
 
-        Like :meth:`eval_in_webview` (and unlike the four ``fetch_via_browser*``
+        Like :meth:`eval_in_webview` (and unlike the three ``fetch_via_browser*``
         passthroughs), this routes to ``self._android`` — the engine that owns the
         single redroid. comix wraps its solve+eval sequence in ``async with
         self._solver_from_ctx(ctx).device_session():`` so the android backend's

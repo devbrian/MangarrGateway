@@ -450,8 +450,9 @@ class CloudflareSolver:
         # On-demand keys (``cloudflare_challenge_optional=True``) — ``warm()`` skips
         # them so an intermittent-challenge source is never eager-solved/force-disabled
         # at startup; it solves on-demand when a request hits a live challenge (debug
-        # pooltimeout-recurrence). No patchright source sets this today; threaded for
-        # symmetry with AndroidSolver via the SolverRouter.
+        # pooltimeout-recurrence). MangaFire is an on-demand patchright source
+        # (260623-m5h): its search computes the vrf in-process and answers cold over
+        # httpx, so it defer-solves Cloudflare instead of warming eagerly.
         on_demand_keys: Iterable[str] = (),
         engine: AntibotEngine = "patchright",
         log_browser_events: bool = False,
@@ -564,8 +565,8 @@ class CloudflareSolver:
         solve re-navigates (short-circuiting on the on-disk cookie). There is therefore
         nothing to return cheaply for a peek, so ``solve_if_missing=False`` on a
         non-force call returns ``None`` and defers to the challenge-triggered
-        force-resolve. (No patchright source sets ``cloudflare_challenge_optional``
-        today; this keeps the seam correct for the router's signature pass-through.)
+        force-resolve. (MangaFire sets ``cloudflare_challenge_optional`` — its search
+        answers cold over httpx — so this on-demand peek path is live for patchright.)
         """
         if source_key not in self._cloudflare_keys:
             return None  # MangaDex et al. — no clearance needed
@@ -772,7 +773,7 @@ class CloudflareSolver:
         ``outcome="ok"`` and return the result); and ``page.close()`` on every
         path. ``op`` is the metrics-event op string AND is woven into the wrap
         messages so each primitive's errors stay self-identifying. ``body`` is
-        the ONLY thing that diverges across the one-shot / paginated / typed
+        the ONLY thing that diverges across the one-shot / paginated / parallel-pages
         workers — it receives the open page and returns the worker's result
         (raising :class:`BrowserFetchError` on its own failures).
 
@@ -883,8 +884,8 @@ class CloudflareSolver:
     ) -> None:
         """Route a ``wait_for`` to ``wait_for_function`` vs ``wait_for_selector``.
 
-        Split out of :meth:`_goto_and_wait` (D-02) so the typed worker can wait
-        AFTER typing — independently of the goto — not only at navigation time.
+        Split out of :meth:`_goto_and_wait` (D-02) so all browser primitives share
+        one wait-classification path for navigation readiness.
         ``wait_for=None`` is a no-op. Classifies via :func:`_looks_like_js_predicate`
         (JS predicate → ``wait_for_function``; CSS selector → ``wait_for_selector``)
         and wraps any Playwright failure as a single :class:`BrowserFetchError`.
@@ -1172,7 +1173,7 @@ class CloudflareSolver:
         button, then fan pages 1..P out CONCURRENTLY and merge the deduped row list
         (generic, source-agnostic; #222, spike 014).
 
-        The 4th sibling browser primitive (alongside :meth:`fetch_via_browser`,
+        The third sibling browser primitive (alongside :meth:`fetch_via_browser`,
         :meth:`fetch_via_browser_paginated`). It
         replaces the SEQUENTIAL in-page Next-walk of
         :meth:`fetch_via_browser_paginated` with a PARALLEL browser-page fan-out for
