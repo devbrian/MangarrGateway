@@ -481,9 +481,17 @@ class MangaFireSource(Source):
     # extract above cover residual cross-source contention.
     max_concurrent_jobs = 1
     # D-05: interior pages answer cold over httpx, but declare cloudflare anyway so the
-    # framework keeps a warm browser + clearance for the manifest path and degrades
-    # gracefully on a datacenter host that trips a managed challenge.
+    # framework keeps a (lazily-solved) browser + clearance for the manifest path and
+    # degrades gracefully on a datacenter host that trips a managed challenge.
     antibot = "cloudflare"
+    # 260623-m5h: search now computes the vrf in-process (mangafire_vrf.compute_vrf)
+    # and answers cold over httpx (verified: /filter returns real results with NO
+    # clearance), so do NOT eagerly solve Cloudflare on the request hot path.
+    # Deferred-solve (like mangaball): cold requests go over httpx first, and a real
+    # challenge is detected (is_cf_challenge) → retried with force_resolve. The
+    # manifest path still solves on-demand via fetch_via_browser when the read page
+    # actually challenges.
+    cloudflare_challenge_optional = True
     cloudflare_challenge_url = "https://mangafire.to/"
     # D-04: the image descramble is geometric (done in fetch_image), NOT the response-
     # byte decrypt seam; no session bootstrap.

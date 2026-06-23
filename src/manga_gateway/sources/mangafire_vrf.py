@@ -37,8 +37,9 @@ depends ONLY on the keyword. Corpus-validated 91/91 byte-exact incl. unicode.
 BUILD-ROTATION RECIPE (when tokens stop validating)
 ---------------------------------------------------
 If MangaFire ships a new build hash and ``compute_vrf`` tokens stop returning real
-results from the live ``/filter``, re-extract the constants via the CDP recipe
-backed up at ``~/mfvrf_crack_backup/cdp_scopes.py``:
+results from the live ``/filter``, re-extract the constants via the checked-in CDP
+recipe ``scripts/mangafire_vrf_extract.py`` (run it headed; it prints the refreshed
+``_RC4``/``_SALT``/``_KEY``/``_OPT``/``_SL`` blocks to paste back into this module):
 
   1. Drive a headed patchright Chromium to ``https://mangafire.to/home`` and wait
      for jQuery + the ``input[name=keyword]`` search box.

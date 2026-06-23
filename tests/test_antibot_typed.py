@@ -64,11 +64,14 @@ _DEAD_DRIVER_MSG = "Connection closed while reading from the driver"
 class _FakeKeyboard:
     """Models ``page.keyboard.type(text, delay=...)`` — records every call."""
 
-    def __init__(self, log: list[str]) -> None:
+    def __init__(self, log: list[str], *, type_error: Exception | None = None) -> None:
         self._log = log
+        self._type_error = type_error
         self.type_calls: list[tuple[str, object]] = []
 
     async def type(self, text: str, *, delay: float | None = None) -> None:
+        if self._type_error is not None:
+            raise self._type_error
         self.type_calls.append((text, delay))
         self._log.append("type")
 
@@ -94,7 +97,7 @@ class _FakeTypedPage:
         self.type_error = type_error
         self.evaluate_error = evaluate_error
         self.log: list[str] = []
-        self.keyboard = _FakeKeyboard(self.log)
+        self.keyboard = _FakeKeyboard(self.log, type_error=type_error)
         self.goto_calls: list[tuple[str, dict[str, object]]] = []
         self.click_calls: list[str] = []
         self.wait_function_calls: list[str] = []
@@ -303,6 +306,23 @@ async def test_typed_does_not_retry_on_non_dead_driver_error() -> None:
     assert launches[0] == 1  # no recycle/relaunch
     assert ctx.closed is False
     assert page.closed is True  # finally clause from the single attempt
+    await solver.aclose()
+
+
+async def test_typed_surfaces_keyboard_type_failure_as_browser_fetch_error() -> None:
+    # A keyboard.type failure surfaces as BrowserFetchError (the page.keyboard.type
+    # wrap in _typed_via_browser_once), and the page is still closed on the way out.
+    page = _FakeTypedPage(type_error=RuntimeError("keyboard detached"))
+    ctx = _FakeTypedContext(page)
+    solver, launches = _solver_with_contexts([ctx])
+
+    with pytest.raises(BrowserFetchError) as exc:
+        await solver.fetch_via_browser_typed(
+            _HOME, type_selector=_SELECTOR, type_text=_QUERY, extract=_EXTRACT
+        )
+    assert "keyboard.type" in str(exc.value)
+    assert launches[0] == 1  # no recycle/relaunch
+    assert page.closed is True
     await solver.aclose()
 
 
