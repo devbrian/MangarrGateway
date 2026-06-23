@@ -69,11 +69,6 @@ _BodyResult = TypeVar("_BodyResult")
 _PAGINATE_POLL_TICKS = 20
 _PAGINATE_POLL_INTERVAL = 0.1
 
-# Per-key delay (ms) for ``fetch_via_browser_typed``'s ``page.keyboard.type`` —
-# a small human-plausible cadence so the keystrokes read as trusted input to a
-# page whose token is minted only by ``event.isTrusted`` keyboard events (#192).
-_TYPED_KEY_DELAY_MS = 40
-
 # Default URL the solver navigates to for cf_clearance acquisition. Overridden
 # by the application wiring (app.py lifespan) from the concrete source's
 # metadata — the framework solver itself never names a host. The framework
@@ -389,11 +384,6 @@ class AntiBotSolver(Protocol):
       -> list`` — the same one-shot read PLUS an optional ``page.route()``
       limit-rewrite and an in-page Next-walk that accumulates deduped rows
       across pagination, all inside ONE page lifecycle (#146).
-    * ``async def fetch_via_browser_typed(url, *, type_selector, type_text,
-      extract, wait_for=None, timeout=30.0) -> Any`` — goto→click→
-      ``keyboard.type``→optional post-type wait→evaluate, for tokens minted
-      only by trusted keyboard events (``event.isTrusted``); the ``wait_for``
-      runs AFTER typing (D-01/D-03, #192).
     * ``async def fetch_via_browser_parallel_pages(url, *, extract,
       wait_for=None, last_page_selector, page_param, route_rewrite,
       max_pages=200, timeout=30.0) -> list`` — discovers the page count P via
@@ -460,8 +450,9 @@ class CloudflareSolver:
         # On-demand keys (``cloudflare_challenge_optional=True``) — ``warm()`` skips
         # them so an intermittent-challenge source is never eager-solved/force-disabled
         # at startup; it solves on-demand when a request hits a live challenge (debug
-        # pooltimeout-recurrence). No patchright source sets this today; threaded for
-        # symmetry with AndroidSolver via the SolverRouter.
+        # pooltimeout-recurrence). MangaFire is an on-demand patchright source
+        # (260623-m5h): its search computes the vrf in-process and answers cold over
+        # httpx, so it defer-solves Cloudflare instead of warming eagerly.
         on_demand_keys: Iterable[str] = (),
         engine: AntibotEngine = "patchright",
         log_browser_events: bool = False,
@@ -547,24 +538,6 @@ class CloudflareSolver:
         self._browser_lock: asyncio.Semaphore = asyncio.Semaphore(
             self._browser_concurrency
         )
-        # Typed-search serialization (focus race). Real ``keyboard.type`` (CDP) is
-        # focus-sensitive — only ONE page may hold input focus at a time — so when
-        # ``fetch_concurrency>1`` lets several typed searches drive ``page.click`` +
-        # ``keyboard.type`` on SEPARATE pages of the ONE shared warm context, they
-        # race for focus and the loser's ``page.click`` never finds an actionable
-        # input and hangs the full ~30s (Playwright's default op timeout; no
-        # ``set_default_timeout``), burning the whole per-source fan-out budget
-        # (measured: MangaFire timed out at ~30000ms on 26.4% of searches).
-        # ``fetch_via_browser_typed`` acquires this BEFORE delegating to
-        # ``_browser_call`` (which acquires ``_browser_lock``), establishing the ONE
-        # lock order ``_typed_lock`` → ``_browser_lock``, never the reverse → no
-        # deadlock (nothing else touches ``_typed_lock``). Hardwired to 1 (NOT
-        # ``fetch_concurrency``): at ``fetch_concurrency=1`` it is a harmless no-op
-        # extra gate (``_browser_lock`` is already a 1-semaphore); it only bites at
-        # ``fetch_concurrency>1`` (the patchright default of 3). The one-shot /
-        # paginated / parallel primitives never touch it and stay bounded only by
-        # ``_browser_lock``.
-        self._typed_lock: asyncio.Semaphore = asyncio.Semaphore(1)
 
     # ─────────────────────────── public seam (D-41) ───────────────────────────
 
@@ -592,8 +565,8 @@ class CloudflareSolver:
         solve re-navigates (short-circuiting on the on-disk cookie). There is therefore
         nothing to return cheaply for a peek, so ``solve_if_missing=False`` on a
         non-force call returns ``None`` and defers to the challenge-triggered
-        force-resolve. (No patchright source sets ``cloudflare_challenge_optional``
-        today; this keeps the seam correct for the router's signature pass-through.)
+        force-resolve. (MangaFire sets ``cloudflare_challenge_optional`` — its search
+        answers cold over httpx — so this on-demand peek path is live for patchright.)
         """
         if source_key not in self._cloudflare_keys:
             return None  # MangaDex et al. — no clearance needed
@@ -800,7 +773,7 @@ class CloudflareSolver:
         ``outcome="ok"`` and return the result); and ``page.close()`` on every
         path. ``op`` is the metrics-event op string AND is woven into the wrap
         messages so each primitive's errors stay self-identifying. ``body`` is
-        the ONLY thing that diverges across the one-shot / paginated / typed
+        the ONLY thing that diverges across the one-shot / paginated / parallel-pages
         workers — it receives the open page and returns the worker's result
         (raising :class:`BrowserFetchError` on its own failures).
 
@@ -911,8 +884,8 @@ class CloudflareSolver:
     ) -> None:
         """Route a ``wait_for`` to ``wait_for_function`` vs ``wait_for_selector``.
 
-        Split out of :meth:`_goto_and_wait` (D-02) so the typed worker can wait
-        AFTER typing — independently of the goto — not only at navigation time.
+        Split out of :meth:`_goto_and_wait` (D-02) so all browser primitives share
+        one wait-classification path for navigation readiness.
         ``wait_for=None`` is a no-op. Classifies via :func:`_looks_like_js_predicate`
         (JS predicate → ``wait_for_function``; CSS selector → ``wait_for_selector``)
         and wraps any Playwright failure as a single :class:`BrowserFetchError`.
@@ -926,155 +899,6 @@ class CloudflareSolver:
                 await page.wait_for_selector(wait_for, timeout=timeout_ms)
         except Exception as exc:  # noqa: BLE001
             raise BrowserFetchError(f"wait_for {wait_for!r} failed: {exc}") from exc
-
-    # ``timeout`` is the per-call Playwright operation budget (goto/click/type/
-    # wait_for/evaluate each receive ``timeout``), NOT a cancellation wrapper —
-    # same justification as ``fetch_via_browser``.
-    async def fetch_via_browser_typed(
-        self,
-        url: str,
-        *,
-        type_selector: str,
-        type_text: str,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — op-budget kwarg, see comment above
-    ) -> Any:
-        """Navigate ``url``, type ``type_text`` into ``type_selector`` with REAL
-        keyboard events, then read ``extract`` from the rendered DOM (D-01/D-03).
-
-        The third sibling browser primitive (alongside :meth:`fetch_via_browser`
-        and :meth:`fetch_via_browser_paginated`). It exists for sites whose token
-        is minted ONLY by trusted keyboard events (``event.isTrusted``): MangaFire
-        keyword search mints its per-query ``vrf`` only when the keyword is typed
-        via real ``page.keyboard.type`` — a synthetic ``dispatchEvent`` does not
-        fire it (verified live, issue #192). So this primitive drives
-        ``page.click(type_selector)`` + ``page.keyboard.type(type_text)`` in the
-        warm context and returns whatever the page's own JS produced (e.g. the
-        captured token read back via ``extract``).
-
-        Interaction shape: ``goto(wait_until="commit")`` → ``page.click`` →
-        ``page.keyboard.type`` → optional post-type ``wait_for`` → ``evaluate``.
-        The ``wait_for`` runs AFTER typing (the token only exists once the page's
-        keyup handler has run), unlike :meth:`fetch_via_browser` where it gates
-        the read right after goto. Everything else — the bounded ``_browser_lock``,
-        the single ``browser`` metrics emit, the page-close discipline — is shared
-        with the other primitives via :meth:`_browser_call` (D-02).
-
-        Like the other two primitives this is OFF the ``runtime_checkable``
-        ``AntiBotSolver`` Protocol (D-41); sources detect it via ``hasattr``.
-
-        Dead-driver recovery (#54): a :func:`_looks_like_dead_driver`
-        ``BrowserFetchError`` on the first attempt triggers exactly ONE
-        ``recycle_now`` + retry against a fresh context (same retry-once cap as
-        :meth:`fetch_via_browser`).
-
-        Args:
-            url: The full URL to navigate to (the page hosting the search input).
-            type_selector: CSS selector for the input element to click + type into.
-            type_text: The text to type with real per-key keyboard events (the
-                search query). Gateway-controlled — echoed into a third-party page.
-            extract: A JS function body returning a JSON-serializable value,
-                wrapped by the framework as ``async () => { ...extract... }`` so it
-                can ``await`` and ``return`` (typically the captured token).
-            wait_for: Optional POST-type readiness wait (CSS selector or JS
-                predicate, routed exactly like :meth:`fetch_via_browser`). Runs
-                after the keyboard type, before the evaluate read.
-            timeout: Seconds budget for goto + click + type + wait_for + evaluate.
-
-        Returns:
-            Whatever the ``extract`` body returns (the page-produced value, RAW —
-            this primitive fetches NOTHING; callers re-validate any URL/token).
-
-        Raises:
-            BrowserFetchError: navigation/click/type/wait/evaluate failed or the
-                context could not be acquired (after the single dead-driver retry).
-        """
-        # Serialize the ENTIRE typed interaction (focus race) — outer half of the
-        # ONE lock order ``_typed_lock`` → ``_browser_lock`` (the inner
-        # ``_browser_call`` takes ``_browser_lock``). Wrapping the whole try/except
-        # — both attempts AND the dead-driver recycle — keeps a mid-recovery retry
-        # from releasing the keyboard to a racing typed call.
-        async with self._typed_lock:
-            try:
-                return await self._typed_via_browser_once(
-                    url,
-                    type_selector=type_selector,
-                    type_text=type_text,
-                    extract=extract,
-                    wait_for=wait_for,
-                    timeout=timeout,
-                    attempt=1,
-                )
-            except BrowserFetchError as exc:
-                if not _looks_like_dead_driver(exc):
-                    raise
-                # Driver died — drop the cached zombie context and retry once
-                # against a freshly launched one. Identical rationale to
-                # fetch_via_browser's dead-driver wrapper (the recycle also clears
-                # the held Clearance, so the next solve runs a fresh CF warm —
-                # correct, not a regression).
-                _log.warning(
-                    "fetch_via_browser_typed: dead-driver signal detected — "
-                    "recycling browser context and retrying once (url=%s)",
-                    url,
-                )
-                await self._lifecycle.recycle_now()
-                return await self._typed_via_browser_once(
-                    url,
-                    type_selector=type_selector,
-                    type_text=type_text,
-                    extract=extract,
-                    wait_for=wait_for,
-                    timeout=timeout,
-                    attempt=2,
-                )
-
-    async def _typed_via_browser_once(
-        self,
-        url: str,
-        *,
-        type_selector: str,
-        type_text: str,
-        extract: str,
-        wait_for: str | None,
-        timeout: float,  # noqa: ASYNC109 — same justification as fetch_via_browser
-        attempt: int,
-    ) -> Any:
-        """One attempt of the goto → click → type → wait → evaluate sequence.
-
-        The lock/context/page/metrics/close envelope is owned by the shared
-        :meth:`_browser_call` helper (D-02); the divergent body is the
-        click + ``keyboard.type`` pair (the ONLY new behavior over the one-shot
-        read) plus the post-type wait and the reused evaluate read. Split out so
-        the public method can wrap a single dead-driver retry around it.
-        """
-        timeout_ms = int(timeout * 1000)
-
-        async def _body(page: Any) -> Any:
-            # No wait at goto — the token only exists AFTER the keyup handler runs,
-            # so navigate with the bare commit-wait and apply ``wait_for`` post-type.
-            await self._goto_and_wait(page, url, None, timeout_ms)
-            try:
-                await page.click(type_selector)
-            except Exception as exc:  # noqa: BLE001
-                raise BrowserFetchError(
-                    f"page.click {type_selector!r} failed: {exc}"
-                ) from exc
-            try:
-                # A small human-plausible per-key delay (ms) so the keystrokes
-                # read as real input to the page's keyup handler (issue #192).
-                await page.keyboard.type(type_text, delay=_TYPED_KEY_DELAY_MS)
-            except Exception as exc:  # noqa: BLE001
-                raise BrowserFetchError(f"page.keyboard.type failed: {exc}") from exc
-            await self._apply_wait(page, wait_for, timeout_ms)
-            return await _evaluate_guarded(
-                page, "async () => { " + extract + " }", timeout
-            )
-
-        return await self._browser_call(
-            url, op="fetch_via_browser_typed", attempt=attempt, body=_body
-        )
 
     # ``timeout`` is the per-call Playwright operation budget (goto/wait_for and
     # each evaluate receive ``timeout``), NOT a cancellation wrapper — same
@@ -1349,8 +1173,8 @@ class CloudflareSolver:
         button, then fan pages 1..P out CONCURRENTLY and merge the deduped row list
         (generic, source-agnostic; #222, spike 014).
 
-        The 4th sibling browser primitive (alongside :meth:`fetch_via_browser`,
-        :meth:`fetch_via_browser_paginated`, :meth:`fetch_via_browser_typed`). It
+        The third sibling browser primitive (alongside :meth:`fetch_via_browser`,
+        :meth:`fetch_via_browser_paginated`). It
         replaces the SEQUENTIAL in-page Next-walk of
         :meth:`fetch_via_browser_paginated` with a PARALLEL browser-page fan-out for
         sites whose long lists paginate via a ``?page=N`` URL the SPA reads on first

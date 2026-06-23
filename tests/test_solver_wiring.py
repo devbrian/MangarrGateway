@@ -96,10 +96,11 @@ async def test_on_demand_source_wired_into_warm_skip_and_bootstrap_peek() -> Non
     async with app.router.lifespan_context(app):
         solver = app.state.solver
         assert isinstance(solver, SolverRouter)
-        # (a) warm-skip wiring: mangaball is on-demand on the Android leg; the
-        # Patchright leg has no on-demand source.
+        # (a) warm-skip wiring: mangaball is on-demand on the Android leg; mangafire
+        # is on-demand on the Patchright leg (260623-m5h: search computes the vrf
+        # in-process and answers cold over httpx, so it defer-solves Cloudflare).
         assert "mangaball" in solver._android._on_demand_keys
-        assert solver._patchright._on_demand_keys == frozenset()
+        assert solver._patchright._on_demand_keys == frozenset({"mangafire"})
 
         # (b) bootstrap provider peeks for an on-demand source, stays eager otherwise.
         calls: list[tuple[str, dict[str, object]]] = []

@@ -2,11 +2,13 @@
 
 MangaFire (``https://mangafire.to``) is a PHP/jQuery server-rendered HTML + AJAX
 site whose download + keyword-search AJAX endpoints are gated by a per-request
-``vrf`` token that is **captured from the warm browser, never reverse-engineered**
-(issue #192, live-verified 2026-06-09 + cross-checked against the Keiyoushi/Mihon
-``src/all/mangafire`` extension). It adds **zero networking glue** — every outbound
-call is ``ctx.get_json`` / ``ctx.get_bytes`` / ``solver.fetch_via_browser*``
-(SRC-01/SRC-02).
+``vrf`` token. The DOWNLOAD (read-page) ``vrf`` is **captured from the warm
+browser** (issue #192, live-verified 2026-06-09 + cross-checked against the
+Keiyoushi/Mihon ``src/all/mangafire`` extension); the SEARCH ``vrf`` has been
+**reverse-engineered** to a pure-Python generator (``mangafire_vrf.compute_vrf``,
+build ``scripts.js?69b68df23``) so search needs no browser at all. It adds **zero
+networking glue** — every outbound call is ``ctx.get_json`` / ``ctx.get_bytes`` /
+``solver.fetch_via_browser*`` (SRC-01/SRC-02).
 
 Each of the four ``Source`` hooks copies a DIFFERENT existing analog:
 
@@ -22,10 +24,10 @@ Each of the four ``Source`` hooks copies a DIFFERENT existing analog:
 * **fetch_image** — ``ctx.get_bytes`` of the fragment-stripped URL + a geometric
   piece-shuffle descramble when ``offset>0`` (port of Keiyoushi ``ImageInterceptor.kt``
   in Pillow, offloaded via ``to_thread``) (D-11/D-12).
-* **search** — type the keyword via the ``fetch_via_browser_typed`` real-keyboard
-  primitive (Plan 12-01), capture the search ``vrf`` from ``performance``, then
-  ``ctx.get_bytes(/filter?keyword=…&vrf=…)``, parse cards, fan out, GAP-2 mint-after-
-  slice (D-13).
+* **search** — compute the per-keyword search ``vrf`` IN-PROCESS via
+  ``compute_vrf(query)`` (a pure stdlib reimplementation of the site's token — no
+  browser, no per-query cache), then ``ctx.get_bytes(/filter?keyword=…&vrf=…)``,
+  parse cards, fan out, GAP-2 mint-after-slice (D-13).
 
 This module (Task 1) holds ONLY the module-level constants + pure functions; the
 concrete ``MangaFireSource`` class lands in Task 2.
@@ -51,7 +53,6 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urldefrag, urlencode, urljoin, urlparse
 
 import lxml.html
-from cachetools import LRUCache
 from PIL import Image, UnidentifiedImageError
 
 from ..framework.base import Source
@@ -61,6 +62,7 @@ from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
+from .mangafire_vrf import compute_vrf
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
@@ -113,11 +115,6 @@ _PREFERRED_ZONE_ATTR = "_mangafire_preferred_cdn_zone"
 PIECE_SIZE = 200
 MIN_SPLIT_COUNT = 5
 
-# ── per-query vrf LRU cache size (D-13). The cache instance itself lives on the
-# MangaFireSource instance (Task 2) so it never leaks across instances/tests; this
-# is the size knob (Claude's discretion per the plan artifacts list). ─────────────
-_VRF_CACHE_MAXSIZE = 20
-
 # ── control-flow constants (mirror atsumaru/weebcentral) ───────────────────────
 # search() deep-enumerates at most this many title candidates (GAP-1 lock).
 _DEFAULT_TITLE_CANDIDATES = 5
@@ -129,8 +126,6 @@ _CHAPTERS_FANOUT_CONCURRENCY = 6
 _RECENT_TITLE_CAP = 20
 # Default chapter language when the request carries no language filter.
 _DEFAULT_LANGUAGE = "en"
-# The keyword <input> the typed primitive drives (D-13).
-_SEARCH_INPUT_SELECTOR = ".search-inner input[name=keyword]"
 
 # ── fetch_manifest contention retry (debug mangafire-manifest-contention) ──────
 # Under concurrent browser navs the in-page manifest capture intermittently yields
@@ -184,25 +179,6 @@ _IMAGE_LIST_EXTRACT_JS = """
     await sleep(500);
   }
   return [];
-"""
-
-# search (D-13): after the keyword is TYPED (real keyboard), the site's debounced
-# handler fires `/ajax/manga/search?…&vrf=…`; find it in `performance` entries and
-# return the captured vrf. The SAME vrf works on `/filter` (Keiyoushi proves it).
-_SEARCH_VRF_EXTRACT_JS = """
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  for (let i = 0; i < 60; i++) {
-    const hit = performance
-      .getEntriesByType('resource')
-      .map((e) => e.name)
-      .find((u) => u.includes('/ajax/manga/search') && u.includes('vrf='));
-    if (hit) {
-      const m = hit.match(/[?&]vrf=([^&]+)/);
-      if (m) return decodeURIComponent(m[1]);
-    }
-    await sleep(500);
-  }
-  return null;
 """
 
 
@@ -505,9 +481,17 @@ class MangaFireSource(Source):
     # extract above cover residual cross-source contention.
     max_concurrent_jobs = 1
     # D-05: interior pages answer cold over httpx, but declare cloudflare anyway so the
-    # framework keeps a warm browser + clearance for the manifest path and degrades
-    # gracefully on a datacenter host that trips a managed challenge.
+    # framework keeps a (lazily-solved) browser + clearance for the manifest path and
+    # degrades gracefully on a datacenter host that trips a managed challenge.
     antibot = "cloudflare"
+    # 260623-m5h: search now computes the vrf in-process (mangafire_vrf.compute_vrf)
+    # and answers cold over httpx (verified: /filter returns real results with NO
+    # clearance), so do NOT eagerly solve Cloudflare on the request hot path.
+    # Deferred-solve (like mangaball): cold requests go over httpx first, and a real
+    # challenge is detected (is_cf_challenge) → retried with force_resolve. The
+    # manifest path still solves on-demand via fetch_via_browser when the read page
+    # actually challenges.
+    cloudflare_challenge_optional = True
     cloudflare_challenge_url = "https://mangafire.to/"
     # D-04: the image descramble is geometric (done in fetch_image), NOT the response-
     # byte decrypt seam; no session bootstrap.
@@ -541,26 +525,20 @@ class MangaFireSource(Source):
     # proxy. Search + the read-page CF solve are never given a pool (unchanged).
     image_fetch_via_proxy_pool = True
 
-    def __init__(self) -> None:
-        super().__init__()
-        # Per-query vrf cache (D-13): a repeat search on the same keyword reuses the
-        # captured vrf and skips the typed browser nav. Instance-scoped so it never
-        # leaks across instances/tests.
-        self._vrf_cache: LRUCache[str, str] = LRUCache(maxsize=_VRF_CACHE_MAXSIZE)
-
     # ─────────────────────────────── search ──────────────────────────────────
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
         """Keyword search → per-chapter Releases (SRCH-01..07, D-13).
 
-        Three-step live flow: (1) type the keyword via the ``fetch_via_browser_typed``
-        real-keyboard primitive (Plan 12-01) and capture the search ``vrf`` from
-        ``performance`` (cached per query, LRU); (2) ``ctx.get_bytes`` the vrf'd
-        ``/filter`` HTML and prune the title-only cards to the candidate cap;
-        (3) deep-enumerate each candidate's chapter list under a bounded semaphore,
-        filter by :meth:`chapter_matches`, slice to ``req.limit``, and ONLY THEN mint
-        (GAP-2 mint-after-slice — a long title would otherwise evict the returned
-        releases' own handles). Zero networking glue (SRC-01/02).
+        Three-step live flow: (1) compute the search ``vrf`` IN-PROCESS via
+        ``compute_vrf(query)`` — a pure stdlib reimplementation of the site's
+        per-keyword token, so there is NO browser nav and NO per-query vrf cache;
+        (2) ``ctx.get_bytes`` the vrf'd ``/filter`` HTML and prune the title-only
+        cards to the candidate cap; (3) deep-enumerate each candidate's chapter list
+        under a bounded semaphore, filter by :meth:`chapter_matches`, slice to
+        ``req.limit``, and ONLY THEN mint (GAP-2 mint-after-slice — a long title would
+        otherwise evict the returned releases' own handles). Zero networking glue
+        (SRC-01/02).
         """
         query = req.query or ""
         if not query:
@@ -568,23 +546,7 @@ class MangaFireSource(Source):
         lang = self._filter_language(req.languages)
 
         async def _resolve_fn() -> list[dict[str, Any]]:
-            vrf = self._vrf_cache.get(query)
-            if vrf is None:
-                solver = self._solver_from_ctx(ctx, need_typed=True)
-                captured = await solver.fetch_via_browser_typed(
-                    f"{self.base_url}/home",
-                    type_selector=_SEARCH_INPUT_SELECTOR,
-                    type_text=query,
-                    extract=_SEARCH_VRF_EXTRACT_JS,
-                    wait_for=None,
-                    timeout=60.0,
-                )
-                if not isinstance(captured, str) or not captured:
-                    raise SourceError(
-                        "source_unavailable", "mangafire search vrf capture failed"
-                    )
-                vrf = captured
-                self._vrf_cache[query] = vrf
+            vrf = compute_vrf(query)
             params = urlencode(
                 {"keyword": query, "language[]": lang, "page": 1, "vrf": vrf}
             )
@@ -598,7 +560,7 @@ class MangaFireSource(Source):
             )
 
         # Layer 1 (D-01): cache the title→pruned-candidate resolution so a repeat
-        # chapter search on the same (query, languages) skips the typed nav + /filter.
+        # chapter search on the same (query, languages) skips the /filter fetch.
         candidates: list[dict[str, Any]] = await ctx.cached_resolve(
             ctx.cached_resolve_key(_normalize(query), req.languages or []),
             _resolve_fn,
@@ -1014,25 +976,20 @@ class MangaFireSource(Source):
         return await asyncio.to_thread(_parse_chapter_list, result)
 
     @staticmethod
-    def _solver_from_ctx(ctx: SourceContext, *, need_typed: bool = False) -> Any:
+    def _solver_from_ctx(ctx: SourceContext) -> Any:
         """Pull the AntiBotSolver out of ``ctx`` for the browser-fetch paths (D-41).
 
         The framework wires the solver into ``SourceContext`` for any ``cloudflare*``
-        source. ``fetch_manifest`` needs the one-shot ``fetch_via_browser`` primitive;
-        ``search`` ALSO needs the off-Protocol ``fetch_via_browser_typed`` real-keyboard
-        primitive (``need_typed=True``). Raises ``SourceError`` when the solver is
-        missing OR lacks a required primitive (a wiring bug, not a runtime condition).
+        source. ``fetch_manifest`` needs the one-shot ``fetch_via_browser`` primitive
+        (``search`` no longer drives the browser — it computes the ``vrf`` in-process).
+        Raises ``SourceError`` when the solver is missing OR lacks ``fetch_via_browser``
+        (a wiring bug, not a runtime condition).
         """
         solver = getattr(ctx, "_solver", None)
         if solver is None or not hasattr(solver, "fetch_via_browser"):
             raise SourceError(
                 "source_unavailable",
                 "mangafire browser-fetch requires a solver with fetch_via_browser",
-            )
-        if need_typed and not hasattr(solver, "fetch_via_browser_typed"):
-            raise SourceError(
-                "source_unavailable",
-                "mangafire search requires a solver with fetch_via_browser_typed",
             )
         return solver
 

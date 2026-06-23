@@ -15,9 +15,11 @@ Anti-bot expectations (D-16)
   browser + clearance for the browser-DOM manifest path (the reader page mints the
   per-request vrf) and degrades gracefully on a datacenter host that trips a managed
   challenge.
-* ``needs_solver_warm = True`` — both the manifest (``fetch_via_browser``) and search
-  (``fetch_via_browser_typed`` real-keyboard) paths require a warm Patchright context,
-  so the harness must ``await solver.warm()`` before issuing requests.
+* ``needs_solver_warm = True`` — the manifest (``fetch_via_browser``) path requires a
+  warm Patchright context, so the harness must ``await solver.warm()`` before issuing
+  requests. Search no longer touches the browser: the per-query vrf is now derived
+  in-process via ``compute_vrf`` (pure Python, PR #313), not minted by real-keyboard
+  typing in a warm browser context.
 
 RESIDENTIAL-ONLY caveat + ONE-ATTRIBUTE escalation path (D-12)
 --------------------------------------------------------------

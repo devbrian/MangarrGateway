@@ -18,13 +18,13 @@ backend owns the key — detected via ``inspect.signature`` exactly like context
 lifespan force-disables exactly the failed sources across both engines); ``aclose()``
 closes BOTH (each guarded so one failure does not skip the other).
 
-Beyond the clearance Protocol the router ALSO passes through the four off-Protocol
+Beyond the clearance Protocol the router ALSO passes through the three off-Protocol
 browser primitives (``fetch_via_browser`` / ``fetch_via_browser_paginated`` /
-``fetch_via_browser_typed`` / ``fetch_via_browser_parallel_pages``, D-41) so that
+``fetch_via_browser_parallel_pages``, D-41) so that
 swapping the bare :class:`CloudflareSolver` for this router as ``app.state.solver``
 does not break a source's ``_solver_from_ctx`` ``hasattr`` gate (comix uses
-``fetch_via_browser`` + ``fetch_via_browser_parallel_pages``; MangaFire keyword search
-uses the typed one). All delegate to the patchright backend (the only engine with a real
+``fetch_via_browser`` + ``fetch_via_browser_parallel_pages``). All delegate to the
+patchright backend (the only engine with a real
 browser; the android backend is a WebView-clearance sidecar with no browser and never
 needs these), keeping criterion 4 "comix unaffected" true.
 """
@@ -73,17 +73,6 @@ class _BrowserFetchSolver(Protocol):
         max_pages: int = 200,
         timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
     ) -> list[Any]: ...
-
-    async def fetch_via_browser_typed(
-        self,
-        url: str,
-        *,
-        type_selector: str,
-        type_text: str,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
-    ) -> Any: ...
 
     async def fetch_via_browser_parallel_pages(
         self,
@@ -263,33 +252,6 @@ class SolverRouter:
             timeout=timeout,
         )
 
-    async def fetch_via_browser_typed(
-        self,
-        url: str,
-        *,
-        type_selector: str,
-        type_text: str,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — matches CloudflareSolver's op-budget kwarg
-    ) -> Any:
-        """Delegate the real-keyboard browser-DOM read to the patchright backend (D-41).
-
-        MangaFire keyword search's ``_solver_from_ctx`` ``hasattr`` gate runs against
-        the production ``app.state.solver`` — which is THIS router — so the router must
-        expose the typed primitive too. Always delegates to ``self._patchright`` (the
-        android backend has no real browser).
-        """
-        backend = cast("_BrowserFetchSolver", self._patchright)
-        return await backend.fetch_via_browser_typed(
-            url,
-            type_selector=type_selector,
-            type_text=type_text,
-            extract=extract,
-            wait_for=wait_for,
-            timeout=timeout,
-        )
-
     # ── off-Protocol in-WebView eval (EVAL-02) — pass-through for comix ──────────
     # The INVERSE of the four browser passthroughs above: this delegates to the
     # ANDROID backend, NOT patchright. comix runs its in-page token-mint /
@@ -307,7 +269,7 @@ class SolverRouter:
     ) -> Any:
         """Delegate the in-WebView JS eval to the ANDROID backend (EVAL-02).
 
-        Unlike the four ``fetch_via_browser*`` passthroughs (which route to
+        Unlike the three ``fetch_via_browser*`` passthroughs (which route to
         ``self._patchright``), this routes to ``self._android`` — the engine that
         owns the Turnstile-cleared redroid WebView the eval runs inside.
         """
@@ -319,7 +281,7 @@ class SolverRouter:
     def device_session(self) -> AbstractAsyncContextManager[None]:
         """Delegate the foreground-device lease to the ANDROID backend (bug 4 Fix C).
 
-        Like :meth:`eval_in_webview` (and unlike the four ``fetch_via_browser*``
+        Like :meth:`eval_in_webview` (and unlike the three ``fetch_via_browser*``
         passthroughs), this routes to ``self._android`` — the engine that owns the
         single redroid. comix wraps its solve+eval sequence in ``async with
         self._solver_from_ctx(ctx).device_session():`` so the android backend's
