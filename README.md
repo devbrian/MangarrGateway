@@ -121,10 +121,12 @@ published images instead of building:
 # latest:
 docker compose -f docker-compose.release.yml up -d
 # pin a specific release (recommended):
-MANGA_GATEWAY_VERSION=v1.0.0 docker compose -f docker-compose.release.yml up -d
+MANGA_GATEWAY_VERSION=1.0.0 docker compose -f docker-compose.release.yml up -d
 ```
 
 `MANGA_GATEWAY_VERSION` pins both owned images to one release (default `latest`).
+**Image tags drop the leading `v`** — the git tag is `v1.0.0`, but the image tag
+is `1.0.0` (use `1.0.0`, not `v1.0.0`).
 Then read the auto-generated API key and call the API:
 
 ```bash

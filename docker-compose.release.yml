@@ -6,8 +6,8 @@
 #
 #     # latest:
 #     docker compose -f docker-compose.release.yml up -d
-#     # pin a release:
-#     MANGA_GATEWAY_VERSION=v1.0.0 docker compose -f docker-compose.release.yml up -d
+#     # pin a release (image tags drop the leading `v`: use 1.0.0, not v1.0.0):
+#     MANGA_GATEWAY_VERSION=1.0.0 docker compose -f docker-compose.release.yml up -d
 #
 # Images (gateway + android-solver are published by .github/workflows/docker-publish.yml
 # on every `v*` tag; redroid is the upstream third-party Android image):
