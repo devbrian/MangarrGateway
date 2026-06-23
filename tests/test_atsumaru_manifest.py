@@ -23,9 +23,11 @@ from typing import Any
 import pytest
 
 from manga_gateway.framework.errors import SourceError
-from manga_gateway.sources.atsumaru import AtsumaruSource
+from manga_gateway.sources.atsumaru import AtsumaruSource, _is_allowed_image_url
 
 _BASE = "https://atsu.moe"
+# Page images live on the CDN host (#306); the JSON API (read/chapter) stays on _BASE.
+_IMG_BASE = "https://cdn.atsu.moe"
 _READ = f"{_BASE}/api/read/chapter"
 
 
@@ -71,9 +73,9 @@ async def test_fetch_manifest_splits_composite_and_prefixes_urls_in_order() -> N
     urls = await AtsumaruSource().fetch_manifest("sVC2A:gGfRS", ctx)  # type: ignore[arg-type]
 
     assert urls == [
-        f"{_BASE}/static/pages/cmgz/gGfRS/0.webp",
-        f"{_BASE}/static/pages/cmgz/gGfRS/1.webp",
-        f"{_BASE}/static/pages/cmgz/gGfRS/2.webp",
+        f"{_IMG_BASE}/static/pages/cmgz/gGfRS/0.webp",
+        f"{_IMG_BASE}/static/pages/cmgz/gGfRS/1.webp",
+        f"{_IMG_BASE}/static/pages/cmgz/gGfRS/2.webp",
     ]
     # BOTH ids reach read/chapter — mangaId is Zod-required (value not re-validated).
     assert len(ctx.calls) == 1
@@ -149,3 +151,45 @@ async def test_fetch_manifest_pages_integrity_passes_on_match() -> None:
     )
     urls = await AtsumaruSource().fetch_manifest("sVC2A:gGfRS", ctx)  # type: ignore[arg-type]
     assert len(urls) == 2
+
+
+# ───────────────────── _is_allowed_image_url direct SSRF tests ─────────────────────
+# Mirror the mangadot/mangaball/projectsuki direct-allowlist test shape: assert the
+# CDN host (#306) is accepted, the legacy host is retained, and every off-host /
+# off-shape / non-https / traversal URL is rejected.
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://cdn.atsu.moe/static/pages/cmgz/gGfRS/0.webp",
+        "https://cdn.atsu.moe/static/pages/cmgz/gGfRS/0.jpg",
+        "https://cdn.atsu.moe/static/pages/cmgz/gGfRS/0.jpeg",
+        "https://cdn.atsu.moe/static/pages/cmgz/gGfRS/0.png",
+        # Legacy host retained (harmless; API host unchanged, future un-migration safe).
+        "https://atsu.moe/static/pages/cmgz/gGfRS/0.webp",
+        "https://www.atsu.moe/static/pages/cmgz/gGfRS/0.webp",
+    ],
+)
+def test_is_allowed_image_url_accepts_cdn_and_legacy_hosts(url: str) -> None:
+    assert _is_allowed_image_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Off-host — the CDN-migration fix must not open up arbitrary hosts.
+        "https://evil.com/static/pages/c/g/0.webp",
+        # Off-shape / off-namespace on the allowlisted CDN host.
+        "https://cdn.atsu.moe/api/secret/0.webp",
+        # Non-https scheme.
+        "http://cdn.atsu.moe/static/pages/c/g/0.webp",
+        # Path traversal (literal ``..`` segments).
+        "https://cdn.atsu.moe/static/../api/secret.webp",
+        "https://cdn.atsu.moe/static/pages/../../etc/passwd",
+    ],
+)
+def test_is_allowed_image_url_rejects_off_host_off_shape_and_traversal(
+    url: str,
+) -> None:
+    assert _is_allowed_image_url(url) is False
