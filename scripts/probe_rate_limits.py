@@ -787,7 +787,7 @@ async def _capture_warmup(
         return result
 
     # ── manifest (best-effort) ──
-    record = ctx.handle_store.resolve(releases[0].download_handle)
+    record = await ctx.handle_store.resolve(releases[0].download_handle)
     if record is None:
         result.note_skip(_CATEGORY_MANIFEST, "download_handle did not resolve")
         result.note_skip(_CATEGORY_IMAGE, "download_handle did not resolve")
@@ -1860,7 +1860,9 @@ async def _resolve_proxy_candidates(
 
 def _build_live_seams(
     source: Source, source_cls: type[Source], proxy: ProxyEntry | None
-) -> tuple[InstrumentedTransport, NoopSolver | CloudflareSolver | AndroidSolver, SourceContext]:
+) -> tuple[
+    InstrumentedTransport, NoopSolver | CloudflareSolver | AndroidSolver, SourceContext
+]:
     """Construct the per-proxy seams (transport/solver/context) for one live attempt.
 
     Built per attempt so rotate-on-failure gets a fresh transport + solver bound to the
@@ -1888,9 +1890,13 @@ def _build_live_seams(
 
 
 async def _close_seams(
-    transport: InstrumentedTransport, solver: NoopSolver | CloudflareSolver | AndroidSolver
+    transport: InstrumentedTransport,
+    solver: NoopSolver | CloudflareSolver | AndroidSolver,
 ) -> None:
-    """Tear down a live attempt's transport + browser/android solver before rotate/exit."""
+    """Tear down a live attempt's transport + browser/android solver before rotate/exit.
+
+    Closes the instrumented transport, then the CF/android browser solver if present.
+    """
     await transport.aclose()
     if isinstance(solver, CloudflareSolver):
         with contextlib.suppress(Exception):
