@@ -879,7 +879,16 @@ class MangaFireSource(Source):
             body = await ctx.get_json(url, vrf=vrf)
             result = body.get("result") if isinstance(body, dict) else None
             images = result.get("images") if isinstance(result, dict) else None
-            if isinstance(images, list) and images:
+            # A malformed envelope (missing/non-dict result, non-list images) is a hard
+            # contract break, NOT a transient empty capture — fail fast instead of
+            # burning the retry budget on a misleading "empty image list" (CodeRabbit
+            # #319). Only an actual empty list ([]) is retryable below.
+            if not isinstance(images, list):
+                raise SourceError(
+                    "source_unavailable",
+                    f"malformed mangafire image list for chapter {item_id}",
+                )
+            if images:
                 return images
         raise SourceError(
             "source_unavailable", f"empty mangafire image list for chapter {item_id}"

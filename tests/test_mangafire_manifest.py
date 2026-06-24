@@ -200,6 +200,29 @@ async def test_fetch_manifest_empty_image_list_raises(_no_sleep: None) -> None:
     assert len(ctx.image_calls) == _MANIFEST_EMPTY_RETRIES + 1
 
 
+@pytest.mark.parametrize(
+    "bad_body",
+    [
+        {"result": None},  # non-dict result
+        {"result": {}},  # missing images key
+        {"result": {"images": "nope"}},  # non-list images
+        {"not": "a result envelope"},  # missing result
+    ],
+)
+@pytest.mark.asyncio
+async def test_fetch_manifest_malformed_image_list_fails_fast(
+    _no_sleep: None, bad_body: Any
+) -> None:
+    """A malformed image-list envelope fails fast (no retry budget burned) with a
+    distinct 'malformed' error — NOT the misleading 'empty image list' (CodeRabbit
+    #319). Only an actual empty list is retryable."""
+    ctx = _ctx(image_bodies=[bad_body])
+    with pytest.raises(SourceError, match="malformed mangafire image list"):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    # Failed on the FIRST attempt — the empty-list retry budget was not spent.
+    assert len(ctx.image_calls) == 1
+
+
 @pytest.mark.asyncio
 async def test_fetch_manifest_retries_empty_then_succeeds(_no_sleep: None) -> None:
     """An empty image list on the first try is re-fetched; the retry's list succeeds."""
