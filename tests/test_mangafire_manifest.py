@@ -1,18 +1,26 @@
-"""Unit tests for ``MangaFireSource.fetch_manifest`` — browser capture + SSRF + offset.
+"""Unit tests for ``MangaFireSource.fetch_manifest`` — browserless httpx, SSRF, offset.
 
-The read page is navigated in the warm browser via ``solver.fetch_via_browser`` with
-``_IMAGE_LIST_EXTRACT_JS``; the extract returns ``[[url, offset], …]`` captured from
-the reader's auto-fired vrf'd AJAX (D-08). ``fetch_manifest``:
+The manifest is derived in PURE PYTHON over httpx (issue #314, no browser): two signed
+reader AJAX calls, each signed in-process with ``mangafire_vrf.compute_vrf`` over the
+``@``-joined path identifiers (the SAME pipeline PR #313 cracked for search):
+
+  1. ``GET /ajax/read/{slug}/chapter/{lang}?vrf=compute_vrf("{slug}@chapter@{lang}")``
+     → reader chapter list HTML whose ``<a data-id data-number>`` rows map the read
+     href's ``chapter-{number}`` to its reader ``itemId``;
+  2. ``GET /ajax/read/chapter/{itemId}?vrf=compute_vrf("chapter@{itemId}")``
+     → ``{"result":{"images":[[url, _, offset], …]}}`` (server-minted page URLs).
+
+``fetch_manifest`` then:
 
 * rejects a malformed (non-``/read/``) chapter id;
-* pulls the solver via ``_solver_from_ctx`` (raises ``source_unavailable`` if absent);
-* SSRF-allowlists EVERY captured URL (fragment stripped first) — raising on the first
-  rejection, never a blind fetch (SEC-01);
-* carries the scramble offset as a ``#scr_{offset}`` fragment when ``offset>0``;
+* SSRF-allowlists EVERY URL (fragment stripped first) — raising on the first rejection,
+  never a blind fetch (SEC-01);
+* carries the scramble offset (entry index 2) as a ``#scr_{offset}`` fragment when
+  ``offset>0``;
 * enforces the ``ctx.expected_pages`` integrity guard when set.
 
-No network/browser: a fake solver returns a canned capture and a fake ``SourceContext``
-exposes ``_solver`` + ``expected_pages``.
+No network/browser: a fake ``SourceContext`` answers ``get_json`` for the two endpoints
+from canned bodies and records the signed vrf each call carried.
 """
 
 from __future__ import annotations
@@ -23,160 +31,92 @@ import pytest
 
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.mangafire import (
-    _IMAGE_LIST_EXTRACT_JS,
     _MANIFEST_EMPTY_RETRIES,
     _PREFERRED_ZONE_ATTR,
     MangaFireSource,
     _rewrite_zone,
     _zone_of,
 )
+from manga_gateway.sources.mangafire_vrf import compute_vrf
 
 _READ_HREF = "/read/blue-lockk.kw9j9/en/chapter-346.2"
-_READ_URL = "https://mangafire.to/read/blue-lockk.kw9j9/en/chapter-346.2"
+_SLUG_ID = "kw9j9"
+_LANG = "en"
+_NUMBER = "346.2"
+_ITEM_ID = "7389265"
 _CDN = "https://o48.mfcdn1.xyz/mf/abcdef0123/h"
 
 
-class _FakeSolver:
-    def __init__(self, capture: Any) -> None:
-        self._capture = capture
-        self.calls: list[dict[str, Any]] = []
-
-    async def fetch_via_browser(
-        self,
-        url: str,
-        *,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — op-budget kwarg mirror
-    ) -> Any:
-        self.calls.append(
-            {"url": url, "extract": extract, "wait_for": wait_for, "timeout": timeout}
-        )
-        return self._capture
+def _reader_list_html(rows: dict[str, str]) -> str:
+    """Build a reader chapter-list ``result.html`` fragment from number→itemId rows."""
+    base = f"/read/blue-lockk.{_SLUG_ID}/{_LANG}"
+    items = "".join(
+        f'<li class="item"><a data-id="{item_id}" data-number="{number}" '
+        f'href="{base}/chapter-{number}">Ch {number}</a></li>'
+        for number, item_id in rows.items()
+    )
+    return f'<ul class="scroll-sm">{items}</ul>'
 
 
 class _FakeCtx:
-    def __init__(self, solver: Any, *, expected_pages: int | None = None) -> None:
-        self._solver = solver
-        self.expected_pages = expected_pages
+    """Answers ``get_json`` for the two reader endpoints from canned bodies (#314).
 
-
-@pytest.mark.asyncio
-async def test_fetch_manifest_captures_ssrf_allowlisted_urls_with_offset() -> None:
-    capture = [
-        [f"{_CDN}/0.jpg", 0],
-        [f"{_CDN}/1.jpg", 3],
-        [f"{_CDN}/2.webp", 0],
-    ]
-    solver = _FakeSolver(capture)
-    ctx = _FakeCtx(solver)
-    urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-
-    # offset==0 passes through; offset>0 carries the #scr_{offset} fragment.
-    assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_3", f"{_CDN}/2.webp"]
-    # The read URL + the manifest extract JS reached the browser primitive.
-    assert len(solver.calls) == 1
-    assert solver.calls[0]["url"] == _READ_URL
-    assert solver.calls[0]["extract"] == _IMAGE_LIST_EXTRACT_JS
-
-
-@pytest.mark.parametrize(
-    "bad_id", ["", "blue-lockk.kw9j9", "/manga/blue-lockk.kw9j9", "/ajax/read/x"]
-)
-@pytest.mark.asyncio
-async def test_fetch_manifest_malformed_chapter_id_raises(bad_id: str) -> None:
-    ctx = _FakeCtx(_FakeSolver([[f"{_CDN}/0.jpg", 0]]))
-    with pytest.raises(SourceError):
-        await MangaFireSource().fetch_manifest(bad_id, ctx)  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_fetch_manifest_missing_solver_raises() -> None:
-    ctx = _FakeCtx(None)
-    with pytest.raises(SourceError):
-        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_fetch_manifest_off_host_url_raises_ssrf() -> None:
-    capture = [[f"{_CDN}/0.jpg", 0], ["https://evil.internal/mf/x/1.jpg", 0]]
-    ctx = _FakeCtx(_FakeSolver(capture))
-    with pytest.raises(SourceError):
-        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_fetch_manifest_off_namespace_url_raises_ssrf() -> None:
-    capture = [["https://o48.mfcdn1.xyz/other/0.jpg", 0]]
-    ctx = _FakeCtx(_FakeSolver(capture))
-    with pytest.raises(SourceError):
-        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_fetch_manifest_empty_capture_raises() -> None:
-    ctx = _FakeCtx(_FakeSolver([]))
-    with pytest.raises(SourceError):
-        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_fetch_manifest_integrity_guard_mismatch_raises() -> None:
-    capture = [[f"{_CDN}/0.jpg", 0], [f"{_CDN}/1.jpg", 0]]
-    ctx = _FakeCtx(_FakeSolver(capture), expected_pages=3)
-    with pytest.raises(SourceError, match="integrity"):
-        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-
-
-@pytest.mark.asyncio
-async def test_fetch_manifest_integrity_guard_passes_on_match() -> None:
-    capture = [[f"{_CDN}/0.jpg", 0], [f"{_CDN}/1.jpg", 2]]
-    ctx = _FakeCtx(_FakeSolver(capture), expected_pages=2)
-    urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-    assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_2"]
-
-
-# ─────────────── bounded retry on empty/malformed capture (contention) ────────────
-# Under concurrent browser navs the in-page manifest capture intermittently returns
-# empty (reader AJAX never fired / in-page re-fetch threw); it self-heals on retry, so
-# fetch_manifest re-navigates up to _MANIFEST_EMPTY_RETRIES extra times before raising
-# "malformed mangafire chapter manifest" (debug mangafire-manifest-contention).
-
-
-class _SeqSolver:
-    """Returns/raises a different result per ``fetch_via_browser`` call.
-
-    ``results`` is consumed in order; each item is either a capture list to RETURN or
-    an ``Exception`` to RAISE (mirroring the observed ``page.evaluate failed``
-    mid-extract). The last item is reused once the sequence is exhausted, so a
-    steady-state can be pinned without listing every attempt.
+    ``list_body`` is returned for the reader chapter-list endpoint; ``image_bodies`` is
+    a list consumed in order for the image-list endpoint (the last item is reused once
+    exhausted, so a steady-state can be pinned). Each item is a body dict to RETURN or
+    an ``Exception`` to RAISE. Records the ``vrf`` query param each call carried so the
+    signing can be asserted.
     """
 
-    def __init__(self, results: list[Any]) -> None:
-        self._results = results
-        self.calls: list[dict[str, Any]] = []
-
-    async def fetch_via_browser(
+    def __init__(
         self,
-        url: str,
         *,
-        extract: str,
-        wait_for: str | None = None,
-        timeout: float = 30.0,  # noqa: ASYNC109 — op-budget kwarg mirror
-    ) -> Any:
-        self.calls.append(
-            {"url": url, "extract": extract, "wait_for": wait_for, "timeout": timeout}
-        )
-        idx = min(len(self.calls) - 1, len(self._results) - 1)
-        result = self._results[idx]
-        if isinstance(result, Exception):
-            raise result
-        return result
+        list_body: Any,
+        image_bodies: list[Any],
+        expected_pages: int | None = None,
+    ) -> None:
+        self._list_body = list_body
+        self._image_bodies = image_bodies
+        self.expected_pages = expected_pages
+        self.list_calls: list[dict[str, Any]] = []
+        self.image_calls: list[dict[str, Any]] = []
+
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        if "/ajax/read/chapter/" in url:
+            self.image_calls.append({"url": url, **params})
+            idx = min(len(self.image_calls) - 1, len(self._image_bodies) - 1)
+            body = self._image_bodies[idx]
+            if isinstance(body, Exception):
+                raise body
+            return body
+        if "/ajax/read/" in url and "/chapter/" in url:
+            self.list_calls.append({"url": url, **params})
+            if isinstance(self._list_body, Exception):
+                raise self._list_body
+            return self._list_body
+        raise AssertionError(f"unexpected get_json url {url!r}")
+
+
+def _ctx(
+    *,
+    images: list[Any] | None = None,
+    image_bodies: list[Any] | None = None,
+    rows: dict[str, str] | None = None,
+    list_body: Any = None,
+    expected_pages: int | None = None,
+) -> _FakeCtx:
+    if list_body is None:
+        list_body = {"result": {"html": _reader_list_html(rows or {_NUMBER: _ITEM_ID})}}
+    if image_bodies is None:
+        image_bodies = [{"result": {"images": images if images is not None else []}}]
+    return _FakeCtx(
+        list_body=list_body, image_bodies=image_bodies, expected_pages=expected_pages
+    )
 
 
 @pytest.fixture
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the manifest-retry backoff a no-op so tests never actually sleep."""
+    """Make the manifest empty-list retry backoff a no-op so tests never sleep."""
 
     async def _instant(_seconds: float) -> None:
         return None
@@ -185,87 +125,137 @@ def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_manifest_retries_empty_then_succeeds(_no_sleep: None) -> None:
-    """An empty capture on the first try is re-navigated; the retry's list succeeds."""
-    valid = [[f"{_CDN}/0.jpg", 0], [f"{_CDN}/1.jpg", 3]]
-    solver = _SeqSolver([[], valid])  # 1st call empty → 2nd call valid
-    ctx = _FakeCtx(solver)
+async def test_fetch_manifest_signs_both_calls_and_resolves_item_id() -> None:
+    """Happy path: the reader list resolves the itemId; both AJAX calls carry the vrf
+    signed over the ``@``-joined identifiers, and the image URLs come back with their
+    scramble offset (entry index 2) carried as a ``#scr_`` fragment."""
+    images = [
+        [f"{_CDN}/0.jpg", 2, 0],
+        [f"{_CDN}/1.jpg", 1, 3],
+        [f"{_CDN}/2.webp", 2, 0],
+    ]
+    ctx = _ctx(images=images)
     urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-    assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_3"]
-    assert len(solver.calls) == 2  # one retry was spent
+
+    assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_3", f"{_CDN}/2.webp"]
+    # Reader list: signed over "{slug}@chapter@{lang}" and pointed at the slug endpoint.
+    assert len(ctx.list_calls) == 1
+    assert ctx.list_calls[0]["url"].endswith(f"/ajax/read/{_SLUG_ID}/chapter/{_LANG}")
+    assert ctx.list_calls[0]["vrf"] == compute_vrf(f"{_SLUG_ID}@chapter@{_LANG}")
+    # Image list: the resolved itemId is in the path, signed over "chapter@{itemId}".
+    assert len(ctx.image_calls) == 1
+    assert ctx.image_calls[0]["url"].endswith(f"/ajax/read/chapter/{_ITEM_ID}")
+    assert ctx.image_calls[0]["vrf"] == compute_vrf(f"chapter@{_ITEM_ID}")
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["", "blue-lockk.kw9j9", "/manga/blue-lockk.kw9j9", "/read/x", "/read/x/en/foo-1"],
+)
+@pytest.mark.asyncio
+async def test_fetch_manifest_malformed_chapter_id_raises(bad_id: str) -> None:
+    ctx = _ctx(images=[[f"{_CDN}/0.jpg", 2, 0]])
+    with pytest.raises(SourceError):
+        await MangaFireSource().fetch_manifest(bad_id, ctx)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
-async def test_fetch_manifest_retries_on_evaluate_raise_then_succeeds(
-    _no_sleep: None,
-) -> None:
-    """A thrown extract (``page.evaluate failed``) on the first try is also retried."""
-    valid = [[f"{_CDN}/0.jpg", 0]]
-    solver = _SeqSolver([RuntimeError("page.evaluate failed"), valid])
-    ctx = _FakeCtx(solver)
-    urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-    assert urls == [f"{_CDN}/0.jpg"]
-    assert len(solver.calls) == 2
+async def test_fetch_manifest_unknown_chapter_number_raises() -> None:
+    """The reader list has no row matching the href's chapter number → no itemId."""
+    ctx = _ctx(rows={"999": "111"}, images=[[f"{_CDN}/0.jpg", 2, 0]])
+    with pytest.raises(SourceError, match="item-id"):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    # Never reached the image endpoint without an itemId.
+    assert ctx.image_calls == []
 
 
 @pytest.mark.asyncio
-async def test_fetch_manifest_empty_all_attempts_raises(_no_sleep: None) -> None:
-    """Empty on EVERY attempt → the original malformed-manifest error, after retries."""
-    solver = _SeqSolver([[]])  # always empty
-    ctx = _FakeCtx(solver)
-    with pytest.raises(SourceError, match="malformed mangafire chapter manifest"):
+async def test_fetch_manifest_unreadable_reader_list_raises() -> None:
+    ctx = _ctx(list_body={"result": None}, images=[[f"{_CDN}/0.jpg", 2, 0]])
+    with pytest.raises(SourceError, match="unreadable"):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_off_host_url_raises_ssrf() -> None:
+    images = [[f"{_CDN}/0.jpg", 2, 0], ["https://evil.internal/mf/x/1.jpg", 2, 0]]
+    ctx = _ctx(images=images)
+    with pytest.raises(SourceError):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_off_namespace_url_raises_ssrf() -> None:
+    ctx = _ctx(images=[["https://o48.mfcdn1.xyz/other/0.jpg", 2, 0]])
+    with pytest.raises(SourceError):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_empty_image_list_raises(_no_sleep: None) -> None:
+    ctx = _ctx(images=[])
+    with pytest.raises(SourceError, match="empty mangafire image list"):
         await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
     # initial attempt + the bounded extra retries were all spent.
-    assert len(solver.calls) == _MANIFEST_EMPTY_RETRIES + 1
+    assert len(ctx.image_calls) == _MANIFEST_EMPTY_RETRIES + 1
 
 
+@pytest.mark.parametrize(
+    "bad_body",
+    [
+        {"result": None},  # non-dict result
+        {"result": {}},  # missing images key
+        {"result": {"images": "nope"}},  # non-list images
+        {"not": "a result envelope"},  # missing result
+    ],
+)
 @pytest.mark.asyncio
-async def test_fetch_manifest_raise_all_attempts_surfaces_typed_error(
-    _no_sleep: None,
+async def test_fetch_manifest_malformed_image_list_fails_fast(
+    _no_sleep: None, bad_body: Any
 ) -> None:
-    """A persistent extract throw surfaces the typed browser-manifest-fetch error."""
-    solver = _SeqSolver([RuntimeError("page.evaluate failed")])
-    ctx = _FakeCtx(solver)
-    with pytest.raises(SourceError, match="browser manifest fetch failed"):
+    """A malformed image-list envelope fails fast (no retry budget burned) with a
+    distinct 'malformed' error — NOT the misleading 'empty image list' (CodeRabbit
+    #319). Only an actual empty list is retryable."""
+    ctx = _ctx(image_bodies=[bad_body])
+    with pytest.raises(SourceError, match="malformed mangafire image list"):
         await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-    assert len(solver.calls) == _MANIFEST_EMPTY_RETRIES + 1
+    # Failed on the FIRST attempt — the empty-list retry budget was not spent.
+    assert len(ctx.image_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_fetch_manifest_integrity_mismatch_not_retried(_no_sleep: None) -> None:
-    """A NON-empty capture that fails the expected_pages guard is a real data problem —
-    it raises immediately and is NEVER re-navigated (only empty/malformed retries)."""
-    capture = [[f"{_CDN}/0.jpg", 0], [f"{_CDN}/1.jpg", 0]]
-    solver = _SeqSolver([capture])
-    ctx = _FakeCtx(solver, expected_pages=3)
+async def test_fetch_manifest_retries_empty_then_succeeds(_no_sleep: None) -> None:
+    """An empty image list on the first try is re-fetched; the retry's list succeeds."""
+    valid = {"result": {"images": [[f"{_CDN}/0.jpg", 2, 0], [f"{_CDN}/1.jpg", 1, 3]]}}
+    ctx = _ctx(image_bodies=[{"result": {"images": []}}, valid])
+    urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_3"]
+    assert len(ctx.image_calls) == 2  # one retry was spent
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_integrity_guard_mismatch_raises() -> None:
+    images = [[f"{_CDN}/0.jpg", 2, 0], [f"{_CDN}/1.jpg", 2, 0]]
+    ctx = _ctx(images=images, expected_pages=3)
     with pytest.raises(SourceError, match="integrity"):
         await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
-    assert len(solver.calls) == 1  # no retry on a genuine integrity mismatch
+    # A genuine integrity mismatch is a real data problem — NOT retried.
+    assert len(ctx.image_calls) == 1
 
 
-# ───────────── extract-JS hardening (in-page re-fetch retry + continue) ───────────
-# The in-page extract must (1) wrap the re-fetch in its OWN retry so a transient throw
-# doesn't abort, and (2) CONTINUE the outer poll loop on a thrown/empty re-fetch rather
-# than break/abort — pinned so a future edit can't silently drop the contention guard
-# (debug mangafire-manifest-contention).
+@pytest.mark.asyncio
+async def test_fetch_manifest_integrity_guard_passes_on_match() -> None:
+    images = [[f"{_CDN}/0.jpg", 2, 0], [f"{_CDN}/1.jpg", 1, 2]]
+    ctx = _ctx(images=images, expected_pages=2)
+    urls = await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
+    assert urls == [f"{_CDN}/0.jpg", f"{_CDN}/1.jpg#scr_2"]
 
 
-def test_image_list_extract_js_wraps_refetch_in_retry() -> None:
-    """The in-page AJAX re-fetch retries on a transient throw and falls through to
-    CONTINUE the outer poll loop instead of aborting (mangafire-manifest-contention)."""
-    js = _IMAGE_LIST_EXTRACT_JS
-    # The in-page re-fetch has its own bounded attempt loop with a try/catch guard.
-    assert "for (let attempt = 0; attempt < 3; attempt++)" in js
-    assert "try {" in js
-    assert "} catch (e) {" in js
-    # Narrow the "no abort" check to the inner re-fetch retry block: on a thrown/empty
-    # re-fetch it must fall through (CONTINUE the outer poll), never break/return out.
-    # A whole-string check would spuriously fail on an unrelated future break (CR #285).
-    start = js.index("for (let attempt = 0; attempt < 3; attempt++)")
-    end = js.index("// re-fetch threw or stayed empty", start)
-    inner_retry_block = js[start:end]
-    assert "break" not in inner_retry_block
-    assert "return []" not in inner_retry_block
+@pytest.mark.asyncio
+async def test_fetch_manifest_malformed_image_entry_raises() -> None:
+    ctx = _ctx(images=[[f"{_CDN}/0.jpg", 2, 0], []])
+    with pytest.raises(SourceError):
+        await MangaFireSource().fetch_manifest(_READ_HREF, ctx)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

@@ -10,16 +10,18 @@ profile is the TEST-ONLY mirror (D-49 keeps profiles structurally separate).
 Anti-bot expectations (D-16)
 ----------------------------
 * ``expected_caps_antibot = "cloudflare"`` — matches ``MangaFireSource.antibot``.
-  Interior listing pages (chapter list / ``/filter``) answer cold over plain httpx,
-  but the source declares ``cloudflare`` anyway (D-05) so the framework keeps a warm
-  browser + clearance for the browser-DOM manifest path (the reader page mints the
-  per-request vrf) and degrades gracefully on a datacenter host that trips a managed
-  challenge.
-* ``needs_solver_warm = True`` — the manifest (``fetch_via_browser``) path requires a
-  warm Patchright context, so the harness must ``await solver.warm()`` before issuing
-  requests. Search no longer touches the browser: the per-query vrf is now derived
-  in-process via ``compute_vrf`` (pure Python, PR #313), not minted by real-keyboard
-  typing in a warm browser context.
+  Interior listing AND reader pages answer cold over plain httpx (issue #314: the
+  manifest is now derived in-process, not navigated), but the source declares
+  ``cloudflare`` anyway (D-05) so the framework keeps a lazily-solved clearance and
+  degrades gracefully on a datacenter host that trips a managed challenge on a
+  listing/reader endpoint.
+* ``needs_solver_warm = True`` — kept as a Cloudflare CLEARANCE FALLBACK only, NOT for
+  the manifest. As of issue #314 NO path drives the browser: search (PR #313) AND the
+  download manifest (#314) now derive their ``vrf`` in-process via ``compute_vrf`` and
+  answer cold over httpx (the reader's two signed AJAX calls). The harness still
+  ``await solver.warm()``s so a datacenter host that trips a managed challenge degrades
+  gracefully; once the nightly confirms the cold reader path holds on the deploy host
+  this can drop to ``False`` (the warm is then unused).
 
 RESIDENTIAL-ONLY caveat + ONE-ATTRIBUTE escalation path (D-12)
 --------------------------------------------------------------
