@@ -625,16 +625,33 @@ class AndroidSolvePipeline:
         ``forward_devtools(pid)``.
 
         Bounded by BOTH the eval ``deadline`` and ``_RELAUNCH_PIDOF_ATTEMPTS``; honors
-        ``_raise_if_cancelled(cancel)`` between attempts (T-10-02). adbd is NEVER
+        ``_raise_if_cancelled(cancel)`` and the ``deadline`` BEFORE the relaunch/settle
+        and between poll attempts, and clamps every sleep to the remaining budget so a
+        cancelled or expired eval never drives the device (T-10-02). adbd is NEVER
         rooted.
         """
         try:
             return self._device.pidof()
-        except AdbError:
+        except AdbError as initial_err:
+            last_err: AdbError = initial_err
             _log.warning("webview_shell not running for eval; relaunching to self-heal")
+        # Respect cancellation + the eval deadline BEFORE the (costly) relaunch and
+        # its settle sleep — a request cancelled or already past deadline must not
+        # keep the single eval worker driving the device.
+        _raise_if_cancelled(cancel)
+        if time.monotonic() >= deadline:
+            raise AdbError(
+                "webview_shell not running and eval deadline expired before relaunch"
+            ) from last_err
         self._device.launch_url(challenge_url)
-        time.sleep(self._launch_settle_s)  # floor before the process registers a pid
-        last_err: AdbError | None = None
+        _raise_if_cancelled(cancel)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AdbError(
+                "webview_shell relaunch completed after the eval deadline"
+            ) from last_err
+        # Floor before the process registers a pid, never overshooting the deadline.
+        time.sleep(min(self._launch_settle_s, remaining))
         for _ in range(_RELAUNCH_PIDOF_ATTEMPTS):
             _raise_if_cancelled(cancel)
             if time.monotonic() >= deadline:
@@ -643,7 +660,10 @@ class AndroidSolvePipeline:
                 return self._device.pidof()
             except AdbError as err:
                 last_err = err
-                time.sleep(self._poll_interval_s)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(self._poll_interval_s, remaining))
         raise AdbError(
             "webview_shell did not register a pid after relaunch before the eval "
             "deadline"

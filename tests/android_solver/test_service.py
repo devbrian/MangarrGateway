@@ -1997,6 +1997,23 @@ def test_eval_relaunches_dead_webview_then_proceeds(
     assert cdp.ran_command(service._EVAL_CMD_ID)
 
 
+def test_ensure_webview_alive_expired_deadline_does_not_relaunch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # webview_shell is dead (pidof raises) AND the eval deadline has already passed:
+    # the recovery MUST NOT relaunch the device or sleep — it raises immediately so a
+    # timed-out request never keeps the single eval worker driving the device.
+    cdp = _DriveEvalCdp({})
+    device = _DeadThenAliveDevice(fail_pidof_times=1)
+    pipeline = _eval_pipeline(monkeypatch, cdp, device=device)
+
+    with pytest.raises(AdbError):
+        pipeline._ensure_webview_alive(_EVAL_URL, None, deadline=time.monotonic() - 1.0)
+
+    assert device.pidof_calls == 1  # only the initial probe; no post-relaunch poll
+    assert device.launched == []  # deadline guard short-circuited before relaunch
+
+
 def _drive(pipeline: AndroidSolvePipeline, expected_egress_ip: str):  # type: ignore[no-untyped-def]
     return pipeline._drive_eval(
         _EVAL_URL,
