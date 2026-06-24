@@ -1,5 +1,7 @@
 # Manga Gateway
 
+📖 **[Documentation &amp; Wiki](https://mangarr.github.io/)** &nbsp;·&nbsp; 💬 **[Join the Discord](https://mangarr.github.io/discord)**
+
 A single external service that **Mangarr** (a manga library manager — a Sonarr
 fork) talks to over HTTP/JSON. The gateway is **one process exposing two
 JSON-REST API surfaces** that share **one authenticated secure-site session**
