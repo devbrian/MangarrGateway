@@ -28,11 +28,13 @@ def test_mangafire_class_declares_cloudflare_antibot() -> None:
     assert MangaFireSource.id_types == []  # title-search fallback (SRCH-07)
 
 
-def test_mangafire_serializes_downloads_to_one_job() -> None:
-    """Download jobs are serialized (max_concurrent_jobs == 1) so concurrent reader
-    navs can't starve each other's manifest capture (debug
-    mangafire-manifest-contention). Search/recent use the separate fan-out semaphore."""
-    assert MangaFireSource.max_concurrent_jobs == 1
+def test_mangafire_downloads_run_concurrently() -> None:
+    """Download jobs run concurrently again (max_concurrent_jobs == 3): issue #314 made
+    the manifest browserless (two signed httpx AJAX calls, no reader nav), dissolving
+    the mangafire-manifest-contention cause that had forced serialization to 1. Restored
+    to the D-14 probe-measured safe value. Search/recent use the separate fan-out
+    semaphore (_CHAPTERS_FANOUT_CONCURRENCY), not this knob."""
+    assert MangaFireSource.max_concurrent_jobs == 3
 
 
 def test_mangafire_is_registered_in_the_builtin_registry() -> None:

@@ -2,13 +2,13 @@
 
 MangaFire (``https://mangafire.to``) is a PHP/jQuery server-rendered HTML + AJAX
 site whose download + keyword-search AJAX endpoints are gated by a per-request
-``vrf`` token. The DOWNLOAD (read-page) ``vrf`` is **captured from the warm
-browser** (issue #192, live-verified 2026-06-09 + cross-checked against the
-Keiyoushi/Mihon ``src/all/mangafire`` extension); the SEARCH ``vrf`` has been
-**reverse-engineered** to a pure-Python generator (``mangafire_vrf.compute_vrf``,
-build ``scripts.js?69b68df23``) so search needs no browser at all. It adds **zero
-networking glue** — every outbound call is ``ctx.get_json`` / ``ctx.get_bytes`` /
-``solver.fetch_via_browser*`` (SRC-01/SRC-02).
+``vrf`` token. BOTH the SEARCH ``vrf`` (PR #313) and the DOWNLOAD (reader) ``vrf``
+(issue #314) are now **reverse-engineered** to the SAME pure-Python generator
+(``mangafire_vrf.compute_vrf``, build ``scripts.js?69b68df23``) — the token signs the
+``@``-joined request identifiers (search: the keyword; reader: ``{slug}@chapter@{lang}``
+and ``chapter@{itemId}``) — so MangaFire needs **no browser at all**. It adds **zero
+networking glue** — every outbound call is ``ctx.get_json`` / ``ctx.get_bytes``
+(SRC-01/SRC-02).
 
 Each of the four ``Source`` hooks copies a DIFFERENT existing analog:
 
@@ -16,11 +16,11 @@ Each of the four ``Source`` hooks copies a DIFFERENT existing analog:
   ``result``, NO vrf) → ``ctx.get_json`` + lxml-in-``to_thread`` (D-06).
 * **recent** — ``GET /filter?sort=recently_updated`` (HTML, NO vrf) → ``ctx.get_bytes``
   + lxml + title→chapter fan-out + DIRECT newest-chapter mint (D-07).
-* **fetch_manifest** — navigate the read page; the reader's own JS mints the per-
-  request ``vrf`` and auto-fires ``/ajax/read/chapter/{itemId}?vrf=…`` →
-  ``solver.fetch_via_browser`` + a ``performance``-entry capture extract; each image
-  URL is SSRF-allowlisted; the ``#scr_{offset}`` scramble offset rides as a URL
-  fragment (D-08/D-09/D-10).
+* **fetch_manifest** — pure httpx (issue #314): sign ``GET /ajax/read/{slug}/chapter/
+  {lang}`` → reader chapter list → the chapter's ``itemId``, then sign ``GET /ajax/
+  read/chapter/{itemId}`` → the server-minted ``result.images`` list; each image URL is
+  SSRF-allowlisted; the ``#scr_{offset}`` scramble offset rides as a URL fragment
+  (D-08/D-09/D-10).
 * **fetch_image** — ``ctx.get_bytes`` of the fragment-stripped URL + a geometric
   piece-shuffle descramble when ``offset>0`` (port of Keiyoushi ``ImageInterceptor.kt``
   in Pillow, offloaded via ``to_thread``) (D-11/D-12).
@@ -50,7 +50,7 @@ from collections.abc import Coroutine
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urldefrag, urlencode, urljoin, urlparse
+from urllib.parse import urldefrag, urlencode, urlparse
 
 import lxml.html
 from PIL import Image, UnidentifiedImageError
@@ -127,59 +127,20 @@ _RECENT_TITLE_CAP = 20
 # Default chapter language when the request carries no language filter.
 _DEFAULT_LANGUAGE = "en"
 
-# ── fetch_manifest contention retry (debug mangafire-manifest-contention) ──────
-# Under concurrent browser navs the in-page manifest capture intermittently yields
-# an EMPTY/malformed list (reader AJAX never fires in the poll window, or the in-page
-# re-fetch throws). It self-heals on retry (live: isolated 8/8 OK). fetch_manifest
-# therefore re-navigates & re-extracts up to this many EXTRA times on an empty/
-# malformed capture, with the backoff below, before raising. An integrity mismatch on
-# a NON-empty capture is a real data problem and is NOT retried.
+# ── fetch_manifest empty-list retry (issue #314 — browserless manifest) ────────
+# The manifest is now derived in pure Python over httpx (NO browser): the reader's
+# two signed AJAX calls (`/ajax/read/{slugId}/chapter/{lang}` → per-chapter item ids,
+# then `/ajax/read/chapter/{itemId}` → the server-minted image list) are reproduced
+# in-process by signing each with `mangafire_vrf.compute_vrf` over the `@`-joined path
+# identifiers (the SAME pipeline PR #313 cracked for search). The image-list JSON
+# carries the per-page URLs + scramble offset directly, so there is nothing to mint
+# client-side. Transport faults / 5xx are already retried by `ctx.get_json` (tenacity);
+# this extra retry only covers a transient EMPTY image list, re-fetching the signed
+# image-list endpoint up to this many extra times with the backoff below. An integrity
+# mismatch on a NON-empty list is a real data problem and is NOT retried.
 _MANIFEST_EMPTY_RETRIES = 2
 # Backoff (seconds) before each extra attempt; index 0 = before the 1st retry, etc.
 _MANIFEST_RETRY_BACKOFF: tuple[float, ...] = (1.0, 2.0)
-
-# ── browser `extract` bodies (bare `return`; the framework wraps `async () => {…}`,
-# mirroring comix `_CHAPTER_PAGES_EXTRACT_JS`). ─────────────────────────────────
-
-# fetch_manifest (D-08): poll the browser's own `performance` resource entries for
-# the reader's auto-fired `/ajax/read/chapter/` AJAX, re-`fetch()` it in-page with
-# the XHR header, and return [url, offset] per image (index 0 = URL, index 2 =
-# offset; offset==0 ⇒ not scrambled). ≤60×500ms.
-#
-# Contention hardening (debug mangafire-manifest-contention, 2026-06-19): under
-# concurrent reader navs the in-page re-`fetch()` of the AJAX URL can transiently
-# THROW or come back empty (observed images=-2). The re-fetch is therefore wrapped
-# in its own small bounded retry, and on a thrown/empty re-fetch we CONTINUE the
-# outer poll loop (keep waiting / retry next tick) instead of aborting the whole
-# extract — the ~30s overall budget (≤60×500ms) is preserved. Contract unchanged:
-# still returns [[url, offset], …] or [].
-_IMAGE_LIST_EXTRACT_JS = """
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  for (let i = 0; i < 60; i++) {
-    const hit = performance
-      .getEntriesByType('resource')
-      .map((e) => e.name)
-      .find((u) => u.includes('/ajax/read/chapter/'));
-    if (hit) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          const r = await fetch(hit, {
-            headers: { 'X-Requested-With': 'XMLHttpRequest' },
-          });
-          const j = await r.json();
-          const imgs = (j && j.result && j.result.images) || [];
-          if (imgs.length) return imgs.map((it) => [it[0], it[2] || 0]);
-        } catch (e) {
-          // transient in-page re-fetch failure under contention — keep trying.
-        }
-        await sleep(200);
-      }
-      // re-fetch threw or stayed empty: fall through and CONTINUE polling.
-    }
-    await sleep(500);
-  }
-  return [];
-"""
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -333,6 +294,31 @@ def _parse_chapter_list(html: str) -> list[dict[str, Any]]:
     return out
 
 
+def _parse_read_item_ids(html: str) -> dict[str, str]:
+    """Parse the reader chapter-list ``result.html`` → ``{number: itemId}`` map (#314).
+
+    ``GET /ajax/read/{slugId}/chapter/{lang}?vrf=…`` returns ``{"result":{"html":
+    "<ul>… <a data-id='{itemId}' data-number='{number}'>…</a> …"}}``.
+    Each ``<a>`` carries BOTH the per-chapter reader ``data-id`` (the ``itemId`` the
+    image-list endpoint signs) and the ``data-number`` (matching the read href's
+    ``chapter-{number}`` segment). This maps number→itemId so ``fetch_manifest`` can
+    resolve the href's chapter number to its reader item id with NO browser. A
+    malformed fragment returns ``{}`` (never raises); the FIRST id wins per number
+    (newest-first document order).
+    """
+    try:
+        doc = lxml.html.fromstring(html)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for a in doc.xpath("//a[@data-id and @data-number]"):
+        number = str(a.get("data-number") or "").strip()
+        item_id = str(a.get("data-id") or "").strip()
+        if number and item_id and number not in out:
+            out[number] = item_id
+    return out
+
+
 def _parse_sync_data(html: bytes | str) -> dict[str, Any]:
     """Parse the detail page's ``<script id="syncData">`` JSON → raw tracker dict.
 
@@ -463,34 +449,31 @@ class MangaFireSource(Source):
     #   * image CDN (separate host): NO limit — clean to 960/min at concurrency 8 (a
     #     FLOOR). The get_bytes image path is exempt from this limiter (limited=False);
     #     its throughput is bounded by max_concurrent_jobs, not rate_limit_per_minute.
-    #   * browser manifest (fetch_via_browser): UNMEASURABLE by the httpx probe (a
-    #     browser-nav path — skipped, "manifest not captured"); the Plan 04 live nightly
-    #     confirms it end-to-end.
+    #   * reader manifest (issue #314): now PURE httpx — the two signed reader AJAX
+    #     calls (`/ajax/read/{slug}/chapter/{lang}` + `/ajax/read/chapter/{itemId}`)
+    #     ride the SAME limited get_json path as the chapter list, so they fall under
+    #     the 60/min ceiling above (no separate browser-nav budget).
     rate_limit_per_minute = 60
     # D-30 per-source override — bounds concurrent download JOBS only (recent/search/
     # filter HTML use the separate per-source _CHAPTERS_FANOUT_CONCURRENCY semaphore,
-    # not this knob). Each job's binding cost is its one browser reader-nav manifest
-    # extract (comix-class). Serialized to 1 (was 3) by the
-    # mangafire-manifest-contention investigation (2026-06-19): concurrent mangafire
-    # reader navs starve each other's in-page `/ajax/read/chapter/` capture,
-    # intermittently yielding an empty manifest → "malformed mangafire chapter
-    # manifest" (live repro: 8/8 isolated OK, 10/10 FAIL at concurrency 5). 1 removes
-    # mangafire-vs-mangafire manifest contention WITHOUT touching the shared solver
-    # `cloudflare_fetch_concurrency`. Tradeoff: mangafire download throughput is one
-    # chapter at a time; search/recent are unaffected, and the bounded retry + hardened
-    # extract above cover residual cross-source contention.
-    max_concurrent_jobs = 1
-    # D-05: interior pages answer cold over httpx, but declare cloudflare anyway so the
-    # framework keeps a (lazily-solved) browser + clearance for the manifest path and
-    # degrades gracefully on a datacenter host that trips a managed challenge.
+    # not this knob). Issue #314 made the manifest BROWSERLESS (two signed httpx AJAX
+    # calls, no reader nav), which DISSOLVES the `mangafire-manifest-contention` cause
+    # (concurrent reader navs starving each other's in-page capture) that had forced
+    # this to 1. Restored to 3 — the D-14 probe-measured safe value (text/AJAX host
+    # clean to concurrency 32 at 60/min; image CDN unlimited to concurrency 8). A
+    # deploy-host re-probe MAY raise it further, but 3 is the documented measured floor.
+    max_concurrent_jobs = 3
+    # D-05: interior + reader pages answer cold over httpx (issue #314: the manifest no
+    # longer needs the browser), but declare cloudflare anyway so the framework keeps a
+    # lazily-solved clearance and degrades gracefully on a datacenter host that trips a
+    # managed challenge on a listing/reader endpoint.
     antibot = "cloudflare"
-    # 260623-m5h: search now computes the vrf in-process (mangafire_vrf.compute_vrf)
-    # and answers cold over httpx (verified: /filter returns real results with NO
-    # clearance), so do NOT eagerly solve Cloudflare on the request hot path.
-    # Deferred-solve (like mangaball): cold requests go over httpx first, and a real
-    # challenge is detected (is_cf_challenge) → retried with force_resolve. The
-    # manifest path still solves on-demand via fetch_via_browser when the read page
-    # actually challenges.
+    # 260623-m5h + #314: search AND the download manifest now compute the vrf in-process
+    # (mangafire_vrf.compute_vrf) and answer cold over httpx (verified: /filter and the
+    # reader AJAX return real results with NO clearance), so do NOT eagerly solve
+    # Cloudflare on the request hot path. Deferred-solve (like mangaball): cold requests
+    # go over httpx first, and a real challenge (is_cf_challenge) → retried with
+    # force_resolve. No path drives `fetch_via_browser` anymore.
     cloudflare_challenge_optional = True
     cloudflare_challenge_url = "https://mangafire.to/"
     # D-04: the image descramble is geometric (done in fetch_image), NOT the response-
@@ -760,36 +743,39 @@ class MangaFireSource(Source):
     # ─────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
 
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
-        """Resolve a read href → ordered SSRF-allowlisted page URLs (PKG-01/R6, D-08).
+        """Resolve a read href → ordered SSRF-allowlisted page URLs (PKG-01/R6, #314).
 
         ``chapter_id`` is the read href (``/read/{slug}.{id}/{lang}/chapter-{number}``,
-        D-09) minted by search/recent. Navigates it in the warm browser via
-        ``solver.fetch_via_browser(read_url, extract=_IMAGE_LIST_EXTRACT_JS)`` — the
-        reader's own JS mints the per-request vrf and auto-fires the image-list AJAX,
-        which the extract captures from ``performance`` and returns as ``[[url, offset],
-        …]``. Each captured URL is SSRF-allowlisted (fragment stripped first; a
-        non-allowlisted URL raises ``source_unavailable`` pre-fetch — SEC-01), and the
-        scramble offset rides as a ``#scr_{offset}`` fragment when ``offset>0`` (D-10).
-        The extracted count is guarded against ``ctx.expected_pages`` when known.
+        D-09) minted by search/recent. Derived in PURE PYTHON over httpx — NO browser
+        (issue #314; the search-vrf crack of PR #313 extended to the reader):
 
-        Bounded retry (debug mangafire-manifest-contention, 2026-06-19): an empty/
-        malformed capture under browser contention self-heals, so on that result we
-        re-navigate & re-extract up to ``_MANIFEST_EMPTY_RETRIES`` extra times with
-        ``_MANIFEST_RETRY_BACKOFF`` before raising "malformed mangafire chapter
-        manifest". The SSRF allowlist, offset parsing, and ``expected_pages`` integrity
-        check run on the FINAL successful capture only — an integrity mismatch is a real
-        data problem and is NOT retried.
+          1. parse the href → ``(slug_id, lang, number)``;
+          2. ``GET /ajax/read/{slug_id}/chapter/{lang}`` signed with
+             ``compute_vrf("{slug_id}@chapter@{lang}")`` → the reader chapter list
+             whose ``<a data-id data-number>`` rows map the href's ``number`` to its
+             reader ``itemId``;
+          3. ``GET /ajax/read/chapter/{itemId}`` signed with
+             ``compute_vrf("chapter@{itemId}")`` → ``{"result":{"images":[[url, _,
+             offset], …]}}`` — the server already mints the per-page CDN URLs, so
+             nothing is derived client-side.
+
+        Each URL is SSRF-allowlisted (fragment stripped first; a non-allowlisted URL
+        raises ``source_unavailable`` pre-fetch — SEC-01); the scramble offset (entry
+        index 2) rides as a ``#scr_{offset}`` fragment when ``offset>0`` (D-10); and the
+        page count is guarded against ``ctx.expected_pages`` when known. Because the
+        manifest is now browserless, concurrent download jobs no longer contend on a
+        shared reader nav (the old ``mangafire-manifest-contention`` cap is lifted).
+
+        A transient EMPTY image list is re-fetched up to ``_MANIFEST_EMPTY_RETRIES``
+        extra times (``_MANIFEST_RETRY_BACKOFF``); the SSRF/offset/``expected_pages``
+        checks run on the FINAL list only — an integrity mismatch is a real data problem
+        and is NOT retried.
         """
-        if not chapter_id.startswith("/read/"):
-            raise SourceError(
-                "source_unavailable",
-                f"malformed mangafire chapter id {chapter_id!r} (want a /read/ href)",
-            )
-        solver = self._solver_from_ctx(ctx)
-        read_url = urljoin(self.base_url + "/", chapter_id.lstrip("/"))
-        captured = await self._capture_image_list(solver, read_url)
+        slug_id, lang, number = self._parse_read_href(chapter_id)
+        item_id = await self._reader_item_id(slug_id, lang, number, ctx)
+        images = await self._fetch_image_list(item_id, ctx)
         urls: list[str] = []
-        for entry in captured:
+        for entry in images:
             if not isinstance(entry, (list, tuple)) or not entry:
                 raise SourceError(
                     "source_unavailable", "malformed mangafire image entry"
@@ -806,7 +792,9 @@ class MangaFireSource(Source):
                     "source_unavailable",
                     f"image URL failed the SSRF allowlist: {clean!r}",
                 )
-            offset = self._parse_int(entry[1]) if len(entry) >= 2 else 0
+            # The reader image entry is ``[url, _, offset]`` — the scramble offset is at
+            # index 2 (index 1 is the site's own quality/width flag, unused here).
+            offset = self._parse_int(entry[2]) if len(entry) >= 3 else 0
             urls.append(f"{clean}#scr_{offset}" if offset and offset > 0 else clean)
         if ctx.expected_pages is not None and len(urls) != ctx.expected_pages:
             raise SourceError(
@@ -816,44 +804,86 @@ class MangaFireSource(Source):
             )
         return urls
 
-    async def _capture_image_list(self, solver: Any, read_url: str) -> list[Any]:
-        """Navigate the read page + run the capture extract, retrying empty captures.
+    @staticmethod
+    def _parse_read_href(chapter_id: str) -> tuple[str, str, str]:
+        """Split a read href → ``(slug_id, lang, number)`` for the reader AJAX (#314).
 
-        Returns the raw ``[[url, offset], …]`` list from ``_IMAGE_LIST_EXTRACT_JS``.
-        Under browser contention the capture intermittently comes back empty/malformed
-        (the reader AJAX never fired, or the in-page re-fetch threw — debug
-        ``mangafire-manifest-contention``); that self-heals, so on an empty/malformed
-        capture (or a ``fetch_via_browser`` raise) we re-navigate up to
-        ``_MANIFEST_EMPTY_RETRIES`` extra times with ``_MANIFEST_RETRY_BACKOFF`` before
-        raising. A non-empty capture is returned as-is — its SSRF/offset/integrity
-        validation (incl. the ``expected_pages`` mismatch, a real data problem that is
-        NOT retried) happens in the caller.
+        ``/read/{slug}.{id}/{lang}/chapter-{number}`` → ``({id}, {lang}, {number})``.
+        ``slug_id`` is the trailing token after the manga token's last ``.`` (the same
+        chapter-list key used elsewhere). Raises ``source_unavailable`` for a malformed
+        (non-``/read/``) id so a bad handle never reaches the network.
         """
-        last_exc: Exception | None = None
-        total_attempts = _MANIFEST_EMPTY_RETRIES + 1
-        for attempt in range(total_attempts):
+        parts = chapter_id.strip("/").split("/")
+        # ["read", "{slug}.{id}", "{lang}", "chapter-{number}"]
+        if len(parts) < 4 or parts[0] != "read" or not parts[3].startswith("chapter-"):
+            raise SourceError(
+                "source_unavailable",
+                f"malformed mangafire chapter id {chapter_id!r} (want a /read/ href)",
+            )
+        _manga_token, slug_id = _manga_token_and_slug_id(parts[1])
+        lang = parts[2]
+        number = parts[3][len("chapter-") :]
+        if not slug_id or not lang or not number:
+            raise SourceError(
+                "source_unavailable",
+                f"malformed mangafire chapter id {chapter_id!r} (want a /read/ href)",
+            )
+        return slug_id, lang, number
+
+    async def _reader_item_id(
+        self, slug_id: str, lang: str, number: str, ctx: SourceContext
+    ) -> str:
+        """Resolve the reader chapter list → the ``itemId`` for ``number`` (#314).
+
+        Signs ``GET /ajax/read/{slug_id}/chapter/{lang}`` with
+        ``compute_vrf("{slug_id}@chapter@{lang}")`` (the SAME pipeline as search) and
+        parses the returned ``result.html`` rows (``_parse_read_item_ids``) for the
+        ``data-id`` matching the href's ``data-number``. Raises ``source_unavailable``
+        when the list is unreadable or the chapter number is absent.
+        """
+        vrf = compute_vrf(f"{slug_id}@chapter@{lang}")
+        body = await ctx.get_json(
+            f"{self.base_url}/ajax/read/{slug_id}/chapter/{lang}", vrf=vrf
+        )
+        result = body.get("result") if isinstance(body, dict) else None
+        html = result.get("html") if isinstance(result, dict) else result
+        if not isinstance(html, str) or not html:
+            raise SourceError(
+                "source_unavailable",
+                f"mangafire reader chapter list unreadable for {slug_id}/{lang}",
+            )
+        id_by_number = await asyncio.to_thread(_parse_read_item_ids, html)
+        item_id = id_by_number.get(number)
+        if not item_id:
+            raise SourceError(
+                "source_unavailable",
+                f"no reader item-id for chapter {number} of {slug_id}/{lang}",
+            )
+        return item_id
+
+    async def _fetch_image_list(self, item_id: str, ctx: SourceContext) -> list[Any]:
+        """Fetch the signed image-list AJAX → the raw ``[[url, _, offset], …]`` (#314).
+
+        Signs ``GET /ajax/read/chapter/{item_id}`` with
+        ``compute_vrf("chapter@{item_id}")`` and returns the ``result.images`` list. A
+        transient EMPTY list is re-fetched up to ``_MANIFEST_EMPTY_RETRIES`` extra times
+        with ``_MANIFEST_RETRY_BACKOFF`` (transport faults / 5xx are already retried by
+        ``ctx.get_json``); a malformed-shape body raises ``source_unavailable``.
+        """
+        vrf = compute_vrf(f"chapter@{item_id}")
+        url = f"{self.base_url}/ajax/read/chapter/{item_id}"
+        for attempt in range(_MANIFEST_EMPTY_RETRIES + 1):
             if attempt > 0:
                 backoff_idx = min(attempt - 1, len(_MANIFEST_RETRY_BACKOFF) - 1)
                 await asyncio.sleep(_MANIFEST_RETRY_BACKOFF[backoff_idx])
-            try:
-                captured = await solver.fetch_via_browser(
-                    read_url,
-                    extract=_IMAGE_LIST_EXTRACT_JS,
-                    wait_for=None,
-                    timeout=60.0,
-                )
-            except Exception as exc:  # noqa: BLE001 — retried then surfaced typed
-                last_exc = exc
-                continue
-            if isinstance(captured, list) and captured:
-                return captured
-            # empty/malformed capture — retry (contention self-heals); no exc to chain.
-            last_exc = None
-        if last_exc is not None:
-            raise SourceError(
-                "source_unavailable", f"browser manifest fetch failed: {last_exc}"
-            ) from last_exc
-        raise SourceError("source_unavailable", "malformed mangafire chapter manifest")
+            body = await ctx.get_json(url, vrf=vrf)
+            result = body.get("result") if isinstance(body, dict) else None
+            images = result.get("images") if isinstance(result, dict) else None
+            if isinstance(images, list) and images:
+                return images
+        raise SourceError(
+            "source_unavailable", f"empty mangafire image list for chapter {item_id}"
+        )
 
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's bytes + geometric descramble (PKG-02, D-11/D-12).
@@ -974,24 +1004,6 @@ class MangaFireSource(Source):
         if not isinstance(result, str):
             return []
         return await asyncio.to_thread(_parse_chapter_list, result)
-
-    @staticmethod
-    def _solver_from_ctx(ctx: SourceContext) -> Any:
-        """Pull the AntiBotSolver out of ``ctx`` for the browser-fetch paths (D-41).
-
-        The framework wires the solver into ``SourceContext`` for any ``cloudflare*``
-        source. ``fetch_manifest`` needs the one-shot ``fetch_via_browser`` primitive
-        (``search`` no longer drives the browser — it computes the ``vrf`` in-process).
-        Raises ``SourceError`` when the solver is missing OR lacks ``fetch_via_browser``
-        (a wiring bug, not a runtime condition).
-        """
-        solver = getattr(ctx, "_solver", None)
-        if solver is None or not hasattr(solver, "fetch_via_browser"):
-            raise SourceError(
-                "source_unavailable",
-                "mangafire browser-fetch requires a solver with fetch_via_browser",
-            )
-        return solver
 
     @classmethod
     def _filter_language(cls, languages: list[str] | None) -> str:
