@@ -107,5 +107,6 @@ docker-compose.dev.yml
 # topology, local paths) and the project's Claude dev skills (spike code,
 # source-onboarding + anti-bot/Cloudflare-bypass methodology). Untracked via
 # `git rm -r --cached` in the same change.
+.planning
 .planning/
 .claude/
