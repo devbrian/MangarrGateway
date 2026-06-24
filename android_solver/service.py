@@ -70,6 +70,10 @@ _log = logging.getLogger("android_solver.service")
 # challenges.cloudflare.com child frame (_FRAME_POLL_* below).
 _LAUNCH_SETTLE_S = 2.0
 _POLL_INTERVAL_S = 1.5
+# Belt-and-braces attempt cap on the post-relaunch pid poll in
+# ``_ensure_webview_alive`` — the eval ``deadline`` is the primary bound; this just
+# guarantees the loop terminates if the clock is stubbed to 0.0 in tests.
+_RELAUNCH_PIDOF_ATTEMPTS = 15
 _WS_TIMEOUT_S = 15.0
 _HTTP_TIMEOUT_S = 10.0
 
@@ -599,6 +603,52 @@ class AndroidSolvePipeline:
         summary = (summary or "in-page promise rejected")[:_EVAL_EXC_SUMMARY_MAX]
         raise EvalError(f"in-page eval threw: {summary}")
 
+    def _ensure_webview_alive(
+        self, challenge_url: str, cancel: Event | None, deadline: float
+    ) -> int:
+        """Return a live ``webview_shell`` pid, relaunching the process if it died.
+
+        Happy path: ``pidof()`` succeeds on the first call and we return immediately
+        with NO ``launch_url`` and NO sleep — the warm comix page the prior eval/solve
+        left alive is untouched and the caller's downstream fast path can engage.
+
+        Recovery path: ``pidof()`` raises ``AdbError`` (toybox ``pidof`` exits 1 when
+        the process is absent) → relaunch ``webview_shell`` on ``challenge_url`` via
+        the same unrooted ``am start`` mechanism ``/solve`` uses, settle, then poll
+        ``pidof`` until a pid appears. We deliberately do NOT ``force_stop_and_clear``
+        here: that would cold-wipe the warm in-page comix env the eval needs (MEMORY
+        "comix clears via eval path, never /solve"). A fresh relaunch lands on the CF
+        "Just a moment…" interstitial, so the caller's ``_is_hydrated_comix_page`` fast
+        path naturally returns False and the existing ``Page.navigate`` +
+        ``_clear_challenge_if_present`` + ``_wait_for_hydration`` else-branch clears and
+        hydrates it — this method only guarantees a live process + valid pid before
+        ``forward_devtools(pid)``.
+
+        Bounded by BOTH the eval ``deadline`` and ``_RELAUNCH_PIDOF_ATTEMPTS``; honors
+        ``_raise_if_cancelled(cancel)`` between attempts (T-10-02). adbd is NEVER
+        rooted.
+        """
+        try:
+            return self._device.pidof()
+        except AdbError:
+            _log.warning("webview_shell not running for eval; relaunching to self-heal")
+        self._device.launch_url(challenge_url)
+        time.sleep(self._launch_settle_s)  # floor before the process registers a pid
+        last_err: AdbError | None = None
+        for _ in range(_RELAUNCH_PIDOF_ATTEMPTS):
+            _raise_if_cancelled(cancel)
+            if time.monotonic() >= deadline:
+                break
+            try:
+                return self._device.pidof()
+            except AdbError as err:
+                last_err = err
+                time.sleep(self._poll_interval_s)
+        raise AdbError(
+            "webview_shell did not register a pid after relaunch before the eval "
+            "deadline"
+        ) from last_err
+
     def _drive_eval(
         self,
         challenge_url: str,
@@ -629,7 +679,7 @@ class AndroidSolvePipeline:
         BEFORE waiting for hydration. The clear/hydrate therefore always happens AFTER
         any egress-verify nav-away, so the eval never runs against a re-challenged page.
         """
-        pid = self._device.pidof()
+        pid = self._ensure_webview_alive(challenge_url, cancel, deadline)
         _raise_if_cancelled(cancel)
         port = self._device.forward_devtools(pid)
         # #275: from the moment the adb/CDP forward exists, tear it down in a finally
