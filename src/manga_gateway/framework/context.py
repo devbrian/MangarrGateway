@@ -307,7 +307,9 @@ class SourceContext:
         """True for a ``cloudflare`` / ``cloudflare+encrypted`` source with a solver."""
         return self._antibot.startswith("cloudflare") and self._solver is not None
 
-    async def _clearance_kwargs(self, *, force_resolve: bool) -> dict[str, Any]:
+    async def _clearance_kwargs(
+        self, *, force_cf: bool, force_csrf: bool
+    ) -> dict[str, Any]:
         """Build the per-request ``headers=`` kwarg from BOTH credential seams.
 
         D-02/D-04 union: the cf_clearance half (D-40, browser) and the session-prep
@@ -327,8 +329,12 @@ class SourceContext:
         jar and leak them onto every other source). Both halves' cookies join into the
         SAME ``Cookie`` string with ``"; "``. The cf half also pins the EXACT UA the
         cookie was issued for (Pitfall 1 — a mismatched UA silently invalidates it).
-        ``force_resolve`` forces a fresh solve (D-35) AND a session-prep refresh
-        (D-03/D-05) on the retry path.
+        The two retry escalations are INDEPENDENT (260624-ize): ``force_cf`` forces a
+        fresh CF solve (D-35) on the cf half, ``force_csrf`` forces a session-prep
+        refresh (D-03/D-05) on the csrf half. A CSRF-only-stale 403 on a union source
+        (cf+csrf, e.g. MangaBall) therefore refreshes ONLY the CSRF token — the cf
+        half stays peek-only, so the solver is never asked to mint clearance (no
+        doomed solve when no live Cloudflare challenge is firing).
         """
         headers: dict[str, str] = {}
         cookie_parts: list[str] = []
@@ -340,14 +346,16 @@ class SourceContext:
             # attempt (not a forced D-35 reconcile), peek the held clearance only —
             # never block on a fresh solve. If no challenge fires, the request just
             # succeeds with no solve; if one does, ``_request_response`` detects it
-            # (``is_cf_challenge``) and retries with ``force_resolve=True``, which
-            # drives a real solve through the ``else`` branch below. Eager sources
+            # (``is_cf_challenge``) and retries with ``force_cf=True``, which drives a
+            # real solve through the ``else`` branch below. Eager sources
             # (``cloudflare_challenge_optional=False``) keep ``solve_if_missing=True``.
+            # ``force_cf`` is the ONLY signal that escalates this half — a CSRF-only
+            # retry (``force_csrf=True``, ``force_cf=False``) leaves it peek-only.
             solve_if_missing = not (
-                self._cloudflare_challenge_optional and not force_resolve
+                self._cloudflare_challenge_optional and not force_cf
             )
             clearance = await self._call_solver(
-                force_resolve=force_resolve, solve_if_missing=solve_if_missing
+                force_resolve=force_cf, solve_if_missing=solve_if_missing
             )
             if clearance is not None:
                 headers["User-Agent"] = clearance.user_agent
@@ -357,7 +365,7 @@ class SourceContext:
 
         # session-prep half (D-01) — CSRF token header + session cookie.
         if self._session_prep is not None:
-            creds = await self._call_session_prep(force_refresh=force_resolve)
+            creds = await self._call_session_prep(force_refresh=force_csrf)
             if creds is not None:
                 headers["X-CSRF-Token"] = creds.csrf_token
                 cookie_parts.extend(
@@ -947,8 +955,9 @@ class SourceContext:
 
         Everything else — a non-challenge/non-CSRF 403, a second 403 after a reconcile,
         or any MangaDex 403 — hits the unchanged strict 401/403/404 STOP. The forced
-        retry passes ``force_resolve=True`` which refreshes WHICHEVER seam applies (the
-        union in ``_clearance_kwargs``). ``method``/``data`` thread a form-POST through
+        retry passes ``force_cf=cf_stale`` / ``force_csrf=csrf_stale`` so ONLY the stale
+        seam(s) refresh (260624-ize) — a CSRF-only-stale 403 no longer drives a doomed
+        CF solve. ``method``/``data`` thread a form-POST through
         the SAME machinery as GET; httpx form-encodes ``data=dict`` as
         ``application/x-www-form-urlencoded``. Returns the validated response (after the
         STOP gate + ``raise_for_status``); callers decide whether to decrypt the body.
@@ -957,7 +966,8 @@ class SourceContext:
             url,
             params=params,
             limited=limited,
-            force_resolve=False,
+            force_cf=False,
+            force_csrf=False,
             method=method,
             data=data,
             json_body=json_body,
@@ -995,7 +1005,8 @@ class SourceContext:
                 url,
                 params=params,
                 limited=limited,
-                force_resolve=True,
+                force_cf=cf_stale,
+                force_csrf=csrf_stale,
                 method=method,
                 data=data,
                 json_body=json_body,
@@ -1085,7 +1096,8 @@ class SourceContext:
         *,
         params: dict[str, Any] | None,
         limited: bool,
-        force_resolve: bool,
+        force_cf: bool,
+        force_csrf: bool,
         method: str = "GET",
         data: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
@@ -1106,7 +1118,7 @@ class SourceContext:
         to a no-op, and ``_emit_http`` swallows any collector-side error so a
         metric failure can never break search/download (T-08-15).
         """
-        kwargs = await self._clearance_kwargs(force_resolve=force_resolve)
+        kwargs = await self._clearance_kwargs(force_cf=force_cf, force_csrf=force_csrf)
         # Pass ``params`` to httpx ONLY when NON-EMPTY. httpx treats ``params=`` as
         # the COMPLETE query and REPLACES any query already present on ``url`` — so
         # an EMPTY dict (``get_json``/``get_json_plain(url)`` forward ``**params``
@@ -1135,10 +1147,12 @@ class SourceContext:
             merged = dict(extra_headers)
             merged.update(kwargs.get("headers") or {})
             kwargs["headers"] = merged
-        # ``attempt`` rides ``force_resolve``: a forced re-solve is the D-35
-        # attempt-2 retry; tenacity's own retries each re-enter ``_send`` and emit
-        # their own http event, so per-attempt counts come for free.
-        attempt = 2 if force_resolve else 1
+        # ``attempt`` rides ``force_cf`` (the D-35 CF reconcile attempt): a forced
+        # re-solve is the attempt-2 retry. A CSRF refresh (``force_csrf``) is NOT a
+        # solver attempt, so it must not bump ``attempt`` (260624-ize). tenacity's own
+        # retries each re-enter ``_send`` and emit their own http event, so per-attempt
+        # counts come for free.
+        attempt = 2 if force_cf else 1
         if limited:
             wait_start = time.perf_counter()
             async with self._limiter:  # gate at CALL SITE (aiolimiter caveat)
