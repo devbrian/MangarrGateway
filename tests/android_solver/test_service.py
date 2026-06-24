@@ -18,6 +18,7 @@ from collections.abc import Iterator
 import pytest
 from android_solver.cdp import ClearanceCookie
 from android_solver.config import ConfigError, SidecarConfig
+from android_solver.device import AdbError
 from android_solver.service import (
     AndroidSolvePipeline,
     SolveCancelled,
@@ -1918,12 +1919,43 @@ class _DriveEvalCdp:
         return any(c == command_id for _, _, c in self.calls)
 
 
+class _DeadThenAliveDevice(FakeDevice):
+    """``pidof`` raises ``AdbError`` for the first ``fail_pidof_times`` calls, then
+    returns a pid — models a dead ``webview_shell`` that the eval relaunches.
+
+    ``launch_url`` records the relaunch target so the test can assert the recovery
+    re-started the WebView on the challenge url.
+    """
+
+    def __init__(self, *, fail_pidof_times: int = 1) -> None:
+        super().__init__()
+        self._fail_pidof_times = fail_pidof_times
+        self.launched: list[str] = []
+        self.pidof_calls = 0
+
+    def launch_url(self, url: str) -> None:
+        self.launched.append(url)
+        return None
+
+    def pidof(self) -> int:
+        self.pidof_calls += 1
+        if self.pidof_calls <= self._fail_pidof_times:
+            raise AdbError(
+                "pidof org.chromium.webview_shell returned no pid "
+                "(process not running?)"
+            )
+        return 4321
+
+
 def _eval_pipeline(
-    monkeypatch: pytest.MonkeyPatch, cdp: _DriveEvalCdp
+    monkeypatch: pytest.MonkeyPatch,
+    cdp: _DriveEvalCdp,
+    *,
+    device: FakeDevice | None = None,
 ) -> AndroidSolvePipeline:
     page_targets = b'[{"type":"page","webSocketDebuggerUrl":"ws://localhost:9222/p"}]'
     pipeline = AndroidSolvePipeline(
-        FakeDevice(),  # type: ignore[arg-type]
+        device or FakeDevice(),  # type: ignore[arg-type]
         timeout_s=60.0,
         ws_factory=lambda url, *, timeout: FakeWs(),  # type: ignore[arg-type,return-value]
         http_get=lambda url, *, timeout: page_targets,
@@ -1933,6 +1965,53 @@ def _eval_pipeline(
     )
     monkeypatch.setattr(service, "cdp_call", cdp)
     return pipeline
+
+
+def test_eval_relaunches_dead_webview_then_proceeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Dead webview_shell: the first pidof() raises AdbError. The eval must relaunch
+    # webview_shell on the challenge url, re-poll pidof() to a valid pid, then take
+    # the re-nav + clear + hydrate branch (a fresh relaunch lands on the CF
+    # interstitial, so _EVAL_LOCATION_CMD_ID is left UNSCRIPTED → fast path declines).
+    cdp = _DriveEvalCdp(
+        {
+            service._EVAL_HYDRATION_CMD_ID: True,
+            service._EVAL_CMD_ID: {"recovered": True},
+        }
+    )
+    device = _DeadThenAliveDevice(fail_pidof_times=1)
+    pipeline = _eval_pipeline(monkeypatch, cdp, device=device)
+    monkeypatch.setattr(
+        pipeline,
+        "_clear_challenge_if_present",
+        lambda ws, ws_url, host, cancel, deadline: None,
+    )
+
+    result = _drive(pipeline, expected_egress_ip="")
+
+    assert result == {"recovered": True}
+    assert device.launched == [_EVAL_URL]
+    assert device.pidof_calls == 2
+    assert cdp.navigated_to(_EVAL_URL)
+    assert cdp.ran_command(service._EVAL_CMD_ID)
+
+
+def test_ensure_webview_alive_expired_deadline_does_not_relaunch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # webview_shell is dead (pidof raises) AND the eval deadline has already passed:
+    # the recovery MUST NOT relaunch the device or sleep — it raises immediately so a
+    # timed-out request never keeps the single eval worker driving the device.
+    cdp = _DriveEvalCdp({})
+    device = _DeadThenAliveDevice(fail_pidof_times=1)
+    pipeline = _eval_pipeline(monkeypatch, cdp, device=device)
+
+    with pytest.raises(AdbError):
+        pipeline._ensure_webview_alive(_EVAL_URL, None, deadline=time.monotonic() - 1.0)
+
+    assert device.pidof_calls == 1  # only the initial probe; no post-relaunch poll
+    assert device.launched == []  # deadline guard short-circuited before relaunch
 
 
 def _drive(pipeline: AndroidSolvePipeline, expected_egress_ip: str):  # type: ignore[no-untyped-def]
