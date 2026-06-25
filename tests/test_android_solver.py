@@ -813,6 +813,75 @@ async def test_successful_solve_clears_a_prior_block_window() -> None:
     assert not solver._in_block_window("mangadot")  # cleared by the successful mint
 
 
+# ── kagane-search-timeout part 3: serve the last-good cached clearance in a block ─────
+# A force-resolve (403 self-heal) that fails because of a Cloudflare block window must
+# not surface as a user-facing search failure while a still-valid clearance is cached.
+# The held cookie (~26 min real lifetime) covers most of a ~15-20 min window, so the
+# block-window failure falls back to the snapshot taken before WR-05 discarded it.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_block_window_force_resolve_serves_last_good_cached_clearance() -> None:
+    """A force-resolve that hits a BLOCK window serves the still-valid held clearance
+    (restored under _held) instead of raising — the search succeeds on the cached cookie
+    while the block window backs off re-solving."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0  # the instant 504 classifies as a block
+    solver._solve_retry_backoff_s = 0.0
+    last_good = Clearance(cookies={"cf_clearance": "last-good"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = last_good
+    solver._expires_at["mangadot"] = time.time() + 9999.0  # still well within lifetime
+    try:
+        served = await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert served is last_good  # served the cached clearance, did NOT raise
+    assert solver._held["mangadot"] is last_good  # restored for subsequent calls
+    assert route.call_count == 1  # one (blocked) solve, no retry
+    assert solver._in_block_window("mangadot")  # part 4: re-solving is backed off
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_block_window_force_resolve_reraises_when_cache_lapsed() -> None:
+    """A block-window force-resolve whose cached clearance has ITSELF lapsed has nothing
+    safe to fall back on → re-raises the real solve error and holds nothing (WR-05)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0
+    solver._solve_retry_backoff_s = 0.0
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "lapsed"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() - 1.0  # already expired
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert "mangadot" not in solver._held  # lapsed snapshot is not re-served / re-held
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_block_window_non_force_with_nothing_held_reraises() -> None:
+    """A block window on the non-force path with NOTHING cached has no fallback → it
+    re-raises the underlying solve error (the external contract is unchanged)."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0
+    solver._solve_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert "mangadot" not in solver._held
+
+
 # ── Bug 5 follow-on #3: page-holder get_clearance serves held-or-None, never /solve ──
 # comix is antibot=cloudflare+encrypted, so the framework calls get_clearance('comix')
 # on its httpx legs. comix can NEVER be /solve'd — /solve runs `pm clear`, cold-wiping

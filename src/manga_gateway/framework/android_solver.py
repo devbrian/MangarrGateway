@@ -540,13 +540,17 @@ class AndroidSolver:
             # and never mint here; the warm prime opportunistically holds a cookie IF a
             # real Turnstile clear deposits one, else the open CDN uses None.
             return await self._page_holder_clearance(source_key, force_resolve)
+        snapshot: Clearance | None = None
+        snapshot_expiry: float | None = None
         if force_resolve:
             # WR-05: discard the held entry BEFORE the fresh solve so a FAILED
             # force-resolve (the common 403 self-heal case) cannot leave the known
             # -bad token held — the next non-force call must re-solve rather than
-            # silently re-serve the stale clearance that produced the 403.
-            self._held.pop(source_key, None)
-            self._expires_at.pop(source_key, None)
+            # silently re-serve the stale clearance that produced the 403. Part 3:
+            # SNAPSHOT it first so a BLOCK-WINDOW re-solve failure (transient CF-side,
+            # NOT a bad token) can fall back to the still-valid last-good clearance.
+            snapshot = self._held.pop(source_key, None)
+            snapshot_expiry = self._expires_at.pop(source_key, None)
         else:
             held = self._held.get(source_key)
             if held is not None:
@@ -559,13 +563,55 @@ class AndroidSolver:
                 source_key, defer_if_foreground=defer_if_foreground
             )
         except _SolveBlocked as blocked:
-            # Part 2 baseline: a Cloudflare block-window solve failure. No cached
-            # fallback is wired here yet (part 3 serves the last-good clearance) — re-
-            # raise the underlying solve error so the external contract is unchanged.
+            # Part 3: a Cloudflare block-page window. A failed RE-solve must not surface
+            # as a user-facing search failure while a still-valid clearance is cached —
+            # the cookie's ~26 min real lifetime covers most of a ~15-20 min window. If
+            # the snapshot is still within its tracked lifetime, restore + serve it (the
+            # block window is already marked, so re-solving backs off — part 4); with no
+            # valid snapshot there is nothing safe to fall back on → re-raise the real
+            # solve error (the external contract is unchanged when nothing is cached).
+            served = self._serve_cached_through_block(
+                source_key, snapshot, snapshot_expiry
+            )
+            if served is not None:
+                return served
             raise (blocked.__cause__ or blocked) from None
         self._held[source_key] = clearance
         self._record_expiry(source_key, expires_at)
         return clearance
+
+    def _serve_cached_through_block(
+        self,
+        source_key: str,
+        snapshot: Clearance | None,
+        snapshot_expiry: float | None,
+    ) -> Clearance | None:
+        """Part 3: restore + return ``snapshot`` if it is still within its lifetime.
+
+        A failed RE-solve during a Cloudflare block window should serve the last-good
+        clearance rather than a user-facing failure. Returns the snapshot (re-held under
+        ``_held``/``_expires_at`` so subsequent non-force calls keep serving it until
+        the window lifts) when it is still valid; ``None`` (caller re-raises the real
+        error) when there is no snapshot or it has itself lapsed.
+
+        A snapshot with NO tracked expiry is treated as still-usable: the cookie
+        lifetime is unknown/session and the block window is short relative to a real
+        clearance, so serving it beats failing — the reactive 403 self-heal re-solves
+        once the window clears. The token is NEVER logged (T-10-04)."""
+        if snapshot is None:
+            return None
+        if snapshot_expiry is not None and snapshot_expiry <= time.time():
+            # The cached clearance has itself lapsed — nothing safe to serve.
+            return None
+        self._held[source_key] = snapshot
+        if snapshot_expiry is not None:
+            self._expires_at[source_key] = snapshot_expiry
+        _log.warning(
+            "AndroidSolver serving last-good cached clearance for %r through a "
+            "Cloudflare block window (re-solve failed; backing off re-solves)",
+            source_key,
+        )
+        return snapshot
 
     async def _page_holder_clearance(
         self, source_key: str, force_resolve: bool
