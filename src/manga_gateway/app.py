@@ -401,6 +401,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ``adb_target=None`` — so the loop below builds exactly one AndroidSolver (one
     # device lock), sends no ``target``, and the router's eval_backend is that one
     # instance (byte-for-byte today).
+    # LANE-01 fail-loud (PR #324 review): a typo in an android_source_lane_map SOURCE
+    # key is otherwise SILENT — resolve_lane_plans only consults the map for keys
+    # already in android_keys, so an unknown/misspelled source key is ignored and the
+    # real source quietly falls back to the shared DEFAULT_LANE, defeating the lane
+    # config. The pydantic _validate_lane_topology validator cannot catch this (it has
+    # no view of the registered sources); validate here where android_keys exists.
+    # Exempt intentionally-disabled sources (GATEWAY_DISABLED_SOURCES) so a disabled
+    # source left in the map does not block startup.
+    known_android_keys = android_keys | settings.disabled_source_keys()
+    unknown_lane_sources = sorted(
+        src for src in settings.android_source_lane_map if src not in known_android_keys
+    )
+    if unknown_lane_sources:
+        raise ValueError(
+            "android_source_lane_map references unknown source key(s) "
+            f"{unknown_lane_sources}: not a registered android source "
+            f"(known android sources: {sorted(android_keys)}). Fix the source->lane "
+            "map — a typo here silently routes the real source to the default lane."
+        )
     lane_plans = resolve_lane_plans(
         android_lanes=settings.android_lanes,
         source_lane_map=settings.android_source_lane_map,

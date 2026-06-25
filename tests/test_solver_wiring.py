@@ -180,6 +180,43 @@ async def test_two_lanes_slice_kagane_onto_its_own_solver() -> None:
         assert solver._source_lane_map == {"kagane": "kagane"}
 
 
+async def test_unknown_lane_map_source_key_fails_loud() -> None:
+    """LANE-01 fail-loud (PR #324 review): a typo'd SOURCE key in
+    android_source_lane_map is rejected at startup, NOT silently dropped (which would
+    leave the real source on the shared default lane and defeat the lane config)."""
+    app = create_app(
+        _settings(
+            android_lanes={
+                "default": "redroid:5555",
+                "kagane": "redroid-kagane:5555",
+            },
+            android_source_lane_map={"kgane": "kagane"},  # typo: should be "kagane"
+        )
+    )
+    with pytest.raises(ValueError, match="unknown source key"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
+async def test_disabled_source_in_lane_map_does_not_block_startup() -> None:
+    """A source intentionally disabled via GATEWAY_DISABLED_SOURCES but left in the
+    lane map must NOT fail startup — only genuine typos fail loud (the disabled source
+    is a known android source, just dropped from the registry for this deploy)."""
+    app = create_app(
+        _settings(
+            android_lanes={
+                "default": "redroid:5555",
+                "kagane": "redroid-kagane:5555",
+            },
+            android_source_lane_map={"kagane": "kagane"},
+            disabled_sources="kagane",
+        )
+    )
+    # Reaching the body (no raise) proves the disabled source was exempted.
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.solver, SolverRouter)
+
+
 async def test_mangadex_resolves_no_clearance_with_real_solver() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
