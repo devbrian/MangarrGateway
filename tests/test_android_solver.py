@@ -956,6 +956,76 @@ async def test_refresh_tick_skips_a_key_in_a_block_window() -> None:
     assert delay > 120.0  # not the 30s min spin — it waits out most of the window
 
 
+# ── CodeRabbit findings 3 + 2: contention is not a block; later blocked callers ──────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_device_lock_contention_is_not_a_block_window() -> None:
+    """Finding 3: time spent QUEUEING on the gateway device lock (contention behind
+    another op on the single redroid) must NOT count toward the block-vs-fast elapsed.
+    A solve that waited a long time for the lock but whose /solve attempt failed FAST is
+    classified fast (retried, no block window) — not a Cloudflare block."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=[httpx.Response(504), _solve_response()]
+    )
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.05  # tiny: the lock wait alone would exceed it
+    solver._solve_retry_backoff_s = 0.0
+    # Hold the device lock so the solve QUEUES on it far longer than the threshold.
+    await solver._device_lock.acquire()
+    task = asyncio.create_task(solver.get_clearance("mangadot"))
+    await asyncio.sleep(0.2)  # >> _solve_block_threshold_s of pure lock-contention wait
+    solver._device_lock.release()
+    try:
+        clearance = await task
+    finally:
+        await solver.aclose()
+    assert clearance is not None  # classified FAST → retried → minted (not blocked)
+    assert route.call_count == 2  # the fast 504 was retried (a block would NOT retry)
+    assert not solver._in_block_window("mangadot")  # contention is NOT a block window
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_concurrent_block_window_callers_all_serve_cached_clearance() -> None:
+    """Finding 2: concurrent force_resolve callers share ONE blocked solve, but only the
+    first snapshots the held clearance. When the shared solve is a block window, EVERY
+    caller — the first (via its snapshot) and the later ones (via the restored-held
+    re-check) — serves the SAME still-valid cached clearance; none re-raise."""
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _gated(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await gate.wait()
+        return httpx.Response(504)
+
+    route = respx.post(f"{_SIDECAR}/solve").mock(side_effect=_gated)
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0  # the shared solve classifies as a block
+    solver._solve_retry_backoff_s = 0.0
+    last_good = Clearance(cookies={"cf_clearance": "last-good"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = last_good
+    solver._expires_at["mangadot"] = time.time() + 9999.0  # still well within lifetime
+    try:
+        tasks = [
+            asyncio.create_task(solver.get_clearance("mangadot", force_resolve=True))
+            for _ in range(5)
+        ]
+        await entered.wait()  # the one shared solve has started; all callers attached
+        gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1  # one shared (blocked) solve, no retry
+    # The first caller restores _held from its snapshot; every later caller (snapshot
+    # None) re-checks the restored held and serves it — all get the same object, none
+    # raise.
+    assert all(r is last_good for r in results)
+    assert solver._in_block_window("mangadot")  # part 4: re-solving is backed off
+
+
 # comix is antibot=cloudflare+encrypted, so the framework calls get_clearance('comix')
 # on its httpx legs. comix can NEVER be /solve'd — /solve runs `pm clear`, cold-wiping
 # the warm WebView comix's managed challenge + env-*.js depend on → 5xx. And (live-
