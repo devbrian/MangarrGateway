@@ -582,6 +582,14 @@ class AndroidSolver:
             )
             if served is not None:
                 return served
+            # CodeRabbit finding 2: concurrent force_resolve callers SHARE one coalesced
+            # solve, but only the FIRST caller snapshots/pops ``_held`` (later callers
+            # see snapshot=None). When the shared solve raises ``_SolveBlocked`` the
+            # first caller may already have RESTORED a still-valid last-good clearance
+            # (above), so a later caller with no snapshot should serve THAT restored
+            # value rather than re-raise. Re-check the restored held before failing.
+            if self._held_is_valid(source_key):
+                return self._held[source_key]
             raise (blocked.__cause__ or blocked) from None
         self._held[source_key] = clearance
         self._record_expiry(source_key, expires_at)
