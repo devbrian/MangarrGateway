@@ -829,7 +829,7 @@ class SourceContext:
         return await self._retrying()(_attempt)
 
     async def get_bytes_plain_with_headers(
-        self, url: str
+        self, url: str, *, extra_headers: dict[str, str] | None = None
     ) -> tuple[bytes, httpx.Headers]:
         """Source-agnostic header-surfacing twin of :meth:`get_bytes_plain`.
 
@@ -838,6 +838,12 @@ class SourceContext:
         decode itself lives entirely in the source, so the framework stays agnostic of
         any header name. Returns ``(resp.content, resp.headers)``: the raw fetched bytes
         plus the (case-insensitive) ``httpx.Headers``.
+
+        ``extra_headers`` are merged onto the request (same precedence as every other
+        caller: credential headers win on a name clash, source keys compose). Comix uses
+        it to send ``Origin``/``Referer: https://comix.to`` on its image fetch so the
+        CDN serves the ORIGINAL unscrambled WebP rather than the datacenter-egress
+        tile-scrambled variant (debug ``comix-scramble-seed-regression``).
 
         Everything else mirrors :meth:`get_bytes_plain` exactly — the same ``_retrying``
         wrapper, the same ``_feed_failure``/``_feed_success`` health feed, NOT
@@ -850,7 +856,11 @@ class SourceContext:
         async def _attempt() -> tuple[bytes, httpx.Headers]:
             try:
                 resp = await self._request_response(
-                    url, params=None, limited=False, op="get_bytes_plain"
+                    url,
+                    params=None,
+                    limited=False,
+                    op="get_bytes_plain",
+                    extra_headers=extra_headers,
                 )
             except SourceError:
                 self._feed_failure()
