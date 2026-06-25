@@ -104,12 +104,37 @@ def test_non_positive_tap_poll_deadline_raises() -> None:
 def test_tap_poll_deadline_above_proxy_budget_raises() -> None:
     # The proxied outer budget must exceed the inner tap-poll deadline (the proxied
     # solve adds CONNECT-hop + egress-verify before the tap loop). Fail loud.
+    # (base solve_timeout is raised above the deadline here so the BASE guard passes and
+    # this exercises the PROXY guard specifically.)
     with pytest.raises(ConfigError):
         SidecarConfig.from_env(
             {
                 "SOLVER_API_KEY": "k",
+                "SOLVER_SOLVE_TIMEOUT_S": "400",
                 "SOLVER_TAP_POLL_DEADLINE_S": "300",
                 "SOLVER_PROXY_SOLVE_TIMEOUT_S": "240",
+            }
+        )
+
+
+def test_tap_poll_deadline_at_or_above_base_solve_timeout_raises() -> None:
+    # The base (no-proxy) outer worker wait is solve_timeout_s, so it too must exceed
+    # the inner tap-poll deadline, else a direct solve's outer cap fires before the
+    # inner loop completes. Fail loud (mirrors the proxy guard). Both == and < raise.
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {
+                "SOLVER_API_KEY": "k",
+                "SOLVER_SOLVE_TIMEOUT_S": "13",
+                "SOLVER_TAP_POLL_DEADLINE_S": "13",
+            }
+        )
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {
+                "SOLVER_API_KEY": "k",
+                "SOLVER_SOLVE_TIMEOUT_S": "10",
+                "SOLVER_TAP_POLL_DEADLINE_S": "13",
             }
         )
 

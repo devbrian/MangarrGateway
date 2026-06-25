@@ -160,6 +160,16 @@ class SidecarConfig:
             _DEFAULT_TAP_POLL_DEADLINE_S,
             _ENV_TAP_POLL_DEADLINE,
         )
+        # Debug ``kagane-search-timeout`` part 1: the BASE (no-proxy) outer worker wait
+        # is ``solve_timeout_s``, so it too MUST stay above the inner tap-poll deadline:
+        # otherwise a direct solve's outer cap fires before the inner locate→tap→poll
+        # loop even completes. Mirrors the proxy guard below. Fail loud at startup.
+        if solve_timeout_s <= tap_poll_deadline_s:
+            raise ConfigError(
+                f"{_ENV_TIMEOUT} ({solve_timeout_s}) must be greater than "
+                f"{_ENV_TAP_POLL_DEADLINE} ({tap_poll_deadline_s}) — the base outer "
+                "budget has to exceed the inner locate→tap→poll deadline"
+            )
 
         cancel_grace_s = _parse_positive_float(
             source.get(_ENV_CANCEL_GRACE), _DEFAULT_CANCEL_GRACE_S, _ENV_CANCEL_GRACE
