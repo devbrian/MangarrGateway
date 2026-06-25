@@ -543,6 +543,13 @@ class AndroidSolver:
         snapshot: Clearance | None = None
         snapshot_expiry: float | None = None
         if force_resolve:
+            if self._in_block_window(source_key) and self._held_is_valid(source_key):
+                # Part 4: a recent re-solve already failed into a Cloudflare block
+                # window for this key. Don't re-hammer /solve on EVERY 403 self-heal
+                # through the ~15-20 min window (each attempt only re-hits the block and
+                # costs ~13s) — serve the still-valid last-good clearance (part 3
+                # restored it) and let the backoff lapse before the next real re-solve.
+                return self._held[source_key]
             # WR-05: discard the held entry BEFORE the fresh solve so a FAILED
             # force-resolve (the common 403 self-heal case) cannot leave the known
             # -bad token held — the next non-force call must re-solve rather than
@@ -1216,6 +1223,16 @@ class AndroidSolver:
         """Part 4: True while ``source_key`` is inside a backed-off block window."""
         return time.time() < self._block_until.get(source_key, 0.0)
 
+    def _held_is_valid(self, source_key: str) -> bool:
+        """True when a clearance is held for ``source_key`` AND still within its tracked
+        expiry. A held entry with no tracked expiry (session/unknown lifetime) counts as
+        valid — the block-window backoff (part 4) only ever serves it for a short
+        window, and the reactive 403 self-heal re-solves once that window lapses."""
+        if source_key not in self._held:
+            return False
+        expiry = self._expires_at.get(source_key)
+        return expiry is None or expiry > time.time()
+
     # ───────────────────────────── in-WebView eval ────────────────────────────
 
     async def eval_in_webview(
@@ -1510,6 +1527,12 @@ class AndroidSolver:
                 # eval page). Its clearance, IF a Turnstile clear ever deposited one, is
                 # re-captured reactively on a 403 self-heal (force-resolve) instead.
                 continue
+            if self._in_block_window(key):
+                # Part 4: a recent re-solve hit a Cloudflare block window for this key —
+                # do NOT re-hammer /solve through the ~15-20 min window on every tick.
+                # The held clearance keeps serving (part 3) and the reactive 403
+                # self-heal backstops it; the next tick retries once the backoff lapses.
+                continue
             if expiry - now > self._refresh_lead_s:
                 continue
             try:
@@ -1534,11 +1557,18 @@ class AndroidSolver:
                 continue
             self._held[key] = clearance
             self._record_expiry(key, new_expiry)
-        upcoming = [
-            expiry - self._refresh_lead_s
-            for key, expiry in self._expires_at.items()
-            if key not in self._on_demand_keys and key not in self._warm_last_keys
-        ]
+        upcoming: list[float] = []
+        for key, expiry in self._expires_at.items():
+            if key in self._on_demand_keys or key in self._warm_last_keys:
+                continue
+            block_until = self._block_until.get(key)
+            if block_until is not None and block_until > now:
+                # Part 4: a blocked key's next meaningful re-check is when its backoff
+                # lapses, not its (already-passed) refresh lead — so the loop sleeps to
+                # the window's end instead of spinning at the min cadence skipping it.
+                upcoming.append(block_until)
+            else:
+                upcoming.append(expiry - self._refresh_lead_s)
         if not upcoming:
             return self._refresh_max_sleep_s
         delay = min(upcoming) - time.time()

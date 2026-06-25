@@ -882,7 +882,80 @@ async def test_block_window_non_force_with_nothing_held_reraises() -> None:
     assert "mangadot" not in solver._held
 
 
-# ── Bug 5 follow-on #3: page-holder get_clearance serves held-or-None, never /solve ──
+# ── kagane-search-timeout part 4: back off re-solving while in a detected block ──────
+# A detected block window backs off re-solving on BOTH the per-request force-resolve
+# path (serve held, no /solve) and the proactive refresh loop (skip the key) instead of
+# re-hammering the single redroid every ~few minutes through the ~15-20 min window.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_force_resolve_in_block_window_serves_held_without_solving() -> None:
+    """In a block window, a force-resolve with a still-valid held clearance serves it
+    WITHOUT any /solve — the 403 self-heal stops re-hammering the device through the
+    window (each attempt would only re-hit the block and cost ~13s)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    held = Clearance(cookies={"cf_clearance": "held"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = held
+    solver._expires_at["mangadot"] = time.time() + 9999.0  # still valid
+    solver._block_until["mangadot"] = time.time() + 9999.0  # inside a block window
+    try:
+        served = await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert served is held  # served the held clearance
+    assert not route.called  # NO /solve — backed off through the window
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_force_resolve_in_block_window_with_lapsed_held_still_solves() -> None:
+    """The block-window backoff only serves a STILL-VALID held clearance — if the held
+    clearance has lapsed it falls through and attempts a real re-solve (the window may
+    have nothing safe left to serve)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "lapsed"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() - 1.0  # lapsed
+    solver._block_until["mangadot"] = time.time() + 9999.0  # inside a block window
+    try:
+        fresh = await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert fresh is not None
+    assert fresh.cookies == {"cf_clearance": "android-minted-token"}
+    assert route.called  # the lapsed held did not satisfy the backoff → a real re-solve
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_skips_a_key_in_a_block_window() -> None:
+    """The proactive refresh loop SKIPS a within-lead key that is in a block window — no
+    /solve hammering through the window — and schedules the next re-check at the
+    window's end (not the min cadence). The held clearance is left untouched."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    solver._refresh_min_sleep_s = 30.0
+    solver._refresh_max_sleep_s = 600.0
+    held = Clearance(cookies={"cf_clearance": "held"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = held
+    solver._expires_at["mangadot"] = time.time() + 30.0  # within lead → would re-mint…
+    solver._block_until["mangadot"] = time.time() + 200.0  # …but it is blocked
+    try:
+        delay = await solver._refresh_tick()
+    finally:
+        await solver.aclose()
+    assert not route.called  # blocked → no proactive /solve
+    assert solver._held["mangadot"] is held  # untouched
+    # Next re-check scheduled at ~the block-window end (≈200s), clamped to [min, max].
+    assert 30.0 <= delay <= 600.0
+    assert delay > 120.0  # not the 30s min spin — it waits out most of the window
+
+
 # comix is antibot=cloudflare+encrypted, so the framework calls get_clearance('comix')
 # on its httpx legs. comix can NEVER be /solve'd — /solve runs `pm clear`, cold-wiping
 # the warm WebView comix's managed challenge + env-*.js depend on → 5xx. And (live-
