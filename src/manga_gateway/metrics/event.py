@@ -78,3 +78,14 @@ class MetricEvent:
     # from the INTERNAL Job projection, ordered most-progressed-first and capped at
     # 50 so a long queued backlog is dropped first.
     queue_items: list[dict[str, object]] | None = None
+    # ── 15-03 per-lane observability (OBS-01, default None) ───────────────────
+    # Additive + optional, payload-only — SAME posture as every block above: it
+    # rides ``json.dumps(asdict(MetricEvent))`` into ring_events.payload with NO new
+    # ring_events column and NO metrics-DB migration, and surfaces through the read
+    # endpoints automatically. ``lane`` is a NON-SECRET solver-lane identifier
+    # ("default"/"kagane") stamped on solve/eval events so device contention is
+    # attributable per lane (PERF-01's later proof). T-15-09: it structurally cannot
+    # carry a token — url stays None on solve/eval, so the T-10-04 redaction posture
+    # is unchanged. Kept in LOCKSTEP with MetricEventOut.lane (test_metrics_models.py
+    # ::test_metricevent_fields_lockstep fails CI if only one side carries it).
+    lane: str | None = None

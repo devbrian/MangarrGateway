@@ -140,6 +140,10 @@ class MetricEventOut(BaseModel):
     # list, but each item is a flat scalar map so list[dict[str, object]] (matching
     # the dataclass type exactly) keeps mypy-strict clean with no extra sub-model.
     queue_items: list[dict[str, object]] | None = None
+    # 15-03 per-lane observability (OBS-01) — LOCKSTEP parity with MetricEvent.lane:
+    # a non-secret solver-lane identifier ("default"/"kagane") on solve/eval events.
+    # The lockstep drift test (test_metrics_models.py) fails CI unless BOTH carry it.
+    lane: str | None = None
 
 
 class RequestBreakdownOut(BaseModel):
