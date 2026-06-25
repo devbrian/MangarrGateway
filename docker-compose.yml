@@ -52,6 +52,24 @@
 # residential proxy is ever added for these sources, redroid must egress the SAME
 # proxy. LANDMINE: do NOT `adb root` against redroid — it wedges adbd; the solver
 # runs UNROOTED. Recover a wedged device by restarting the redroid container.
+#
+# SOLVER LANES (LANE-04 — optional, off by default). The DEFAULT android stack is
+# exactly ONE redroid + ONE android-solver (above). A "lane" is a DEDICATED extra
+# redroid device for a single source whose cookie-jar (cf_clearance) must NOT be
+# clobbered by another source's `pm clear` — e.g. kagane. Each lane = +1 redroid
+# container, gated behind its OWN per-lane sub-profile (`lane-<name>`) LAYERED on
+# the `android` profile, so `COMPOSE_PROFILES=android` ALONE still starts exactly
+# one redroid (no container sprawl for default deployers). A lane redroid shares
+# the host iGPU (`/dev/dri`, validated by the iGPU GO spike — a 2nd redroid runs
+# hardware-accelerated alongside the live device) but gets its OWN persistent
+# `/data` volume (cookie-jar isolation — a shared `/data` would re-introduce the
+# cross-lane pm-clear clobber). Cost: ~800 MiB RAM + ~2% CPU per lane (iGPU GO
+# spike). adb stays docker-internal on every lane (no host publish, #215). The
+# single `android-solver` learns enabled lanes via `SOLVER_ADB_TARGETS`. The
+# `redroid-kagane` service below is the worked example; to enable it flip
+# `COMPOSE_PROFILES=android,lane-kagane` + add `redroid-kagane:5555` to
+# `SOLVER_ADB_TARGETS` + set the gateway lane config — see README "Add a solver
+# lane".
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -142,6 +160,58 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # ── redroid-kagane — EXAMPLE solver lane (LANE-04, opt-in, OFF by default).
+  # A DEDICATED extra Android device so kagane's cleared cookie jar is never
+  # clobbered by another source's `pm clear`. It mirrors the `redroid` service
+  # above EXACTLY (privileged, host iGPU `/dev/dri`, host GPU boot arg, the
+  # `getprop sys.boot_completed` healthcheck, adb 5555 DOCKER-INTERNAL ONLY — no
+  # ports stanza, #215) but differs in two deliberate ways:
+  #   1. profiles: ["lane-kagane"] — gated by the lane sub-profile ONLY (Compose
+  #      profile membership is OR, so it must NOT also list `android` or it would
+  #      start under a bare COMPOSE_PROFILES=android). Deployers LAYER it on android
+  #      by setting COMPOSE_PROFILES=android,lane-kagane. `COMPOSE_PROFILES=android`
+  #      alone leaves it DOWN → default deploy stays at exactly one redroid.
+  #   2. its OWN persistent `/data` volume (redroid-kagane-data) — cookie-jar
+  #      isolation; a shared /data would re-introduce the cross-lane clobber that
+  #      separate devices exist to prevent.
+  # The host iGPU (/dev/dri) is SHARED with the default redroid (iGPU GO spike:
+  # a 2nd instance runs hardware-accelerated alongside the live device). To enable
+  # this lane: COMPOSE_PROFILES=android,lane-kagane + add `redroid-kagane:5555` to
+  # the android-solver SOLVER_ADB_TARGETS + set the gateway lane config (see
+  # README "Add a solver lane"). Copy this block (rename redroid-<lane> +
+  # redroid-<lane>-data + lane-<lane>) to add further lanes.
+  redroid-kagane:
+    image: redroid/redroid:11.0.0-latest
+    # Gated by the lane sub-profile ONLY. Compose profile membership is OR (a
+    # service starts if ANY listed profile is active), so listing "android" here
+    # too would make this lane start under a bare COMPOSE_PROFILES=android — the
+    # exact container-sprawl we must avoid. With only "lane-kagane":
+    #   COMPOSE_PROFILES=android             → lane DOWN (default = 1 redroid)
+    #   COMPOSE_PROFILES=android,lane-kagane → lane UP   (layered on android)
+    # The "layered on android" relationship is the deployer convention (always set
+    # BOTH); android-solver itself is gated by the `android` profile.
+    profiles: ["lane-kagane"]  # opt-in lane sub-profile; set alongside `android`
+    privileged: true
+    devices:
+      - "/dev/dri:/dev/dri"  # SHARED host iGPU (iGPU GO spike) — real-GPU WebGL for the CF render check
+    command:
+      - androidboot.redroid_gpu_mode=host
+    volumes:
+      # OWN persistent Android /data (per-lane cookie-jar isolation). Defaults to a
+      # named volume; set MANGARR_REDROID_KAGANE_DIR to bind a host dir.
+      - ${MANGARR_REDROID_KAGANE_DIR:-redroid-kagane-data}:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "[ \"$$(getprop sys.boot_completed 2>/dev/null | tr -d '\\r')\" = \"1\" ]",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
   # ── android-solver — thin sidecar (adb + the solver code, no gateway source).
   # Built from android_solver/Dockerfile. Drives redroid over adb+CDP and serves
   # the authenticated control API (POST /solve). Every secret arrives via env
@@ -161,11 +231,28 @@ services:
     depends_on:
       redroid:
         condition: service_healthy
+      # Lane device (LANE-04): wait on it ONLY when the lane-kagane sub-profile
+      # started it. `required: false` keeps the default deploy (no lane-kagane)
+      # from waiting on — or erroring about — a service that isn't running.
+      redroid-kagane:
+        condition: service_healthy
+        required: false
     environment:
       # MUST match the gateway's GATEWAY_ANDROID_SOLVER_API_KEY (same .env value).
       SOLVER_API_KEY: "${GATEWAY_ANDROID_SOLVER_API_KEY:-}"
-      # The redroid adb target on the docker-internal network (service name:5555).
+      # The DEFAULT redroid adb target on the docker-internal network
+      # (service name:5555). The single-target default — UNCHANGED for default
+      # deployers. The sidecar always treats SOLVER_ADB_TARGET as a member of its
+      # target registry (15-02), so leaving this alone keeps today's behavior.
       SOLVER_ADB_TARGET: "redroid:5555"
+      # SOLVER LANES (LANE-04, opt-in): the comma-list of ALL enabled adb targets
+      # the single sidecar should serve, one per redroid device. DEFAULT (this stays
+      # COMMENTED OUT) = single-target = today (the sidecar collapses to just
+      # SOLVER_ADB_TARGET). To enable the kagane lane, uncomment the line below AND
+      # set COMPOSE_PROFILES=android,lane-kagane AND the gateway lane config
+      # (GATEWAY_ANDROID_LANES / GATEWAY_ANDROID_SOURCE_LANE_MAP) — see README
+      # "Add a solver lane". (env_file/.env may also override this without editing.)
+      # SOLVER_ADB_TARGETS: "redroid:5555,redroid-kagane:5555"
       # SSRF allowlist — the only challenge hosts the sidecar will drive a device
       # against (the strict-Turnstile sources). Anything else → 422. mangaball.net
       # joined 2026-06-15 (#243): its managed challenge is unclearable by desktop
@@ -179,3 +266,6 @@ volumes:
   gateway-state:
   gateway-output:
   redroid-data:
+  # Per-lane cookie-jar isolation (LANE-04). Used only when the lane-kagane
+  # sub-profile starts redroid-kagane; harmless (uncreated) otherwise.
+  redroid-kagane-data:
