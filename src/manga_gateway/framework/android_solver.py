@@ -1158,8 +1158,8 @@ class AndroidSolver:
         re-raised untouched) when a comix foreground lease is claimed while it queues —
         the ``_device_op`` contract is unchanged.
 
-        On a failure the elapsed of THAT attempt is the discriminator (debug
-        ``kagane-search-timeout`` part 2): elapsed >= ``_solve_block_threshold_s`` means
+        On a failure the elapsed of the ``/solve`` ATTEMPT ITSELF is the discriminator
+        (debug ``kagane-search-timeout`` part 2): elapsed >= the block threshold means
         the sidecar polled to its inner tap-poll deadline — a Cloudflare block-page
         window — so it is NOT retried (a retry just re-hits the block); the block window
         is marked (part 4) and :class:`_SolveBlocked` is raised (carrying the original
@@ -1170,16 +1170,29 @@ class AndroidSolver:
         never reaches this retry), so this adds at most ONE extra device hit, only on a
         genuine fast failure. The ``cf_clearance`` token is parsed into the D-40
         ``Clearance`` shape and is NEVER logged (T-10-04).
+
+        CodeRabbit finding 3: the timer starts ONLY AFTER the gateway-side device-op
+        lock is acquired (right before the POST), so the lock-queue wait / acquire
+        budget never counts toward ``elapsed``. Otherwise a device-CONTENTION failure
+        (queueing behind another op on the single redroid — the kind of ~21s fail seen
+        live) would be misclassified as a block window: wrongly marked, served from
+        cache, and denied the retry an infra hiccup deserves. A failure raised BEFORE
+        the POST (``started is None`` — a ``_RefreshDeferred``-adjacent acquire error, a
+        pre-POST device-op timeout) is treated as a FAST failure (retried, never a block
+        window) because it never reached the sidecar's tap-poll loop.
         """
         url = f"{self._base_url}/solve"
         for attempt in range(1, self._solve_max_attempts + 1):
-            started = time.monotonic()
+            started: float | None = None
             try:
                 async with self._device_op(
                     defer_if_foreground=defer_if_foreground
                 ) as acquired:
                     if not acquired:
                         raise _RefreshDeferred(source_key)
+                    # Start the block-vs-fast timer only now — AFTER the lock is held —
+                    # so device-lock contention is never charged to the /solve elapsed.
+                    started = time.monotonic()
                     resp = await self._post_sidecar(
                         url, json=body, headers=headers, timeout=self._timeout_s
                     )
@@ -1190,8 +1203,10 @@ class AndroidSolver:
             except _RefreshDeferred:
                 raise
             except Exception as exc:
-                elapsed = time.monotonic() - started
-                if elapsed >= self._solve_block_threshold_s:
+                # A pre-POST failure (started is None) never reached the sidecar's
+                # tap-poll loop, so it is a FAST failure (elapsed 0.0), never a block.
+                elapsed = time.monotonic() - started if started is not None else 0.0
+                if started is not None and elapsed >= self._solve_block_threshold_s:
                     # Deadline-exhaustion = a Cloudflare block-page window. Back off
                     # (part 4) and signal so the caller serves a cached clearance
                     # (part 3) rather than retrying into the same block.
