@@ -2270,7 +2270,7 @@ def test_solve_per_target_allowlist_allows_scoped_host() -> None:
         {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe},
         allowed_hosts_by_target={_KAGANE_TARGET: frozenset({"kagane.to"})},
     )
-    # The scoped host on its lane is accepted; the default lane still uses the global set.
+    # The scoped host on its lane is accepted; the default lane uses the global set.
     k_status, _ = service.solve(
         api_key="s3cret-solver-key",
         body=(
