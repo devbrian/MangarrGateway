@@ -328,6 +328,59 @@ usual `docker compose -f docker-compose.yml up --build -d` brings up the full st
 boot there — the mangadot/kagane live-smoke tests keep their `ci_skip_reason` and
 skip in CI. This is a **deploy-only** capability.
 
+### Add a solver lane (LANE-04 / DOC-01)
+
+By default the Android stack is **one** redroid + **one** android-solver, and every
+Android source shares that single device's WebView cookie jar. A **solver lane** is
+a **dedicated extra redroid** for one source whose cleared `cf_clearance` must not be
+wiped when another source's WebView is `pm clear`-ed (kagane is the canonical case).
+A lane is purely a **deployer opt-in** — the default (no lane config) deploy needs
+**zero change**.
+
+`docker-compose.yml` ships a worked example, `redroid-kagane`, gated behind the
+`lane-kagane` compose sub-profile. To enable it (or model a new lane on it):
+
+1. **Declare the lane (gateway config).** Map the lane to its adb target and route
+   the source to it — JSON env (or the equivalent `config.toml` keys):
+   ```bash
+   GATEWAY_ANDROID_LANES='{"kagane": "redroid-kagane:5555"}'
+   GATEWAY_ANDROID_SOURCE_LANE_MAP='{"kagane": "kagane"}'
+   ```
+   Empty (the default) ⇒ one shared lane = today.
+2. **Add the redroid lane service + its `/data` volume + the sub-profile.** Copy the
+   `redroid-kagane` block in `docker-compose.yml` (rename `redroid-<lane>`,
+   `redroid-<lane>-data`, and `profiles: ["lane-<lane>"]`). It mirrors the default
+   `redroid` exactly — `privileged`, the **shared** host iGPU (`/dev/dri`),
+   `androidboot.redroid_gpu_mode=host`, the `getprop sys.boot_completed` healthcheck,
+   and adb `5555` **docker-internal only (no host port)** — but gets its **own**
+   `/data` volume so its cookie jar is isolated. Add `redroid-<lane>-data:` to the
+   top-level `volumes:` block.
+3. **Add the lane target to `SOLVER_ADB_TARGETS`** (and optionally scope it):
+   ```bash
+   SOLVER_ADB_TARGETS=redroid:5555,redroid-kagane:5555
+   # optional: lock the lane to only its source's host
+   SOLVER_ALLOWED_HOSTS_BY_TARGET='{"redroid-kagane:5555": ["kagane.to"]}'
+   ```
+   The single sidecar serves every listed target (one serialized worker per device).
+4. **Layer the lane sub-profile on `android`:**
+   ```bash
+   COMPOSE_PROFILES=android,lane-kagane
+   ```
+   Compose profile membership is **OR**, so the lane redroid lists only its own
+   `lane-<lane>` profile; `COMPOSE_PROFILES=android` **alone** still starts exactly
+   one redroid.
+5. **Redeploy and validate one CF clear on the new lane.** `docker compose -f
+   docker-compose.yml up --build -d`, then confirm the source clears Cloudflare end
+   to end through its dedicated device (binderfs + the shared iGPU are validated for
+   multiple instances by the iGPU GO spike).
+
+**Cost & constraints.** Each lane is **+1 redroid container** — roughly **~800 MiB
+RAM + ~2% CPU** — that **shares the host iGPU** (`/dev/dri`) with the default device
+(no extra GPU needed). adb stays **docker-internal** on every lane (#215); the lane
+never reuses the default `redroid-data` volume (a shared `/data` would re-introduce
+the cross-lane `pm clear` clobber the lane exists to prevent). All the lane knobs are
+documented in `.env.example`.
+
 ## Observability & Metrics
 
 The gateway records a small event for every meaningful outbound action (HTTP
