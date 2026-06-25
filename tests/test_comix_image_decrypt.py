@@ -22,11 +22,10 @@ from PIL import Image
 
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.comix import (
+    _IMAGE_FETCH_HEADERS,
     ComixSource,
-    _cache_bust_url,
     _scramble_permutation,
     _unscramble_image,
-    _webp_is_scramble_container,
 )
 
 # Spike-012 offline regression vector (page 04 — x-enc-seed header + raw bytes;
@@ -43,15 +42,23 @@ _ALGO2_PLAIN = bytes.fromhex("524946463c7b02005745425056503820307b0200")
 
 
 class _FakeCtx:
-    """``SourceContext`` stand-in serving fixed bytes + headers to ``fetch_image``."""
+    """``SourceContext`` stand-in serving fixed bytes + headers to ``fetch_image``.
+
+    Records the per-call ``extra_headers`` so tests can assert Comix sends its
+    ``Origin``/``Referer`` image headers (debug ``comix-scramble-seed-regression``).
+    """
 
     def __init__(self, data: bytes, headers: dict[str, str]) -> None:
         self._data = data
         self._headers = httpx.Headers(headers)
+        self.calls = 0
+        self.last_extra_headers: dict[str, str] | None = None
 
     async def get_bytes_plain_with_headers(
-        self, url: str
+        self, url: str, *, extra_headers: dict[str, str] | None = None
     ) -> tuple[bytes, httpx.Headers]:
+        self.calls += 1
+        self.last_extra_headers = extra_headers
         return self._data, self._headers
 
 
@@ -325,15 +332,15 @@ def test_algo_header_parser() -> None:
     assert h("garbage", 1) == -1  # malformed → guaranteed-unknown (fails loud)
 
 
-# ───────── Cloudflare seed-header recovery (comix-scramble-seed-regression) ─────────
+# ---- Origin-header plaintext fix (comix-scramble-seed-regression) ----
 
 
 def _scramble_to_vp8x_exif(
     img: Image.Image, seed: int, cols: int, rows: int, algo: int
 ) -> bytes:
     """Forward-scramble (as :func:`_scramble_to_webp`) but re-encode into the VP8X+EXIF
-    container Comix emits for scrambled pages — the cache-stable body signature the
-    seed-recovery branch keys on (the seed header itself is Cloudflare-strippable)."""
+    container Comix emits for a residual tile-scrambled page — exercises the header-seed
+    descramble on the extended-WebP container shape."""
     perm = _scramble_permutation(seed, cols * rows, algo)
     tw, th = img.width // cols, img.height // rows
     scr = img.copy()
@@ -356,112 +363,67 @@ def _scramble_to_vp8x_exif(
     return buf.getvalue()
 
 
-class _RecoveryCtx:
-    """``SourceContext`` stand-in modelling Cloudflare's header-stripping cache.
-
-    The first (plain) fetch returns the scrambled body with NO ``x-scramble-*`` headers
-    (a CF cache HIT that dropped them). The cache-busted refetch (URL carries ``cb=``)
-    returns the SAME body WITH the seed/grid/algo headers (origin on a forced MISS) —
-    but only when ``recoverable``. Records every requested URL for call-count asserts.
-    """
-
-    def __init__(
-        self,
-        data: bytes,
-        seed: int,
-        cols: int,
-        rows: int,
-        algo: int,
-        *,
-        recoverable: bool = True,
-    ) -> None:
-        self._data = data
-        self._seed_headers = httpx.Headers(
-            {
-                "x-scramble-seed": str(seed),
-                "x-scramble-grid": f"{cols}x{rows}",
-                "x-scramble-algo": str(algo),
-            }
-        )
-        self._recoverable = recoverable
-        self.urls: list[str] = []
-
-    async def get_bytes_plain_with_headers(
-        self, url: str
-    ) -> tuple[bytes, httpx.Headers]:
-        self.urls.append(url)
-        if "cb=" in url and self._recoverable:
-            return self._data, self._seed_headers
-        return self._data, httpx.Headers({})  # CF-stripped: scramble headers gone
-
-
-def test_webp_is_scramble_container_detects_vp8x_exif() -> None:
-    img = _make_grid_image(5, 5)
-    # VP8X + EXIF (scramble container) → True
-    vp8x = _scramble_to_vp8x_exif(img, 123, 5, 5, 3)
-    assert vp8x[12:16] == b"VP8X"
-    assert _webp_is_scramble_container(vp8x) is True
-    # plain lossless (VP8L, no EXIF) → False
-    buf = io.BytesIO()
-    img.save(buf, format="WEBP", lossless=True)
-    assert _webp_is_scramble_container(buf.getvalue()) is False
-    # simple VP8 / non-RIFF / truncated → False (never trips the recovery refetch)
-    assert _webp_is_scramble_container(b"RIFF\x10\x00\x00\x00WEBPVP8 ") is False
-    assert _webp_is_scramble_container(b"not a webp at all") is False
-    assert _webp_is_scramble_container(b"RIFF\x04\x00\x00\x00WEBPVP8X") is False
-
-
-def test_cache_bust_url_appends_unique_param() -> None:
-    a = _cache_bust_url("https://cdn.example.store/i5/T/abc")
-    b = _cache_bust_url("https://cdn.example.store/i5/T/abc")
-    assert a.startswith("https://cdn.example.store/i5/T/abc?cb=")
-    assert a != b  # cryptographically unique → guarantees a fresh CF cache key
-    # an existing query string uses & rather than a second ?
-    q = _cache_bust_url("https://cdn.example.store/i5/T/abc?6a3ce71c")
-    assert "?6a3ce71c&cb=" in q
+@pytest.mark.asyncio
+async def test_fetch_image_sends_origin_referer_headers() -> None:
+    """Comix must send ``Origin``/``Referer: https://comix.to`` on the image fetch — the
+    live-proven discriminator that makes the CDN return the plaintext original."""
+    payload = b"RIFF\x10\x00\x00\x00WEBPVP8 "  # plaintext page
+    ctx = _FakeCtx(payload, {})
+    out = await ComixSource().fetch_image("https://cdn.example.store/i5/T/01", ctx)
+    assert out == payload  # plaintext → untouched
+    assert ctx.calls == 1  # single fetch, no refetch
+    assert ctx.last_extra_headers == _IMAGE_FETCH_HEADERS
+    assert ctx.last_extra_headers["Origin"] == "https://comix.to"
 
 
 @pytest.mark.asyncio
-async def test_fetch_image_recovers_cloudflare_stripped_seed() -> None:
-    """The core regression: a scrambled VP8X page whose seed header CF stripped is
-    recovered via a cache-bust refetch and correctly descrambled (not shipped as-is).
-    """
+async def test_fetch_image_unscrambles_residual_vp8x_with_seed() -> None:
+    """The residual VP8X page that survives the Origin header still carries a usable
+    ``x-scramble-seed`` and is descrambled via the existing header path."""
     cols, rows, seed, algo = 5, 5, 4167260734, 3
     original = _make_grid_image(cols, rows)
     scrambled = _scramble_to_vp8x_exif(original, seed, cols, rows, algo)
-    assert _webp_is_scramble_container(scrambled)  # fixture sanity
-    ctx = _RecoveryCtx(scrambled, seed, cols, rows, algo)
+    ctx = _FakeCtx(
+        scrambled,
+        {
+            "x-scramble-seed": str(seed),
+            "x-scramble-grid": f"{cols}x{rows}",
+            "x-scramble-algo": str(algo),
+        },
+    )
     out = await ComixSource().fetch_image("https://cdn.example.store/i5/T/abc", ctx)
     restored = Image.open(io.BytesIO(out)).convert("RGB")
     assert restored.tobytes() == original.tobytes()
-    # exactly one recovery refetch, and it was cache-busted
-    assert len(ctx.urls) == 2
-    assert "cb=" in ctx.urls[1]
+    assert ctx.last_extra_headers == _IMAGE_FETCH_HEADERS
 
 
 @pytest.mark.asyncio
-async def test_fetch_image_scramble_container_unrecoverable_fails_loud() -> None:
-    """A scramble container whose seed stays absent even after the bypass must FAIL LOUD
-    — never silently package the still-scrambled (valid-WebP) page."""
-    cols, rows, seed, algo = 5, 5, 4167260734, 3
-    original = _make_grid_image(cols, rows)
-    scrambled = _scramble_to_vp8x_exif(original, seed, cols, rows, algo)
-    ctx = _RecoveryCtx(scrambled, seed, cols, rows, algo, recoverable=False)
-    with pytest.raises(SourceError, match="after cache-bypass refetch"):
-        await ComixSource().fetch_image("https://cdn.example.store/i5/T/abc", ctx)
-    assert len(ctx.urls) == 2  # attempted the recovery refetch before failing
+async def test_fetch_image_seedless_vp8x_passes_through() -> None:
+    """A VP8X+EXIF body with NO ``x-scramble-seed`` is the plaintext original (Comix
+    serves some plaintext pages — e.g. tall end-pages — as VP8X+EXIF). It must pass
+    through UNTOUCHED, never be misclassified as scrambled and rejected."""
+    img = _make_grid_image(5, 5)
+    exif = Image.Exif()
+    exif[0x0112] = 1
+    buf = io.BytesIO()
+    img.save(buf, format="WEBP", lossless=True, exif=exif.tobytes())  # plaintext VP8X
+    payload = buf.getvalue()
+    assert payload[12:16] == b"VP8X"
+    ctx = _FakeCtx(payload, {})  # no scramble seed header
+    out = await ComixSource().fetch_image("https://cdn.example.store/i5/T/end", ctx)
+    assert out == payload
+    assert ctx.calls == 1
 
 
 @pytest.mark.asyncio
-async def test_fetch_image_plaintext_non_container_no_refetch() -> None:
-    """A plaintext page (not a VP8X+EXIF container) with no seed header passes through
-    untouched and incurs NO extra cache-bust fetch (the over-reported ``s:1`` case)."""
+async def test_fetch_image_plaintext_passthrough() -> None:
+    """A plaintext page with no seed header passes through untouched — the common case
+    under the Origin header."""
     img = _make_grid_image(5, 5)
     buf = io.BytesIO()
-    img.save(buf, format="WEBP", lossless=True)  # VP8L, not a scramble container
+    img.save(buf, format="WEBP", lossless=True)
     payload = buf.getvalue()
-    assert not _webp_is_scramble_container(payload)
-    ctx = _RecoveryCtx(payload, 1, 5, 5, 3)
+    ctx = _FakeCtx(payload, {})
     out = await ComixSource().fetch_image("https://cdn.example.store/i5/T/x", ctx)
     assert out == payload
-    assert len(ctx.urls) == 1  # no recovery refetch
+    assert ctx.calls == 1  # single fetch, no refetch

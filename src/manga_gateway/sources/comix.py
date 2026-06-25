@@ -106,7 +106,6 @@ import io
 import json
 import logging
 import re
-import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, cast
@@ -381,52 +380,13 @@ def _unscramble_image(
     return buf.getvalue()
 
 
-def _webp_is_scramble_container(data: bytes) -> bool:
-    """True iff ``data`` is the VP8X+EXIF WebP container Comix emits for a
-    TILE-SCRAMBLED page (debug ``comix-scramble-seed-regression``).
-
-    Comix re-encodes a scrambled page into an *extended* WebP (``VP8X``) that carries
-    an ``EXIF`` metadata chunk; plaintext pages stay simple ``VP8 ``/``VP8L`` with no
-    EXIF. The descramble SEED itself rides only the ``x-scramble-seed`` response header,
-    which Cloudflare's edge cache STRIPS on a cache HIT — but the body is cached
-    verbatim, so this container signature is the reliable, cache-stable "this page is
-    scrambled" signal when the header is absent (the live ``s:1`` manifest flag
-    over-reports — it is set on plaintext pages too — so it is deliberately NOT used).
-
-    Walks the RIFF chunk table rather than naively substring-scanning for ``EXIF``
-    (which could false-match compressed pixel bytes). Any truncation / malformed length
-    short-circuits to ``False`` (treated as "not a scramble container"), so a partial
-    body never trips the recovery refetch.
-    """
-    if len(data) < 16 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
-        return False
-    if data[12:16] != b"VP8X":
-        return False
-    off = 12
-    n = len(data)
-    while off + 8 <= n:
-        fourcc = data[off : off + 4]
-        size = int.from_bytes(data[off + 4 : off + 8], "little")
-        if fourcc == b"EXIF":
-            return True
-        # chunks are padded to an even length (RIFF)
-        off += 8 + size + (size & 1)
-    return False
-
-
-def _cache_bust_url(url: str) -> str:
-    """Append a unique throwaway ``cb=`` query param to force a Cloudflare cache MISS.
-
-    A Cloudflare HIT can serve a cached image copy whose ``x-scramble-*`` response
-    headers were stripped; a fresh ORIGIN response always re-attaches them (proven live
-    on VP8X pages). The value is content-irrelevant — the CDN ignores it for the bytes,
-    but Cloudflare keys its edge cache on the full query string, so a never-before-seen
-    value guarantees a MISS → origin → seed header. Uses ``&`` when the URL already has
-    a query string. The token is cryptographically random only to be collision-free; it
-    carries no security meaning.
-    """
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}cb={secrets.token_hex(8)}"
+# Comix's image CDN serves the ORIGINAL unscrambled WebP when the request carries the
+# reader's cross-origin headers, and a tile-SCRAMBLED variant to header-less (datacenter
+# scraper) requests (debug ``comix-scramble-seed-regression``: live-proven that
+# ``Origin`` is the discriminator — ``Referer``/UA alone do not flip it). Sending these
+# on the image fetch makes the gateway receive the same plaintext bytes the in-browser
+# reader does, so no descramble is needed for the vast majority of pages.
+_IMAGE_FETCH_HEADERS = {"Origin": "https://comix.to", "Referer": "https://comix.to/"}
 
 
 def _make_deferred_composite(hid: str, slug: str, chapter_number: str) -> str:
@@ -1781,32 +1741,20 @@ class ComixSource(Source):
         the wrong transform — PR #170 regressed (#169) by blind-applying algo-1 to
         algo-2. ``httpx.Headers.get`` is case-insensitive, so casing does not matter.
 
-        **Cloudflare seed-header recovery (debug ``comix-scramble-seed-regression``):**
-        Comix delivers the tile-scramble seed ONLY on the ``x-scramble-seed`` response
-        header, which Cloudflare's edge cache intermittently STRIPS on a cache HIT. A
-        genuinely-scrambled page is a VP8X+EXIF container in the cache-stable BODY, so
-        when the body says "scrambled" but the seed header is gone, this forces a fresh
-        ORIGIN response (cache-bust query → CF MISS) that re-attaches the header — just
-        as Comix's own reader receives. Without this, ~90% of chapters shipped ≥1
-        silently still-scrambled (but valid-WebP) page that slipped past the downstream
-        ``is_valid_image`` guard.
+        **Plaintext-via-Origin (debug ``comix-scramble-seed-regression``):** Comix's CDN
+        tile-scrambles page images for header-less (datacenter scraper) requests but
+        serves the ORIGINAL plaintext WebP when the request carries the reader's
+        ``Origin: https://comix.to`` (live-proven the discriminator). Sending
+        ``_IMAGE_FETCH_HEADERS`` makes the gateway receive the same plaintext bytes the
+        in-browser reader does, so the vast majority of pages need no descramble at all.
+        The few residual tile-scrambled pages still carry a usable ``x-scramble-seed``
+        and decode via the path above; a seed-less page is the plaintext original (the
+        CDN also encodes some plaintext pages as ``VP8X+EXIF``, so the container is NOT
+        a scramble signal: only ``x-scramble-seed`` is) — passed through unchanged.
         """
-        data, headers = await ctx.get_bytes_plain_with_headers(url)
-
-        # 0. Cloudflare-stripped scramble-header recovery. The seed lives only on the
-        # response header; CF drops it on a cache HIT. When the BODY is a scramble
-        # container (VP8X+EXIF) yet the header is absent, re-fetch once through a
-        # cache-bust query to force a CF MISS → origin, which reliably re-emits the
-        # seed/grid/algo headers. If even the bypass yields no seed (never observed for
-        # a real VP8X page), FAIL LOUD below rather than package a still-scrambled page.
-        if headers.get("x-scramble-seed") is None and _webp_is_scramble_container(data):
-            data, headers = await ctx.get_bytes_plain_with_headers(_cache_bust_url(url))
-            if headers.get("x-scramble-seed") is None:
-                raise SourceError(
-                    "source_unavailable",
-                    "tile-scrambled page (VP8X/EXIF) missing x-scramble-seed even "
-                    "after cache-bypass refetch",
-                )
+        data, headers = await ctx.get_bytes_plain_with_headers(
+            url, extra_headers=_IMAGE_FETCH_HEADERS
+        )
 
         # 1. byte cipher
         seed = self._enc_header_int(headers.get("x-enc-seed"))
@@ -1837,6 +1785,13 @@ class ComixSource(Source):
                 "0",
             ):
                 raise SourceError("source_unavailable", "invalid x-scramble-seed")
+            # No seed header → not scrambled, pass through. With the Origin/Referer
+            # image headers the CDN returns the plaintext original for scrambled pages,
+            # so a seed-less body is the page exactly as Comix's reader renders it
+            # (debug ``comix-scramble-seed-regression``). A VP8X+EXIF container is NOT
+            # by itself a scramble signal: Comix serves some plaintext pages (e.g. tall
+            # end-pages) as VP8X+EXIF too, so a fail-loud keyed on the container would
+            # wrongly reject them; ``x-scramble-seed`` is the only reliable marker.
         else:
             cols, rows = self._scramble_grid(headers.get("x-scramble-grid"))
             scramble_algo = self._algo_header(
