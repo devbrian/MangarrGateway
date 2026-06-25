@@ -241,6 +241,15 @@ class Settings(BaseSettings):
     # (Phase 10 live-verify). Default 180 = the 120s cap + 60s margin, so a clean
     # out-of-the-box run does not trip the coupling. Raise it if you raise the cap.
     android_solver_timeout_s: float = Field(default=180.0, gt=0)
+    # Debug ``kagane-search-timeout`` part 2: a MIRROR of the sidecar's inner tap-poll
+    # deadline (``SOLVER_TAP_POLL_DEADLINE_S``, default 13s). The gateway times a
+    # failing ``/solve`` and classifies it as a Cloudflare block-page window (no retry —
+    # serve a still-valid cached clearance and back off re-solving) when the elapsed
+    # reaches ~this deadline, or as a fast device-contention hiccup (retry ONCE). Keep
+    # this in sync with the sidecar value if it is tuned; it is the discriminator that
+    # stops a ~15-20 min CF block window from re-hammering the single redroid and from
+    # surfacing transient solver hiccups as user-facing "kagane timed out" searches.
+    android_solve_block_deadline_s: float = Field(default=13.0, gt=0)
     # Bug 5 Lever A (per-source proactive-refresh horizon, MEASURE-FIRST knob). The
     # android proactive-refresh loop re-mints a held clearance ahead of its COOKIE
     # expiry. But for kagane.to / mangadot.net the captured cf_clearance cookie carries

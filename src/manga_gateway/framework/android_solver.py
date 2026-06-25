@@ -103,6 +103,32 @@ _SIDECAR_EVAL_THREW_STATUS = 504
 # the 3-digit HTTP status it reports and retry ONLY when it is in the 5xx band.
 _EVAL_THROW_STATUS_RE = re.compile(r"status code (\d{3})")
 
+# ── Debug ``kagane-search-timeout`` parts 2-4: block-window-aware /solve retry ─────
+# A sidecar ``/solve`` can fail two ways. (1) FAST — an infra/device-contention hiccup
+# that returns well before the sidecar's inner tap-poll deadline (~13s); ONE retry
+# usually recovers it. (2) DEADLINE-EXHAUSTION — the sidecar polled to its ~13s inner
+# deadline because Cloudflare served a BLOCK PAGE (no solvable Turnstile rendered); a
+# retry just re-hits the block, so it is NEVER retried. The DEADLINE TIMER is the
+# discriminator: the gateway times the failing /solve and compares the elapsed against a
+# mirror of the sidecar's inner deadline. A deadline-exhaustion failure raises
+# :class:`_SolveBlocked` so the caller serves a still-valid CACHED clearance (part 3)
+# and backs off re-solving (part 4) instead of surfacing a user-facing search failure or
+# re-hammering /solve through the ~15-20 min block window. Instance attrs so tests trim.
+_SOLVE_MAX_ATTEMPTS = 2  # 1 initial + one conditional fast-fail retry
+_SOLVE_RETRY_BACKOFF_S = 0.5
+# Mirror of the sidecar ``SOLVER_TAP_POLL_DEADLINE_S`` inner deadline (~13s). A /solve
+# failure whose measured elapsed >= deadline * fraction is a block window (no retry);
+# below it is a fast failure (retry once). The fraction leaves margin for the HTTP
+# round-trip / clock skew so a genuine ~13s block is reliably classified as such while a
+# sub-second infra hiccup is reliably classified fast.
+_SOLVE_BLOCK_DEADLINE_S = 13.0
+_SOLVE_BLOCK_DEADLINE_FRACTION = 0.7
+# Part 4: how long to back off re-solving a key after a detected block window so the
+# proactive-refresh loop + the 403 self-heal do not re-hammer /solve every ~few minutes
+# through a ~15-20 min Cloudflare block window while a still-valid cached clearance
+# keeps serving (part 3). Shorter than the window so re-solving resumes as it clears.
+_SOLVE_BLOCK_BACKOFF_S = 300.0
+
 
 def _is_origin_5xx_eval_throw(response: httpx.Response) -> bool:
     """True iff a sidecar ``/eval`` response is a TRANSIENT origin-5xx in-page throw.
@@ -143,6 +169,17 @@ def _is_origin_5xx_eval_throw(response: httpx.Response) -> bool:
 # extractors are async IIFEs of the same shape), so an async-arrow IIFE that resolves to
 # ``true`` is the minimal valid prime. The ``js`` is never logged (T-14-04).
 _WEBVIEW_PRIME_JS = "(async () => true)()"
+
+
+class _SolveBlocked(RuntimeError):  # noqa: N818 — control-flow signal for a CF block window
+    """Debug ``kagane-search-timeout`` parts 2-4: a sidecar ``/solve`` failed at ~the
+    inner tap-poll deadline — a Cloudflare BLOCK-PAGE window (no solvable Turnstile
+    rendered), NOT a fast infra hiccup. Raised by
+    :meth:`AndroidSolver._solve_with_retry` INSTEAD of retrying (a retry just re-hits
+    the block). It carries the originating exception as ``__cause__`` so a caller with
+    NO cached fallback re-raises the real solve error (the external contract is the same
+    when nothing is cached); :meth:`AndroidSolver.get_clearance` catches it to serve a
+    still-valid cached clearance (part 3); the block window (part 4) backs off."""
 
 
 class _RefreshDeferred(Exception):  # noqa: N818 — control-flow sentinel, not an error
@@ -309,6 +346,12 @@ class AndroidSolver:
         # is a no-op until :meth:`arm_warm_gate` is called (the app lifespan), so a
         # solver that never warms (tests / unconfigured sidecar / CI) never waits.
         warm_gate_timeout_s: float = 25.0,
+        # Debug ``kagane-search-timeout`` part 2: a mirror of the sidecar's inner
+        # tap-poll deadline (``SOLVER_TAP_POLL_DEADLINE_S``, ~13s). The gateway times a
+        # failing /solve and classifies it as a block window (no retry, serve cached,
+        # back off) when its elapsed reaches ~this, or a fast hiccup (retry once) below
+        # it. Keep this in sync with the sidecar value if it is tuned.
+        solve_block_deadline_s: float = _SOLVE_BLOCK_DEADLINE_S,
         # LANE-02 (Plan 15-04): the adb target of THIS lane's redroid device. When set
         # it rides the /solve + /eval POST body as ``target`` so the sidecar drives the
         # lane's own device (Plan 15-02 validates it). ``None`` (the single-lane
@@ -376,6 +419,17 @@ class AndroidSolver:
         # origin blip self-recovers WITHIN the single search instead of returning 0.
         self._eval_origin_5xx_retry_attempts = _EVAL_ORIGIN_5XX_RETRY_ATTEMPTS
         self._eval_origin_5xx_retry_backoff_s = _EVAL_ORIGIN_5XX_RETRY_BACKOFF_S
+        # Debug ``kagane-search-timeout`` parts 2-4: block-window-aware /solve retry.
+        # ``_solve_block_threshold_s`` is the elapsed at/above which a failed /solve is
+        # a block window (deadline-exhaustion) not a fast hiccup. ``_block_until``
+        # holds the per-source epoch until which re-solving is backed off (part 4).
+        self._solve_max_attempts = _SOLVE_MAX_ATTEMPTS
+        self._solve_retry_backoff_s = _SOLVE_RETRY_BACKOFF_S
+        self._solve_block_threshold_s = (
+            solve_block_deadline_s * _SOLVE_BLOCK_DEADLINE_FRACTION
+        )
+        self._block_backoff_s = _SOLVE_BLOCK_BACKOFF_S
+        self._block_until: dict[str, float] = {}
         # Bug 4 Fix C: count of in-flight FOREGROUND android sequences (raised by
         # device_session(), read by _refresh_tick). A non-zero count defers the
         # proactive-refresh loop so it never navigates the shared WebView away while a
@@ -500,9 +554,15 @@ class AndroidSolver:
             if not solve_if_missing:
                 # On-demand peek with nothing held — do NOT block on a sidecar solve.
                 return None
-        clearance, expires_at = await self._coalesced_solve(
-            source_key, defer_if_foreground=defer_if_foreground
-        )
+        try:
+            clearance, expires_at = await self._coalesced_solve(
+                source_key, defer_if_foreground=defer_if_foreground
+            )
+        except _SolveBlocked as blocked:
+            # Part 2 baseline: a Cloudflare block-window solve failure. No cached
+            # fallback is wired here yet (part 3 serves the last-good clearance) — re-
+            # raise the underlying solve error so the external contract is unchanged.
+            raise (blocked.__cause__ or blocked) from None
         self._held[source_key] = clearance
         self._record_expiry(source_key, expires_at)
         return clearance
@@ -998,28 +1058,9 @@ class AndroidSolver:
             body["target"] = self._adb_target
         start = time.perf_counter()
         try:
-            # Fix B: serialize the sidecar /solve behind the single gateway-side
-            # _device_lock so the refresh loop's solves + the comix fan-out's evals
-            # QUEUE on the one redroid (no `503 solver busy` from our own calls).
-            # Bug 5 Fix (a): a refresh solve passes defer_if_foreground=True — if a
-            # comix foreground lease was claimed while it queued on the lock, _device_op
-            # yields False and we BAIL (no POST) so the shared WebView is never
-            # navigated away mid comix sequence.
-            async with self._device_op(
-                defer_if_foreground=defer_if_foreground
-            ) as acquired:
-                if not acquired:
-                    raise _RefreshDeferred(source_key)
-                resp = await self._post_sidecar(
-                    f"{self._base_url}/solve",
-                    json=body,
-                    headers=headers,
-                    timeout=self._timeout_s,
-                )
-                resp.raise_for_status()
-                payload = resp.json()
-                token = payload["cf_clearance"]
-                user_agent = payload["user_agent"]
+            clearance, expires_at = await self._solve_with_retry(
+                source_key, body, headers, defer_if_foreground=defer_if_foreground
+            )
         except _RefreshDeferred:
             # A deliberate skip, NOT a solve failure — propagate without an error
             # metric (the deferred refresh must not read as a solve error).
@@ -1042,13 +1083,92 @@ class AndroidSolver:
             error=None,
             lane=self._lane,
         )
-        expires_at = _parse_expiry(payload.get("cf_clearance_expires"))
+        # Part 4: a successful mint clears any block-window backoff for this key — the
+        # window has cleared, so the refresh loop / 403 self-heal may re-solve freely.
+        self._block_until.pop(source_key, None)
         # Log the solve event only — never the token value (T-10-04).
         _log.info("AndroidSolver minted clearance for source %r", source_key)
-        return (
-            Clearance(cookies={"cf_clearance": token}, user_agent=user_agent),
-            expires_at,
-        )
+        return (clearance, expires_at)
+
+    async def _solve_with_retry(
+        self,
+        source_key: str,
+        body: dict[str, object],
+        headers: dict[str, str],
+        *,
+        defer_if_foreground: bool,
+    ) -> tuple[Clearance, float | None]:
+        """POST the sidecar ``/solve`` with a block-window-aware single retry (part 2).
+
+        Each attempt serializes behind the gateway-side ``_device_lock`` (Fix B) and a
+        refresh solve passing ``defer_if_foreground=True`` BAILS (``_RefreshDeferred``,
+        re-raised untouched) when a comix foreground lease is claimed while it queues —
+        the ``_device_op`` contract is unchanged.
+
+        On a failure the elapsed of THAT attempt is the discriminator (debug
+        ``kagane-search-timeout`` part 2): elapsed >= ``_solve_block_threshold_s`` means
+        the sidecar polled to its inner tap-poll deadline — a Cloudflare block-page
+        window — so it is NOT retried (a retry just re-hits the block); the block window
+        is marked (part 4) and :class:`_SolveBlocked` is raised (carrying the original
+        error) so the caller can serve a cached clearance (part 3). A FAST failure
+        (below the threshold — an infra/device-contention hiccup) is retried ONCE; a
+        second fast failure re-raises the underlying error unchanged. The ``503 solver
+        busy`` backpressure is still absorbed INSIDE :meth:`_post_sidecar` (a 200 there
+        never reaches this retry), so this adds at most ONE extra device hit, only on a
+        genuine fast failure. The ``cf_clearance`` token is parsed into the D-40
+        ``Clearance`` shape and is NEVER logged (T-10-04).
+        """
+        url = f"{self._base_url}/solve"
+        for attempt in range(1, self._solve_max_attempts + 1):
+            started = time.monotonic()
+            try:
+                async with self._device_op(
+                    defer_if_foreground=defer_if_foreground
+                ) as acquired:
+                    if not acquired:
+                        raise _RefreshDeferred(source_key)
+                    resp = await self._post_sidecar(
+                        url, json=body, headers=headers, timeout=self._timeout_s
+                    )
+                    resp.raise_for_status()
+                    payload = resp.json()
+                    token = payload["cf_clearance"]
+                    user_agent = payload["user_agent"]
+            except _RefreshDeferred:
+                raise
+            except Exception as exc:
+                elapsed = time.monotonic() - started
+                if elapsed >= self._solve_block_threshold_s:
+                    # Deadline-exhaustion = a Cloudflare block-page window. Back off
+                    # (part 4) and signal so the caller serves a cached clearance
+                    # (part 3) rather than retrying into the same block.
+                    self._mark_block_window(source_key)
+                    raise _SolveBlocked(source_key) from exc
+                if attempt < self._solve_max_attempts:
+                    await asyncio.sleep(self._solve_retry_backoff_s)
+                    continue
+                raise
+            expires_at = _parse_expiry(payload.get("cf_clearance_expires"))
+            return (
+                Clearance(cookies={"cf_clearance": token}, user_agent=user_agent),
+                expires_at,
+            )
+        # Unreachable: every iteration either returns on success or raises on failure
+        # (the final fast-fail attempt re-raises). Satisfies mypy's return analysis.
+        raise AssertionError("solve retry loop exited without returning")
+
+    def _mark_block_window(self, source_key: str) -> None:
+        """Part 4: record a detected Cloudflare block window for ``source_key``.
+
+        While the window is active (:meth:`_in_block_window`) the refresh loop and the
+        force-resolve path back off re-solving — a still-valid cached clearance keeps
+        serving (part 3) and the device is not hammered with /solves that will only
+        re-hit the block. Cleared by a later successful solve (:meth:`_solve`)."""
+        self._block_until[source_key] = time.time() + self._block_backoff_s
+
+    def _in_block_window(self, source_key: str) -> bool:
+        """Part 4: True while ``source_key`` is inside a backed-off block window."""
+        return time.time() < self._block_until.get(source_key, 0.0)
 
     # ───────────────────────────── in-WebView eval ────────────────────────────
 
