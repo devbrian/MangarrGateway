@@ -71,6 +71,9 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
         "clearance_lifetime_s",
         "warm_gate_timeout_s",
         "timeout_s",
+        # Debug kagane-search-timeout part 2: the block-window discriminator (mirror of
+        # the sidecar inner tap-poll deadline).
+        "solve_block_deadline_s",
         "proxy",
         # LANE-02 (Plan 15-04): the session-shared solver mirrors the single-lane
         # collapse — adb_target=None + lane="default".
