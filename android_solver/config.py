@@ -30,6 +30,16 @@ _ENV_ALLOWED_HOSTS = "SOLVER_ALLOWED_HOSTS"
 # here MUST be a member of SOLVER_ADB_TARGETS (fail loud at from_env).
 _ENV_ALLOWED_HOSTS_BY_TARGET = "SOLVER_ALLOWED_HOSTS_BY_TARGET"
 _ENV_TIMEOUT = "SOLVER_SOLVE_TIMEOUT_S"
+# Debug ``kagane-search-timeout`` (defensive fix part 1): the INNER locate→tap→poll
+# deadline that bounds ``_drive_solve`` (and the frame-readiness wait), separate from
+# the base ``solve_timeout_s`` (which still caps the EVAL path + the outer worker
+# wait). During a Cloudflare block-page window kagane.to serves a "you have been
+# blocked" page instead of a solvable Turnstile, so the checkbox locator finds nothing
+# and the loop used to poll to the full ~120s ``solve_timeout_s`` — blowing the
+# gateway's 30s search fan-out budget. Max observed SUCCESSFUL solve is 11.2s and the
+# fastest in-window FAILURE is 21s (a clean gap), so a ~13s inner deadline aborts ZERO
+# good solves while turning each block-window failure from ~120s into ~13s.
+_ENV_TAP_POLL_DEADLINE = "SOLVER_TAP_POLL_DEADLINE_S"
 _ENV_CANCEL_GRACE = "SOLVER_CANCEL_GRACE_S"
 _ENV_BIND_HOST = "SOLVER_BIND_HOST"
 _ENV_PORT = "SOLVER_PORT"
@@ -51,6 +61,11 @@ _DEFAULT_ADB_TARGET = "redroid:5555"
 # by desktop Chromium from our Linux fingerprint (CI + deploy both timed out).
 _DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("mangadot.net", "kagane.to", "mangaball.net")
 _DEFAULT_TIMEOUT_S = 120.0
+# Debug ``kagane-search-timeout`` part 1: 13s = just above the 11.2s max successful
+# solve and below the 21s fastest in-window failure (the empirical gap), so it aborts
+# zero good solves while capping a block-window failure at ~13s. MUST stay below
+# ``proxy_solve_timeout_s`` (the outer proxied budget) — enforced in ``from_env``.
+_DEFAULT_TAP_POLL_DEADLINE_S = 13.0
 # Bounded cleanup window (issue #207 / WR-02): when a solve exceeds the timeout
 # its worker thread CANNOT be force-killed, so the service signals cooperative
 # cancellation and waits at most this long for the worker to abort at its next
@@ -91,6 +106,10 @@ class SidecarConfig:
     # global ``allowed_hosts`` (see :meth:`allowed_hosts_for`).
     allowed_hosts_by_target: Mapping[str, frozenset[str]] = field(default_factory=dict)
     solve_timeout_s: float = _DEFAULT_TIMEOUT_S
+    # Inner locate→tap→poll deadline (debug ``kagane-search-timeout`` part 1). Bounds
+    # ``_drive_solve``'s frame-readiness wait + tap loop INDEPENDENTLY of the base
+    # ``solve_timeout_s`` (which still caps the eval path + the outer worker wait).
+    tap_poll_deadline_s: float = _DEFAULT_TAP_POLL_DEADLINE_S
     cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S
     bind_host: str = _DEFAULT_BIND_HOST
     port: int = _DEFAULT_PORT
@@ -136,6 +155,12 @@ class SidecarConfig:
             source.get(_ENV_TIMEOUT), _DEFAULT_TIMEOUT_S, _ENV_TIMEOUT
         )
 
+        tap_poll_deadline_s = _parse_positive_float(
+            source.get(_ENV_TAP_POLL_DEADLINE),
+            _DEFAULT_TAP_POLL_DEADLINE_S,
+            _ENV_TAP_POLL_DEADLINE,
+        )
+
         cancel_grace_s = _parse_positive_float(
             source.get(_ENV_CANCEL_GRACE), _DEFAULT_CANCEL_GRACE_S, _ENV_CANCEL_GRACE
         )
@@ -146,6 +171,16 @@ class SidecarConfig:
         proxy_solve_timeout_s = _parse_positive_float(
             source.get(_ENV_PROXY_TIMEOUT), _DEFAULT_PROXY_TIMEOUT_S, _ENV_PROXY_TIMEOUT
         )
+        # Debug ``kagane-search-timeout`` part 1: the proxied solve adds a CONNECT-hop +
+        # egress-verify BEFORE the tap loop, so its OUTER budget MUST stay above the
+        # inner tap-poll deadline — otherwise a misconfig could abort a proxied solve
+        # at the outer wait before the inner loop even runs. Fail loud at startup.
+        if proxy_solve_timeout_s <= tap_poll_deadline_s:
+            raise ConfigError(
+                f"{_ENV_PROXY_TIMEOUT} ({proxy_solve_timeout_s}) must be greater than "
+                f"{_ENV_TAP_POLL_DEADLINE} ({tap_poll_deadline_s}) — the proxied outer "
+                "budget has to exceed the inner locate→tap→poll deadline"
+            )
         hop_port = _parse_port(
             source.get(_ENV_HOP_PORT), _DEFAULT_HOP_PORT, _ENV_HOP_PORT
         )
@@ -158,6 +193,7 @@ class SidecarConfig:
             allowed_hosts=allowed_hosts,
             allowed_hosts_by_target=allowed_hosts_by_target,
             solve_timeout_s=solve_timeout_s,
+            tap_poll_deadline_s=tap_poll_deadline_s,
             cancel_grace_s=cancel_grace_s,
             bind_host=bind_host,
             port=port,

@@ -222,7 +222,7 @@ def _eval_pipeline(
         monkeypatch.setattr(
             pipeline,
             "_wait_for_cf_frame",
-            lambda ws, ws_url, host, cancel=None: None,
+            lambda ws, ws_url, host, cancel=None, *, deadline=None: None,
         )
         monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
     if proxy:
