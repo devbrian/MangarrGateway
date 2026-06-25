@@ -69,6 +69,11 @@ _log = logging.getLogger("android_solver.service")
 # only a floor — the real readiness gate is polling Page.getFrameTree for the
 # challenges.cloudflare.com child frame (_FRAME_POLL_* below).
 _LAUNCH_SETTLE_S = 2.0
+# Debug ``kagane-search-timeout`` part 1: the inner locate→tap→poll deadline default
+# when a pipeline is built without an explicit ``tap_poll_deadline_s`` (production wires
+# it from ``SidecarConfig.tap_poll_deadline_s``). ``None`` ⇒ fall back to ``timeout_s``
+# so existing solve unit tests (which pass only ``timeout_s``) keep today's bound.
+_TAP_POLL_DEADLINE_S = 13.0
 _POLL_INTERVAL_S = 1.5
 # Belt-and-braces attempt cap on the post-relaunch pid poll in
 # ``_ensure_webview_alive`` — the eval ``deadline`` is the primary bound; this just
@@ -364,6 +369,11 @@ class AndroidSolvePipeline:
         device: AdbDevice,
         *,
         timeout_s: float,
+        # Debug ``kagane-search-timeout`` part 1: the INNER locate→tap→poll deadline
+        # for ``_drive_solve`` (frame-readiness wait + tap loop), separate from
+        # ``timeout_s`` (which still caps the eval path). ``None`` ⇒ fall back to
+        # ``timeout_s`` so a pipeline built with only ``timeout_s`` is unchanged.
+        tap_poll_deadline_s: float | None = None,
         ws_factory: WebSocketFactory | None = None,
         http_get: HttpGetter | None = None,
         launch_settle_s: float = _LAUNCH_SETTLE_S,
@@ -377,6 +387,12 @@ class AndroidSolvePipeline:
     ) -> None:
         self._device = device
         self._timeout_s = timeout_s
+        # Inner locate→tap→poll deadline (part 1). Defaults to ``timeout_s`` when unset
+        # so existing solve units (timeout_s-only) keep their bound; production passes a
+        # short ~13s value so a Cloudflare block-page window fails fast, not at ~120s.
+        self._tap_poll_deadline_s = (
+            tap_poll_deadline_s if tap_poll_deadline_s is not None else timeout_s
+        )
         self._launch_settle_s = launch_settle_s
         self._poll_interval_s = poll_interval_s
         self._retap_interval_s = retap_interval_s
@@ -900,6 +916,7 @@ class AndroidSolvePipeline:
         cancel: Event | None,
         *,
         is_clean: Callable[[], bool],
+        deadline: float | None = None,
     ) -> bool:
         """Poll a freshly-navigated page until it resolves, returning WHICH state:
 
@@ -929,9 +946,18 @@ class AndroidSolvePipeline:
         long deadline when a challenge genuinely renders. The CF frame is checked FIRST
         each iteration so a real interstitial is never mistaken for a clean page (the
         genuine-challenge path is unchanged).
+
+        Debug ``kagane-search-timeout`` part 1: ``deadline`` (when given, the solve
+        path's inner tap-poll deadline) caps this wait at ``min(now +
+        _frame_poll_timeout_s, deadline)`` so a block page — neither a CF frame nor a
+        clean page ever appears — does not burn the full ~20s frame poll before the tap
+        loop sees the deadline has passed. The eval path passes no ``deadline`` (its own
+        longer eval deadline already dominates), so it is byte-for-byte unchanged.
         """
-        deadline = time.monotonic() + self._frame_poll_timeout_s
-        while time.monotonic() < deadline:
+        effective_deadline = time.monotonic() + self._frame_poll_timeout_s
+        if deadline is not None:
+            effective_deadline = min(effective_deadline, deadline)
+        while time.monotonic() < effective_deadline:
             _raise_if_cancelled(cancel)  # issue #207: don't poll past a cancel
             if self._cf_frame_present(ws):
                 return True
@@ -1113,8 +1139,18 @@ class AndroidSolvePipeline:
             ws_url = self._discover_page_ws(port)
             _raise_if_cancelled(cancel)
 
-            # Bound the whole locate→tap→poll loop by the solve deadline (T-10-11).
-            deadline = time.monotonic() + self._timeout_s
+            # Bound the whole locate→tap→poll loop by the inner tap-poll deadline
+            # (T-10-11; debug ``kagane-search-timeout`` part 1). This is the SHORT ~13s
+            # deadline (not the ~120s base ``timeout_s``) so a Cloudflare block-page
+            # window — no solvable Turnstile renders, the checkbox locator finds
+            # nothing — aborts at ~13s instead of grinding to ~120s and blowing the
+            # gateway's 30s search fan-out budget. Max observed good solve is 11.2s, so
+            # 13s clips zero successes. The frame wait below shares this SAME deadline
+            # (its own ``_frame_poll_timeout_s`` is a per-call cap, not the floor) so a
+            # block page does not burn the full 20s frame poll before the tap loop sees
+            # the deadline has passed. The proxied OUTER budget stays larger (config
+            # guard) to cover the CONNECT-hop + egress-verify overhead.
+            deadline = time.monotonic() + self._tap_poll_deadline_s
             ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
             try:
                 cdp_call(ws, "Page.enable", command_id=10)
@@ -1156,7 +1192,7 @@ class AndroidSolvePipeline:
                 # warm/auto-issued cf_clearance, no widget). Short-circuits on either,
                 # never burning the full frame-poll deadline on an already-cleared load
                 # (bug 5 solve-path parity). The real readiness gate, not the settle.
-                self._wait_for_cf_frame(ws, ws_url, host, cancel)
+                self._wait_for_cf_frame(ws, ws_url, host, cancel, deadline=deadline)
                 # Page ws, DOM/Page enable, frame readiness, and the viewport scales
                 # are computed ONCE; only locate+tap+poll repeats inside the loop.
                 x_scale, y_scale = self._compute_scales(ws)
@@ -1455,6 +1491,8 @@ class AndroidSolvePipeline:
         ws_url: str,
         host: str,
         cancel: Event | None = None,
+        *,
+        deadline: float | None = None,
     ) -> None:
         """Wait until the page resolves to ONE of two states before tapping.
 
@@ -1475,9 +1513,16 @@ class AndroidSolvePipeline:
         the genuine-challenge path is detected FIRST and is byte-for-byte unchanged.
         Returns either way so ``_tap_until_cleared`` (which can still try the
         secondary/screenshot locate paths) always runs next.
+
+        Debug ``kagane-search-timeout`` part 1: ``deadline`` (the solve's inner tap-poll
+        deadline) caps the frame poll so a block page fails at ~13s rather than burning
+        the full ~20s frame poll first.
         """
         self._await_cf_challenge_or_clean(
-            ws, cancel, is_clean=lambda: self._host_already_cleared(ws_url, host)
+            ws,
+            cancel,
+            is_clean=lambda: self._host_already_cleared(ws_url, host),
+            deadline=deadline,
         )
 
     @staticmethod
@@ -2232,6 +2277,7 @@ def build_pipeline(config: SidecarConfig) -> SolvePipeline:
     return AndroidSolvePipeline(
         device,
         timeout_s=config.solve_timeout_s,
+        tap_poll_deadline_s=config.tap_poll_deadline_s,
         hop_host=config.hop_host,
         hop_port=config.hop_port,
     )
@@ -2250,6 +2296,7 @@ def build_pipelines(config: SidecarConfig) -> dict[str, SolvePipeline]:
         target: AndroidSolvePipeline(
             AdbDevice(target),
             timeout_s=config.solve_timeout_s,
+            tap_poll_deadline_s=config.tap_poll_deadline_s,
             hop_host=config.hop_host,
             hop_port=config.hop_port,
         )

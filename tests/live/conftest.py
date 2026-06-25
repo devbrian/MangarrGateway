@@ -576,6 +576,9 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
         "clearance_lifetime_s": settings.android_clearance_lifetime_s,
         "warm_gate_timeout_s": settings.android_warm_gate_timeout_s,
         "timeout_s": settings.android_solver_timeout_s,
+        # Debug kagane-search-timeout part 2: the block-window discriminator (mirror of
+        # the sidecar inner tap-poll deadline). Same Settings field app.py reads.
+        "solve_block_deadline_s": settings.android_solve_block_deadline_s,
         "proxy": playwright_proxy,
         # LANE-02 (Plan 15-04): the session-shared solver mirrors the single-lane
         # collapse — adb_target=None (no ``target`` sent) + lane="default". Present here

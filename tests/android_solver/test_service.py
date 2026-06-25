@@ -1345,6 +1345,7 @@ def _build_pipeline(
     extract: SeqExtract,
     clock: FakeClock,
     timeout_s: float,
+    tap_poll_deadline_s: float | None = None,
     retap_interval_s: float = 5.0,
     poll_interval_s: float = 1.0,
 ) -> AndroidSolvePipeline:
@@ -1355,6 +1356,7 @@ def _build_pipeline(
     pipeline = AndroidSolvePipeline(
         device,  # type: ignore[arg-type]
         timeout_s=timeout_s,
+        tap_poll_deadline_s=tap_poll_deadline_s,
         ws_factory=lambda url, *, timeout: FakeWs(),  # type: ignore[arg-type,return-value]
         http_get=lambda url, *, timeout: page_targets,
         launch_settle_s=0.0,
@@ -1369,7 +1371,9 @@ def _build_pipeline(
     # Pre-loop readiness/scale steps are covered by their own units; collapse them
     # to constants here so the loop under test runs deterministically.
     monkeypatch.setattr(
-        pipeline, "_wait_for_cf_frame", lambda ws, ws_url, host, cancel=None: None
+        pipeline,
+        "_wait_for_cf_frame",
+        lambda ws, ws_url, host, cancel=None, *, deadline=None: None,
     )
     monkeypatch.setattr(pipeline, "_compute_scales", lambda ws: (2.0, 2.586))
     return pipeline
@@ -1542,6 +1546,84 @@ def test_solve_raises_when_deadline_passes_without_clearance(
 
     # It kept re-tapping across the bounded deadline rather than giving up at one.
     assert len(device.taps) >= 2
+
+
+# ── Debug kagane-search-timeout part 1: the inner tap-poll deadline, not timeout_s ──
+
+
+def test_tap_poll_deadline_bounds_the_loop_independently_of_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A Cloudflare block-page window serves no solvable Turnstile, so the checkbox
+    # never clears. The locate→tap→poll loop must abort at the SHORT tap_poll_deadline_s
+    # (~13s), NOT the long base timeout_s (~120s) — otherwise an in-window solve blows
+    # the gateway's 30s search fan-out budget. With timeout_s far above the deadline,
+    # the solve must still give up at ~tap_poll_deadline_s of wall time.
+    device = FakeDevice()
+    locate = SeqLocate([(50, 100)])  # widget present but never clears (block page)
+    extract = SeqExtract(token_after=10_000)  # token never appears
+    clock = FakeClock()
+    pipeline = _build_pipeline(
+        monkeypatch,
+        device=device,
+        locate=locate,
+        extract=extract,
+        clock=clock,
+        timeout_s=600.0,  # base/eval budget is huge…
+        tap_poll_deadline_s=13.0,  # …but the inner tap-poll deadline is short
+        poll_interval_s=1.0,
+    )
+
+    start = clock.now
+    with pytest.raises(SolveError):
+        pipeline.solve("https://mangadot.net/", "mangadot.net")
+    elapsed = clock.now - start
+
+    # Aborted at ~the tap-poll deadline, not the 600s base timeout (one poll of slack).
+    assert 13.0 <= elapsed <= 13.0 + pipeline._poll_interval_s
+    assert elapsed < 600.0
+
+
+def test_tap_poll_deadline_defaults_to_timeout_when_unset() -> None:
+    # Back-compat: a pipeline built with only timeout_s (every existing solve unit)
+    # keeps the inner deadline == timeout_s, byte-for-byte today's bound.
+    pipeline = AndroidSolvePipeline(FakeDevice(), timeout_s=42.0)  # type: ignore[arg-type]
+    assert pipeline._tap_poll_deadline_s == 42.0
+    explicit = AndroidSolvePipeline(  # type: ignore[arg-type]
+        FakeDevice(), timeout_s=120.0, tap_poll_deadline_s=13.0
+    )
+    assert explicit._tap_poll_deadline_s == 13.0
+
+
+def test_frame_poll_is_bounded_by_the_solve_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A block page never renders the challenges.cloudflare.com OOPIF AND never mints a
+    # cookie, so _wait_for_cf_frame would otherwise grind the full ~20s frame poll. When
+    # the solve passes its short inner deadline, the frame wait must stop at that
+    # deadline (min(frame_poll_timeout, deadline)) so the tap loop is not starved.
+    clock = FakeClock()
+    cdp = _FrameTreeCdp(cf_after=10**9)  # CF OOPIF never renders (block page)
+    pipeline = _frame_pipeline(
+        monkeypatch,
+        clock=clock,
+        cdp=cdp,
+        extract=lambda ws_url, host: None,  # never cleared → block page, no cookie
+    )
+
+    start = clock.now
+    deadline = clock.now + 5.0  # shorter than _FRAME_POLL_TIMEOUT_S (20s)
+    pipeline._wait_for_cf_frame(
+        FakeWs(),  # type: ignore[arg-type]
+        "ws://localhost:9222/p",
+        "mangadot.net",
+        deadline=deadline,
+    )
+    elapsed = clock.now - start
+
+    # Stopped at the (short) solve deadline, not the full 20s frame poll.
+    assert elapsed <= 5.0 + pipeline._frame_poll_interval_s
+    assert elapsed < service._FRAME_POLL_TIMEOUT_S
 
 
 def test_solve_stops_tapping_once_widget_gone_then_returns_token(

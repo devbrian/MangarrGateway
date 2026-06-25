@@ -310,27 +310,34 @@ async def test_force_resolve_reposts_and_replaces_held() -> None:
 @pytest.mark.asyncio
 async def test_force_resolve_failure_does_not_keep_stale_clearance() -> None:
     """WR-05: a FAILED force-resolve must invalidate the held clearance so the
-    next non-force call re-solves instead of re-serving the known-bad token."""
+    next non-force call re-solves instead of re-serving the known-bad token. The
+    instant 504s are FAST failures (kagane-search-timeout part 2), so the force-resolve
+    retries once (2 device hits) before raising — but it is NOT a block window (fast,
+    not deadline-exhaustion), so WR-05 still discards the hold and serves no cached
+    clearance."""
     route = respx.post(f"{_SIDECAR}/solve").mock(
         side_effect=[
             _solve_response(),  # 1: initial solve → held
-            httpx.Response(504),  # 2: force-resolve self-heal FAILS
-            _solve_response(),  # 3: next non-force call must RE-SOLVE (not serve stale)
+            httpx.Response(504),  # 2: force-resolve self-heal FAILS (fast)
+            httpx.Response(504),  # 3: the one fast-fail retry FAILS too
+            _solve_response(),  # 4: next non-force call must RE-SOLVE (not serve stale)
         ]
     )
     solver = _solver()
+    solver._solve_retry_backoff_s = 0.0  # no real sleep between the fast-fail retries
     try:
         first = await solver.get_clearance("mangadot")
         with pytest.raises(httpx.HTTPStatusError):
             await solver.get_clearance("mangadot", force_resolve=True)
         # If the stale clearance were still held, this would return it WITHOUT a
-        # network call (call_count would stay 2). It must instead re-solve.
+        # network call. It must instead re-solve.
         third = await solver.get_clearance("mangadot")
     finally:
         await solver.aclose()
     assert isinstance(first, Clearance)
     assert isinstance(third, Clearance)
-    assert route.call_count == 3  # the failed force-resolve invalidated the hold
+    # 1 seed + 2 fast-fail force-resolve attempts + 1 re-solve = 4 device hits.
+    assert route.call_count == 4
 
 
 @respx.mock
@@ -338,6 +345,7 @@ async def test_force_resolve_failure_does_not_keep_stale_clearance() -> None:
 async def test_sidecar_non_200_raises() -> None:
     respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
     solver = _solver()
+    solver._solve_retry_backoff_s = 0.0  # part 2: fast 504 retries once; no real sleep
     try:
         with pytest.raises(httpx.HTTPStatusError):
             await solver.get_clearance("mangadot")
@@ -735,7 +743,289 @@ async def test_solve_retries_sidecar_503_busy_then_succeeds() -> None:
     assert route.call_count == 2
 
 
-# ── Bug 5 follow-on #3: page-holder get_clearance serves held-or-None, never /solve ──
+# ── kagane-search-timeout part 2: block-window-aware single /solve retry ──────────────
+# A sidecar /solve fails two ways. A FAST failure (returns well before the sidecar inner
+# ~13s tap-poll deadline — an infra/device-contention hiccup) is retried ONCE. A
+# DEADLINE-EXHAUSTION failure (the sidecar polled to its deadline because Cloudflare
+# served a BLOCK PAGE) is NEVER retried (a retry re-hits the block); it raises and marks
+# a block window. The deadline timer is the discriminator: the gateway times the failing
+# /solve and compares it against a mirror of the sidecar inner deadline.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_retries_a_fast_failure_then_succeeds() -> None:
+    """A FAST 504 (returned well below the inner tap-poll deadline — a transient infra
+    hiccup) is retried ONCE; the second attempt mints the clearance. Distinct from the
+    503 busy-backpressure retry (which lives inside _post_sidecar)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=[httpx.Response(504), _solve_response()]
+    )
+    solver = _solver()
+    solver._solve_retry_backoff_s = 0.0
+    try:
+        clearance = await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert clearance is not None
+    assert clearance.cookies == {"cf_clearance": "android-minted-token"}
+    assert route.call_count == 2  # initial fast fail + one retry that succeeded
+    assert not solver._in_block_window("mangadot")  # a fast fail is NOT a block window
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_does_not_retry_a_block_window_failure() -> None:
+    """A DEADLINE-EXHAUSTION failure (elapsed >= the block threshold — a Cloudflare
+    block-page window) is NOT retried: exactly ONE device hit, then it raises and the
+    key is marked in a block window so the refresh loop / force-resolve back off (part
+    4). The threshold is forced to 0 so the instant respx failure counts as a block."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=[httpx.Response(504), _solve_response()]
+    )
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0  # any failure is deadline-exhaustion → block
+    solver._solve_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    # No retry — the second (success) response is never consumed.
+    assert route.call_count == 1
+    assert solver._in_block_window("mangadot")  # part 4: a block window was marked
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_successful_solve_clears_a_prior_block_window() -> None:
+    """Part 4: once a solve succeeds the block-window backoff is cleared (the window has
+    lifted) so the refresh loop / 403 self-heal may re-solve freely again."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    solver._block_until["mangadot"] = time.time() + 9999.0  # pretend mid-block-window
+    try:
+        clearance = await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert clearance is not None
+    assert route.call_count == 1
+    assert not solver._in_block_window("mangadot")  # cleared by the successful mint
+
+
+# ── kagane-search-timeout part 3: serve the last-good cached clearance in a block ─────
+# A force-resolve (403 self-heal) that fails because of a Cloudflare block window must
+# not surface as a user-facing search failure while a still-valid clearance is cached.
+# The held cookie (~26 min real lifetime) covers most of a ~15-20 min window, so the
+# block-window failure falls back to the snapshot taken before WR-05 discarded it.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_block_window_force_resolve_serves_last_good_cached_clearance() -> None:
+    """A force-resolve that hits a BLOCK window serves the still-valid held clearance
+    (restored under _held) instead of raising — the search succeeds on the cached cookie
+    while the block window backs off re-solving."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0  # the instant 504 classifies as a block
+    solver._solve_retry_backoff_s = 0.0
+    last_good = Clearance(cookies={"cf_clearance": "last-good"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = last_good
+    solver._expires_at["mangadot"] = time.time() + 9999.0  # still well within lifetime
+    try:
+        served = await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert served is last_good  # served the cached clearance, did NOT raise
+    assert solver._held["mangadot"] is last_good  # restored for subsequent calls
+    assert route.call_count == 1  # one (blocked) solve, no retry
+    assert solver._in_block_window("mangadot")  # part 4: re-solving is backed off
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_block_window_force_resolve_reraises_when_cache_lapsed() -> None:
+    """A block-window force-resolve whose cached clearance has ITSELF lapsed has nothing
+    safe to fall back on → re-raises the real solve error and holds nothing (WR-05)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0
+    solver._solve_retry_backoff_s = 0.0
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "lapsed"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() - 1.0  # already expired
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert "mangadot" not in solver._held  # lapsed snapshot is not re-served / re-held
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_block_window_non_force_with_nothing_held_reraises() -> None:
+    """A block window on the non-force path with NOTHING cached has no fallback → it
+    re-raises the underlying solve error (the external contract is unchanged)."""
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0
+    solver._solve_retry_backoff_s = 0.0
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert "mangadot" not in solver._held
+
+
+# ── kagane-search-timeout part 4: back off re-solving while in a detected block ──────
+# A detected block window backs off re-solving on BOTH the per-request force-resolve
+# path (serve held, no /solve) and the proactive refresh loop (skip the key) instead of
+# re-hammering the single redroid every ~few minutes through the ~15-20 min window.
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_force_resolve_in_block_window_serves_held_without_solving() -> None:
+    """In a block window, a force-resolve with a still-valid held clearance serves it
+    WITHOUT any /solve — the 403 self-heal stops re-hammering the device through the
+    window (each attempt would only re-hit the block and cost ~13s)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    held = Clearance(cookies={"cf_clearance": "held"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = held
+    solver._expires_at["mangadot"] = time.time() + 9999.0  # still valid
+    solver._block_until["mangadot"] = time.time() + 9999.0  # inside a block window
+    try:
+        served = await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert served is held  # served the held clearance
+    assert not route.called  # NO /solve — backed off through the window
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_force_resolve_in_block_window_with_lapsed_held_still_solves() -> None:
+    """The block-window backoff only serves a STILL-VALID held clearance — if the held
+    clearance has lapsed it falls through and attempts a real re-solve (the window may
+    have nothing safe left to serve)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    solver._held["mangadot"] = Clearance(
+        cookies={"cf_clearance": "lapsed"}, user_agent=_WEBVIEW_UA
+    )
+    solver._expires_at["mangadot"] = time.time() - 1.0  # lapsed
+    solver._block_until["mangadot"] = time.time() + 9999.0  # inside a block window
+    try:
+        fresh = await solver.get_clearance("mangadot", force_resolve=True)
+    finally:
+        await solver.aclose()
+    assert fresh is not None
+    assert fresh.cookies == {"cf_clearance": "android-minted-token"}
+    assert route.called  # the lapsed held did not satisfy the backoff → a real re-solve
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_refresh_tick_skips_a_key_in_a_block_window() -> None:
+    """The proactive refresh loop SKIPS a within-lead key that is in a block window — no
+    /solve hammering through the window — and schedules the next re-check at the
+    window's end (not the min cadence). The held clearance is left untouched."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    solver._refresh_lead_s = 120.0
+    solver._refresh_min_sleep_s = 30.0
+    solver._refresh_max_sleep_s = 600.0
+    held = Clearance(cookies={"cf_clearance": "held"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = held
+    solver._expires_at["mangadot"] = time.time() + 30.0  # within lead → would re-mint…
+    solver._block_until["mangadot"] = time.time() + 200.0  # …but it is blocked
+    try:
+        delay = await solver._refresh_tick()
+    finally:
+        await solver.aclose()
+    assert not route.called  # blocked → no proactive /solve
+    assert solver._held["mangadot"] is held  # untouched
+    # Next re-check scheduled at ~the block-window end (≈200s), clamped to [min, max].
+    assert 30.0 <= delay <= 600.0
+    assert delay > 120.0  # not the 30s min spin — it waits out most of the window
+
+
+# ── CodeRabbit findings 3 + 2: contention is not a block; later blocked callers ──────
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_device_lock_contention_is_not_a_block_window() -> None:
+    """Finding 3: time spent QUEUEING on the gateway device lock (contention behind
+    another op on the single redroid) must NOT count toward the block-vs-fast elapsed.
+    A solve that waited a long time for the lock but whose /solve attempt failed FAST is
+    classified fast (retried, no block window) — not a Cloudflare block."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(
+        side_effect=[httpx.Response(504), _solve_response()]
+    )
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.05  # tiny: the lock wait alone would exceed it
+    solver._solve_retry_backoff_s = 0.0
+    # Hold the device lock so the solve QUEUES on it far longer than the threshold.
+    await solver._device_lock.acquire()
+    task = asyncio.create_task(solver.get_clearance("mangadot"))
+    await asyncio.sleep(0.2)  # >> _solve_block_threshold_s of pure lock-contention wait
+    solver._device_lock.release()
+    try:
+        clearance = await task
+    finally:
+        await solver.aclose()
+    assert clearance is not None  # classified FAST → retried → minted (not blocked)
+    assert route.call_count == 2  # the fast 504 was retried (a block would NOT retry)
+    assert not solver._in_block_window("mangadot")  # contention is NOT a block window
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_concurrent_block_window_callers_all_serve_cached_clearance() -> None:
+    """Finding 2: concurrent force_resolve callers share ONE blocked solve, but only the
+    first snapshots the held clearance. When the shared solve is a block window, EVERY
+    caller — the first (via its snapshot) and the later ones (via the restored-held
+    re-check) — serves the SAME still-valid cached clearance; none re-raise."""
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def _gated(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        await gate.wait()
+        return httpx.Response(504)
+
+    route = respx.post(f"{_SIDECAR}/solve").mock(side_effect=_gated)
+    solver = _solver()
+    solver._solve_block_threshold_s = 0.0  # the shared solve classifies as a block
+    solver._solve_retry_backoff_s = 0.0
+    last_good = Clearance(cookies={"cf_clearance": "last-good"}, user_agent=_WEBVIEW_UA)
+    solver._held["mangadot"] = last_good
+    solver._expires_at["mangadot"] = time.time() + 9999.0  # still well within lifetime
+    try:
+        tasks = [
+            asyncio.create_task(solver.get_clearance("mangadot", force_resolve=True))
+            for _ in range(5)
+        ]
+        await entered.wait()  # the one shared solve has started; all callers attached
+        gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1  # one shared (blocked) solve, no retry
+    # The first caller restores _held from its snapshot; every later caller (snapshot
+    # None) re-checks the restored held and serves it — all get the same object, none
+    # raise.
+    assert all(r is last_good for r in results)
+    assert solver._in_block_window("mangadot")  # part 4: re-solving is backed off
+
+
 # comix is antibot=cloudflare+encrypted, so the framework calls get_clearance('comix')
 # on its httpx legs. comix can NEVER be /solve'd — /solve runs `pm clear`, cold-wiping
 # the warm WebView comix's managed challenge + env-*.js depend on → 5xx. And (live-
@@ -921,6 +1211,7 @@ async def test_coalesced_failed_solve_propagates_and_leaves_no_hold() -> None:
 
     route = respx.post(f"{_SIDECAR}/solve").mock(side_effect=_gated)
     solver = _solver()
+    solver._solve_retry_backoff_s = 0.0  # part 2: fast fail retries once; no real sleep
     try:
         tasks = [
             asyncio.create_task(solver.get_clearance("mangadot", force_resolve=True))
@@ -931,7 +1222,9 @@ async def test_coalesced_failed_solve_propagates_and_leaves_no_hold() -> None:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await solver.aclose()
-    assert route.call_count == 1  # one shared (failed) solve for the herd
+    # The shared (coalesced) solve fails FAST, so it retries once: 2 device hits for the
+    # whole herd (still ONE shared task — the herd never fans out to N solves).
+    assert route.call_count == 2
     assert all(isinstance(r, httpx.HTTPStatusError) for r in results)
     assert "mangadot" not in solver._held  # WR-05: nothing held after a failed solve
     assert "mangadot" not in solver._expires_at
@@ -1043,11 +1336,13 @@ async def test_solve_emits_error_metric_on_failure(
     monkeypatch.setattr("manga_gateway.metrics.collector.get_collector", lambda: fake)
     respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
     solver = _solver()
+    solver._solve_retry_backoff_s = 0.0  # part 2: fast 504 retries once; no real sleep
     try:
         with pytest.raises(httpx.HTTPStatusError):
             await solver.get_clearance("mangadot")
     finally:
         await solver.aclose()
+    # The fast-fail retry adds device hits but the metric is emitted ONCE per _solve.
     assert len(fake.solves) == 1
     assert fake.solves[0]["outcome"] == "error"
     assert fake.solves[0]["error"] == "HTTPStatusError"
@@ -1202,6 +1497,7 @@ async def test_refresh_tick_keeps_old_clearance_when_resolve_fails() -> None:
     respx.post(f"{_SIDECAR}/solve").mock(return_value=httpx.Response(504))
     solver = _solver()
     solver._refresh_lead_s = 120.0
+    solver._solve_retry_backoff_s = 0.0  # part 2: fast 504 retries once; no real sleep
     old = Clearance(cookies={"cf_clearance": "old-token"}, user_agent=_WEBVIEW_UA)
     solver._held["mangadot"] = old
     solver._expires_at["mangadot"] = time.time() + 10.0

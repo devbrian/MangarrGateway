@@ -461,6 +461,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             # lets the search attempt within the per-source fan-out budget.
             warm_gate_timeout_s=settings.android_warm_gate_timeout_s,
             timeout_s=settings.android_solver_timeout_s,
+            # Debug kagane-search-timeout part 2: mirror of the sidecar inner tap-poll
+            # deadline — the discriminator the gateway uses to tell a fast solver hiccup
+            # (retry once) from a CF block-page window (serve cached + back off).
+            solve_block_deadline_s=settings.android_solve_block_deadline_s,
             # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
             # the CloudflareSolver (no second build_proxy call, no new setting). The
             # sidecar's CF-solve egress then matches the gateway's httpx-fetch egress

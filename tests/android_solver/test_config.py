@@ -75,6 +75,70 @@ def test_base_solve_timeout_default_unchanged() -> None:
     )
 
 
+# ── Debug kagane-search-timeout part 1: the inner tap-poll deadline knob ──────
+
+
+def test_tap_poll_deadline_default_and_bounds() -> None:
+    cfg = SidecarConfig.from_env(_MINIMAL)
+    # ~13s: above the 11.2s max good solve, below the 21s fastest in-window failure.
+    assert cfg.tap_poll_deadline_s == 13.0
+    # MUST stay below both the base solve timeout and the proxied outer budget.
+    assert cfg.tap_poll_deadline_s < cfg.solve_timeout_s
+    assert cfg.tap_poll_deadline_s < cfg.proxy_solve_timeout_s
+
+
+def test_tap_poll_deadline_override_from_env() -> None:
+    cfg = SidecarConfig.from_env(
+        {"SOLVER_API_KEY": "k", "SOLVER_TAP_POLL_DEADLINE_S": "9"}
+    )
+    assert cfg.tap_poll_deadline_s == 9.0
+
+
+def test_non_positive_tap_poll_deadline_raises() -> None:
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {"SOLVER_API_KEY": "k", "SOLVER_TAP_POLL_DEADLINE_S": "0"}
+        )
+
+
+def test_tap_poll_deadline_above_proxy_budget_raises() -> None:
+    # The proxied outer budget must exceed the inner tap-poll deadline (the proxied
+    # solve adds CONNECT-hop + egress-verify before the tap loop). Fail loud.
+    # (base solve_timeout is raised above the deadline here so the BASE guard passes and
+    # this exercises the PROXY guard specifically.)
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {
+                "SOLVER_API_KEY": "k",
+                "SOLVER_SOLVE_TIMEOUT_S": "400",
+                "SOLVER_TAP_POLL_DEADLINE_S": "300",
+                "SOLVER_PROXY_SOLVE_TIMEOUT_S": "240",
+            }
+        )
+
+
+def test_tap_poll_deadline_at_or_above_base_solve_timeout_raises() -> None:
+    # The base (no-proxy) outer worker wait is solve_timeout_s, so it too must exceed
+    # the inner tap-poll deadline, else a direct solve's outer cap fires before the
+    # inner loop completes. Fail loud (mirrors the proxy guard). Both == and < raise.
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {
+                "SOLVER_API_KEY": "k",
+                "SOLVER_SOLVE_TIMEOUT_S": "13",
+                "SOLVER_TAP_POLL_DEADLINE_S": "13",
+            }
+        )
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {
+                "SOLVER_API_KEY": "k",
+                "SOLVER_SOLVE_TIMEOUT_S": "10",
+                "SOLVER_TAP_POLL_DEADLINE_S": "13",
+            }
+        )
+
+
 def test_service_port_still_parsed_and_guarded() -> None:
     # Generalizing _parse_port must not regress the existing SOLVER_PORT path.
     cfg = SidecarConfig.from_env({"SOLVER_API_KEY": "k", "SOLVER_PORT": "9090"})
