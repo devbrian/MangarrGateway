@@ -2127,3 +2127,203 @@ def test_no_proxy_eval_runs_no_egress_probe_of_either_kind(
     assert result == {"x": 1}
     assert not cdp.ran_command(service._EGRESS_IN_PAGE_CMD_ID)  # no in-page probe
     assert not cdp.navigated_to(service._EGRESS_ECHO_URL)  # no destructive nav
+
+
+# ── multi-target registry + body `target` routing (LANE-03 / SEC-01) ──────────
+
+_DEFAULT_TARGET = "redroid:5555"
+_KAGANE_TARGET = "redroid-kagane:5555"
+
+
+def _multi_config(**overrides: object) -> SidecarConfig:
+    base: dict[str, object] = {
+        "api_key": "s3cret-solver-key",
+        "adb_target": _DEFAULT_TARGET,
+        "adb_targets": (_DEFAULT_TARGET, _KAGANE_TARGET),
+        "allowed_hosts": frozenset({"mangadot.net", "kagane.to"}),
+        "solve_timeout_s": 5.0,
+    }
+    base.update(overrides)
+    return SidecarConfig(**base)  # type: ignore[arg-type]
+
+
+def _multi_service(pipelines: dict[str, FakePipeline], **cfg: object) -> SolverService:
+    return SolverService(_multi_config(**cfg), pipelines=pipelines)
+
+
+def test_solve_absent_target_uses_default_worker() -> None:
+    default_pipe = FakePipeline()
+    kagane_pipe = FakePipeline()
+    service = _multi_service(
+        {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe}
+    )
+    status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert status == 200
+    # Absent target ⇒ the DEFAULT worker's pipeline only (byte-for-byte today).
+    assert default_pipe.calls == [("https://mangadot.net/", "mangadot.net")]
+    assert kagane_pipe.calls == []
+
+
+def test_solve_explicit_target_routes_to_that_worker_only() -> None:
+    default_pipe = FakePipeline()
+    kagane_pipe = FakePipeline()
+    service = _multi_service(
+        {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe}
+    )
+    status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://kagane.to/", "target": "redroid-kagane:5555"}'
+        ),
+    )
+    assert status == 200
+    assert kagane_pipe.calls == [("https://kagane.to/", "kagane.to")]
+    # The default target's pipeline is NEVER invoked.
+    assert default_pipe.calls == []
+
+
+def test_solve_unknown_target_is_pre_device_422() -> None:
+    default_pipe = FakePipeline()
+    kagane_pipe = FakePipeline()
+    service = _multi_service(
+        {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe}
+    )
+    status, payload = service.solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://kagane.to/", "target": "redroid-nope:5555"}'
+        ),
+    )
+    assert status == 422
+    assert "target" in payload["error"]
+    # NO device action on ANY worker — never build/use an AdbDevice for a bad target.
+    assert default_pipe.calls == []
+    assert kagane_pipe.calls == []
+
+
+def test_eval_unknown_target_is_pre_device_422() -> None:
+    default_pipe = FakePipeline()
+    kagane_pipe = FakePipeline()
+    service = _multi_service(
+        {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe}
+    )
+    status, payload = service.eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://kagane.to/", "js": "1",'
+            b' "target": "redroid-nope:5555"}'
+        ),
+    )
+    assert status == 422
+    assert "target" in payload["error"]
+    assert default_pipe.calls == []
+    assert kagane_pipe.calls == []
+
+
+def test_eval_explicit_target_routes_to_that_worker_only() -> None:
+    default_pipe = FakePipeline()
+    kagane_pipe = FakePipeline()
+    service = _multi_service(
+        {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe}
+    )
+    status, _ = service.eval(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://kagane.to/", "js": "1",'
+            b' "target": "redroid-kagane:5555"}'
+        ),
+    )
+    assert status == 200
+    assert kagane_pipe.calls == [("https://kagane.to/", "kagane.to")]
+    assert default_pipe.calls == []
+
+
+def test_solve_per_target_allowlist_rejects_global_host() -> None:
+    # kagane lane scoped to ONLY kagane.to; mangadot.net is globally allowed but NOT
+    # in kagane's scope ⇒ 422 before any device action (SEC-01).
+    default_pipe = FakePipeline()
+    kagane_pipe = FakePipeline()
+    service = _multi_service(
+        {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe},
+        allowed_hosts_by_target={_KAGANE_TARGET: frozenset({"kagane.to"})},
+    )
+    status, payload = service.solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://mangadot.net/",'
+            b' "target": "redroid-kagane:5555"}'
+        ),
+    )
+    assert status == 422
+    assert "allowlist" in payload["error"]
+    assert kagane_pipe.calls == []
+    assert default_pipe.calls == []
+
+
+def test_solve_per_target_allowlist_allows_scoped_host() -> None:
+    default_pipe = FakePipeline()
+    kagane_pipe = FakePipeline()
+    service = _multi_service(
+        {_DEFAULT_TARGET: default_pipe, _KAGANE_TARGET: kagane_pipe},
+        allowed_hosts_by_target={_KAGANE_TARGET: frozenset({"kagane.to"})},
+    )
+    # The scoped host on its lane is accepted; the default lane uses the global set.
+    k_status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=(
+            b'{"challenge_url": "https://kagane.to/", "target": "redroid-kagane:5555"}'
+        ),
+    )
+    d_status, _ = service.solve(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/"}',
+    )
+    assert k_status == 200
+    assert d_status == 200
+    assert kagane_pipe.calls == [("https://kagane.to/", "kagane.to")]
+    assert default_pipe.calls == [("https://mangadot.net/", "mangadot.net")]
+
+
+def test_concurrent_different_targets_do_not_503_each_other() -> None:
+    # Per-target Lock: two lanes run concurrently (no cross-target 503); a SECOND
+    # solve on the SAME target still serializes (503 busy) — T-10-11 per lane.
+    started_a = threading.Event()
+    started_b = threading.Event()
+    release = threading.Event()
+    pipe_a = FakePipeline(started=started_a, release=release)
+    pipe_b = FakePipeline(started=started_b, release=release)
+    service = _multi_service({_DEFAULT_TARGET: pipe_a, _KAGANE_TARGET: pipe_b})
+    results: dict[str, int] = {}
+
+    def run(name: str, target: str | None, host: str) -> None:
+        target_field = f', "target": "{target}"' if target else ""
+        body = f'{{"challenge_url": "https://{host}/"{target_field}}}'.encode()
+        status, _ = service.solve(api_key="s3cret-solver-key", body=body)
+        results[name] = status
+
+    thread_a = threading.Thread(target=run, args=("a", None, "mangadot.net"))
+    thread_a.start()
+    thread_b = threading.Thread(target=run, args=("b", _KAGANE_TARGET, "kagane.to"))
+    thread_b.start()
+    try:
+        assert started_a.wait(timeout=5)  # default lane in flight
+        assert started_b.wait(timeout=5)  # kagane lane in flight CONCURRENTLY
+        # A second solve on the DEFAULT target (its lock held) is 503 busy.
+        busy_status, busy_payload = service.solve(
+            api_key="s3cret-solver-key",
+            body=b'{"challenge_url": "https://mangadot.net/"}',
+        )
+        assert busy_status == 503
+        assert "busy" in busy_payload["error"]
+    finally:
+        release.set()
+        thread_a.join(timeout=5)
+        thread_b.join(timeout=5)
+
+    assert results == {"a": 200, "b": 200}
+    # Each device was driven by at most one solve at a time.
+    assert pipe_a.max_concurrent == 1
+    assert pipe_b.max_concurrent == 1

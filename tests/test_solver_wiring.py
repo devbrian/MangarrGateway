@@ -48,7 +48,8 @@ async def test_lifespan_swaps_in_solver_router() -> None:
         # Patchright (mangafire) and Android (comix/mangadot/kagane/mangaball) backends.
         assert isinstance(solver, SolverRouter)
         assert isinstance(solver._patchright, CloudflareSolver)
-        assert isinstance(solver._android, AndroidSolver)
+        # Single-lane collapse: the sole "default" lane is the android backend.
+        assert isinstance(solver._android_by_lane["default"], AndroidSolver)
         # The per-source breaker map still covers EVERY cloudflare source,
         # regardless of which engine solves it (both engines).
         assert isinstance(app.state.source_health, dict)
@@ -76,8 +77,9 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
         assert solver._patchright._challenge_urls == {
             "mangafire": "https://mangafire.to/",
         }
-        # Android leg: comix + mangadot + kagane + mangaball (NOT mangafire).
-        assert solver._android._challenge_urls == {
+        # Android leg (single-lane collapse — the "default" lane carries all android
+        # sources): comix + mangadot + kagane + mangaball (NOT mangafire).
+        assert solver._android_by_lane["default"]._challenge_urls == {
             "comix": "https://comix.to/",
             "mangadot": "https://mangadot.net/",
             "kagane": "https://kagane.to/",
@@ -99,7 +101,7 @@ async def test_on_demand_source_wired_into_warm_skip_and_bootstrap_peek() -> Non
         # (a) warm-skip wiring: mangaball is on-demand on the Android leg; mangafire
         # is on-demand on the Patchright leg (260623-m5h: search computes the vrf
         # in-process and answers cold over httpx, so it defer-solves Cloudflare).
-        assert "mangaball" in solver._android._on_demand_keys
+        assert "mangaball" in solver._android_by_lane["default"]._on_demand_keys
         assert solver._patchright._on_demand_keys == frozenset({"mangafire"})
 
         # (b) bootstrap provider peeks for an on-demand source, stays eager otherwise.
@@ -117,6 +119,102 @@ async def test_on_demand_source_wired_into_warm_skip_and_bootstrap_peek() -> Non
     by_key = dict(calls)
     assert by_key["mangaball"] == {"solve_if_missing": False}  # peek, no eager solve
     assert by_key["comix"] == {}  # eager (no solve_if_missing forwarded)
+
+
+# ───────────────── per-lane construction + single-lane collapse (LANE-02) ─────────
+
+
+async def test_single_lane_collapse_builds_exactly_one_android_solver() -> None:
+    """CRITICAL regression guard (LANE-02): with NO lane config the app builds EXACTLY
+    ONE AndroidSolver (one device lock), adb_target=None, lane="default"; the router's
+    android_by_lane has length 1 and eval_backend IS that one instance — single-lane
+    collapse, byte-for-byte today."""
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        # exactly one lane instance
+        assert list(solver._android_by_lane) == ["default"]
+        only = solver._android_by_lane["default"]
+        assert isinstance(only, AndroidSolver)
+        # no target sent (single-lane collapse), default lane label
+        assert only._adb_target is None
+        assert only._lane == "default"
+        # eval_backend is that one instance (the off-Protocol eval passthrough target)
+        assert solver._eval_backend is only
+        # source_lane_map empty (no per-source lane routing)
+        assert solver._source_lane_map == {}
+
+
+async def test_two_lanes_slice_kagane_onto_its_own_solver() -> None:
+    """With a dedicated kagane lane: TWO AndroidSolver instances; the kagane instance
+    carries adb_target + lane + ONLY kagane's challenge_url; the default instance
+    carries the rest and the page-holder (comix) is the eval_backend."""
+    app = create_app(
+        _settings(
+            android_lanes={
+                "default": "redroid:5555",
+                "kagane": "redroid-kagane:5555",
+            },
+            android_source_lane_map={"kagane": "kagane"},
+        )
+    )
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        assert set(solver._android_by_lane) == {"default", "kagane"}
+        kagane = solver._android_by_lane["kagane"]
+        default = solver._android_by_lane["default"]
+        # kagane lane: its own device target + lane label + ONLY its challenge_url
+        assert kagane._adb_target == "redroid-kagane:5555"
+        assert kagane._lane == "kagane"
+        assert kagane._challenge_urls == {"kagane": "https://kagane.to/"}
+        # default lane: the other android sources, its own device target
+        assert default._adb_target == "redroid:5555"
+        assert default._lane == "default"
+        assert "kagane" not in default._challenge_urls
+        assert "comix" in default._challenge_urls  # page-holder rides the default lane
+        # the page-holder (comix) lane's instance is the eval_backend
+        assert solver._eval_backend is default
+        # the source_lane_map is threaded through for per-source dispatch
+        assert solver._source_lane_map == {"kagane": "kagane"}
+
+
+async def test_unknown_lane_map_source_key_fails_loud() -> None:
+    """LANE-01 fail-loud (PR #324 review): a typo'd SOURCE key in
+    android_source_lane_map is rejected at startup, NOT silently dropped (which would
+    leave the real source on the shared default lane and defeat the lane config)."""
+    app = create_app(
+        _settings(
+            android_lanes={
+                "default": "redroid:5555",
+                "kagane": "redroid-kagane:5555",
+            },
+            android_source_lane_map={"kgane": "kagane"},  # typo: should be "kagane"
+        )
+    )
+    with pytest.raises(ValueError, match="unknown source key"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
+async def test_disabled_source_in_lane_map_does_not_block_startup() -> None:
+    """A source intentionally disabled via GATEWAY_DISABLED_SOURCES but left in the
+    lane map must NOT fail startup — only genuine typos fail loud (the disabled source
+    is a known android source, just dropped from the registry for this deploy)."""
+    app = create_app(
+        _settings(
+            android_lanes={
+                "default": "redroid:5555",
+                "kagane": "redroid-kagane:5555",
+            },
+            android_source_lane_map={"kagane": "kagane"},
+            disabled_sources="kagane",
+        )
+    )
+    # Reaching the body (no raise) proves the disabled source was exempted.
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.solver, SolverRouter)
 
 
 async def test_mangadex_resolves_no_clearance_with_real_solver() -> None:

@@ -62,6 +62,7 @@ import manga_gateway.app as _app_module
 from manga_gateway.config import Settings
 from manga_gateway.framework.android_solver import AndroidSolver
 from manga_gateway.framework.antibot import CloudflareSolver
+from manga_gateway.framework.lanes import DEFAULT_LANE
 from manga_gateway.framework.proxy import build_proxy
 from manga_gateway.framework.registry import SourceRegistry
 from manga_gateway.sources import register_builtin_sources
@@ -576,6 +577,12 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
         "warm_gate_timeout_s": settings.android_warm_gate_timeout_s,
         "timeout_s": settings.android_solver_timeout_s,
         "proxy": playwright_proxy,
+        # LANE-02 (Plan 15-04): the session-shared solver mirrors the single-lane
+        # collapse — adb_target=None (no ``target`` sent) + lane="default". Present here
+        # so test_android_solver_kwargs_lockstep stays green against app.py's per-lane
+        # AndroidSolver(...) build (which now passes adb_target=plan.adb_target + lane).
+        "adb_target": None,
+        "lane": DEFAULT_LANE,
     }
 
 

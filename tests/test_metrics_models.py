@@ -69,6 +69,7 @@ def _populated_event() -> MetricEvent:
                 "status": "completed",
             }
         ],
+        lane="kagane",  # 15-03 OBS-01: exercise the additive lane label round-trip
     )
 
 

@@ -72,6 +72,10 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
         "warm_gate_timeout_s",
         "timeout_s",
         "proxy",
+        # LANE-02 (Plan 15-04): the session-shared solver mirrors the single-lane
+        # collapse — adb_target=None + lane="default".
+        "adb_target",
+        "lane",
     }
     # The kwargs construct a real AndroidSolver offline (no network until /solve).
     solver = AndroidSolver(**kwargs)

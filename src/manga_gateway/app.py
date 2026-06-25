@@ -31,6 +31,7 @@ from .framework.antibot import Clearance, CloudflareSolver
 from .framework.cooldown import SourceFailureCooldown
 from .framework.enum_cache import EnumerationCache
 from .framework.health import SourceHealth
+from .framework.lanes import DEFAULT_LANE, resolve_lane_plans
 from .framework.proxy import build_proxy
 from .framework.proxy_pool import ProxyPool
 from .framework.ratelimit import RateLimiter
@@ -391,46 +392,115 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if key in android_keys
         and (url := getattr(cls, "cloudflare_challenge_url", None))
     }
-    android_solver = AndroidSolver(
-        base_url=settings.android_solver_url,
-        api_key=settings.android_solver_api_key,
-        challenge_urls=android_challenge_urls,
-        # warm() skips on-demand android sources (mangaball) — they solve on-demand,
-        # never eager (debug pooltimeout-recurrence).
-        on_demand_keys=on_demand_keys & android_keys,
-        # Bug 5 perf (warm-ordering) + follow-on #3 (Option A2): the page-holding
-        # android key (comix) is EXCLUDED from the eager /solve and EVAL-PRIMED last by
-        # warm() instead, so the redroid ends startup parked on its cleared page.
-        warm_last_keys=webview_page_keys,
-        # Bug 5 Lever A (#298): per-source proactive-refresh horizon map (seeded
-        # kagane=1680s, mangadot=14400s — measured re-challenge cadences). Sources
-        # absent from the map keep the historic cookie-expiry behavior; operator-tunable
-        # per source via GATEWAY_ANDROID_CLEARANCE_LIFETIME_S.
-        clearance_lifetime_s=settings.android_clearance_lifetime_s,
-        # Bug 5 Fix #2: how long an android foreground search waits at the device door
-        # for the startup warm() to finish before proceeding (armed below, just before
-        # the non-blocking warm task is created). Bounded so a slow/hung warm still lets
-        # the search attempt within the per-source fan-out budget.
-        warm_gate_timeout_s=settings.android_warm_gate_timeout_s,
-        timeout_s=settings.android_solver_timeout_s,
-        # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
-        # the CloudflareSolver (no second build_proxy call, no new setting). The
-        # sidecar's CF-solve egress then matches the gateway's httpx-fetch egress
-        # for the minted clearance. ``None`` when ``cloudflare_proxy_*`` is
-        # unconfigured ⇒ no proxy in the /solve body (D-08). Never logged.
-        proxy=playwright_proxy,
+    # LANE-02 (Plan 15-04): partition the android sources across configurable solver
+    # LANES — one redroid device (adb target) per lane, each with its OWN AndroidSolver
+    # (own device lock + held-clearance store). ``resolve_lane_plans`` returns one
+    # ``LanePlan`` per lane carrying the android source keys mapped to it. CRITICAL
+    # single-lane collapse: with NO lane config (default Settings → both dicts empty) it
+    # returns EXACTLY ONE "default" lane carrying every android key with
+    # ``adb_target=None`` — so the loop below builds exactly one AndroidSolver (one
+    # device lock), sends no ``target``, and the router's eval_backend is that one
+    # instance (byte-for-byte today).
+    # LANE-01 fail-loud (PR #324 review): a typo in an android_source_lane_map SOURCE
+    # key is otherwise SILENT — resolve_lane_plans only consults the map for keys
+    # already in android_keys, so an unknown/misspelled source key is ignored and the
+    # real source quietly falls back to the shared DEFAULT_LANE, defeating the lane
+    # config. The pydantic _validate_lane_topology validator cannot catch this (it has
+    # no view of the registered sources); validate here where android_keys exists.
+    # Exempt intentionally-disabled sources (GATEWAY_DISABLED_SOURCES) so a disabled
+    # source left in the map does not block startup.
+    known_android_keys = android_keys | settings.disabled_source_keys()
+    unknown_lane_sources = sorted(
+        src for src in settings.android_source_lane_map if src not in known_android_keys
+    )
+    if unknown_lane_sources:
+        raise ValueError(
+            "android_source_lane_map references unknown source key(s) "
+            f"{unknown_lane_sources}: not a registered android source "
+            f"(known android sources: {sorted(android_keys)}). Fix the source->lane "
+            "map — a typo here silently routes the real source to the default lane."
+        )
+    lane_plans = resolve_lane_plans(
+        android_lanes=settings.android_lanes,
+        source_lane_map=settings.android_source_lane_map,
+        android_keys=android_keys,
+    )
+    # Build one AndroidSolver per lane, slicing each per-source kwarg to that lane's own
+    # sources (Pitfall 3: warm_last/on_demand/clearance_lifetime must be sliced per lane
+    # so comix's eval-prime + a dedicated lane's refresh never bleed across devices).
+    android_by_lane: dict[str, AndroidSolver] = {}
+    for lane_id, plan in lane_plans.items():
+        android_by_lane[lane_id] = AndroidSolver(
+            base_url=settings.android_solver_url,
+            api_key=settings.android_solver_api_key,
+            # Per-lane slice: only THIS lane's android sources' challenge URLs.
+            challenge_urls={
+                key: url
+                for key, url in android_challenge_urls.items()
+                if key in plan.source_keys
+            },
+            # warm() skips on-demand android sources (mangaball) — they solve on-demand,
+            # never eager (debug pooltimeout-recurrence). Sliced to this lane's sources.
+            on_demand_keys=(on_demand_keys & android_keys) & plan.source_keys,
+            # Bug 5 perf (warm-ordering) + follow-on #3 (Option A2): the page-holding
+            # android key (comix) is EXCLUDED from the eager /solve and EVAL-PRIMED last
+            # by warm() instead. Sliced so only the page-holder's OWN lane primes it.
+            warm_last_keys=webview_page_keys & plan.source_keys,
+            # Bug 5 Lever A (#298): per-source proactive-refresh horizon map (seeded
+            # kagane=1680s, mangadot=14400s — measured re-challenge cadences). Sources
+            # absent keep historic cookie-expiry behavior; operator-tunable via
+            # GATEWAY_ANDROID_CLEARANCE_LIFETIME_S. Sliced to this lane's sources.
+            clearance_lifetime_s={
+                key: secs
+                for key, secs in settings.android_clearance_lifetime_s.items()
+                if key in plan.source_keys
+            },
+            # Bug 5 Fix #2: how long an android foreground search waits at the device
+            # door for the startup warm() to finish before proceeding (armed below, just
+            # before the non-blocking warm task is created). Bounded so a slow/hung warm
+            # lets the search attempt within the per-source fan-out budget.
+            warm_gate_timeout_s=settings.android_warm_gate_timeout_s,
+            timeout_s=settings.android_solver_timeout_s,
+            # Req 7: reuse the SAME ``playwright_proxy`` already built once above for
+            # the CloudflareSolver (no second build_proxy call, no new setting). The
+            # sidecar's CF-solve egress then matches the gateway's httpx-fetch egress
+            # for the minted clearance. ``None`` when ``cloudflare_proxy_*`` is
+            # unconfigured ⇒ no proxy in the /solve body (D-08). Never logged.
+            proxy=playwright_proxy,
+            # LANE-02: this lane's redroid device. ``None`` in the single-lane collapse
+            # (no ``target`` sent — byte-for-byte today); a real adb target in a
+            # dedicated-lane deploy so the sidecar drives that lane's own device.
+            adb_target=plan.adb_target,
+            # OBS-01: the non-secret lane label stamped onto this solver's metric emits.
+            lane=lane_id,
+        )
+    # The eval_backend is the page-holder (comix) lane's AndroidSolver — the
+    # off-Protocol eval_in_webview/device_session passthroughs route there so comix's
+    # foreground lease defers only its OWN lane's refresh (T-15-08). The page-holder
+    # lane is the lane whose sources include a webview_page_keys member; default to
+    # DEFAULT_LANE (the single-lane collapse, where it is the one-and-only instance).
+    eval_lane = next(
+        (
+            lane_id
+            for lane_id, plan in lane_plans.items()
+            if plan.source_keys & webview_page_keys
+        ),
+        DEFAULT_LANE,
     )
     solver = SolverRouter(
         patchright=cloudflare_solver,
-        android=android_solver,
+        android_by_lane=android_by_lane,
+        source_lane_map=settings.android_source_lane_map,
+        eval_backend=android_by_lane[eval_lane],
         engine_by_source=engine_by_source,
     )
     app.state.solver = solver
-    # D-35 follow-up: start the android proactive-refresh loop so a held clearance is
-    # re-minted ahead of its cookie expiry (off the request hot path) instead of only
-    # reactively on a 403. No-op when the sidecar is unconfigured; cancelled by
-    # solver.aclose() → android.aclose() on shutdown.
-    android_solver.start()
+    # D-35 follow-up: start EVERY lane's android proactive-refresh loop so a held
+    # clearance is re-minted ahead of its cookie expiry (off the request hot path)
+    # instead of only reactively on a 403. No-op when the sidecar is unconfigured;
+    # cancelled by solver.aclose() → each lane's aclose() on shutdown.
+    for lane_solver in android_by_lane.values():
+        lane_solver.start()
 
     async def _warm_solver() -> None:
         # #88 / PR#90 review: per-domain warm isolation. ``solver.warm()`` returns
@@ -468,11 +538,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # search (a comix solve+eval inside device_session) WAITS for warm() to finish
     # before claiming the shared device. This prevents a search that arrives during the
     # startup warm storm from racing the in-flight foreign solves (the collision spike).
-    # No-op on the patchright-only / unconfigured-sidecar path (android_solver.warm()
+    # No-op on the patchright-only / unconfigured-sidecar path (each lane's warm()
     # still sets the completion event in its finally). Arming here (not inside warm())
     # closes the create_task scheduling race: the gate is armed before the lifespan
-    # yields.
-    android_solver.arm_warm_gate()
+    # yields. LANE-02: arm EVERY lane's gate.
+    for lane_solver in android_by_lane.values():
+        lane_solver.arm_warm_gate()
     warm_task = asyncio.create_task(_warm_solver())  # non-blocking (Pitfall 3)
     # (app.state.ratelimiter is created earlier, before CsrfBootstrap, so the
     # bootstrap GET shares the per-source limiter — see above.)

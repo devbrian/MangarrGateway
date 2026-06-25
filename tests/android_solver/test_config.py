@@ -81,3 +81,109 @@ def test_service_port_still_parsed_and_guarded() -> None:
     assert cfg.port == 9090
     with pytest.raises(ConfigError):
         SidecarConfig.from_env({"SOLVER_API_KEY": "k", "SOLVER_PORT": "0"})
+
+
+# ── multi-target registry + per-target allowlist (LANE-03 / SEC-01) ───────────
+
+
+def test_adb_targets_defaults_to_single_target() -> None:
+    # Default collapse: no SOLVER_ADB_TARGETS -> the registry is exactly the one
+    # existing SOLVER_ADB_TARGET (byte-for-byte today).
+    cfg = SidecarConfig.from_env(_MINIMAL)
+    assert cfg.adb_targets == ("redroid:5555",)
+    assert cfg.adb_target == "redroid:5555"
+
+
+def test_adb_targets_parses_comma_list_default_first() -> None:
+    cfg = SidecarConfig.from_env(
+        {
+            "SOLVER_API_KEY": "k",
+            "SOLVER_ADB_TARGET": "redroid:5555",
+            "SOLVER_ADB_TARGETS": "redroid:5555,redroid-kagane:5555",
+        }
+    )
+    assert cfg.adb_targets == ("redroid:5555", "redroid-kagane:5555")
+    # The DEFAULT target stays the existing SOLVER_ADB_TARGET.
+    assert cfg.adb_target == "redroid:5555"
+
+
+def test_adb_targets_always_contains_default() -> None:
+    # SEC-01 invariant: the default target is always a member of the registry,
+    # even when SOLVER_ADB_TARGETS omits it.
+    cfg = SidecarConfig.from_env(
+        {
+            "SOLVER_API_KEY": "k",
+            "SOLVER_ADB_TARGET": "redroid:5555",
+            "SOLVER_ADB_TARGETS": "redroid-kagane:5555",
+        }
+    )
+    assert cfg.adb_target in cfg.adb_targets
+    assert "redroid-kagane:5555" in cfg.adb_targets
+
+
+def test_malformed_adb_targets_falls_back_to_single() -> None:
+    # All-blank entries -> fall back to the single SOLVER_ADB_TARGET (default).
+    cfg = SidecarConfig.from_env(
+        {
+            "SOLVER_API_KEY": "k",
+            "SOLVER_ADB_TARGET": "redroid:5555",
+            "SOLVER_ADB_TARGETS": " , , ",
+        }
+    )
+    assert cfg.adb_targets == ("redroid:5555",)
+
+
+def test_allowed_hosts_for_defaults_to_global() -> None:
+    cfg = SidecarConfig.from_env(_MINIMAL)
+    # No per-target map -> every target uses the global allowlist.
+    assert cfg.allowed_hosts_for("redroid:5555") == cfg.allowed_hosts
+
+
+def test_allowed_hosts_for_scopes_per_target() -> None:
+    cfg = SidecarConfig.from_env(
+        {
+            "SOLVER_API_KEY": "k",
+            "SOLVER_ADB_TARGETS": "redroid:5555,redroid-kagane:5555",
+            "SOLVER_ALLOWED_HOSTS_BY_TARGET": '{"redroid-kagane:5555":"kagane.to"}',
+        }
+    )
+    assert cfg.allowed_hosts_for("redroid-kagane:5555") == frozenset({"kagane.to"})
+    # An unscoped target still falls back to the global allowlist.
+    assert cfg.allowed_hosts_for("redroid:5555") == cfg.allowed_hosts
+
+
+def test_allowed_hosts_by_target_accepts_list_value() -> None:
+    cfg = SidecarConfig.from_env(
+        {
+            "SOLVER_API_KEY": "k",
+            "SOLVER_ADB_TARGETS": "redroid:5555,redroid-kagane:5555",
+            "SOLVER_ALLOWED_HOSTS_BY_TARGET": (
+                '{"redroid-kagane:5555":["kagane.to","Cdn.Kagane.To"]}'
+            ),
+        }
+    )
+    assert cfg.allowed_hosts_for("redroid-kagane:5555") == frozenset(
+        {"kagane.to", "cdn.kagane.to"}
+    )
+
+
+def test_allowed_hosts_by_target_unknown_target_raises() -> None:
+    # Fail loud: a per-target allowlist naming a target not in adb_targets.
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {
+                "SOLVER_API_KEY": "k",
+                "SOLVER_ADB_TARGETS": "redroid:5555",
+                "SOLVER_ALLOWED_HOSTS_BY_TARGET": '{"redroid-nope:5555":"x.to"}',
+            }
+        )
+
+
+def test_allowed_hosts_by_target_malformed_json_raises() -> None:
+    with pytest.raises(ConfigError):
+        SidecarConfig.from_env(
+            {
+                "SOLVER_API_KEY": "k",
+                "SOLVER_ALLOWED_HOSTS_BY_TARGET": "not-json",
+            }
+        )

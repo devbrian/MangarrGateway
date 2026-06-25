@@ -287,6 +287,32 @@ class Settings(BaseSettings):
     # sources never enter ``device_session``); the gate is a no-op until the app arms it
     # at startup, so the gate / CI / a solver that never warms stays unchanged.
     android_warm_gate_timeout_s: float = Field(default=25.0, gt=0)
+    # ── Configurable per-source solver lanes (Phase 15, LANE-01) ───────────────
+    # A *lane* = one redroid device (an adb target) with its own AndroidSolver
+    # instance (own device lock + held-clearance store). These two additive dict
+    # fields let a deployer give a contention-heavy source (kagane) its OWN
+    # redroid so its CF-gated download flood no longer self-floods the single
+    # shared device and trips the multi-minute SourceFailureCooldown (debug
+    # ``kagane-unreliable-unavailables``). ONE android-solver sidecar addresses N
+    # adb targets — every lane shares the ONE android_solver_url/_api_key.
+    #
+    #   android_lanes           : lane_id -> adb_target, e.g.
+    #       {"default": "redroid:5555", "kagane": "redroid-kagane:5555"}
+    #   android_source_lane_map : source_key -> lane_id, e.g. {"kagane": "kagane"}
+    #
+    # DEFAULT = BOTH EMPTY = the single-lane collapse = today's exact behavior
+    # (zero new containers, byte-for-byte): framework.lanes.resolve_lane_plans
+    # synthesizes exactly ONE "default" lane carrying every android source with
+    # adb_target=None, so the app omits the sidecar ``target`` field entirely. An
+    # unmapped android source falls to the "default" lane. Both ride the
+    # load_settings TOML->kwargs dict merge exactly like
+    # android_clearance_lifetime_s (a dict value, same machinery); env override is
+    # a JSON object (GATEWAY_ANDROID_LANES / GATEWAY_ANDROID_SOURCE_LANE_MAP).
+    # The _validate_lane_topology model_validator below fails LOUD at startup on an
+    # invalid topology (T-15-01/T-15-02). Per-lane proxy/sticky-session config is
+    # intentionally absent (forward dependency — no proxy ships on the deploy).
+    android_lanes: dict[str, str] = Field(default_factory=dict)
+    android_source_lane_map: dict[str, str] = Field(default_factory=dict)
     # ── Source enable/disable (reversible ops knob; #198/#202) ─────────────────
     # Comma-separated source keys to SKIP registering at startup, e.g.
     # GATEWAY_DISABLED_SOURCES="kagane,mangadot". A disabled source is dropped
@@ -603,6 +629,71 @@ class Settings(BaseSettings):
                 "result. Fix via env: set GATEWAY_ENUM_CACHE_EMPTY_TTL_SECONDS <= "
                 "GATEWAY_ENUM_CACHE_TTL_SECONDS."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_lane_topology(self) -> Settings:
+        """Fail fast on an invalid solver-lane topology at startup (LANE-01).
+
+        The lane fields (``android_lanes`` lane_id->adb_target,
+        ``android_source_lane_map`` source_key->lane_id) come from deployer config
+        (operator-trusted) but a typo must never silently mis-route a source to a
+        non-existent or blank-target lane (T-15-01/T-15-02). BOTH empty is the
+        single-lane collapse (today's behavior) and passes untouched; otherwise
+        every rule below must hold or construction raises — mirroring
+        ``_reject_camoufox_parallel``/``_enum_cache_ttl_within_handle_ttl`` so the
+        misconfiguration surfaces LOUD at startup rather than mis-routing at solve
+        time. Uses ``framework.lanes.DEFAULT_LANE`` for the "default" literal so the
+        validator and ``resolve_lane_plans`` agree on the default-lane rule.
+        """
+        from manga_gateway.framework.lanes import DEFAULT_LANE
+
+        if not self.android_lanes:
+            # Collapse path: a source->lane map with NO lane definitions has nowhere
+            # to route — that is a config error, not the (both-empty) collapse.
+            if self.android_source_lane_map:
+                offenders = ", ".join(sorted(self.android_source_lane_map))
+                raise ValueError(
+                    "android_source_lane_map is set but android_lanes is empty: a "
+                    "source->lane map needs lane definitions to route to. Either "
+                    "define android_lanes (with a "
+                    f'"{DEFAULT_LANE}" lane) or clear the map. Offending source(s): '
+                    f"{offenders}."
+                )
+            return self
+
+        # A non-empty android_lanes MUST declare the default lane — unmapped
+        # android sources fall to it (resolve_lane_plans), so it must exist.
+        if DEFAULT_LANE not in self.android_lanes:
+            raise ValueError(
+                f'android_lanes is non-empty but has no "{DEFAULT_LANE}" lane: '
+                "unmapped android sources fall to the default lane, so it must be "
+                f'declared. Add a "{DEFAULT_LANE}" entry, e.g. '
+                f'{{"{DEFAULT_LANE}": "redroid:5555", ...}}.'
+            )
+
+        # Every lane needs a non-empty/non-blank adb target — the app must never
+        # construct an AndroidSolver pointed at a blank target (T-15-02).
+        for lane_id, target in self.android_lanes.items():
+            if not target or not target.strip():
+                raise ValueError(
+                    f"android_lanes[{lane_id!r}] has an empty adb_target; every "
+                    "lane must name a non-blank adb target (e.g. "
+                    '"redroid-kagane:5555").'
+                )
+
+        # Every mapped lane_id must be a declared lane (T-15-01) — a typo can never
+        # route a source to a non-existent lane.
+        for source_key, lane_id in self.android_source_lane_map.items():
+            if lane_id not in self.android_lanes:
+                declared = ", ".join(sorted(self.android_lanes))
+                raise ValueError(
+                    f"android_source_lane_map[{source_key!r}] references lane "
+                    f"{lane_id!r}, which is not declared in android_lanes "
+                    f"(declared lanes: {declared}). Add the lane to android_lanes "
+                    "or fix the mapping."
+                )
+
         return self
 
 

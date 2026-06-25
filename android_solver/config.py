@@ -11,6 +11,7 @@ R1: this module imports ONLY the stdlib — never anything from
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -18,7 +19,16 @@ from dataclasses import dataclass, field
 # Env var names (the compose service in 10-05 supplies these).
 _ENV_API_KEY = "SOLVER_API_KEY"
 _ENV_ADB_TARGET = "SOLVER_ADB_TARGET"
+# LANE-03: the FULL multi-target registry (comma list). One android-solver
+# addresses N adb targets; absent ⇒ the registry collapses to the single
+# SOLVER_ADB_TARGET (byte-for-byte today).
+_ENV_ADB_TARGETS = "SOLVER_ADB_TARGETS"
 _ENV_ALLOWED_HOSTS = "SOLVER_ALLOWED_HOSTS"
+# SEC-01: optional per-target challenge-host allowlist scoping. A JSON object
+# mapping an adb target -> a host (or comma-list / JSON list of hosts) so a
+# dedicated lane can be scoped to ONLY its own source's host. Any target named
+# here MUST be a member of SOLVER_ADB_TARGETS (fail loud at from_env).
+_ENV_ALLOWED_HOSTS_BY_TARGET = "SOLVER_ALLOWED_HOSTS_BY_TARGET"
 _ENV_TIMEOUT = "SOLVER_SOLVE_TIMEOUT_S"
 _ENV_CANCEL_GRACE = "SOLVER_CANCEL_GRACE_S"
 _ENV_BIND_HOST = "SOLVER_BIND_HOST"
@@ -70,8 +80,16 @@ class SidecarConfig:
     """Immutable sidecar settings (the api key + adb target + SSRF allowlist)."""
 
     api_key: str
+    # The DEFAULT target — used when a /solve|/eval request omits ``target``
+    # (byte-for-byte today's single-device behavior, LANE-03).
     adb_target: str = _DEFAULT_ADB_TARGET
+    # The FULL registry the sidecar drives (LANE-03). Always contains
+    # ``adb_target``; a single-target deploy collapses to ``(adb_target,)``.
+    adb_targets: tuple[str, ...] = (_DEFAULT_ADB_TARGET,)
     allowed_hosts: frozenset[str] = field(default=frozenset(_DEFAULT_ALLOWED_HOSTS))
+    # SEC-01: per-target allowlist overrides. Empty ⇒ every target uses the
+    # global ``allowed_hosts`` (see :meth:`allowed_hosts_for`).
+    allowed_hosts_by_target: Mapping[str, frozenset[str]] = field(default_factory=dict)
     solve_timeout_s: float = _DEFAULT_TIMEOUT_S
     cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S
     bind_host: str = _DEFAULT_BIND_HOST
@@ -79,6 +97,16 @@ class SidecarConfig:
     proxy_solve_timeout_s: float = _DEFAULT_PROXY_TIMEOUT_S
     hop_port: int = _DEFAULT_HOP_PORT
     hop_host: str = _DEFAULT_HOP_HOST
+
+    def allowed_hosts_for(self, target: str) -> frozenset[str]:
+        """Return the challenge-host allowlist for ``target`` (SEC-01).
+
+        A target with a per-target override (``SOLVER_ALLOWED_HOSTS_BY_TARGET``)
+        is scoped to only those hosts; every other target falls back to the
+        global ``allowed_hosts``. This keeps a dedicated lane from driving
+        another source's host while leaving the default deploy untouched.
+        """
+        return self.allowed_hosts_by_target.get(target, self.allowed_hosts)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> SidecarConfig:
@@ -97,8 +125,12 @@ class SidecarConfig:
             )
 
         adb_target = (source.get(_ENV_ADB_TARGET) or _DEFAULT_ADB_TARGET).strip()
+        adb_targets = _parse_targets(source.get(_ENV_ADB_TARGETS), adb_target)
 
         allowed_hosts = _parse_hosts(source.get(_ENV_ALLOWED_HOSTS))
+        allowed_hosts_by_target = _parse_allowed_hosts_by_target(
+            source.get(_ENV_ALLOWED_HOSTS_BY_TARGET), adb_targets
+        )
 
         solve_timeout_s = _parse_positive_float(
             source.get(_ENV_TIMEOUT), _DEFAULT_TIMEOUT_S, _ENV_TIMEOUT
@@ -122,7 +154,9 @@ class SidecarConfig:
         return cls(
             api_key=api_key,
             adb_target=adb_target,
+            adb_targets=adb_targets,
             allowed_hosts=allowed_hosts,
+            allowed_hosts_by_target=allowed_hosts_by_target,
             solve_timeout_s=solve_timeout_s,
             cancel_grace_s=cancel_grace_s,
             bind_host=bind_host,
@@ -139,6 +173,77 @@ def _parse_hosts(raw: str | None) -> frozenset[str]:
         return frozenset(_DEFAULT_ALLOWED_HOSTS)
     hosts = {part.strip().lower() for part in raw.split(",") if part.strip()}
     return frozenset(hosts) if hosts else frozenset(_DEFAULT_ALLOWED_HOSTS)
+
+
+def _parse_targets(raw: str | None, default_target: str) -> tuple[str, ...]:
+    """Parse the comma-separated multi-target registry (LANE-03).
+
+    Reuses the comma-split/strip idiom from :func:`_parse_hosts`. When unset or
+    all-blank, the registry collapses to ``(default_target,)`` so a single-target
+    deploy is byte-for-byte today. The DEFAULT target is always a member: it is
+    prepended when the explicit list omits it, with order otherwise preserved.
+    """
+    targets: list[str] = []
+    if raw and raw.strip():
+        for part in raw.split(","):
+            value = part.strip()
+            if value and value not in targets:
+                targets.append(value)
+    if not targets:
+        return (default_target,)
+    if default_target not in targets:
+        targets.insert(0, default_target)
+    return tuple(targets)
+
+
+def _parse_allowed_hosts_by_target(
+    raw: str | None, adb_targets: tuple[str, ...]
+) -> dict[str, frozenset[str]]:
+    """Parse the optional per-target allowlist override map (SEC-01).
+
+    ``raw`` is a JSON object mapping an adb target -> a host string (comma list)
+    OR a JSON list of hosts. Raises ``ConfigError`` on malformed JSON, a
+    non-object payload, an unparseable value, or a target NOT present in
+    ``adb_targets`` (fail loud — never scope an allowlist to a target the sidecar
+    does not drive).
+    """
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ConfigError(
+            f"{_ENV_ALLOWED_HOSTS_BY_TARGET} must be a JSON object, got {raw!r}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ConfigError(
+            f"{_ENV_ALLOWED_HOSTS_BY_TARGET} must be a JSON object mapping "
+            f"target -> hosts, got {type(parsed).__name__}"
+        )
+
+    result: dict[str, frozenset[str]] = {}
+    for target, value in parsed.items():
+        if target not in adb_targets:
+            raise ConfigError(
+                f"{_ENV_ALLOWED_HOSTS_BY_TARGET} names target {target!r} which is "
+                f"not in {_ENV_ADB_TARGETS} ({list(adb_targets)})"
+            )
+        if isinstance(value, str):
+            hosts = {part.strip().lower() for part in value.split(",") if part.strip()}
+        elif isinstance(value, list):
+            hosts = {str(part).strip().lower() for part in value if str(part).strip()}
+        else:
+            raise ConfigError(
+                f"{_ENV_ALLOWED_HOSTS_BY_TARGET}[{target!r}] must be a host string "
+                f"or a list of hosts, got {type(value).__name__}"
+            )
+        if not hosts:
+            raise ConfigError(
+                f"{_ENV_ALLOWED_HOSTS_BY_TARGET}[{target!r}] resolved to an empty "
+                "allowlist"
+            )
+        result[target] = frozenset(hosts)
+    return result
 
 
 def _parse_positive_float(raw: str | None, default: float, name: str) -> float:

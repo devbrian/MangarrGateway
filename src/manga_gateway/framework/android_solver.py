@@ -164,6 +164,7 @@ def _emit_solve(
     duration_ms: float,
     attempt: int,
     error: str | None,
+    lane: str | None = None,
 ) -> None:
     """No-op-safe, failure-isolated ``emit_solve`` for the android sidecar solve.
 
@@ -172,7 +173,9 @@ def _emit_solve(
     per-request breakdown (it surfaced only as an unexplained gap between two http
     events). This mirrors ``solver_lifecycle._emit_solve`` so the android solve shows as
     a labeled ``solve`` row. A ``None`` collector is a no-op; a collector error never
-    breaks the solve. The ``cf_clearance`` value is NEVER passed here (T-10-04)."""
+    breaks the solve. The ``cf_clearance`` value is NEVER passed here (T-10-04). The
+    ``lane`` (OBS-01, Plan 15-04) is the non-secret solver-lane label forwarded to the
+    event; ``None`` keeps the event's lane unset (byte-for-byte today)."""
     from ..metrics.collector import get_collector
 
     collector = get_collector()
@@ -185,6 +188,7 @@ def _emit_solve(
             duration_ms=duration_ms,
             attempt=attempt,
             error=error,
+            lane=lane,
         )
     except Exception:  # noqa: BLE001 — a metric failure must never break a solve
         pass
@@ -196,6 +200,7 @@ def _emit_eval(
     outcome: str,
     duration_ms: float,
     error: str | None,
+    lane: str | None = None,
 ) -> None:
     """No-op-safe, failure-isolated ``emit_eval`` for the android-WebView ``/eval``.
 
@@ -205,7 +210,9 @@ def _emit_eval(
     :func:`_emit_solve` so each outer ``eval`` shows as a labeled, REAL-timed row. A
     ``None`` collector is a clean no-op; a collector error never breaks the eval. The
     eval ``js``, the eval result, and any ``cf_clearance`` token are NEVER passed here
-    (T-14-04) — redaction is structural (``emit_eval`` records ``url=None``)."""
+    (T-14-04) — redaction is structural (``emit_eval`` records ``url=None``). The
+    ``lane`` (OBS-01, Plan 15-04) is the non-secret solver-lane label forwarded to the
+    event."""
     from ..metrics.collector import get_collector
 
     collector = get_collector()
@@ -217,6 +224,7 @@ def _emit_eval(
             outcome=outcome,
             duration_ms=duration_ms,
             error=error,
+            lane=lane,
         )
     except Exception:  # noqa: BLE001 — a metric failure must never break an eval
         pass
@@ -301,6 +309,16 @@ class AndroidSolver:
         # is a no-op until :meth:`arm_warm_gate` is called (the app lifespan), so a
         # solver that never warms (tests / unconfigured sidecar / CI) never waits.
         warm_gate_timeout_s: float = 25.0,
+        # LANE-02 (Plan 15-04): the adb target of THIS lane's redroid device. When set
+        # it rides the /solve + /eval POST body as ``target`` so the sidecar drives the
+        # lane's own device (Plan 15-02 validates it). ``None`` (the single-lane
+        # collapse — no lane config) omits the field entirely, so a no-lane deploy is
+        # byte-for-byte today. Gateway-chosen, never caller-supplied (SEC-01).
+        adb_target: str | None = None,
+        # OBS-01 (Plan 15-04): the non-secret lane label stamped onto this solver's
+        # emit_solve/emit_eval metric events so a solve/eval is attributable to its
+        # lane. Defaults to "default" (the sole lane in the single-lane collapse).
+        lane: str = "default",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
@@ -319,6 +337,10 @@ class AndroidSolver:
         }
         self._timeout_s = timeout_s
         self._proxy = proxy
+        # LANE-02 / OBS-01 (Plan 15-04): this lane's adb target (forwarded as the
+        # sidecar ``target`` only when set) + the lane label stamped on metric emits.
+        self._adb_target = adb_target
+        self._lane = lane
         self._client = client
         self._owns_client = client is None
         # Last-good clearance per source key (the D-35 hold — mirrors the browser
@@ -970,6 +992,10 @@ class AndroidSolver:
         body: dict[str, object] = {"challenge_url": challenge_url}
         if self._proxy is not None:
             body["proxy"] = self._proxy
+        # LANE-02 (Plan 15-04): drive this lane's own redroid device. Gated like proxy —
+        # ``None`` (single-lane collapse) sends NO ``target`` key (byte-for-byte today).
+        if self._adb_target is not None:
+            body["target"] = self._adb_target
         start = time.perf_counter()
         try:
             # Fix B: serialize the sidecar /solve behind the single gateway-side
@@ -1005,6 +1031,7 @@ class AndroidSolver:
                 duration_ms=(time.perf_counter() - start) * 1000.0,
                 attempt=1,
                 error=type(exc).__name__,
+                lane=self._lane,
             )
             raise
         _emit_solve(
@@ -1013,6 +1040,7 @@ class AndroidSolver:
             duration_ms=(time.perf_counter() - start) * 1000.0,
             attempt=1,
             error=None,
+            lane=self._lane,
         )
         expires_at = _parse_expiry(payload.get("cf_clearance_expires"))
         # Log the solve event only — never the token value (T-10-04).
@@ -1103,6 +1131,7 @@ class AndroidSolver:
                     outcome="ok",
                     duration_ms=(time.perf_counter() - start) * 1000.0,
                     error=None,
+                    lane=self._lane,
                 )
                 return payload["value"]
             # Unreachable: the loop always returns a value or re-raises on the final
@@ -1114,6 +1143,7 @@ class AndroidSolver:
                 outcome="error",
                 duration_ms=(time.perf_counter() - start) * 1000.0,
                 error=type(exc).__name__,
+                lane=self._lane,
             )
             raise
 
@@ -1166,6 +1196,10 @@ class AndroidSolver:
         # (already unpacked by build_proxy) and NEVER logged (T-14-04 / T-11-02).
         if self._proxy is not None:
             body["proxy"] = self._proxy
+        # LANE-02 (Plan 15-04): drive this lane's own redroid device (mirrors _solve).
+        # ``None`` (single-lane collapse) sends NO ``target`` key (byte-for-byte today).
+        if self._adb_target is not None:
+            body["target"] = self._adb_target
         # Fix B: serialize the sidecar /eval behind the single gateway-side
         # _device_lock — the comix candidate-chapter-list fan-out gathers N evals
         # concurrently, but each takes the lock per-op so they QUEUE on the one
