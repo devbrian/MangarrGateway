@@ -135,9 +135,7 @@ def test_emit_solve_stamps_lane(
     unbound), which is the AndroidSolver emit posture plan 15-04 will use.
     """
     c, store = collector
-    c.emit_solve(
-        source_key="kagane", outcome="ok", duration_ms=11000.0, lane="kagane"
-    )
+    c.emit_solve(source_key="kagane", outcome="ok", duration_ms=11000.0, lane="kagane")
     solves = [e for e in store.iter_recent() if e.kind == "solve"]
     assert len(solves) == 1
     assert solves[0].lane == "kagane"
@@ -149,9 +147,7 @@ def test_emit_eval_stamps_lane(
 ) -> None:
     """emit_eval(lane=...) emits a kind="eval" event carrying that lane (OBS-01)."""
     c, store = collector
-    c.emit_eval(
-        source_key="comix", outcome="ok", duration_ms=8000.0, lane="default"
-    )
+    c.emit_eval(source_key="comix", outcome="ok", duration_ms=8000.0, lane="default")
     evals = [e for e in store.iter_recent() if e.kind == "eval"]
     assert len(evals) == 1
     assert evals[0].lane == "default"

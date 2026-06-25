@@ -173,6 +173,8 @@ def test_metric_event_has_all_fields_incl_method() -> None:
         "chapter_number",
         # 260605-wab per-item GET /downloads queue contents (default None).
         "queue_items",
+        # 15-03 per-lane observability (OBS-01) — non-secret solver-lane label.
+        "lane",
     }
     assert field_names == expected
 
