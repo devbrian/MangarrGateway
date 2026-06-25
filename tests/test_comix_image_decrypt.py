@@ -22,11 +22,18 @@ from PIL import Image
 
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.comix import (
-    _IMAGE_FETCH_HEADERS,
     ComixSource,
     _scramble_permutation,
     _unscramble_image,
 )
+
+# The exact headers Comix's image fetch must send — pinned literally here (NOT imported
+# from the production ``_IMAGE_FETCH_HEADERS``) so a bad change to either value fails a
+# test instead of silently tracking the implementation.
+_EXPECTED_IMAGE_FETCH_HEADERS = {
+    "Origin": "https://comix.to",
+    "Referer": "https://comix.to/",
+}
 
 # Spike-012 offline regression vector (page 04 — x-enc-seed header + raw bytes;
 # plaintext is the deterministic WebP header: RIFF + filesize-8 LE + WEBP + …).
@@ -49,6 +56,7 @@ class _FakeCtx:
     """
 
     def __init__(self, data: bytes, headers: dict[str, str]) -> None:
+        """Seed the fake with the fixed body + response headers to serve."""
         self._data = data
         self._headers = httpx.Headers(headers)
         self.calls = 0
@@ -57,6 +65,7 @@ class _FakeCtx:
     async def get_bytes_plain_with_headers(
         self, url: str, *, extra_headers: dict[str, str] | None = None
     ) -> tuple[bytes, httpx.Headers]:
+        """Return the fixed bytes/headers, recording the call + ``extra_headers``."""
         self.calls += 1
         self.last_extra_headers = extra_headers
         return self._data, self._headers
@@ -372,8 +381,7 @@ async def test_fetch_image_sends_origin_referer_headers() -> None:
     out = await ComixSource().fetch_image("https://cdn.example.store/i5/T/01", ctx)
     assert out == payload  # plaintext → untouched
     assert ctx.calls == 1  # single fetch, no refetch
-    assert ctx.last_extra_headers == _IMAGE_FETCH_HEADERS
-    assert ctx.last_extra_headers["Origin"] == "https://comix.to"
+    assert ctx.last_extra_headers == _EXPECTED_IMAGE_FETCH_HEADERS
 
 
 @pytest.mark.asyncio
@@ -394,7 +402,7 @@ async def test_fetch_image_unscrambles_residual_vp8x_with_seed() -> None:
     out = await ComixSource().fetch_image("https://cdn.example.store/i5/T/abc", ctx)
     restored = Image.open(io.BytesIO(out)).convert("RGB")
     assert restored.tobytes() == original.tobytes()
-    assert ctx.last_extra_headers == _IMAGE_FETCH_HEADERS
+    assert ctx.last_extra_headers == _EXPECTED_IMAGE_FETCH_HEADERS
 
 
 @pytest.mark.asyncio
