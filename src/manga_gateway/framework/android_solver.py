@@ -311,13 +311,13 @@ class AndroidSolver:
         warm_gate_timeout_s: float = 25.0,
         # LANE-02 (Plan 15-04): the adb target of THIS lane's redroid device. When set
         # it rides the /solve + /eval POST body as ``target`` so the sidecar drives the
-        # lane's own device (Plan 15-02 validates it). ``None`` (the single-lane collapse
-        # — no lane config) omits the field entirely, so a no-lane deploy is byte-for-byte
-        # today. Gateway-chosen, never caller-supplied (SEC-01); a non-secret identifier.
+        # lane's own device (Plan 15-02 validates it). ``None`` (the single-lane
+        # collapse — no lane config) omits the field entirely, so a no-lane deploy is
+        # byte-for-byte today. Gateway-chosen, never caller-supplied (SEC-01).
         adb_target: str | None = None,
         # OBS-01 (Plan 15-04): the non-secret lane label stamped onto this solver's
-        # emit_solve/emit_eval metric events so a solve/eval is attributable to its lane.
-        # Defaults to "default" (the sole lane in the single-lane collapse).
+        # emit_solve/emit_eval metric events so a solve/eval is attributable to its
+        # lane. Defaults to "default" (the sole lane in the single-lane collapse).
         lane: str = "default",
         client: httpx.AsyncClient | None = None,
     ) -> None:
@@ -338,7 +338,7 @@ class AndroidSolver:
         self._timeout_s = timeout_s
         self._proxy = proxy
         # LANE-02 / OBS-01 (Plan 15-04): this lane's adb target (forwarded as the
-        # sidecar ``target`` only when set) + the lane label stamped on the metric emits.
+        # sidecar ``target`` only when set) + the lane label stamped on metric emits.
         self._adb_target = adb_target
         self._lane = lane
         self._client = client

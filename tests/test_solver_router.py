@@ -133,9 +133,14 @@ def _router(**over: object) -> tuple[SolverRouter, _FakeBackend, _FakeBackend]:
         "mangadot": "android",
         "kagane": "android",
     }
+    # Single-lane construction (mechanical: the old single ``android`` backend is now
+    # the sole "default" lane; eval_backend is that instance; source_lane_map empty).
+    # The behavioral assertions in the legacy tests below are unchanged.
     kwargs: dict[str, object] = {
         "patchright": patchright,
-        "android": android,
+        "android_by_lane": {"default": android},
+        "source_lane_map": {},
+        "eval_backend": android,
         "engine_by_source": engine_map,
     }
     kwargs.update(over)
@@ -210,7 +215,9 @@ async def test_warm_returns_union_of_failed_keys() -> None:
     android = _FakeBackend(owns={"mangadot", "kagane"}, tag="droid", fails=["kagane"])
     router = SolverRouter(
         patchright=patchright,
-        android=android,
+        android_by_lane={"default": android},
+        source_lane_map={},
+        eval_backend=android,
         engine_by_source={"comix": "patchright", "kagane": "android"},
     )
     failed = await router.warm()
@@ -223,7 +230,13 @@ async def test_warm_returns_union_of_failed_keys() -> None:
 async def test_warm_dedupes_overlapping_failed_keys() -> None:
     patchright = _FakeBackend(owns=set(), tag="pw", fails=["x"])
     android = _FakeBackend(owns=set(), tag="droid", fails=["x"])
-    router = SolverRouter(patchright=patchright, android=android, engine_by_source={})
+    router = SolverRouter(
+        patchright=patchright,
+        android_by_lane={"default": android},
+        source_lane_map={},
+        eval_backend=android,
+        engine_by_source={},
+    )
     assert await router.warm() == ["x"]
 
 
@@ -236,7 +249,13 @@ async def test_aclose_closes_both_even_if_one_raises() -> None:
         raise RuntimeError("patchright close failed")
 
     patchright.aclose = _boom  # type: ignore[method-assign]
-    router = SolverRouter(patchright=patchright, android=android, engine_by_source={})
+    router = SolverRouter(
+        patchright=patchright,
+        android_by_lane={"default": android},
+        source_lane_map={},
+        eval_backend=android,
+        engine_by_source={},
+    )
     await router.aclose()  # must NOT raise
     assert android.closed == 1  # android still closed despite patchright raising
 
@@ -289,7 +308,9 @@ async def test_eval_in_webview_delegates_to_android() -> None:
     android = _FakeEvalBackend(tag="droid")
     router = SolverRouter(
         patchright=patchright,  # type: ignore[arg-type]
-        android=android,  # type: ignore[arg-type]
+        android_by_lane={"default": android},  # type: ignore[dict-item]
+        source_lane_map={},
+        eval_backend=android,  # type: ignore[arg-type]
         engine_by_source={},
     )
     result = await router.eval_in_webview(
@@ -344,7 +365,9 @@ async def test_device_session_delegates_to_android() -> None:
     android = _FakeDeviceSessionBackend(tag="droid")
     router = SolverRouter(
         patchright=patchright,  # type: ignore[arg-type]
-        android=android,  # type: ignore[arg-type]
+        android_by_lane={"default": android},  # type: ignore[dict-item]
+        source_lane_map={},
+        eval_backend=android,  # type: ignore[arg-type]
         engine_by_source={},
     )
     async with router.device_session():
@@ -500,7 +523,7 @@ async def test_eval_in_webview_delegates_to_eval_backend_lane() -> None:
     other_lane = _FakeEvalBackend(tag="other")
     router = SolverRouter(
         patchright=patchright,  # type: ignore[arg-type]
-        android_by_lane={"default": other_lane, "comix": page_holder},  # type: ignore[arg-type]
+        android_by_lane={"default": other_lane, "comix": page_holder},  # type: ignore[dict-item]
         source_lane_map={"comix": "comix"},
         eval_backend=page_holder,  # type: ignore[arg-type]
         engine_by_source={},
@@ -520,7 +543,7 @@ async def test_device_session_delegates_to_eval_backend_lane() -> None:
     other_lane = _FakeDeviceSessionBackend(tag="other")
     router = SolverRouter(
         patchright=patchright,  # type: ignore[arg-type]
-        android_by_lane={"default": other_lane, "comix": page_holder},  # type: ignore[arg-type]
+        android_by_lane={"default": other_lane, "comix": page_holder},  # type: ignore[dict-item]
         source_lane_map={"comix": "comix"},
         eval_backend=page_holder,  # type: ignore[arg-type]
         engine_by_source={},

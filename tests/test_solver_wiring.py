@@ -48,7 +48,8 @@ async def test_lifespan_swaps_in_solver_router() -> None:
         # Patchright (mangafire) and Android (comix/mangadot/kagane/mangaball) backends.
         assert isinstance(solver, SolverRouter)
         assert isinstance(solver._patchright, CloudflareSolver)
-        assert isinstance(solver._android, AndroidSolver)
+        # Single-lane collapse: the sole "default" lane is the android backend.
+        assert isinstance(solver._android_by_lane["default"], AndroidSolver)
         # The per-source breaker map still covers EVERY cloudflare source,
         # regardless of which engine solves it (both engines).
         assert isinstance(app.state.source_health, dict)
@@ -76,8 +77,9 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
         assert solver._patchright._challenge_urls == {
             "mangafire": "https://mangafire.to/",
         }
-        # Android leg: comix + mangadot + kagane + mangaball (NOT mangafire).
-        assert solver._android._challenge_urls == {
+        # Android leg (single-lane collapse — the "default" lane carries all android
+        # sources): comix + mangadot + kagane + mangaball (NOT mangafire).
+        assert solver._android_by_lane["default"]._challenge_urls == {
             "comix": "https://comix.to/",
             "mangadot": "https://mangadot.net/",
             "kagane": "https://kagane.to/",
@@ -99,7 +101,7 @@ async def test_on_demand_source_wired_into_warm_skip_and_bootstrap_peek() -> Non
         # (a) warm-skip wiring: mangaball is on-demand on the Android leg; mangafire
         # is on-demand on the Patchright leg (260623-m5h: search computes the vrf
         # in-process and answers cold over httpx, so it defer-solves Cloudflare).
-        assert "mangaball" in solver._android._on_demand_keys
+        assert "mangaball" in solver._android_by_lane["default"]._on_demand_keys
         assert solver._patchright._on_demand_keys == frozenset({"mangafire"})
 
         # (b) bootstrap provider peeks for an on-demand source, stays eager otherwise.
@@ -146,8 +148,8 @@ async def test_single_lane_collapse_builds_exactly_one_android_solver() -> None:
 
 async def test_two_lanes_slice_kagane_onto_its_own_solver() -> None:
     """With a dedicated kagane lane: TWO AndroidSolver instances; the kagane instance
-    carries adb_target + lane + ONLY kagane's challenge_url; the default instance carries
-    the remaining android sources and the page-holder (comix) is the eval_backend."""
+    carries adb_target + lane + ONLY kagane's challenge_url; the default instance
+    carries the rest and the page-holder (comix) is the eval_backend."""
     app = create_app(
         _settings(
             android_lanes={

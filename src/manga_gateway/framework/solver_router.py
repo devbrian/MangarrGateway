@@ -36,7 +36,10 @@ import inspect
 import logging
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from .lanes import DEFAULT_LANE
+
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from contextlib import AbstractAsyncContextManager
 
     from .antibot import AntiBotSolver, Clearance
@@ -92,12 +95,13 @@ class _EvalSolver(Protocol):
     """The off-Protocol ``eval_in_webview`` primitive the ANDROID backend exposes.
 
     Declared locally — mirroring :class:`_BrowserFetchSolver` — so the router can
-    ``cast`` ``self._android`` (typed as the engine-agnostic ``AntiBotSolver``
+    ``cast`` ``self._eval_backend`` (typed as the engine-agnostic ``AntiBotSolver``
     Protocol, which intentionally omits it) to a shape that declares it, and
     delegate mypy-strict-clean with NO ``# type: ignore``. The INVERSE of the four
     ``fetch_via_browser*`` passthroughs: those cast ``self._patchright`` (the only
-    engine with a real browser); this one casts ``self._android`` (the only engine
-    with the cleared WebView the eval runs inside).
+    engine with a real browser); this one casts ``self._eval_backend`` (the page-holder
+    lane's AndroidSolver — the only engine with the cleared WebView the eval runs
+    inside; LANE-02).
     """
 
     async def eval_in_webview(
@@ -116,7 +120,7 @@ class _EvalSolver(Protocol):
         solver.device_session():`` so the proactive-refresh loop defers and the warm
         comix page survives across the sequence's evals. Declared here (not a
         coroutine — it returns an async context manager) so the router can ``cast``
-        ``self._android`` and delegate mypy-strict-clean.
+        ``self._eval_backend`` and delegate mypy-strict-clean.
         """
         ...
 
@@ -129,29 +133,60 @@ _ANDROID_ENGINE = "android"
 
 
 class SolverRouter:
-    """Composite AntiBotSolver dispatching ``get_clearance`` by per-source engine."""
+    """Composite AntiBotSolver dispatching ``get_clearance`` by per-source engine.
+
+    LANE-02 (Plan 15-04): the single ``android`` backend is replaced by an
+    ``android_by_lane`` dict (one ``AndroidSolver`` per lane = per redroid device, each
+    with its OWN device lock) plus a ``source_lane_map`` (source_key → lane_id) and an
+    ``eval_backend`` (the page-holder lane's instance). An android source routes to its
+    lane's instance; the off-Protocol ``eval_in_webview``/``device_session`` pass-
+    throughs route to the page-holder lane (``eval_backend``), so comix's foreground
+    lease defers only its own lane's refresh. ``warm()``/``aclose()`` iterate EVERY
+    lane. With a single lane (``android_by_lane={"default": solver}``,
+    ``source_lane_map={}``,
+    ``eval_backend=solver``) this is behaviorally identical to the old single-android
+    router — the single-lane collapse.
+    """
 
     def __init__(
         self,
         *,
         patchright: AntiBotSolver,
-        android: AntiBotSolver,
-        engine_by_source: dict[str, str],
+        android_by_lane: Mapping[str, AntiBotSolver],
+        source_lane_map: Mapping[str, str],
+        eval_backend: AntiBotSolver,
+        engine_by_source: Mapping[str, str],
     ) -> None:
         self._patchright = patchright
-        self._android = android
+        # One AndroidSolver per lane (per redroid device); copied so a later mutation
+        # of the caller's dict cannot re-point a lane mid-flight.
+        self._android_by_lane = dict(android_by_lane)
+        # source_key → lane_id; an unmapped android source falls to ``DEFAULT_LANE``.
+        self._source_lane_map = dict(source_lane_map)
+        # The page-holder lane's AndroidSolver — the target of the off-Protocol eval
+        # passthroughs (eval_in_webview/device_session). In the single-lane collapse
+        # this IS the one-and-only AndroidSolver.
+        self._eval_backend = eval_backend
         self._engine_by_source = dict(engine_by_source)
 
     def _backend_for(self, source_key: str) -> AntiBotSolver:
-        """Select the backend for ``source_key`` from the engine map.
+        """Select the backend for ``source_key`` from the engine + lane maps.
 
-        ``"android"`` → the AndroidSolver; everything else (the ``"patchright"``
-        default AND any unmapped key) → the desktop CloudflareSolver. Both backends
-        return ``None`` for a key they do not own, so an unmapped/non-cloudflare key
-        resolves to ``None`` whichever backend it lands on (BOT-01).
+        ``"android"`` → the AndroidSolver of the source's lane
+        (``source_lane_map`` → ``android_by_lane``; an unmapped source uses
+        ``DEFAULT_LANE``, and a resolved lane MISSING from ``android_by_lane`` falls
+        back to the ``DEFAULT_LANE`` instance — SEC-01/T-15-07: never an arbitrary
+        device). Everything else (the ``"patchright"`` default AND any unmapped key) →
+        the desktop CloudflareSolver. Both backends return ``None`` for a key they do
+        not own, so an
+        unmapped/non-cloudflare key resolves to ``None`` whichever backend it lands on
+        (BOT-01).
         """
         engine = self._engine_by_source.get(source_key, "patchright")
-        return self._android if engine == _ANDROID_ENGINE else self._patchright
+        if engine != _ANDROID_ENGINE:
+            return self._patchright
+        lane = self._source_lane_map.get(source_key, DEFAULT_LANE)
+        return self._android_by_lane.get(lane, self._android_by_lane[DEFAULT_LANE])
 
     async def get_clearance(
         self,
@@ -267,51 +302,69 @@ class SolverRouter:
         wait_for: str | None = None,
         timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
     ) -> Any:
-        """Delegate the in-WebView JS eval to the ANDROID backend (EVAL-02).
+        """Delegate the in-WebView JS eval to the page-holder lane (EVAL-02 / LANE-02).
 
         Unlike the three ``fetch_via_browser*`` passthroughs (which route to
-        ``self._patchright``), this routes to ``self._android`` — the engine that
-        owns the Turnstile-cleared redroid WebView the eval runs inside.
+        ``self._patchright``), this routes to ``self._eval_backend`` — the page-holder
+        lane's AndroidSolver, the engine that owns the Turnstile-cleared redroid WebView
+        the eval runs inside. comix runs in the page-holder lane, so its eval never
+        lands on another lane's device (T-15-08). In the single-lane collapse this is
+        the one AndroidSolver.
         """
-        backend = cast("_EvalSolver", self._android)
+        backend = cast("_EvalSolver", self._eval_backend)
         return await backend.eval_in_webview(
             challenge_url, js, wait_for=wait_for, timeout=timeout
         )
 
     def device_session(self) -> AbstractAsyncContextManager[None]:
-        """Delegate the foreground-device lease to the ANDROID backend (bug 4 Fix C).
+        """Delegate the foreground-device lease to the page-holder lane (bug 4 Fix C).
 
         Like :meth:`eval_in_webview` (and unlike the three ``fetch_via_browser*``
-        passthroughs), this routes to ``self._android`` — the engine that owns the
-        single redroid. comix wraps its solve+eval sequence in ``async with
-        self._solver_from_ctx(ctx).device_session():`` so the android backend's
-        proactive-refresh loop defers and the warm comix page survives across the
-        sequence. It is a no-op-safe CM even when the android backend is unconfigured
-        (``base_url is None``): the lease is just a counter, so a local box / CI /
-        the gate without a redroid enters+exits it cleanly (the evals inside raise
+        passthroughs), this routes to ``self._eval_backend`` — the page-holder lane's
+        AndroidSolver, the engine that owns comix's redroid. comix wraps its solve+eval
+        sequence in ``async with self._solver_from_ctx(ctx).device_session():`` so ONLY
+        that lane's proactive-refresh loop defers and the warm comix page survives
+        across the sequence (T-15-08). It is a no-op-safe CM even when the backend is
+        unconfigured (``base_url is None``): the lease is just a counter, so a local
+        box / CI / the gate without a redroid enters+exits it cleanly (the evals raise
         ``RuntimeError`` anyway). Returns the CM (not a coroutine) so callers use it
         directly as ``async with``.
         """
-        backend = cast("_EvalSolver", self._android)
+        backend = cast("_EvalSolver", self._eval_backend)
         return backend.device_session()
 
     async def warm(self) -> list[str]:
-        """Warm BOTH backends; return the UNION of their failed keys (deduped).
+        """Warm patchright + EVERY lane; return the UNION of failed keys (deduped).
 
         Each backend's ``warm()`` returns the source keys whose eager solve failed
         (D-33). The lifespan force-disables exactly those, so the router returns the
-        union across both engines (first-seen order, deduped). Both backends are
-        warmed unconditionally — a patchright warm failure must NOT skip the android
-        warm (and vice versa).
+        union across patchright AND every lane's AndroidSolver (first-seen order,
+        deduped). Every backend is warmed unconditionally — one backend's warm failure
+        must NOT skip the others (LANE-02: a dedicated lane's warm is independent).
         """
         failed: list[str] = []
         seen: set[str] = set()
-        for backend in (self._patchright, self._android):
+        for backend in self._all_backends():
             for key in await self._warm_backend(backend):
                 if key not in seen:
                     seen.add(key)
                     failed.append(key)
         return failed
+
+    def _all_backends(self) -> list[AntiBotSolver]:
+        """patchright + every lane's AndroidSolver, deduped by identity.
+
+        Lanes are distinct instances, but dedupe by ``id`` defensively so a lane dict
+        that ever aliases the same instance (or aliases patchright) is warmed/closed
+        exactly once.
+        """
+        backends: list[AntiBotSolver] = []
+        seen_ids: set[int] = set()
+        for backend in (self._patchright, *self._android_by_lane.values()):
+            if id(backend) not in seen_ids:
+                seen_ids.add(id(backend))
+                backends.append(backend)
+        return backends
 
     @staticmethod
     async def _warm_backend(backend: AntiBotSolver) -> list[str]:
@@ -337,8 +390,9 @@ class SolverRouter:
             return []
 
     async def aclose(self) -> None:
-        """Close BOTH backends, guarding each so one failure does not skip the other."""
-        for backend in (self._patchright, self._android):
+        """Close patchright + every lane, guarding each so one failure does not skip the
+        others (LANE-02: each lane's AndroidSolver owns its client + refresh loop)."""
+        for backend in self._all_backends():
             aclose = getattr(backend, "aclose", None)
             if aclose is None:
                 continue

@@ -382,7 +382,8 @@ async def test_lifespan_threads_same_proxy_into_android_solver() -> None:
     async with app.router.lifespan_context(app):
         # The Android leg carries the same dict the Patchright leg does — one
         # build_proxy call feeds both (no second call, no new setting).
-        assert app.state.solver._android._proxy == {
+        # Single-lane collapse: the sole "default" lane is the android backend.
+        assert app.state.solver._android_by_lane["default"]._proxy == {
             "server": _FAKE_SERVER,
             "username": _FAKE_USER,
             "password": _FAKE_PASS,
@@ -396,4 +397,4 @@ async def test_lifespan_no_proxy_leaves_android_solver_proxy_none() -> None:
 
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
-        assert app.state.solver._android._proxy is None
+        assert app.state.solver._android_by_lane["default"]._proxy is None
