@@ -105,14 +105,19 @@ def _eval_clearance_response(
 
 
 class _FakeCollector:
-    """Records ``emit_solve`` calls so a test can assert the android solve is now a
-    labeled metric event (the gap-mystery fix). Other ``emit_*`` are no-ops."""
+    """Records ``emit_solve`` / ``emit_eval`` calls so a test can assert the android
+    solve/eval is now a labeled metric event (the gap-mystery fix + OBS-01 lane).
+    Other ``emit_*`` are no-ops."""
 
     def __init__(self) -> None:
         self.solves: list[dict[str, object]] = []
+        self.evals: list[dict[str, object]] = []
 
     def emit_solve(self, **kwargs: object) -> None:
         self.solves.append(kwargs)
+
+    def emit_eval(self, **kwargs: object) -> None:
+        self.evals.append(kwargs)
 
     def __getattr__(self, _name: str):  # type: ignore[no-untyped-def]
         return lambda *a, **k: None
@@ -2051,3 +2056,143 @@ async def test_eval_in_webview_emits_error_metric_then_reraises(
     assert ev.source_key == "comix"
     assert ev.duration_ms > 0.0
     assert ev.url is None
+
+
+# ─────────────── adb_target + lane (LANE-02 / OBS-01, Plan 15-04) ───────────────
+# AndroidSolver gains two additive ctor params: ``adb_target`` (forwarded as the
+# sidecar ``target`` body field ONLY when set) and ``lane`` (stamped onto the
+# emit_solve/emit_eval metrics). With no adb_target the /solve+/eval bodies are
+# byte-for-byte today; lane defaults to "default".
+
+
+def test_adb_target_and_lane_default_to_none_and_default() -> None:
+    """Additive defaults: ``adb_target`` is None and ``lane`` is "default" so an
+    existing construction (no lane config) is byte-for-byte today."""
+    solver = _solver()
+    assert solver._adb_target is None
+    assert solver._lane == "default"
+
+
+def test_adb_target_and_lane_are_stored() -> None:
+    """The two new params are stored verbatim on the instance."""
+    solver = _solver(adb_target="redroid-kagane:5555", lane="kagane")
+    assert solver._adb_target == "redroid-kagane:5555"
+    assert solver._lane == "kagane"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_body_carries_target_when_adb_target_set() -> None:
+    """LANE-02: a configured ``adb_target`` rides the /solve body as ``target`` so the
+    sidecar drives the lane's own redroid device."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(adb_target="redroid-kagane:5555", lane="kagane")
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert body["challenge_url"] == _CHALLENGE_URLS["mangadot"]
+    assert body["target"] == "redroid-kagane:5555"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_body_omits_target_when_no_adb_target() -> None:
+    """Single-lane collapse: adb_target=None ⇒ the /solve body has NO ``target`` key
+    (byte-for-byte today)."""
+    route = respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert "target" not in body
+    assert body == {"challenge_url": _CHALLENGE_URLS["mangadot"]}
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_body_carries_target_when_adb_target_set() -> None:
+    """LANE-02: a configured ``adb_target`` rides the /eval body as ``target`` too."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": 1})
+    )
+    solver = _solver(adb_target="redroid-kagane:5555", lane="kagane")
+    try:
+        await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert body["challenge_url"] == _EVAL_URL
+    assert body["js"] == "return 1"
+    assert body["target"] == "redroid-kagane:5555"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_body_omits_target_when_no_adb_target() -> None:
+    """Single-lane collapse: adb_target=None ⇒ the /eval body has NO ``target`` key."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": 1})
+    )
+    solver = _solver()
+    try:
+        await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+    body = json.loads(route.calls.last.request.content)
+    assert "target" not in body
+    assert body == {"challenge_url": _EVAL_URL, "js": "return 1"}
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_emits_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OBS-01: emit_solve is called with ``lane=self._lane``."""
+    fake = _FakeCollector()
+    monkeypatch.setattr("manga_gateway.metrics.collector.get_collector", lambda: fake)
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver(lane="kagane")
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert len(fake.solves) == 1
+    assert fake.solves[0]["lane"] == "kagane"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_solve_emits_default_lane_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OBS-01: the default lane label is stamped when no lane is configured."""
+    fake = _FakeCollector()
+    monkeypatch.setattr("manga_gateway.metrics.collector.get_collector", lambda: fake)
+    respx.post(f"{_SIDECAR}/solve").mock(return_value=_solve_response())
+    solver = _solver()
+    try:
+        await solver.get_clearance("mangadot")
+    finally:
+        await solver.aclose()
+    assert fake.solves[0]["lane"] == "default"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_emits_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OBS-01: emit_eval is called with ``lane=self._lane``."""
+    fake = _FakeCollector()
+    monkeypatch.setattr("manga_gateway.metrics.collector.get_collector", lambda: fake)
+    respx.post(f"{_SIDECAR}/eval").mock(
+        return_value=httpx.Response(200, json={"value": 1})
+    )
+    solver = _solver(lane="comix")
+    try:
+        await solver.eval_in_webview(_EVAL_URL, "return 1")
+    finally:
+        await solver.aclose()
+    assert len(fake.evals) == 1
+    assert fake.evals[0]["lane"] == "comix"
