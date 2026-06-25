@@ -24,9 +24,7 @@ def test_single_lane_collapse_no_config() -> None:
     """The critical regression guard: empty config -> ONE default lane, no target."""
     keys = frozenset({"kagane", "mangadot", "comix", "mangaball"})
 
-    plans = resolve_lane_plans(
-        android_lanes={}, source_lane_map={}, android_keys=keys
-    )
+    plans = resolve_lane_plans(android_lanes={}, source_lane_map={}, android_keys=keys)
 
     assert list(plans) == [DEFAULT_LANE]
     plan = plans[DEFAULT_LANE]
