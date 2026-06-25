@@ -1545,28 +1545,73 @@ class AndroidSolvePipeline:
 # ── the control service: auth + allowlist + serialized/timeout-bounded solve ──
 
 
+@dataclass(frozen=True)
+class _Worker:
+    """A single adb target's serializer (LANE-03).
+
+    One ``Lock`` + one single-worker ``Executor`` + one ``SolvePipeline`` per
+    target. The lock serializes callers WITHIN a lane (T-10-11 preserved per
+    target) and the single-worker executor bounds each solve by wall-clock
+    timeout; two DIFFERENT targets each hold their own lock/executor so the lanes
+    run concurrently. Cookie-jar isolation is physical — each target is a
+    separate redroid ``/data`` volume (Plan 15-05), so a ``pm clear`` on one
+    lane's WebView can never touch another's.
+    """
+
+    lock: Lock
+    executor: Executor
+    pipeline: SolvePipeline
+
+
 class SolverService:
     """Stateless-per-request control logic, independent of the HTTP transport.
 
     Tested directly (no socket needed): ``solve()`` and ``healthz()`` return a
     ``(status_code, json_body)`` pair the HTTP handler just serializes.
+
+    One service addresses N adb targets via a per-target ``_Worker`` registry
+    (LANE-03). A ``/solve``|``/eval`` request selects a worker by an optional
+    body ``target`` field; an absent ``target`` resolves to the DEFAULT target
+    (``config.adb_target``) so a single-target deploy is byte-for-byte today.
     """
 
     def __init__(
         self,
         config: SidecarConfig,
-        pipeline: SolvePipeline,
+        pipeline: SolvePipeline | None = None,
         *,
+        pipelines: dict[str, SolvePipeline] | None = None,
         executor: Executor | None = None,
     ) -> None:
         self._config = config
-        self._pipeline = pipeline
-        # One WebView solve at a time (T-10-11): the lock serializes callers and
-        # the single-worker executor bounds each solve by wall-clock timeout.
-        self._lock = Lock()
-        self._executor = executor or ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="android-solve"
-        )
+        # The target used when a request omits ``target`` (byte-for-byte today).
+        self._default_target = config.adb_target
+        # Resolve the per-target pipeline set (back-compatible construction):
+        #   pipelines= : an explicit {target: pipeline} registry (multi-lane tests)
+        #   pipeline=  : a single pipeline registered under the DEFAULT target
+        #                (preserves the legacy SolverService(config, pipeline) shape)
+        #   neither    : build one real device-backed pipeline per config.adb_targets
+        if pipelines is not None:
+            resolved = dict(pipelines)
+        elif pipeline is not None:
+            resolved = {self._default_target: pipeline}
+        else:
+            resolved = build_pipelines(config)
+        # One WebView solve at a time PER target (T-10-11): each worker gets its
+        # own lock + own single-worker executor. The injected ``executor`` (tests)
+        # backs ONLY the default target; every other target gets a fresh executor.
+        self._workers: dict[str, _Worker] = {}
+        for target, pipe in resolved.items():
+            worker_executor = (
+                executor
+                if executor is not None and target == self._default_target
+                else ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix=f"android-solve-{target}"
+                )
+            )
+            self._workers[target] = _Worker(
+                lock=Lock(), executor=worker_executor, pipeline=pipe
+            )
 
     def _authenticate(self, provided_key: str | None) -> bool:
         if not provided_key:
@@ -1580,7 +1625,9 @@ class SolverService:
         return self._authenticate(provided_key)
 
     def healthz(self) -> tuple[int, dict[str, Any]]:
-        ok = self._pipeline.health()
+        # Health is the DEFAULT target's device health (byte-for-byte today's
+        # single-device check; the default lane is the always-present one).
+        ok = self._workers[self._default_target].pipeline.health()
         status = HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE
         return int(status), {"status": "ok" if ok else "unavailable"}
 
@@ -1621,9 +1668,18 @@ class SolverService:
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "challenge url scheme not allowed"
             }
-        if host not in self._config.allowed_hosts:
+        # LANE-03 / T-15-03: resolve the optional body ``target`` and validate it
+        # against the configured registry BEFORE any device action — never build or
+        # drive an ``AdbDevice`` for an arbitrary caller value (mirrors the SSRF
+        # host-allowlist gate below). Absent ⇒ the DEFAULT target = today.
+        target_err = self._resolve_target(payload.get("target"))
+        if isinstance(target_err, tuple):
+            return target_err
+        target = target_err
+        if host not in self._config.allowed_hosts_for(target):
             # T-10-09 SSRF guard: reject BEFORE any device action — the gateway
-            # only ever sends a source's own cloudflare_challenge_url.
+            # only ever sends a source's own cloudflare_challenge_url. SEC-01: the
+            # SELECTED target's (possibly scoped) allowlist is used.
             _log.warning("rejected non-allowlisted challenge host %r", host)
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "challenge host not allowlisted"
@@ -1640,7 +1696,7 @@ class SolverService:
             return proxy_err
         proxy = payload.get("proxy")
 
-        return self._run_solve(challenge_url, host, proxy, disconnected)
+        return self._run_solve(challenge_url, host, proxy, disconnected, target=target)
 
     def eval(
         self,
@@ -1687,8 +1743,15 @@ class SolverService:
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "challenge url scheme not allowed"
             }
-        if host not in self._config.allowed_hosts:
-            # T-14-02 SSRF guard: reject BEFORE any device action.
+        # LANE-03 / T-15-03: resolve + validate the optional body ``target`` BEFORE
+        # any device action (mirrors /solve); absent ⇒ the DEFAULT target.
+        target_err = self._resolve_target(payload.get("target"))
+        if isinstance(target_err, tuple):
+            return target_err
+        target = target_err
+        if host not in self._config.allowed_hosts_for(target):
+            # T-14-02 SSRF guard: reject BEFORE any device action. SEC-01: uses the
+            # SELECTED target's (possibly scoped) allowlist.
             _log.warning("rejected non-allowlisted eval challenge host %r", host)
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "challenge host not allowlisted"
@@ -1735,7 +1798,30 @@ class SolverService:
             proxy,
             disconnected,
             with_clearance=with_clearance,
+            target=target,
         )
+
+    def _resolve_target(self, raw: Any) -> str | tuple[int, dict[str, Any]]:
+        """Resolve the optional body ``target`` to a configured worker (LANE-03).
+
+        Returns the resolved target string, or a 422 tuple when ``target`` is
+        present-but-malformed or names a target NOT in the configured registry
+        (T-15-03: never build/use an ``AdbDevice`` for an arbitrary caller value).
+        An absent/empty ``target`` resolves to the DEFAULT target (today).
+        """
+        if raw is None:
+            return self._default_target
+        if not isinstance(raw, str) or not raw:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "target must be a non-empty string"
+            }
+        if raw not in self._workers:
+            # Mirror the host-allowlist gate: reject BEFORE any device action.
+            _log.warning("rejected unknown solve/eval target %r", raw)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "target not configured"
+            }
+        return raw
 
     @staticmethod
     def _validate_proxy(
@@ -1799,7 +1885,10 @@ class SolverService:
         host: str,
         proxy: dict[str, Any] | None = None,
         disconnected: Callable[[], bool] | None = None,
+        *,
+        target: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
+        worker = self._workers[target or self._default_target]
         cancel = Event()
         # D-07 / Pitfall 6: a proxied solve adds a cross-container CONNECT hop +
         # egress-verify BEFORE the tap loop, so the OUTER future wait below is bounded
@@ -1819,12 +1908,12 @@ class SolverService:
         # already in flight is rejected 503 immediately rather than queuing behind the
         # single device — an abandoned/bursty caller can never pile a backlog the one
         # redroid cannot work off. The single WebView solve stays serialized (T-10-11).
-        if not self._lock.acquire(blocking=False):
+        if not worker.lock.acquire(blocking=False):
             _log.info("solver busy; rejecting concurrent /solve for host %s", host)
             return int(HTTPStatus.SERVICE_UNAVAILABLE), {"error": "solver busy"}
         try:
-            future = self._executor.submit(
-                self._pipeline.solve, challenge_url, host, cancel, proxy=proxy
+            future = worker.executor.submit(
+                worker.pipeline.solve, challenge_url, host, cancel, proxy=proxy
             )
             # #275 req 1: wait on the worker in short polls (bounded overall by
             # timeout_s) so an abandoned request is detected and the in-flight solve
@@ -1874,7 +1963,7 @@ class SolverService:
                     "cf_clearance_expires": result.cf_clearance_expires,
                 }
         finally:
-            self._lock.release()
+            worker.lock.release()
 
     def _run_eval(
         self,
@@ -1886,12 +1975,14 @@ class SolverService:
         disconnected: Callable[[], bool] | None = None,
         *,
         with_clearance: bool = False,
+        target: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
         """Serialize + timeout-bound one in-WebView eval (mirrors ``_run_solve``).
 
-        Shares the SAME ``self._lock`` + single-worker ``self._executor`` as
-        ``_run_solve`` (never a second executor), so an eval and a solve can never
-        run concurrently against the one redroid (PERF-01 / R1). NON-blocking lock
+        Shares the SAME per-target ``worker.lock`` + single-worker
+        ``worker.executor`` as ``_run_solve`` (never a second executor), so an eval
+        and a solve can never run concurrently against the SAME redroid (PERF-01 /
+        R1) while two DIFFERENT lanes run concurrently. NON-blocking lock
         acquire → 503 busy; short-poll the worker future bounded by the solve
         timeout, cancelling-and-draining on timeout / caller disconnect. On success
         returns ``(200, {"value": <marshalled eval result>})``. The ``js`` and the
@@ -1903,6 +1994,7 @@ class SolverService:
         outer future wait is bounded by the LONGER ``proxy_solve_timeout_s`` to absorb
         that overhead. A no-proxy eval keeps the base ``solve_timeout_s`` (D-08).
         """
+        worker = self._workers[target or self._default_target]
         cancel = Event()
         timeout_s = (
             self._config.proxy_solve_timeout_s
@@ -1912,7 +2004,7 @@ class SolverService:
         # T-14-05 / PERF-01: NON-blocking acquire — an eval (or solve) arriving while
         # one is already in flight is rejected 503 immediately rather than queuing
         # behind the single device.
-        if not self._lock.acquire(blocking=False):
+        if not worker.lock.acquire(blocking=False):
             _log.info("solver busy; rejecting concurrent /eval for host %s", host)
             return int(HTTPStatus.SERVICE_UNAVAILABLE), {"error": "solver busy"}
         try:
@@ -1922,8 +2014,8 @@ class SolverService:
             eval_kwargs: dict[str, Any] = {"wait_for": wait_for, "proxy": proxy}
             if with_clearance:
                 eval_kwargs["with_clearance"] = True
-            future = self._executor.submit(
-                self._pipeline.eval_in_webview,
+            future = worker.executor.submit(
+                worker.pipeline.eval_in_webview,
                 challenge_url,
                 host,
                 js,
@@ -1988,7 +2080,7 @@ class SolverService:
                     }
                 return int(HTTPStatus.OK), {"value": value, "clearance": clearance_body}
         finally:
-            self._lock.release()
+            worker.lock.release()
 
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
         """Signal cancellation and wait (bounded) for the orphan to unwind (#207).
@@ -2016,7 +2108,8 @@ class SolverService:
             _log.warning("solve for host %s errored after cancel", host, exc_info=True)
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        for worker in self._workers.values():
+            worker.executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ── stdlib HTTP transport (thin shim over SolverService) ─────────────────────
@@ -2144,6 +2237,26 @@ def build_pipeline(config: SidecarConfig) -> SolvePipeline:
     )
 
 
+def build_pipelines(config: SidecarConfig) -> dict[str, SolvePipeline]:
+    """Build one device-backed pipeline per configured adb target (LANE-03).
+
+    Mirrors :func:`build_pipeline` per target — one ``AdbDevice(target)`` each,
+    with the SHARED hop ``host``/``port`` (the single pproxy hop is untouched; no
+    per-target hop — concurrent proxied multi-target is a documented forward
+    dependency, not built here). The default-only deploy yields a one-entry dict
+    keyed by ``config.adb_target`` (byte-for-byte today).
+    """
+    return {
+        target: AndroidSolvePipeline(
+            AdbDevice(target),
+            timeout_s=config.solve_timeout_s,
+            hop_host=config.hop_host,
+            hop_port=config.hop_port,
+        )
+        for target in config.adb_targets
+    }
+
+
 def _spawn_proxy_hop(config: SidecarConfig) -> subprocess.Popen[bytes]:
     """Start the persistent pproxy CONNECT hop as a sidecar child subprocess.
 
@@ -2231,7 +2344,7 @@ def main() -> None:
     # first solve has a live hop and a clean device (Runtime State / Req 5).
     hop = _spawn_proxy_hop(config)
     _boot_defensive_clear(config)
-    service = SolverService(config, build_pipeline(config))
+    service = SolverService(config, pipelines=build_pipelines(config))
     server = _SolverHTTPServer(
         (config.bind_host, config.port), _Handler, service=service
     )
