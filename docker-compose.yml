@@ -212,6 +212,40 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # ── redroid-comix — solver lane for comix (LANE-04, opt-in, OFF by default).
+  # A clone of `redroid-kagane` (per the README "Add a solver lane" recipe):
+  # comix runs the in-page EVAL path and HOLDS a warm cleared WebView page, so a
+  # dedicated device keeps its foreground-leased page off the shared device where
+  # kagane/mangadot/mangaball solves would otherwise contend with it. Gated by the
+  # `lane-comix` sub-profile ONLY (Compose profile membership is OR — layer it on
+  # `android` via COMPOSE_PROFILES=android,lane-kagane,lane-comix); its OWN
+  # `/data` volume isolates the cookie jar; SHARED host iGPU (/dev/dri). To enable:
+  # add `redroid-comix:5555` to the android-solver SOLVER_ADB_TARGETS + map comix in
+  # the gateway lane config (GATEWAY_ANDROID_SOURCE_LANE_MAP).
+  redroid-comix:
+    image: redroid/redroid:11.0.0-latest
+    profiles: ["lane-comix"]  # opt-in lane sub-profile; set alongside `android`
+    privileged: true
+    devices:
+      - "/dev/dri:/dev/dri"  # SHARED host iGPU (iGPU GO spike) — real-GPU WebGL for the CF render check
+    command:
+      - androidboot.redroid_gpu_mode=host
+    volumes:
+      # OWN persistent Android /data (per-lane cookie-jar isolation). Defaults to a
+      # named volume; set MANGARR_REDROID_COMIX_DIR to bind a host dir.
+      - ${MANGARR_REDROID_COMIX_DIR:-redroid-comix-data}:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "[ \"$$(getprop sys.boot_completed 2>/dev/null | tr -d '\\r')\" = \"1\" ]",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
   # ── android-solver — thin sidecar (adb + the solver code, no gateway source).
   # Built from android_solver/Dockerfile. Drives redroid over adb+CDP and serves
   # the authenticated control API (POST /solve). Every secret arrives via env
@@ -236,6 +270,19 @@ services:
       # from waiting on — or erroring about — a service that isn't running.
       redroid-kagane:
         condition: service_healthy
+        required: false
+      # Lane device (LANE-04): wait on it ONLY when the lane-comix sub-profile
+      # started it. `required: false` keeps a deploy without lane-comix from
+      # waiting on — or erroring about — a service that isn't running.
+      redroid-comix:
+        condition: service_healthy
+        required: false
+    # env_file so the SOLVER LANES knobs (SOLVER_ADB_TARGETS / per-target allowlist)
+    # can be set in .env without editing this file. The explicit `environment:`
+    # block below still wins over env_file for the keys it sets (SOLVER_ADB_TARGET,
+    # SOLVER_API_KEY, SOLVER_ALLOWED_HOSTS, SOLVER_SOLVE_TIMEOUT_S).
+    env_file:
+      - path: .env
         required: false
     environment:
       # MUST match the gateway's GATEWAY_ANDROID_SOLVER_API_KEY (same .env value).
@@ -269,3 +316,6 @@ volumes:
   # Per-lane cookie-jar isolation (LANE-04). Used only when the lane-kagane
   # sub-profile starts redroid-kagane; harmless (uncreated) otherwise.
   redroid-kagane-data:
+  # Per-lane cookie-jar isolation for the comix lane (LANE-04). Used only when the
+  # lane-comix sub-profile starts redroid-comix; harmless (uncreated) otherwise.
+  redroid-comix-data:
