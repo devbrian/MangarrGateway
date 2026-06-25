@@ -78,6 +78,7 @@ class Collector:
         candidates_enumerated: int | None = None,
         manga_title: str | None = None,
         chapter_number: float | None = None,
+        lane: str | None = None,
     ) -> None:
         req = current_request.get()
         # 260605-e9a: the umbrella ``request`` event's request_blob / result_count /
@@ -135,6 +136,10 @@ class Collector:
             # event only — None for every other kind. Reuses the existing _req_list
             # accessor (already returns list[dict[str, object]] | None).
             queue_items=_req_list(req, "queue_items") if kind == "request" else None,
+            # 15-03 OBS-01: the non-secret solver-lane label, passed explicitly by
+            # emit_solve/emit_eval (AndroidSolver call sites in plan 15-04). Absent
+            # on every other emitter -> None (additive default), byte-for-byte today.
+            lane=lane,
         )
         # O(1) hot path: update the rollup + get the ring-membership set, then a
         # plain queue append to the disk ring writer (no await, no disk I/O here —
@@ -176,9 +181,12 @@ class Collector:
         duration_ms: float,
         attempt: int = 1,
         error: str | None = None,
+        lane: str | None = None,
     ) -> None:
         # source_key normally rides the contextvar; the explicit arg is a fallback
-        # for the solver path which may run outside a source_scope.
+        # for the solver path which may run outside a source_scope. ``lane`` (OBS-01)
+        # is the non-secret solver-lane label threaded into the emitted event in BOTH
+        # branches; omitting it keeps lane=None (byte-for-byte today).
         if source_key is not None and current_source.get() is None:
             from .context import source_scope
 
@@ -193,6 +201,7 @@ class Collector:
                     duration_ms=duration_ms,
                     attempt=attempt,
                     error=error,
+                    lane=lane,
                 )
             return
         self._ingest(
@@ -205,6 +214,7 @@ class Collector:
             duration_ms=duration_ms,
             attempt=attempt,
             error=error,
+            lane=lane,
         )
 
     def emit_eval(
@@ -216,6 +226,7 @@ class Collector:
         duration_ms: float,
         attempt: int = 1,
         error: str | None = None,
+        lane: str | None = None,
     ) -> None:
         """Emit an in-WebView eval event (kind=``eval``) — the eval analog of
         ``emit_solve``, with a REAL (non-zero) ``duration_ms``.
@@ -245,6 +256,7 @@ class Collector:
                     duration_ms=duration_ms,
                     attempt=attempt,
                     error=error,
+                    lane=lane,
                 )
             return
         self._ingest(
@@ -257,6 +269,7 @@ class Collector:
             duration_ms=duration_ms,
             attempt=attempt,
             error=error,
+            lane=lane,
         )
 
     def emit_package(
