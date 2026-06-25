@@ -342,10 +342,12 @@ A lane is purely a **deployer opt-in** — the default (no lane config) deploy n
 
 1. **Declare the lane (gateway config).** Map the lane to its adb target and route
    the source to it — JSON env (or the equivalent `config.toml` keys):
+
    ```bash
    GATEWAY_ANDROID_LANES='{"kagane": "redroid-kagane:5555"}'
    GATEWAY_ANDROID_SOURCE_LANE_MAP='{"kagane": "kagane"}'
    ```
+
    Empty (the default) ⇒ one shared lane = today.
 2. **Add the redroid lane service + its `/data` volume + the sub-profile.** Copy the
    `redroid-kagane` block in `docker-compose.yml` (rename `redroid-<lane>`,
@@ -356,16 +358,20 @@ A lane is purely a **deployer opt-in** — the default (no lane config) deploy n
    `/data` volume so its cookie jar is isolated. Add `redroid-<lane>-data:` to the
    top-level `volumes:` block.
 3. **Add the lane target to `SOLVER_ADB_TARGETS`** (and optionally scope it):
+
    ```bash
    SOLVER_ADB_TARGETS=redroid:5555,redroid-kagane:5555
    # optional: lock the lane to only its source's host
    SOLVER_ALLOWED_HOSTS_BY_TARGET='{"redroid-kagane:5555": ["kagane.to"]}'
    ```
+
    The single sidecar serves every listed target (one serialized worker per device).
 4. **Layer the lane sub-profile on `android`:**
+
    ```bash
    COMPOSE_PROFILES=android,lane-kagane
    ```
+
    Compose profile membership is **OR**, so the lane redroid lists only its own
    `lane-<lane>` profile; `COMPOSE_PROFILES=android` **alone** still starts exactly
    one redroid.
