@@ -119,6 +119,65 @@ async def test_on_demand_source_wired_into_warm_skip_and_bootstrap_peek() -> Non
     assert by_key["comix"] == {}  # eager (no solve_if_missing forwarded)
 
 
+# ───────────────── per-lane construction + single-lane collapse (LANE-02) ─────────
+
+
+async def test_single_lane_collapse_builds_exactly_one_android_solver() -> None:
+    """CRITICAL regression guard (LANE-02): with NO lane config the app builds EXACTLY
+    ONE AndroidSolver (one device lock), adb_target=None, lane="default"; the router's
+    android_by_lane has length 1 and eval_backend IS that one instance — single-lane
+    collapse, byte-for-byte today."""
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        # exactly one lane instance
+        assert list(solver._android_by_lane) == ["default"]
+        only = solver._android_by_lane["default"]
+        assert isinstance(only, AndroidSolver)
+        # no target sent (single-lane collapse), default lane label
+        assert only._adb_target is None
+        assert only._lane == "default"
+        # eval_backend is that one instance (the off-Protocol eval passthrough target)
+        assert solver._eval_backend is only
+        # source_lane_map empty (no per-source lane routing)
+        assert solver._source_lane_map == {}
+
+
+async def test_two_lanes_slice_kagane_onto_its_own_solver() -> None:
+    """With a dedicated kagane lane: TWO AndroidSolver instances; the kagane instance
+    carries adb_target + lane + ONLY kagane's challenge_url; the default instance carries
+    the remaining android sources and the page-holder (comix) is the eval_backend."""
+    app = create_app(
+        _settings(
+            android_lanes={
+                "default": "redroid:5555",
+                "kagane": "redroid-kagane:5555",
+            },
+            android_source_lane_map={"kagane": "kagane"},
+        )
+    )
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        assert set(solver._android_by_lane) == {"default", "kagane"}
+        kagane = solver._android_by_lane["kagane"]
+        default = solver._android_by_lane["default"]
+        # kagane lane: its own device target + lane label + ONLY its challenge_url
+        assert kagane._adb_target == "redroid-kagane:5555"
+        assert kagane._lane == "kagane"
+        assert kagane._challenge_urls == {"kagane": "https://kagane.to/"}
+        # default lane: the other android sources, its own device target
+        assert default._adb_target == "redroid:5555"
+        assert default._lane == "default"
+        assert "kagane" not in default._challenge_urls
+        assert "comix" in default._challenge_urls  # page-holder rides the default lane
+        # the page-holder (comix) lane's instance is the eval_backend
+        assert solver._eval_backend is default
+        # the source_lane_map is threaded through for per-source dispatch
+        assert solver._source_lane_map == {"kagane": "kagane"}
+
+
 async def test_mangadex_resolves_no_clearance_with_real_solver() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):

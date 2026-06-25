@@ -429,3 +429,174 @@ async def test_fetch_via_browser_parallel_pages_delegates_to_patchright() -> Non
         )
     ]
     assert android.parallel_calls == []  # android (no browser) is NEVER consulted
+
+
+# ─────────────────── lane-keyed android dispatch (LANE-02, Plan 15-04) ───────────
+# The router replaces its single ``android`` backend with ``android_by_lane`` +
+# ``source_lane_map`` + an ``eval_backend`` (the page-holder lane's instance). An
+# android source routes to its lane's instance; the off-Protocol eval passthroughs
+# route to the page-holder lane (eval_backend), never an arbitrary lane.
+
+
+@pytest.mark.asyncio
+async def test_lane_dispatch_routes_each_source_to_its_lane() -> None:
+    """kagane (mapped) → android_by_lane["kagane"]; mangadot (unmapped) → ["default"];
+    comix (patchright) → the patchright backend (unchanged)."""
+    patchright = _FakeBackend(owns={"comix"}, tag="pw")
+    default_lane = _FakeBackend(owns={"mangadot"}, tag="droid-default")
+    kagane_lane = _FakeBackend(owns={"kagane"}, tag="droid-kagane")
+    router = SolverRouter(
+        patchright=patchright,
+        android_by_lane={"default": default_lane, "kagane": kagane_lane},
+        source_lane_map={"kagane": "kagane"},
+        eval_backend=default_lane,
+        engine_by_source={
+            "comix": "patchright",
+            "mangadot": "android",
+            "kagane": "android",
+        },
+    )
+    # kagane → its own lane (only the kagane lane is consulted)
+    clr = await router.get_clearance("kagane")
+    assert clr is not None
+    assert clr.cookies == {"cf_clearance": "droid-kagane-kagane"}
+    assert kagane_lane.calls == [("kagane", False)]
+    assert default_lane.calls == []
+    # mangadot (unmapped) → the default lane
+    clr = await router.get_clearance("mangadot")
+    assert clr is not None
+    assert clr.cookies == {"cf_clearance": "droid-default-mangadot"}
+    assert default_lane.calls == [("mangadot", False)]
+    # comix → patchright (unchanged)
+    await router.get_clearance("comix")
+    assert patchright.calls == [("comix", False)]
+
+
+@pytest.mark.asyncio
+async def test_unresolved_lane_falls_back_to_default() -> None:
+    """SEC-01 / T-15-07: a source mapped to a lane MISSING from android_by_lane resolves
+    to the "default" lane — NEVER an arbitrary device."""
+    patchright = _FakeBackend(owns=set(), tag="pw")
+    default_lane = _FakeBackend(owns={"orphan"}, tag="droid-default")
+    router = SolverRouter(
+        patchright=patchright,
+        android_by_lane={"default": default_lane},
+        source_lane_map={"orphan": "ghost-lane"},  # ghost-lane not in android_by_lane
+        eval_backend=default_lane,
+        engine_by_source={"orphan": "android"},
+    )
+    clr = await router.get_clearance("orphan")
+    assert clr is not None
+    assert clr.cookies == {"cf_clearance": "droid-default-orphan"}
+    assert default_lane.calls == [("orphan", False)]
+
+
+@pytest.mark.asyncio
+async def test_eval_in_webview_delegates_to_eval_backend_lane() -> None:
+    """The off-Protocol eval passthrough routes to the page-holder lane (eval_backend),
+    NOT an arbitrary android lane."""
+    patchright = _FakeEvalBackend(tag="pw")
+    page_holder = _FakeEvalBackend(tag="holder")
+    other_lane = _FakeEvalBackend(tag="other")
+    router = SolverRouter(
+        patchright=patchright,  # type: ignore[arg-type]
+        android_by_lane={"default": other_lane, "comix": page_holder},  # type: ignore[arg-type]
+        source_lane_map={"comix": "comix"},
+        eval_backend=page_holder,  # type: ignore[arg-type]
+        engine_by_source={},
+    )
+    result = await router.eval_in_webview("https://comix.to/", "return 1")
+    assert result == "holder-eval"
+    assert page_holder.eval_calls != []
+    assert other_lane.eval_calls == []
+    assert patchright.eval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_device_session_delegates_to_eval_backend_lane() -> None:
+    """device_session leases the page-holder lane (eval_backend), never another lane."""
+    patchright = _FakeDeviceSessionBackend(tag="pw")
+    page_holder = _FakeDeviceSessionBackend(tag="holder")
+    other_lane = _FakeDeviceSessionBackend(tag="other")
+    router = SolverRouter(
+        patchright=patchright,  # type: ignore[arg-type]
+        android_by_lane={"default": other_lane, "comix": page_holder},  # type: ignore[arg-type]
+        source_lane_map={"comix": "comix"},
+        eval_backend=page_holder,  # type: ignore[arg-type]
+        engine_by_source={},
+    )
+    async with router.device_session():
+        assert page_holder.entered == 1
+        assert other_lane.entered == 0
+        assert patchright.entered == 0
+    assert page_holder.exited == 1
+
+
+@pytest.mark.asyncio
+async def test_warm_unions_every_lane() -> None:
+    """warm() warms patchright + EVERY lane's AndroidSolver, returning the deduped union
+    of failed keys."""
+    patchright = _FakeBackend(owns=set(), tag="pw", fails=["comix"])
+    default_lane = _FakeBackend(owns=set(), tag="d", fails=["mangadot"])
+    kagane_lane = _FakeBackend(owns=set(), tag="k", fails=["kagane"])
+    router = SolverRouter(
+        patchright=patchright,
+        android_by_lane={"default": default_lane, "kagane": kagane_lane},
+        source_lane_map={"kagane": "kagane"},
+        eval_backend=default_lane,
+        engine_by_source={},
+    )
+    failed = await router.warm()
+    assert patchright.warmed == 1
+    assert default_lane.warmed == 1
+    assert kagane_lane.warmed == 1
+    assert set(failed) == {"comix", "mangadot", "kagane"}
+
+
+@pytest.mark.asyncio
+async def test_aclose_closes_every_lane_even_if_one_raises() -> None:
+    """aclose() closes patchright + every lane, each guarded."""
+    patchright = _FakeBackend(owns=set(), tag="pw")
+    default_lane = _FakeBackend(owns=set(), tag="d")
+    kagane_lane = _FakeBackend(owns=set(), tag="k")
+
+    async def _boom() -> None:
+        raise RuntimeError("default lane close failed")
+
+    default_lane.aclose = _boom  # type: ignore[method-assign]
+    router = SolverRouter(
+        patchright=patchright,
+        android_by_lane={"default": default_lane, "kagane": kagane_lane},
+        source_lane_map={"kagane": "kagane"},
+        eval_backend=default_lane,
+        engine_by_source={},
+    )
+    await router.aclose()  # must NOT raise
+    assert patchright.closed == 1
+    assert kagane_lane.closed == 1  # other lanes still closed despite one raising
+
+
+@pytest.mark.asyncio
+async def test_single_lane_construction_behaves_like_old_router() -> None:
+    """Single-lane collapse: android_by_lane={"default": solver}, source_lane_map={},
+    eval_backend=solver behaves exactly like the old single-android router."""
+    patchright = _FakeBackend(owns={"comix"}, tag="pw")
+    android = _FakeBackend(owns={"mangadot", "kagane"}, tag="droid")
+    router = SolverRouter(
+        patchright=patchright,
+        android_by_lane={"default": android},
+        source_lane_map={},
+        eval_backend=android,
+        engine_by_source={
+            "comix": "patchright",
+            "mangadot": "android",
+            "kagane": "android",
+        },
+    )
+    assert (await router.get_clearance("mangadot")).cookies == {  # type: ignore[union-attr]
+        "cf_clearance": "droid-mangadot"
+    }
+    assert (await router.get_clearance("comix")).cookies == {  # type: ignore[union-attr]
+        "cf_clearance": "pw-comix"
+    }
+    assert await router.get_clearance("mangadex") is None
