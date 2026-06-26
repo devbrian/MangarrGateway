@@ -154,13 +154,131 @@ single-process search→handle→download→package flow must work.
 <!-- GSD:conventions-start source:CONVENTIONS.md -->
 ## Conventions
 
-Conventions not yet established. Will populate as patterns emerge during development.
+Full, evidence-cited detail in `.planning/codebase/CONVENTIONS.md` (mapped 2026-06-26). The load-bearing patterns:
+
+**Adding a source is the central pattern.** A source is a ~30-line subclass of
+`framework.base.Source` (`src/manga_gateway/framework/base.py`) that sets static
+**class-attribute metadata** and overrides four async hooks — `search`, `recent`,
+`fetch_manifest`, `fetch_image`. ALL networking, rate-limiting, retry/backoff,
+pagination, session sharing, and anti-bot solving live in the framework and arrive
+via the injected `SourceContext` (`ctx`); sources never touch httpx directly.
+Registration is **centralized** — add one `(key, Class)` tuple to the `builtin`
+table in `sources/__init__.py` (`register_builtin_sources()`), not a module-level
+decorator on the class. Anti-bot/session escalation is likewise pure declarative
+attrs (`antibot`, `solver_engine`, `cloudflare_challenge_url`,
+`cloudflare_challenge_optional`, `session_prep`, `decrypt_scheme`,
+`holds_webview_page`, `max_concurrent_jobs`, `download_rate_limit_per_minute`,
+`image_fetch_via_proxy_pool`, `reresolve_manifest_on_403`). **Never name a source
+by key in `framework/`/`app.py`** — derive behavior from a class attribute + a
+registry comprehension (the framework knows no source by name; copy `app.py`'s
+`cf_sources`/`engine_by_source` derivations).
+
+**Async.** All outbound HTTP goes through `ctx.get_json` / `get_json_array` /
+`get_bytes` / `post_json` (which own the limiter, tenacity retry, and challenge
+re-solve). Per-source rate limiting is one `aiolimiter.AsyncLimiter` per key, gated
+**at the call site** (not a transport hook); an optional 2nd `{key}:download`
+limiter gates `bucket="download"` calls. Blocking work (Pillow decode, `zipfile`,
+`os.replace`) MUST be offloaded via `asyncio.to_thread` — ruff's `ASYNC` rule set is
+enabled to catch slips. Bounded concurrency is `asyncio.TaskGroup` +
+`asyncio.Semaphore`, never a third-party task queue.
+
+**Pydantic v2 wire models.** Every contract DTO extends `ApiModel` — the single
+owner of `model_config = ConfigDict(populate_by_name=True)` (`models/common.py`);
+never re-declare `model_config`. Snake_case Python fields carry a camelCase
+`Field(alias=...)` matching the OpenAPI names; `Decimal` chapter numbers serialize
+to a JSON number via `@field_serializer(when_used="json")`. Settings use
+`pydantic-settings` (`env_prefix="GATEWAY_"`) with `@model_validator(mode="after")`
+guards that **fail fast at startup** on misconfiguration.
+
+**Errors.** Two decoupled modules: `errors.py` (the HTTP contract envelope
+`{"error": {"code", "message"}}`; the catch-all 500 emits a generic message and
+never echoes stack detail) and `framework/errors.py` (`SourceError`, imports no
+FastAPI so sources stay framework-pure). Tenacity policy lives in `context.py`:
+exp backoff + jitter, **STOP on permanent 4xx (401/403/404)**, retry on
+5xx/transport. A CF-challenge 403 → one forced re-solve + retry (D-35); a CSRF 403 →
+one token refresh (D-03) — independent branches, both before the 4xx STOP.
+
+**Config.** TOML is source of truth (D-10); `GATEWAY_`-prefixed env overrides ops
+knobs (D-11); precedence `env > TOML > default`. The `api_key` is excluded from the
+env prefix (D-01) — `GATEWAY_API_KEY` can NEVER set it; it is auto-generated and
+persisted to TOML on first run. Secrets are `SecretStr`; dict-valued env knobs are
+JSON (`GATEWAY_ANDROID_LANES`), the one plain-CSV exception being
+`GATEWAY_DISABLED_SOURCES`.
+
+**Constraint-tag comments — the strongest stylistic convention.** Comments and
+docstrings cite the governing requirement/decision/issue so intent stays traceable:
+`R1`, `D-01..D-63`, spec/task IDs (`AUTH-01`, `PKG-01`, `SRCH-06`), GitHub `#NN`,
+debug-session names (`comix-parallel-engine-probe`), dated refs (`260625-rom`). When
+you add or change behavior, cite the same way.
+
+**Tooling.** ruff (lint + format; rules `F, E, I, UP, B, ASYNC`), mypy **strict** +
+the `pydantic.mypy` plugin, `target-version = py312`. Run `uv run nox -s gate`
+before every PR.
 <!-- GSD:conventions-end -->
 
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->
 ## Architecture
 
-Architecture not yet mapped. Follow existing patterns found in the codebase.
+Full detail + ASCII diagram in `.planning/codebase/ARCHITECTURE.md` and
+`STRUCTURE.md` (mapped 2026-06-26).
+
+**Shape.** A single-process, in-memory-shared, layered gateway with a declarative
+source-plugin framework. One FastAPI app (`create_app` + `lifespan`,
+`src/manga_gateway/app.py`) exposes two surfaces over `/api/v1`: the
+**search/indexer** surface (`api/routes/search.py`, `recent.py`, `caps.py`) that
+returns opaque `downloadHandle`s, and the **download** surface
+(`api/routes/downloads.py`, `status.py`, `version.py`) that consumes them — plus an
+admin metrics router under `/admin/metrics/v1`. Layering: API routes → source
+framework (`framework/`) → 9 concrete sources (`sources/*.py`) → state/output.
+
+**The framework owns all cross-cutting infra.** `base.Source` +
+`registry.SourceRegistry`, `context.SourceContext` (rate-limit / retry / clearance /
+decrypt), `fanout.fan_out` (per-source `TaskGroup` + timeout isolation),
+`solver_router.SolverRouter` → `CloudflareSolver` (Patchright/Chromium) |
+`AndroidSolver` (redroid-WebView sidecar over HTTP), `session.SessionManager` over an
+injectable `transport.HttpxTransport`, plus `ratelimit`, `decrypt`, `enum_cache`,
+`cooldown`, `health`, `proxy`/`proxy_pool`, `lanes`, `session_prep`. Sources hold the
+ONLY source-specific code: param shaping + response parsing.
+
+**R1 — single process, never multi-worker.** All shared mutable state (the anti-bot
+session, caps cache, handle store, in-memory job projection, rate limiters, metrics
+rings) lives in one process's memory; a handle minted in one worker is unknown to
+another, and the one shared `cf_clearance`/session can't be duplicated. Forbidden:
+`--workers N`, Gunicorn, Celery/RQ — scale concurrency *within* the process via
+asyncio. Every R1 singleton is built ONCE in the `lifespan` and stowed on
+`app.state`; `deps.py` accessors only READ `request.app.state`, never construct
+per-request (PLAT-02).
+
+**Search flow.** `POST /search` → select registry sources → build a per-source
+`SourceContext` → `fan_out` runs each `search` concurrently in a `TaskGroup`, each
+under an `asyncio.timeout` (~30s); one source failing/timing out becomes a
+`(sourceKey, code, message)` warning, never failing the request (SRCH-03). Each
+chapter mints an opaque handle via the handle store.
+
+**Download flow.** `POST /downloads` → `JobManager.submit` resolves the handle
+(idempotency-by-existence, DL-03), mints a `j_`-prefixed jobId, write-through
+INSERTs the `queued` job to `gateway.db` before the projection, schedules a coro.
+Under a global `Semaphore(max_concurrent_chapters)` + a per-source `Semaphore`,
+`JobEngine` drives `resolving → downloading → archiving → completed/failed`:
+`fetch_manifest` resolves page URLs / fresh tokens INTERNALLY (never over the wire,
+R6/PKG-01); per-page `fetch_image` is validated by Pillow (never recompressed,
+PKG-04); the CBZ is written ZIP_STORED to a `*.cbz.tmp` staging file then
+`os.replace`d, off the event loop. `GET /downloads` serves the in-memory projection
+— NO disk re-scan per poll (DL-05, ~1 min cadence).
+
+**Persistence.** aiosqlite, with in-memory authorities in front: `handles.db`
+(handle store; `TTLCache` authority — volatile at-home baseUrl/cookies are NEVER
+stored, D-17), `gateway.db` (jobs; write-through on each transition, rehydrate +
+resume on restart), `metrics.db` (rollup/ring snapshots).
+
+**Anti-bot.** The one shared `SolverRouter` dispatches per source by `solver_engine`
+— `patchright` (Chromium; comix) vs `android` (redroid-WebView sidecar; mangadot,
+kagane). Clearance rides per-request `Cookie` headers paired with the exact issuing
+UA (D-40), never the shared httpx `cookies=` jar. **Browser engine is Patchright
+only in practice** — the Camoufox framing in the stack tables above is stale.
+
+**Entry points.** `python -m manga_gateway` (`__main__.py`) → `create_app()`
+(`app.py`) → `lifespan` builds the singletons.
 <!-- GSD:architecture-end -->
 
 <!-- GSD:skills-start source:skills/ -->
