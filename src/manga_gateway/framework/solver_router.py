@@ -97,7 +97,7 @@ class _EvalSolver(Protocol):
     Declared locally — mirroring :class:`_BrowserFetchSolver` — so the router can
     ``cast`` ``self._eval_backend`` (typed as the engine-agnostic ``AntiBotSolver``
     Protocol, which intentionally omits it) to a shape that declares it, and
-    delegate mypy-strict-clean with NO ``# type: ignore``. The INVERSE of the four
+    delegate mypy-strict-clean with NO ``# type: ignore``. The INVERSE of the three
     ``fetch_via_browser*`` passthroughs: those cast ``self._patchright`` (the only
     engine with a real browser); this one casts ``self._eval_backend`` (the page-holder
     lane's AndroidSolver — the only engine with the cleared WebView the eval runs
@@ -288,7 +288,7 @@ class SolverRouter:
         )
 
     # ── off-Protocol in-WebView eval (EVAL-02) — pass-through for comix ──────────
-    # The INVERSE of the four browser passthroughs above: this delegates to the
+    # The INVERSE of the three browser passthroughs above: this delegates to the
     # ANDROID backend, NOT patchright. comix runs its in-page token-mint /
     # chapter-list / manifest JS inside the redroid WebView (the only fingerprint
     # that clears comix.to's Cloudflare); only the android backend owns that

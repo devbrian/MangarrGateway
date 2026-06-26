@@ -100,7 +100,7 @@ def is_failure(ev: MetricEvent) -> bool:
     the enumeration cache's ``hit``/``miss``/``refetch`` (``kind="cache"``,
     ``enum_cache.py``) and Comix's expected pre-solve Cloudflare 403 — emitted as
     ``client_error`` at the per-source http seam (``framework/context.py``) BEFORE
-    ``_send_with_clearance`` re-solves + retries it to ``ok`` — both inherit
+    ``_send`` re-solves + retries it to ``ok`` — both inherit
     ``endpoint="POST /search"`` + a ``source_key`` and so inflated the per-source
     ``POST /search`` ``error_rate`` (and contaminated the ``failures`` ring, which
     shared the test).

@@ -466,7 +466,8 @@ class MangadotSource(Source):
         GAP-2 (mangaball): mint handles ONLY for the post-slice survivors. A long
         title's full ``chapters/list`` (hundreds of rows × language rows) would
         otherwise over-mint and EVICT the returned releases' own handles from the
-        10_000-entry store, so a later ``POST /downloads`` resolves to a miss.
+        bounded handle store (maxsize 200_000, GATEWAY_HANDLE_MAXSIZE), so a later
+        ``POST /downloads`` resolves to a miss.
         Collect sort keys first, slice to ``limit``, THEN mint.
         """
         sortable: list[tuple[datetime, dict[str, Any]]] = []

@@ -2,12 +2,11 @@
 
 The single-process R1 seams are built ONCE in the lifespan and stowed on
 ``app.state`` (PLAT-02): an injectable ``Transport`` (SRC-04), the shared
-``SessionManager``, a ``NoopSolver`` (BOT-01 default), a ``RateLimiter`` seam, an
-empty ``SourceRegistry`` (SRC-01), and the 12h caps ``TTLCache`` (PLAT-04). Global
-API-key auth (AUTH-01/D-02) is applied on the app so every route is covered, and
-the contract JSON error model (ERR-01) is registered.
-
-The full ``load_settings`` default wiring lands in Task 3.
+``SessionManager``, the shared ``SolverRouter`` anti-bot solver (BOT-01), a
+``RateLimiter`` seam, a registry populated by ``register_builtin_sources``
+(SRC-01), and the 12h caps ``TTLCache`` (PLAT-04). Global API-key auth
+(AUTH-01/D-02) is applied on the app so every route is covered, and the contract
+JSON error model (ERR-01) is registered.
 """
 
 from __future__ import annotations
@@ -566,9 +565,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # from settings exactly like RateLimiter()/HandleStore() above. The per-source TTL
     # override map (D-09) is harvested from the registry the SAME way cf_sources /
     # csrf_bootstrap_keys are derived — anything declaring ``enum_cache_ttl_seconds``
-    # contributes an override; the framework clamps each entry to the 60-min handle TTL
-    # (CACHE-05). The POST /search route threads this into its SourceContext; the recent
-    # + download paths leave the default None (CACHE-05).
+    # contributes an override; the framework clamps each entry to the configured handle
+    # TTL (CACHE-05). The POST /search route threads this into its SourceContext; the
+    # recent + download paths leave the default None (CACHE-05).
     enum_cache_ttl_overrides: dict[str, int] = {
         key: cls.enum_cache_ttl_seconds
         for key, cls in registry.items()
@@ -853,7 +852,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     Args:
         settings: Explicit settings (tests inject a fixed key per D-03). When
-            ``None``, Task 3 wires this to ``load_settings()``.
+            ``None``, falls back to ``load_settings()``.
     """
     if settings is None:
         from .config import load_settings  # noqa: PLC0415

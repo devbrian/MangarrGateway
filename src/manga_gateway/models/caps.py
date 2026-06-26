@@ -4,10 +4,10 @@ All models extend the shared :class:`~manga_gateway.models.common.ApiModel` base
 (single owner of ``populate_by_name=True``) and carry camelCase ``Field(alias=...)``
 matching ``manga-gateway.openapi.yaml`` exactly (Pitfall 3 — serialize by alias).
 
-Phase-1 stance (D-05): ``Capabilities.sources`` stays ``[]`` (empty-but-valid; no
-invented ``SourceCap`` data). ``SourceCap`` is fully defined — including support for
-``enabled=False`` (CAPS-03) and the constrained ``antibot`` enum (CAPS-02) — but is
-unexercised this phase because no sources exist until Phase 2.
+``Capabilities.sources`` defaults to ``[]`` but is populated LIVE per request by the
+``GET /caps`` route from the registry + per-source ``SourceHealth`` map (D-05/D-38).
+``SourceCap`` carries support for ``enabled=False`` (CAPS-03) and the constrained
+``antibot`` enum (CAPS-02).
 """
 
 from __future__ import annotations
@@ -47,9 +47,8 @@ class Limits(ApiModel):
 class SourceCap(ApiModel):
     """Per-source capability advertisement (CAPS-02/03).
 
-    Defined-but-unexercised in Phase 1 (sources stays empty, D-05). Supports
-    ``enabled=False`` for the degraded-source signal (CAPS-03), and constrains
-    ``antibot`` to the contract enum (CAPS-02).
+    Supports ``enabled=False`` for the degraded-source signal (CAPS-03), and
+    constrains ``antibot`` to the contract enum (CAPS-02).
     """
 
     key: str
@@ -66,8 +65,8 @@ class SourceCap(ApiModel):
 class Capabilities(ApiModel):
     """``GET /caps`` capabilities document (CAPS-01).
 
-    ``sources`` defaults to ``[]`` and STAYS empty in Phase 1 (D-05): no invented
-    ``SourceCap`` data. Real sources are advertised starting in Phase 2.
+    ``sources`` defaults to ``[]``; the route fills it LIVE from the registry +
+    ``SourceHealth`` map on every call (D-05/D-38).
     """
 
     gateway_version: str = Field(alias="gatewayVersion")

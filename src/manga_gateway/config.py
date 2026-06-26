@@ -412,10 +412,11 @@ class Settings(BaseSettings):
     # D-07 ops knobs. Field(ge=1): a zero/negative bound would break the cache's
     # TTLCache construction (T-09-05). Blueprint defaults: maxsize 512, ttl 30min.
     enum_cache_maxsize: int = Field(default=512, ge=1)
-    # D-09/CACHE-05: the TTL MUST stay ≤ the 60-min (3600s) handle TTL so a cached
-    # enumeration can never out-live the downloadHandle it would serve. The
+    # D-09/CACHE-05: the TTL MUST stay <= the configured handle TTL
+    # (``handle_ttl_seconds``, default 21600s/6h) so a cached enumeration can never
+    # out-live the downloadHandle it would serve. The
     # `_enum_cache_ttl_within_handle_ttl` model validator below fails fast above
-    # 3600 (mirrors _reject_camoufox_parallel).
+    # ``handle_ttl_seconds`` (mirrors _reject_camoufox_parallel).
     enum_cache_ttl_seconds: int = Field(default=1800, ge=1)
     # Mode-E (debug comix-warm-hydration-wait): the SHORT negative-cache TTL applied
     # to a SUCCESSFUL-but-EMPTY result (an empty candidate list / an Enumeration with

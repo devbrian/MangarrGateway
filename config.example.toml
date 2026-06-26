@@ -54,8 +54,10 @@ output_root = "/data/manga"
 # enum_cache_enabled: kill-switch (D-08), default true. Set false to disable
 #   caching entirely while debugging stale/wrong results.
 # enum_cache_maxsize: max cached series enumerations (≥1). Caps cache memory.
-# enum_cache_ttl_seconds: cache TTL; default 1800 (30 min). MUST stay ≤ 3600 (the
-#   60-min downloadHandle TTL) — the gateway fails fast at startup otherwise (D-09).
+# enum_cache_ttl_seconds: cache TTL; default 1800 (30 min). MUST stay ≤
+#   handle_ttl_seconds (the downloadHandle TTL, default 21600 / 6h) — a cached
+#   enumeration can never out-live the handle it serves; the gateway fails fast at
+#   startup otherwise (D-09/CACHE-05).
 enum_cache_enabled = true
 enum_cache_maxsize = 512
 enum_cache_ttl_seconds = 1800

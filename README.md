@@ -263,17 +263,19 @@ it, keeping all Android machinery **out of the gateway process** (R1):
   bundled `org.chromium.webview_shell`. `privileged: true` and the host iGPU
   (`/dev/dri`) are **required** so Android renders WebGL on real hardware and the
   render-consistency check passes; the GPU is selected with the boot arg
-  `androidboot.redroid_gpu_mode=host`. By default adb `5555` is docker-internal
-  only; this deploy **publishes** it as host `15555` by operator decision for
-  LAN-only device inspection (see the `REMOVE for untrusted networks` note in
-  `docker-compose.yml`).
+  `androidboot.redroid_gpu_mode=host`. adb `5555` is **docker-internal only**
+  (no host publish — hardening for #215): adb is full device control, so it is
+  never reachable from the host/LAN. The `android-solver` sidecar reaches the
+  device over the compose network (`SOLVER_ADB_TARGET=redroid:5555`); for one-off
+  inspection, exec into the container or run adb from inside the docker network.
 - **`android-solver`** — a thin sidecar that drives redroid over adb + CDP: load
   the challenge URL in the WebView, dynamically locate and hardware-`input tap` the
   Turnstile checkbox, poll for `cf_clearance`, and return `{cf_clearance,
   user_agent}` from an authenticated, SSRF-allowlisted `POST /solve`. The control
-  API (`:8080`) is docker-internal by default; this deploy **publishes** it as host
-  `18080` (LAN-only, operator decision — same `docker-compose.yml` caveat;
-  `/solve` still requires `X-Solver-Key`). The gateway's `AndroidSolver` POSTs it
+  API (`:8080`) is **published** as host `18080` only when the `android` profile is
+  active (LAN-only, operator decision — see the `REMOVE for untrusted networks`
+  caveat in `docker-compose.yml`; `/solve` still requires `X-Solver-Key`). The
+  gateway's `AndroidSolver` POSTs it
   and injects the returned cookie + UA on the existing shared httpx leg.
 
 ### Host prerequisite (redroid will NOT boot without it)
@@ -401,8 +403,9 @@ stays Mangarr's contract of record (D-06).
 ### The `/admin/metrics/v1/*` contract
 
 Six read-only endpoints, all relative to the base path `/admin/metrics/v1/` and
-all behind the API key. Reads are **flat-cost** (served from in-memory
-rollups/rings), so frequent polling is cheap:
+all behind the API key. Reads are **flat-cost** (served from precomputed
+in-memory rollups + the indexed disk-backed `ring_events` table), so frequent
+polling is cheap:
 
 | Endpoint | Params | Returns | What it is |
 |----------|--------|---------|------------|
@@ -414,7 +417,7 @@ rollups/rings), so frequent polling is cheap:
 | `GET requests/{request_id}` | path id | `RequestBreakdown` | The drill-down: `request_id`, `surface`, `endpoint`, `ts`, `total_duration_ms`, `outcome`, and the ordered `calls[]` (every child action under one inbound request). A `request_id` aged out of the ring → 404. |
 
 A `MetricEvent` carries: `ts` (epoch seconds), `kind`
-(`http`/`solve`/`package`/`limiter-wait`/`job`/`request`), `request_id`,
+(`http`/`solve`/`eval`/`package`/`limiter-wait`/`job`/`request`), `request_id`,
 `surface`, `endpoint`, `source_key`, `op`, `method`, `url` (redacted), `status`,
 `outcome` (`ok`/`error`), `duration_ms`, `attempt`, `error` (redacted).
 
@@ -457,7 +460,7 @@ directly off the volume (D-09); every line is valid JSON carrying the
 `request_id` join key (D-08) and is run through the same redaction as the served
 metrics — no raw secret or API key is ever written.
 
-### Configuration (the 11 observability env vars)
+### Configuration (the observability env vars)
 
 All are `GATEWAY_`-prefixed, env > TOML > default (D-11 ops knobs — same treatment
 as `host`/`port`, **not** the API-key exclusion):
@@ -469,21 +472,31 @@ as `host`/`port`, **not** the API-key exclusion):
 | `GATEWAY_LOG_MAX_BYTES` | `10000000` | `RotatingFileHandler` `maxBytes` per file (≥1). |
 | `GATEWAY_LOG_BACKUP_COUNT` | `5` | How many rotated log files to keep (≥1). |
 | `GATEWAY_METRICS_CORS_ORIGINS` | `[]` (deny) | JSON list of dashboard origins allowed cross-origin. |
-| `GATEWAY_METRICS_RECENT_RING` | `500` | Bounded size of the `recent` event ring (≥1). |
-| `GATEWAY_METRICS_FAILURES_RING` | `200` | Bounded size of the `failures` event ring (≥1). |
-| `GATEWAY_METRICS_SLOW_RING` | `200` | Bounded size of the `slow` event ring (≥1). |
-| `GATEWAY_METRICS_SNAPSHOT_INTERVAL_S` | `45` | Snapshot-loop cadence; the worst-case data lost on a hard crash (≥1). |
+| `GATEWAY_METRICS_RING_MAX_ROWS` | `200000` | Disk-backed ring retention: max `ring_events` rows kept (oldest pruned beyond this) (≥1). |
+| `GATEWAY_METRICS_RING_MAX_AGE_DAYS` | `30` | Disk-backed ring retention: max `ring_events` age in days (older pruned) (≥1). |
+| `GATEWAY_METRICS_RING_FLUSH_INTERVAL_S` | `5` | Batched ring-write flush cadence; ≤ this many seconds of ring events lost on a hard crash (≥1). |
+| `GATEWAY_METRICS_RING_FLUSH_MAX_BATCH` | `1000` | Flush early once the pending-write queue reaches this size (≥1). |
+| `GATEWAY_METRICS_SNAPSHOT_INTERVAL_S` | `45` | Rollup snapshot-loop cadence (≥1). |
 | `GATEWAY_METRICS_SLOW_FACTOR` | `3.0` | "Slow" admission multiplier — `duration_ms > max(factor × avg, p95)` per rollup (>0). |
 | `GATEWAY_METRICS_DB_PATH` | `/state/metrics.db` | The metrics snapshot DB (a **separate** SQLite file from `gateway.db` so metrics persistence never contends with the job store). |
 
+> The legacy in-memory ring-size knobs `GATEWAY_METRICS_RECENT_RING` (500),
+> `GATEWAY_METRICS_FAILURES_RING` (200), and `GATEWAY_METRICS_SLOW_RING` (200) are
+> **superseded** by the disk-backed `ring_events` table (system of record), now
+> bounded by the retention knobs above rather than a per-ring `maxlen`. They are
+> still accepted (existing TOML/env won't fail validation) but the disk store
+> ignores them.
+
 ### Restart survival
 
-Metrics survive a restart: the store is snapshotted to `/state/metrics.db` on the
-`GATEWAY_METRICS_SNAPSHOT_INTERVAL_S` cadence (plus a final snapshot on graceful
-shutdown) and `rehydrate()`d on startup, so rollups/rings persist across a
-gateway restart. On a *hard* crash, at most one snapshot interval (≤45s by
-default) of pre-crash data is lost — metrics are diagnostic, so this bound is
-accepted (OBS-04).
+Metrics survive a restart: the rollup store is snapshotted to `/state/metrics.db`
+on the `GATEWAY_METRICS_SNAPSHOT_INTERVAL_S` cadence (plus a final snapshot on
+graceful shutdown) and `rehydrate()`d on startup, so rollups persist across a
+gateway restart; ring events are persisted continuously to the `ring_events`
+table (batched, flushed on the `GATEWAY_METRICS_RING_FLUSH_INTERVAL_S` cadence).
+On a *hard* crash, at most one snapshot interval (≤45s) of rollup data and one
+flush interval (≤5s) of ring events are lost — metrics are diagnostic, so this
+bound is accepted (OBS-04).
 
 ## Development
 

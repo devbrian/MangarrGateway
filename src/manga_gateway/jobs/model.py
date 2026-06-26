@@ -13,8 +13,9 @@ enum (incl. ``warning``/``paused``, D-29a); those two never become internal stat
 ``Job`` is MUTABLE (not ``frozen``) because progress fields (``status``,
 ``downloaded_pages``, byte counters, ``message``, timestamps) advance as the engine
 drives the state machine. Following the ``handles/store.py`` discipline, it stores
-only STABLE ids (``chapter_id`` = MangaDex chapter UUID) plus the resolution
-snapshot — it NEVER carries the volatile at-home ``baseUrl``/cookies (HDL-01/D-17).
+only STABLE ids (``chapter_id`` = the source's chapter resolve unit) plus the
+resolution snapshot — it NEVER carries the volatile at-home ``baseUrl``/cookies
+(HDL-01/D-17).
 """
 
 from __future__ import annotations

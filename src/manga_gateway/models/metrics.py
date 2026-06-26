@@ -14,7 +14,7 @@ for three reasons specific to this surface:
    we copy ``search.py``'s ConfigDict discipline, NOT its camelCase.
 
 2. **``extra="allow"`` passthrough (the no-regression safety net).** A
-   ``response_model`` DROPS undeclared keys by default. We declare all 18 known
+   ``response_model`` DROPS undeclared keys by default. We declare all 22 known
    :class:`MetricEvent` fields, but set ``extra="allow"`` so if a NEW event/payload
    key ever appears before this model is updated, the route passes it through
    verbatim instead of silently dropping it. The lockstep drift test

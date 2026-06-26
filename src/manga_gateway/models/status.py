@@ -3,9 +3,9 @@
 Extends the shared :class:`~manga_gateway.models.common.ApiModel` base and carries
 camelCase ``Field(alias=...)`` matching ``manga-gateway.openapi.yaml``.
 
-Phase-1 stance: the body is contract-shaped with non-sensitive placeholders. Real
-``isLocalhost`` is computed from the bind host; ``outputRootFolders`` reports the
-configured output root; ``maxConcurrentChapters`` is a placeholder per RESEARCH A6.
+The route fills the body from live settings: ``isLocalhost`` is computed from the
+bind host; ``outputRootFolders`` reports the configured output root;
+``maxConcurrentChapters`` is the configured ``max_concurrent_chapters``.
 """
 
 from __future__ import annotations
