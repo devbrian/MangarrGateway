@@ -47,6 +47,18 @@ class SourcePinnedProxies:
         # absent from the map until its first successful ``get_or_acquire``.
         self._pins: dict[str, PooledProxy] = {}
 
+    @property
+    def pool(self) -> ProxyPool | None:
+        """The shared ``ProxyPool`` this singleton delegates to (read-only).
+
+        The SEARCH ctx is NOT given a ``proxy_pool`` (only the download ctx is), so when
+        the framework pins an opted-in search request it resolves the per-proxy
+        transport via THIS pool (``pool.transport_for(pin)``) — the SAME pool the
+        image leg's ``_proxy_pool`` points at (both the one ``image_proxy_pool``, D-03).
+        ``None`` when the pool is disabled (every pin is then ``None`` anyway).
+        """
+        return self._pool
+
     def get_or_acquire(self, source_key: str) -> PooledProxy | None:
         """The pinned proxy for ``source_key`` — acquire+pin on first call (PROXY-04).
 

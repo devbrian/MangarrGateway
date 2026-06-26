@@ -25,11 +25,12 @@ import respx
 from pydantic import SecretStr
 
 from manga_gateway.config import Settings
-from manga_gateway.framework.context import _ACTIVE_IMAGE_PROXY, SourceContext
+from manga_gateway.framework.context import _ACTIVE_PROXY, SourceContext
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.framework.proxy_pool import PooledProxy, ProxyPool
 from manga_gateway.framework.ratelimit import RateLimiter
 from manga_gateway.framework.session import SessionManager
+from manga_gateway.framework.source_pin import SourcePinnedProxies
 from manga_gateway.handles.store import HandleStore
 
 TEST_API_KEY = "test-key-deterministic-0123456789"
@@ -85,7 +86,7 @@ async def test_pool_unset_download_egresses_direct() -> None:
     out = await ctx.fetch_image_via_pool(_fetch)
     assert out == _IMG
     assert calls == 1  # transparent passthrough — fetch ran exactly once
-    assert _ACTIVE_IMAGE_PROXY.get() is None  # no proxy machinery touched
+    assert _ACTIVE_PROXY.get() is None  # no proxy machinery touched
     # The DIRECT download pool received the request; the search pool did not.
     assert download.calls == [_CDN_URL]
     assert search.calls == []
@@ -196,6 +197,39 @@ async def test_rotation_logs_identity_never_credentials(
     assert all(_FAKE_PASS not in code + text for code, text in ctx.warnings)
     # Observability still works WITHOUT leaking creds: a host:port identity is logged.
     assert any(f"{_HOST}:8000" in msg for msg in messages)
+
+
+# ─────── Phase 16 STEP B: non-opted source unchanged after the rename + pinning ───────
+
+
+async def test_non_opted_source_transport_pick_unchanged_after_rename() -> None:
+    """The contextvar rename + the opted-in search-leg pinning must NOT touch a source
+    that did NOT opt in: with ``solve_search_via_proxy_pool`` False (the default) a
+    plain ``get_bytes`` egresses the SEARCH transport, ``_ACTIVE_PROXY`` is never set,
+    and the pinned-proxy singleton acquires nothing — byte-for-byte today (the #65 /
+    260620-4im regression contract for the search dimension)."""
+    search = _RecordingTransport()
+    download = _RecordingTransport()
+    pf_pool = None  # no pin involvement at all on the non-opted path
+    ctx = SourceContext(
+        source_key="mangadex",
+        rate_limit_per_minute=6000,
+        session=SessionManager(search, download),  # type: ignore[arg-type]
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+        # A pinned-proxy singleton IS threaded (as in production), but the source did
+        # NOT opt in, so it must be ignored entirely.
+        source_pins=SourcePinnedProxies(pf_pool),
+        solve_search_via_proxy_pool=False,
+    )
+
+    out = await ctx.get_bytes(_CDN_URL)
+
+    assert out == _IMG
+    assert _ACTIVE_PROXY.get() is None  # never set for a non-opted source
+    # The SEARCH transport served it (no download_transport, no proxy pool).
+    assert len(search.calls) == 1
+    assert download.calls == []
 
 
 async def test_exhaustion_error_carries_no_credentials() -> None:

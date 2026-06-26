@@ -209,3 +209,105 @@ async def test_single_shared_pool_starves_search_control(
         await shared.aclose()
         server.close()
         await server.wait_closed()
+
+
+# ────────── Phase 16 STEP B: opted-in search egress routes through the pin ──────────
+#
+# The transport pick in ``_send_emitting`` already routes through
+# ``pool.transport_for(active_proxy)`` when ``_ACTIVE_PROXY`` is set; STEP B SETS it for
+# an opted-in source's ``get_json``. A non-opted source leaves it unset and routes the
+# existing search/download transport byte-for-byte (the regression contract).
+
+from pydantic import SecretStr  # noqa: E402
+
+from manga_gateway.framework.proxy_pool import PooledProxy, ProxyPool  # noqa: E402
+from manga_gateway.framework.source_pin import SourcePinnedProxies  # noqa: E402
+
+_PIN_HOST = "proxy.invalid"
+_PIN_USER = "fakeuser"
+_PIN_PASS = "NOTAREALSECRET-zzz9"  # distinctive sentinel — never a real credential
+
+
+class _PinTransport:
+    """A per-proxy transport that records it served the request."""
+
+    def __init__(self, settings: object, *, proxy_override: object) -> None:
+        self.calls = 0
+
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        self.calls += 1
+        return httpx.Response(
+            200, json={"served_by": "pin"}, request=httpx.Request(method, url)
+        )
+
+    async def aclose(self) -> None:  # pragma: no cover - interface completeness
+        pass
+
+
+def _pinned_pool() -> tuple[ProxyPool, dict[str, _PinTransport]]:
+    """A real ``ProxyPool`` over one fake proxy with a recording per-proxy transport."""
+    made: dict[str, _PinTransport] = {}
+
+    def _factory(settings: object, *, proxy_override: object) -> _PinTransport:
+        t = _PinTransport(settings, proxy_override=proxy_override)
+        made["pin"] = t
+        return t
+
+    pool = ProxyPool(
+        [PooledProxy(_PIN_HOST, 8000, _PIN_USER, SecretStr(_PIN_PASS))],
+        settings=Settings(api_key=TEST_API_KEY),  # type: ignore[call-arg]
+        cooldown_seconds=300.0,
+        transport_factory=_factory,  # type: ignore[arg-type]
+    )
+    return pool, made
+
+
+def _opted_ctx(
+    session: SessionManager, pins: SourcePinnedProxies, *, opted: bool
+) -> SourceContext:
+    return SourceContext(
+        source_key="mangadot",
+        rate_limit_per_minute=6000,
+        session=session,
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+        source_pins=pins,
+        solve_search_via_proxy_pool=opted,
+    )
+
+
+@pytest.mark.asyncio
+async def test_opted_in_search_routes_through_pinned_transport() -> None:
+    search, download = _RecordingTransport("search"), _RecordingTransport("download")
+    session = SessionManager(search, download)
+    pool, made = _pinned_pool()
+    pins = SourcePinnedProxies(pool)
+    try:
+        await _opted_ctx(session, pins, opted=True).get_json("https://x/api")
+        # The pinned per-proxy transport served it — NOT the search/download pool.
+        assert made["pin"].calls == 1
+        assert search.calls == 0
+        assert download.calls == 0
+        # The pin is stable (acquired once, kept) for the source.
+        assert pins.current("mangadot") is not None
+    finally:
+        await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_opted_search_routes_through_existing_transport_byte_for_byte() -> (
+    None
+):
+    search, download = _RecordingTransport("search"), _RecordingTransport("download")
+    session = SessionManager(search, download)
+    pool, made = _pinned_pool()
+    pins = SourcePinnedProxies(pool)
+    try:
+        # A non-opted source threads the singleton but the flag is False ⇒ no pin set ⇒
+        # the existing search transport serves it, exactly as today.
+        await _opted_ctx(session, pins, opted=False).get_json("https://x/api")
+        assert search.calls == 1
+        assert "pin" not in made  # the pinned transport was never even built
+        assert pins.current("mangadot") is None  # nothing acquired/pinned
+    finally:
+        await pool.aclose()
