@@ -34,14 +34,16 @@ The shapes below come from real Comix traffic captured via the Plan 04-04 recon
 * search (PLAINTEXT, httpx): ``GET /api/v1/manga`` with ``keyword``, ``limit``,
   ``page``, ``content_rating=suggestive``, ``order[relevance]=desc``
   → ``{"status":"ok","result":{"items":[{"hid","title","url","latestChapter", …}]}}``
-* chapter list (Option A — browser-DOM): navigate ``/title/{hid}-{slug}`` and
+* chapter list (Option A — browser-DOM; SUPERSEDED, see Spike 019 below):
+  navigate ``/title/{hid}-{slug}`` and
   read the rendered chapter list off the DOM, including the scanlation group
   name from each row's ``<a class="mchap-row__group">`` anchor. (The plaintext
   ``/api/v1/manga/{hid}/chapter-indexes?group_id=-1`` endpoint now requires
   a JS-minted ``_=`` request token and returns 403 ``{"message":"Invalid
   token."}`` for any unsigned call; the browser-DOM read is the only
   reachable source for the group name.)
-* chapter pages (Option A — browser-DOM): navigate
+* chapter pages (Option A — browser-DOM; SUPERSEDED, see Spike 019 below):
+  navigate
   ``/title/{hid}-{slug}/{chapter_id}-chapter-{number}`` and read the rendered
   ``<img src="https://{cdn}.store/{seg}/{token}/{NN}.webp">`` tags off the
   DOM (``{seg}`` is a rotating short path segment — ``si``/``i3``/…; see
@@ -1090,36 +1092,23 @@ class ComixSource(Source):
         ``/api/v1/manga/{hid}/chapters`` endpoint is bypassed for the same
         Option A reason as the chapter-pages endpoint: rather than maintain two
         decrypt paths (one statically-decrypted list endpoint and one
-        browser-driven pages endpoint), funnel both through the warm Patchright
-        page that the SPA already drives correctly.
+        browser-driven pages endpoint), funnel both through the warm cleared
+        redroid WebView (``eval_in_webview``) that runs comix's own SPA logic.
 
-        Concurrency: the per-candidate ``_series_chapters`` browser
-        navigations are awaited CONCURRENTLY via :func:`asyncio.gather` so
-        /search's wall-clock is bounded by ``max(individual)`` rather than
-        ``sum(individual)``. The fan-out is bounded entirely by the framework's
-        existing ``CloudflareSolver._browser_lock`` — an
-        ``asyncio.Semaphore(cloudflare_fetch_concurrency)`` — so it self-throttles
-        to whatever the deployment configures; this source adds no second gate.
+        Concurrency: the per-candidate ``_series_chapters`` WebView evals are
+        awaited CONCURRENTLY via :func:`asyncio.gather` so /search's wall-clock is
+        bounded by ``max(individual)`` rather than ``sum(individual)``. Comix runs
+        on the android solver engine (``solver_engine="android"``): the candidate
+        evals are serialized AT the gateway by the android solver's ``_device_lock``
+        (Bug 4 Fix B below), while the ``device_session`` lease (Bug 4 Fix C) holds
+        the foreground counter so the proactive-refresh loop defers and the cleared
+        comix WebView stays warm across the whole resolve+enumerate sequence.
         ``return_exceptions=True`` isolates per-candidate failures: a single
         ``_series_chapters`` raise surfaces as an item in the result list (logged
         at WARNING and skipped), so one stale/missing series does not blank the
         whole search response. ``asyncio.gather`` preserves coroutine-launch
         order, so the returned ``releases`` keep the relevance-sorted candidate
         ordering the upstream ``/api/v1/manga`` already provides.
-
-        Concurrency safety is ENGINE-specific (debug session
-        ``comix-parallel-engine-probe``, 2026-06-01). With the default
-        ``cloudflare_fetch_concurrency=1`` the Semaphore admits one nav at a
-        time, so this is behaviourally identical to the historic sequential
-        loop — zero change for the default deployment. Parallelism is OPT-IN:
-        bumping the cap is only safe on ``engine=patchright`` (Chromium), which
-        runs N concurrent CF navigations on one warm context cleanly (4/4 proven
-        on residential-IP Windows + Linux, and through a residential proxy).
-        ``engine=camoufox`` (Firefox) STALLS such navigations at goto-commit, so
-        ``cloudflare_fetch_concurrency`` MUST stay at 1 there — the earlier
-        "Cloudflare per-IP burst" diagnosis (issue #59) was an artifact of
-        testing only Camoufox and is REFUTED. See ``config.py`` and the README
-        for the engine/concurrency constraint.
         """
         # Comix is English-only (live recon); ``languages`` is honored downstream
         # and is the language half of both cache keys (T-09-01).
@@ -1481,8 +1470,8 @@ class ComixSource(Source):
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
         """Resolve a chapter id → ordered page-image URLs, INTERNALLY (PKG-01/R6).
 
-        Spike 019 (2026-06): navigate the chapter page in the warm Patchright
-        browser, then run comix's OWN internal ``chapters/{id}`` API loader in-page
+        Spike 019 (2026-06): navigate the chapter page in the cleared redroid
+        WebView, then run comix's OWN internal ``chapters/{id}`` API loader in-page
         (``_CHAPTER_PAGES_API_EXTRACT_JS``) to get the decrypted page list. The env
         module's axios instance (``ro(ri)``) signs the ``_=`` token + decrypts the
         ``{"e":...}`` envelope, returning ``pages.items[].url`` — every page in one
@@ -2110,7 +2099,7 @@ class ComixSource(Source):
         """Browser-tab read of the FULL series chapter list (#146 / spike 019).
 
         Delegates to :meth:`_fetch_series_chapters_raw`, which navigates
-        ``{base_url}/title/{hid}-{slug}`` in the warm Patchright browser and ALWAYS
+        ``{base_url}/title/{hid}-{slug}`` in the cleared redroid WebView and ALWAYS
         enumerates the FULL chapter list by running comix's OWN internal
         ``chapters(hid, {limit:100})`` loader in-page (spike 019) — yielding
         ``[{id, chapter, lang, groups, publishedAtRelative, likes, volume}, …]`` for

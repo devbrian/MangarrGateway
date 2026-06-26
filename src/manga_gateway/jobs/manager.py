@@ -18,8 +18,10 @@ download surface's moving parts:
 ``submit`` mints a stable ``j_``-prefixed jobId (R5, CSPRNG via ``secrets`` — the
 ``handles/store.py`` discipline), write-through-INSERTs the ``queued`` job to SQLite
 BEFORE adding it to the projection (RESEARCH Pattern 2), schedules the background coro,
-and returns ``(jobId, "queued")``. The idempotency stat-check, single-job GET, DELETE,
-and staging sweep are the next slice (Plan 04) — here ``submit`` just inserts.
+and returns ``(jobId, "queued")`` — short-circuiting to an existing job on the
+idempotency-by-existence stat-check (DL-03). Single-job GET (``get``/``get_dto``),
+DELETE (``remove``, with the per-job staging unlink), and restart resume
+(``rehydrate``/``resume_interrupted``) also live here.
 """
 
 from __future__ import annotations

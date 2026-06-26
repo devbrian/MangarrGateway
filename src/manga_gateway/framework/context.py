@@ -938,12 +938,14 @@ class SourceContext:
         The framework wrapper the engine puts around an opted-in source's
         ``fetch_image`` (260620-4im). When no pool is wired OR this source did not opt
         in (``image_fetch_via_proxy_pool``) — and ALWAYS on the search path, which is
-        never given a pool — this is a transparent ``await fetch()``: ``_active_proxy``
+        never given a pool — this is a transparent ``await fetch()``:
+        ``_ACTIVE_IMAGE_PROXY``
         is never set, so transport routing stays byte-for-byte today (the regression
         contract).
 
         With a pool active it orchestrates, per call: pick the job's sticky proxy (or
-        ``acquire`` a fresh one), set ``_active_proxy`` so every inner ``ctx.get_bytes``
+        ``acquire`` a fresh one), set ``_ACTIVE_IMAGE_PROXY`` so every inner
+        ``ctx.get_bytes``
         (incl. the source's per-page zone-retry) egresses through it, and run ``fetch``.
         On a fetch failure (``SourceError`` incl. upstream 403, or any
         ``httpx.HTTPError`` — proxy 407 / ConnectTimeout / connect error) the proxy is
@@ -1269,7 +1271,7 @@ class SourceContext:
         Outcome classification mirrors the request-middleware WR-04 split (and the
         contract ``client_error`` value): ``>=500 -> "error"``,
         ``>=400 -> "client_error"``, else ``"ok"``. This success path is reached
-        BEFORE the caller's ``raise_for_status()`` (``_send_with_clearance`` raises
+        BEFORE the caller's ``raise_for_status()`` (``_request_response`` raises
         only AFTER ``_send`` returns), so a 4xx/5xx transport response DOES land here
         and was previously mis-emitted as ``"ok"`` — a 401/404/500 from the upstream
         is now visible in the failures ring / error_rate per-call, not just at the

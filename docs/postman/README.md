@@ -38,9 +38,9 @@ Manga Gateway. Built against `manga-gateway.openapi.yaml` (the contract of recor
 3. **Edit the environment:**
    - `apiKey` — paste the value from your `config.toml` config (the same
      value Mangarr uses). Sent via the collection-level `X-Api-Key` auth.
-   - `sourceKey` — defaults to `mangadex` (no anti-bot, fast). Switch to
-     `comix` to exercise the `cloudflare+encrypted` path; that requires a
-     warm Patchright solver and live network.
+   - `sourceKey` — defaults to `comix`, which exercises the
+     `cloudflare+encrypted` path (requires a warm solver and live network).
+     Switch to `mangadex` (no anti-bot, fast) for an offline-friendly run.
    - `searchQuery` — defaults to `the forgotten field` (works on both
      mangadex + comix); swap as needed.
 
@@ -104,7 +104,8 @@ on disk at that path.
   gateway resolves it into a page manifest internally (R6); the manifest
   never crosses back over the wire.
 - `POST /downloads` is **idempotent on `releaseHandle`** (R5) — resubmitting
-  the same handle returns the same `jobId` until that job's TTL expires.
+  the same handle returns the same `jobId` while a live job exists for it (or a
+  completed job whose CBZ is still on disk).
 - `GET /downloads` is poll-friendly (served from in-memory projection, no
   disk re-scan). The contract assumes ~1 min Mangarr poll cadence; the
   collection runs at 1 s for fast feedback.

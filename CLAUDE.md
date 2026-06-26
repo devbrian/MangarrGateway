@@ -42,8 +42,9 @@ single-process search→handle→download→package flow must work.
 - **Proxy-ready networking**: the framework's outbound transport is abstracted/injectable from day
   one so per-source/global proxy pools + rotation can be added later (to spread load / bypass rate
   limits) without touching source subclasses. No proxy config ships in v1 — design constraint only.
-- **TTLs**: `/caps` cache 12h; `downloadHandle` TTL 60 min (≥ the 30-min floor — Mangarr caches
-  interactive-search releases 30 min).
+- **TTLs**: `/caps` cache 12h; `downloadHandle` TTL default 6h / `GATEWAY_HANDLE_TTL_SECONDS`,
+  floor 30 min (D-16 reversal — the handle store is SQLite-backed so handles survive a restart, and
+  the TTL covers Mangarr's grab-replay latency; Mangarr caches interactive-search releases 30 min).
 - **Poll-friendliness**: `GET /downloads` must be cheap under frequent polling (~1 min cadence,
   debounced 5s) — return cached state, don't re-scan disk per poll.
 - **Build order**: search surface first — the download surface consumes the `downloadHandle` that
