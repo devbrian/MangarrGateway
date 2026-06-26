@@ -175,6 +175,21 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
+def _pop_bucket(params: dict[str, Any]) -> Literal["default", "download"]:
+    """Pop the optional ``bucket`` selector out of a ``**params`` query dict.
+
+    The ``**params`` JSON methods (``get_json`` / ``get_json_array`` /
+    ``get_json_plain``) accept an optional ``bucket="download"`` to route onto the
+    second rate-limit bucket WITHOUT a typed keyword-only arg — a typed keyword-only
+    arg makes mypy reject a source unpacking a query ``**dict[str, list[str]]`` into the
+    call (mangadex's ``**{"includes[]": [...]}``). Defaults to ``"default"``; any
+    non-``"download"`` value normalizes to ``"default"`` (the selector is gateway
+    internal, never client input). No source uses ``bucket`` as a real query key.
+    """
+    raw = params.pop("bucket", "default")
+    return "download" if raw == "download" else "default"
+
+
 class SourceContext:
     """Framework-owned HTTP + warning context handed to a source hook."""
 
@@ -614,13 +629,7 @@ class SourceContext:
             reraise=True,
         )
 
-    async def get_json(
-        self,
-        url: str,
-        *,
-        bucket: Literal["default", "download"] = "default",
-        **params: Any,
-    ) -> dict[str, Any]:
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         """GET ``url`` with ``params`` → parsed JSON, rate-limited + retried.
 
         Gates the limiter at the call site (CLAUDE.md). For a ``cloudflare*`` source it
@@ -630,7 +639,14 @@ class SourceContext:
         parse, and health is fed on the terminal outcome (D-36) — the parse runs INSIDE
         the failure-feeding ``try`` so a malformed-shape ``200`` (a non-object body →
         ``SourceError`` from :meth:`_parse_json_object`) also trips ``_feed_failure``.
+
+        ``bucket`` (260625-rom; ``"default"`` | ``"download"``) selects the rate-limit
+        bucket and is popped out of the query ``params`` BEFORE the closure so a retry
+        re-reads the same value (see :meth:`_send`). It is taken from ``**params``
+        rather than a typed keyword-only arg so a source that unpacks a query ``**dict``
+        is unaffected (mypy parity); no source uses ``bucket`` as a query key.
         """
+        bucket = _pop_bucket(params)
 
         async def _attempt() -> dict[str, Any]:
             try:
@@ -646,13 +662,7 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
-    async def get_json_array(
-        self,
-        url: str,
-        *,
-        bucket: Literal["default", "download"] = "default",
-        **params: Any,
-    ) -> list[Any]:
+    async def get_json_array(self, url: str, **params: Any) -> list[Any]:
         """GET ``url`` with ``params`` → parsed top-level JSON ARRAY, like
         :meth:`get_json` but parsing a bare list body rather than an object.
 
@@ -668,7 +678,11 @@ class SourceContext:
         failure-feeding ``try`` (byte-for-byte parity with :meth:`get_json`) so a
         non-array ``200`` body also trips ``_feed_failure``. Additive: the existing
         object-bodied call paths (comix/mangadex/mangaball) are untouched.
+
+        ``bucket`` (260625-rom) is popped out of ``**params`` before the closure — see
+        :meth:`get_json` and :func:`_pop_bucket` for why it is not a typed keyword arg.
         """
+        bucket = _pop_bucket(params)
 
         async def _attempt() -> list[Any]:
             try:
@@ -784,13 +798,7 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
-    async def get_json_plain(
-        self,
-        url: str,
-        *,
-        bucket: Literal["default", "download"] = "default",
-        **params: Any,
-    ) -> dict[str, Any]:
+    async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
         """Identical to :meth:`get_json` but BYPASSES the decrypt seam (D-39).
 
         Some ``cloudflare+encrypted`` sources mix plaintext + encrypted endpoints —
@@ -801,7 +809,11 @@ class SourceContext:
         (clearance injection, rate limit, retry, 403 reconciliation, health feed —
         including the parse running INSIDE the failure-feeding ``try`` so a non-object
         ``200`` body also trips ``_feed_failure``) stays identical to ``get_json``.
+
+        ``bucket`` (260625-rom) is popped out of ``**params`` before the closure — see
+        :meth:`get_json` and :func:`_pop_bucket` for why it is not a typed keyword arg.
         """
+        bucket = _pop_bucket(params)
 
         async def _attempt() -> dict[str, Any]:
             try:
@@ -1218,11 +1230,12 @@ class SourceContext:
         # counts come for free.
         attempt = 2 if force_cf else 1
         if limited:
-            # 260625-rom / SRC-03: pick the bucket. A ``bucket="download"`` call uses the
-            # separate download limiter ONLY when this source opted in (provisioned it);
-            # otherwise it FALLS BACK to the primary limiter — so a download-tagged call
-            # on a non-opted source is byte-for-byte unchanged. Every ``default`` call,
-            # and every call on a single-bucket source, gates the primary ``self._limiter``.
+            # 260625-rom / SRC-03: pick the bucket. A ``bucket="download"`` call uses
+            # the separate download limiter ONLY when the source opted in (provisioned
+            # it); otherwise it FALLS BACK to the primary limiter — so a download-tagged
+            # call on a non-opted source is byte-for-byte unchanged. Every ``default``
+            # call, and every call on a single-bucket source, gates the primary
+            # ``self._limiter``.
             selected = (
                 self._download_limiter
                 if (bucket == "download" and self._download_limiter is not None)

@@ -42,7 +42,9 @@ class _RecordingTransport:
 
     async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
         self.calls += 1
-        return httpx.Response(200, json={"ok": True}, request=httpx.Request(method, url))
+        return httpx.Response(
+            200, json={"ok": True}, request=httpx.Request(method, url)
+        )
 
     async def aclose(self) -> None:  # pragma: no cover - interface completeness
         pass
@@ -155,7 +157,7 @@ async def test_download_bucket_call_falls_back_to_primary_when_not_opted_in() ->
     )
     assert ctx._download_limiter is None
     # A download-tagged call on a source that did NOT opt in must NOT crash and must
-    # fall back to the single primary limiter (the every-other-source-unchanged contract).
+    # fall back to the single primary limiter (every-other-source-unchanged contract).
     await ctx.post_json_body("https://x/api", body={}, bucket="download")
     assert transport.calls == 1
     assert ctx._limiter.has_capacity() is False

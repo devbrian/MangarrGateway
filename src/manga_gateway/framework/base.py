@@ -131,13 +131,14 @@ class Source(ABC):
     # 260625-rom / SRC-03 / D-30 optional SECOND rate-limit bucket. ``None`` (default,
     # every other source) ⇒ single-bucket behavior byte-for-byte unchanged: the source
     # has ONE per-source ``AsyncLimiter`` gating every ``limited`` call. An int
-    # provisions a SECOND, independent per-source limiter (keyed ``{key}:download``) for
-    # the calls a source tags ``bucket="download"`` — the token/DRM path (kagane's
-    # ``POST /api/integrity`` → ``POST /api/v2/books/{id}``). Splitting that hard-throttled
-    # token path off the search bucket means a download flood can no longer drain the
-    # shared bucket and starve interactive search into 30s timeouts. NOT advertised in
-    # ``source_cap()`` / ``SourceCap`` — the /caps contract still exposes only the single
-    # primary ``rate_limit_per_minute``; the download bucket is gateway-internal.
+    # provisions a SECOND, independent per-source limiter (keyed ``{key}:download``)
+    # for the calls a source tags ``bucket="download"`` — the token/DRM path (kagane's
+    # ``POST /api/integrity`` → ``POST /api/v2/books/{id}``). Splitting that
+    # hard-throttled token path off the search bucket means a download flood can no
+    # longer drain the shared bucket and starve interactive search into 30s timeouts.
+    # NOT advertised in ``source_cap()`` / ``SourceCap`` — the /caps contract still
+    # exposes only the single primary ``rate_limit_per_minute``; the download bucket
+    # is gateway-internal.
     download_rate_limit_per_minute: int | None = None
     # D-09 per-source enumeration-cache TTL override (seconds). ``None`` = use the
     # global ``settings.enum_cache_ttl_seconds`` default. A source whose feed is
