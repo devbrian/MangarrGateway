@@ -79,6 +79,10 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
         # collapse — adb_target=None + lane="default".
         "adb_target",
         "lane",
+        # Phase 16 (PROXY-04/PROXY-06): the pinned-proxy singleton + the lane's opted-in
+        # source-key slice, mirroring app.py's per-lane AndroidSolver(...) build.
+        "source_pins",
+        "solve_search_keys",
     }
     # The kwargs construct a real AndroidSolver offline (no network until /solve).
     solver = AndroidSolver(**kwargs)
