@@ -40,7 +40,8 @@ Manga Gateway. Built against `manga-gateway.openapi.yaml` (the contract of recor
      value Mangarr uses). Sent via the collection-level `X-Api-Key` auth.
    - `sourceKey` — defaults to `comix`, which exercises the
      `cloudflare+encrypted` path (requires a warm solver and live network).
-     Switch to `mangadex` (no anti-bot, fast) for an offline-friendly run.
+     Switch to `mangadex` (solver-free and fast — no anti-bot, but still
+     needs the gateway plus upstream network) for the simplest run.
    - `searchQuery` — defaults to `the forgotten field` (works on both
      mangadex + comix); swap as needed.
 

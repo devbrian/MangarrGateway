@@ -937,7 +937,8 @@ class SourceContext:
 
         The framework wrapper the engine puts around an opted-in source's
         ``fetch_image`` (260620-4im). When no pool is wired OR this source did not opt
-        in (``image_fetch_via_proxy_pool``) — and ALWAYS on the search path, which is
+        in (the ``image_fetch_via_proxy_pool`` Source attribute, wired here as
+        ``self._image_via_proxy_pool``) — and ALWAYS on the search path, which is
         never given a pool — this is a transparent ``await fetch()``:
         ``_ACTIVE_IMAGE_PROXY``
         is never set, so transport routing stays byte-for-byte today (the regression
