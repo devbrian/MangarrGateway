@@ -1224,6 +1224,38 @@ class SourceContext:
                     "upstream WAF block (sanitizable query)",
                     status=resp.status_code,
                 )
+            # Phase 16 (PROXY-05/PROXY-07, D-08): an ORIGIN reputation-block 403 on an
+            # opted-in source's PINNED IP → rotate to a fresh IP, re-solve on it, retry.
+            # The per-source ``is_origin_block`` predicate (threaded onto
+            # ``_is_origin_block_fn`` by Task 1) is consulted ONLY here in the 403 path,
+            # so the happy path is untouched. Gated to OPTED-IN sources with a pin, and
+            # SUBTRACTS the CF/CSRF/WAF cases (cf_stale/csrf_stale already reconciled
+            # IN PLACE above on the same pin — D-35 unchanged; WAF raised just above) so
+            # only a SURVIVING non-CF, non-CSRF, non-WAF origin-403 rotates. A non-opted
+            # ctx (``_is_origin_block_fn is None``) skips this entirely and falls to the
+            # unchanged ``source_unavailable`` raise below.
+            origin_block = (
+                self._solve_search_via_proxy_pool
+                and self._source_pins is not None
+                and self._is_origin_block_fn is not None
+                and not cf_stale
+                and not csrf_stale
+                and not is_waf_block(resp)
+                and self._is_origin_block_fn(resp)
+            )
+            if origin_block:
+                return await self._rotate_and_retry_origin_block(
+                    url,
+                    params=params,
+                    limited=limited,
+                    method=method,
+                    data=data,
+                    json_body=json_body,
+                    extra_headers=extra_headers,
+                    op=op,
+                    bucket=bucket,
+                    status=resp.status_code,
+                )
             raise SourceError(
                 "source_unavailable",
                 f"upstream {resp.status_code}",
@@ -1231,6 +1263,101 @@ class SourceContext:
             )
         resp.raise_for_status()  # 5xx → HTTPStatusError → retried by _is_retryable
         return resp
+
+    async def _rotate_and_retry_origin_block(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None,
+        limited: bool,
+        method: str,
+        data: dict[str, Any] | None,
+        json_body: dict[str, Any] | None,
+        extra_headers: dict[str, str] | None,
+        op: str,
+        bucket: Literal["default", "download"],
+        status: int,
+    ) -> httpx.Response:
+        """D-08 origin-403 recovery: rotate the pin + re-solve on the new IP + retry.
+
+        Phase 16 (PROXY-05/PROXY-07, D-05/D-06/D-08). The debug evidence is decisive: a
+        FRESH clearance still origin-403'd 9s later on the SAME IP (debug
+        mangadot-turnstile-cf), so re-solving in place is provably useless — the IP is
+        reputation-blocked at the origin. Rotate FIRST, then ``force_cf=True`` (the next
+        ``_send`` re-mints clearance via the solver's ``force_resolve``, which pops
+        ``_held[source_key]`` and re-solves THROUGH the now-rotated pin — D-05 couples
+        rotation + re-clear), then retry the request through the new pin's transport.
+
+        Budget is ``image_proxy_max_attempts`` (D-06, default 3); exhaustion (``rotate``
+        returns ``None`` — every proxy on cooldown/excluded) raises the terminal
+        ``source_unavailable`` (T-4im-03 pattern). Rotation runs only with a pin active
+        (the caller gated ``_source_pins is not None``); ``_set_search_pin`` already set
+        ``_ACTIVE_PROXY``, so each rotation re-``set``s it to the new pin and the inner
+        ``_send_emitting`` picks ``transport_for(new_pin)``. The CF branch was already
+        tried IN PLACE upstream (cheap re-solve); only a surviving non-CF origin-403
+        reaches here, so the order composes (cheap CF re-solve first, expensive rotate
+        only if it survives).
+        """
+        assert self._source_pins is not None  # caller gated this
+        tried: set[str] = set()
+        current = _ACTIVE_PROXY.get()
+        if current is not None:
+            tried.add(current.selection_key)
+        for _ in range(self._image_proxy_max_attempts):
+            new_pin = self._source_pins.rotate(self._source_key, exclude=tried)
+            if new_pin is None:
+                # Pool exhausted — never re-use a known-bad IP (T-4im-03 terminal).
+                raise SourceError(
+                    "source_unavailable",
+                    "no proxy available for opted-in source (all proxies on cooldown)",
+                    status=status,
+                )
+            tried.add(new_pin.selection_key)
+            token = _ACTIVE_PROXY.set(new_pin)
+            try:
+                # force_cf=True: re-mint clearance on the NEW pin (D-05) + retry through
+                # the new pin's transport (the contextvar set above routes it).
+                resp = await self._send(
+                    url,
+                    params=params,
+                    limited=limited,
+                    force_cf=True,
+                    force_csrf=False,
+                    method=method,
+                    data=data,
+                    json_body=json_body,
+                    extra_headers=extra_headers,
+                    op=op,
+                    bucket=bucket,
+                )
+            finally:
+                _ACTIVE_PROXY.reset(token)
+            # The survivor is already the singleton's ``current(source_key)`` (rotate
+            # set it), so the NEXT request's ``_set_search_pin`` rides the working IP —
+            # no dangling contextvar set needed (the response below is already fetched).
+            if resp.status_code not in _PERMANENT_STATUSES:
+                resp.raise_for_status()  # 5xx → retried by tenacity
+                return resp
+            # Still blocked → if it is ANOTHER origin block, keep rotating; otherwise
+            # the new IP hit a different terminal 4xx (e.g. a 404) — stop rotating.
+            if self._is_origin_block_fn is None or not self._is_origin_block_fn(resp):
+                raise SourceError(
+                    "source_unavailable",
+                    f"upstream {resp.status_code}",
+                    status=resp.status_code,
+                )
+            _log.info(
+                "origin block on %s (source=%s op=%s) — rotated pin, retrying",
+                new_pin.identity,  # host:port only — NEVER creds (T-16-03)
+                self._source_key,
+                op,
+            )
+        # Budget spent, still origin-blocked on every rotated IP.
+        raise SourceError(
+            "source_unavailable",
+            "no proxy available for opted-in source (all proxies on cooldown)",
+            status=status,
+        )
 
     async def _request_bytes(
         self,

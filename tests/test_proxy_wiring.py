@@ -508,3 +508,126 @@ class _RecordingTransport:
 
     async def aclose(self) -> None:  # pragma: no cover - interface completeness
         pass
+
+
+# ─────────── Phase 16 Task 3: /solve body carries the pinned proxy override ───────────
+
+
+import json  # noqa: E402
+
+import respx  # noqa: E402
+from pydantic import SecretStr  # noqa: E402
+
+from manga_gateway.framework.android_solver import AndroidSolver  # noqa: E402
+from manga_gateway.framework.proxy_pool import PooledProxy  # noqa: E402
+
+_SIDECAR = "http://android-solver.invalid:8191"
+_SOLVE_PIN_PASS = "NOTAREALSECRET-pin9"  # distinctive sentinel, never a real credential
+_FAKE_SERVER_HOST = "proxy.invalid"
+
+
+class _OnePin:
+    """A SourcePinnedProxies-shaped fake exposing one PEEKED pin for a source."""
+
+    def __init__(self, pin: PooledProxy | None) -> None:
+        self._pin = pin
+
+    def current(self, source_key: str) -> PooledProxy | None:
+        return self._pin
+
+
+def _solve_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "cf_clearance": "android-minted-token",
+            "user_agent": "Mozilla/5.0 (Linux; Android 11) Chrome/120 Mobile",
+            "host": "mangadot.net",
+            "cf_clearance_expires": 2000000000.0,
+        },
+    )
+
+
+def _android(**over: object) -> AndroidSolver:
+    kwargs: dict[str, object] = {
+        "base_url": _SIDECAR,
+        "api_key": SecretStr("sidecar-secret"),
+        "challenge_urls": {"mangadot": "https://mangadot.net/"},
+        "timeout_s": 5.0,
+    }
+    kwargs.update(over)
+    return AndroidSolver(**kwargs)  # type: ignore[arg-type]
+
+
+@respx.mock
+async def test_solve_body_carries_pinned_proxy_for_opted_in_source() -> None:
+    """PROXY-04/PROXY-06: an opted-in source's /solve body OVERRIDES the global proxy
+    with the source's pinned ``as_solve_dict()`` so the solve egress matches the
+    search/image httpx egress (one IP)."""
+    bodies: list[dict[str, object]] = []
+
+    async def _capture(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return _solve_response()
+
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_capture)
+
+    pin = PooledProxy(_FAKE_SERVER_HOST, 9000, _FAKE_USER, SecretStr(_SOLVE_PIN_PASS))
+    solver = _android(
+        proxy={"server": "http://global.invalid:1"},  # the global to be overridden
+        source_pins=_OnePin(pin),
+        solve_search_keys={"mangadot"},
+    )
+    try:
+        await solver._solve("mangadot")  # type: ignore[attr-defined]
+    finally:
+        await solver.aclose()
+
+    assert len(bodies) == 1
+    # The pinned dict OVERRODE the global proxy.
+    assert bodies[0]["proxy"] == pin.as_solve_dict()
+    assert bodies[0]["proxy"] != {"server": "http://global.invalid:1"}
+
+
+@respx.mock
+async def test_solve_body_keeps_global_for_non_opted_source() -> None:
+    """PROXY-06/D-07: a source NOT in the opted-in key set keeps the global proxy (no
+    override) — byte-for-byte today."""
+    bodies: list[dict[str, object]] = []
+
+    async def _capture(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return _solve_response()
+
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_capture)
+
+    pin = PooledProxy(_FAKE_SERVER_HOST, 9000, _FAKE_USER, SecretStr(_SOLVE_PIN_PASS))
+    solver = _android(
+        proxy={"server": "http://global.invalid:1"},
+        source_pins=_OnePin(pin),
+        solve_search_keys=set(),  # mangadot NOT opted in
+    )
+    try:
+        await solver._solve("mangadot")  # type: ignore[attr-defined]
+    finally:
+        await solver.aclose()
+
+    assert bodies[0]["proxy"] == {"server": "http://global.invalid:1"}
+
+
+@respx.mock
+async def test_solve_body_proxy_password_never_logged(caplog: Any) -> None:
+    """T-16-03: the pinned proxy dict carries creds but the password sentinel never
+    appears in ANY log record (host:port identity only)."""
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=lambda r: _solve_response())
+
+    pin = PooledProxy(_FAKE_SERVER_HOST, 9000, _FAKE_USER, SecretStr(_SOLVE_PIN_PASS))
+    solver = _android(source_pins=_OnePin(pin), solve_search_keys={"mangadot"})
+    try:
+        with caplog.at_level(logging.DEBUG, logger="manga_gateway"):
+            await solver._solve("mangadot")  # type: ignore[attr-defined]
+    finally:
+        await solver.aclose()
+
+    for record in caplog.records:
+        assert _SOLVE_PIN_PASS not in record.getMessage()

@@ -31,6 +31,7 @@ import pytest
 
 from manga_gateway.framework.antibot import Clearance
 from manga_gateway.framework.context import SourceContext, is_csrf_failure
+from manga_gateway.framework.errors import SourceError
 from manga_gateway.framework.ratelimit import RateLimiter
 from manga_gateway.framework.session import SessionManager
 from manga_gateway.framework.session_prep import SessionCredentials
@@ -290,3 +291,183 @@ async def test_mangadex_no_antibot_unchanged() -> None:
 def test_both_stale_body_satisfies_csrf_predicate() -> None:
     req = httpx.Request("POST", _URL)
     assert is_csrf_failure(_both_403(req)) is True
+
+
+# ─────────────────── Phase 16 Task 3: D-08 origin-403 rotation branch ───────────────
+#
+# An opted-in source's PINNED IP that hits an ORIGIN reputation-block 403 (no CF
+# challenge, no CSRF, no WAF) rotates to a fresh IP, re-solves on it, and retries. A CF
+# 403 re-solves IN PLACE (no rotation). Budget exhaustion → source_unavailable. A
+# non-opted source NEVER rotates (regression).
+
+from manga_gateway.framework.context import is_cf_challenge  # noqa: E402
+
+
+class _FakePin:
+    """A minimal PooledProxy-shaped stand-in with a distinct selection_key/identity."""
+
+    def __init__(self, port: int) -> None:
+        self._port = port
+
+    @property
+    def selection_key(self) -> str:
+        return f"proxy.invalid:{self._port}"
+
+    @property
+    def identity(self) -> str:
+        return f"proxy.invalid:{self._port}"
+
+    def as_solve_dict(self) -> dict[str, str]:
+        return {"server": f"http://proxy.invalid:{self._port}"}
+
+
+class _FakePool:
+    """A ProxyPool-shaped fake whose ``transport_for`` always returns ONE transport.
+
+    The origin-403 rotation tests route ALL pinned egress through the same recording
+    transport (the test asserts on rotation bookkeeping + the /403 sequence, not on the
+    physical proxy hop), so ``transport_for`` ignores the proxy and returns the session
+    transport handed in.
+    """
+
+    def __init__(self, transport: _RecordingTransport) -> None:
+        self._transport = transport
+
+    def transport_for(self, proxy: object) -> _RecordingTransport:
+        return self._transport
+
+
+class _CountingPins:
+    """A SourcePinnedProxies-shaped fake that counts rotate() calls and hands out pins.
+
+    ``get_or_acquire`` pins port 8000; ``rotate`` cycles 8001, 8002, ... until
+    ``available`` is spent, then returns ``None`` (exhaustion). ``current`` peeks.
+    ``pool`` exposes a fake pool so ``_send_emitting`` can resolve a transport for the
+    active pin (the SEARCH ctx is not given a ``proxy_pool``, Phase 16).
+    """
+
+    def __init__(self, *, available: int, transport: _RecordingTransport) -> None:
+        self.rotate_calls = 0
+        self._available = available
+        self._pin: _FakePin | None = None
+        self._pool = _FakePool(transport)
+
+    @property
+    def pool(self) -> _FakePool:
+        return self._pool
+
+    def get_or_acquire(self, source_key: str) -> _FakePin | None:
+        if self._pin is None:
+            self._pin = _FakePin(8000)
+        return self._pin
+
+    def current(self, source_key: str) -> _FakePin | None:
+        return self._pin
+
+    def rotate(self, source_key: str, *, exclude: set[str]) -> _FakePin | None:
+        self.rotate_calls += 1
+        if self.rotate_calls > self._available:
+            self._pin = None
+            return None
+        self._pin = _FakePin(8000 + self.rotate_calls)
+        return self._pin
+
+
+def _origin_403(req: httpx.Request) -> httpx.Response:
+    """An openresty origin-403: NO cf-mitigated header, NO CF body markers, NOT CSRF."""
+    return httpx.Response(
+        403,
+        headers={"server": "openresty"},
+        content=b"<html>403 Forbidden (openresty)</html>",
+        request=req,
+    )
+
+
+def _origin_ctx(
+    transport: _RecordingTransport,
+    pins: object,
+    *,
+    solver: _OnDemandSolver | None = None,
+    opted: bool = True,
+) -> SourceContext:
+    """A cloudflare opted-in (or non-opted) ctx wiring the pinned-proxy singleton."""
+
+    def _is_origin_block(resp: httpx.Response) -> bool:
+        return resp.status_code == 403 and not is_cf_challenge(resp)
+
+    return SourceContext(
+        source_key="mangadot",
+        rate_limit_per_minute=6000,
+        session=SessionManager(transport),  # type: ignore[arg-type]
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+        solver=solver,  # type: ignore[arg-type]
+        antibot="cloudflare",
+        source_pins=pins,  # type: ignore[arg-type]
+        solve_search_via_proxy_pool=opted,
+        is_origin_block_fn=_is_origin_block if opted else None,
+        image_proxy_max_attempts=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_origin_block_rotates_resolves_and_retries_to_success() -> None:
+    """(a) An opted-in origin-403 triggers ONE rotation + a forced re-solve on the new
+    IP + a retry that succeeds."""
+    req = httpx.Request("GET", _URL)
+    transport = _RecordingTransport([_origin_403(req), _ok(req)])
+    pins = _CountingPins(available=3, transport=transport)
+    solver = _OnDemandSolver(held=True)  # held so the first send does not solve
+
+    out = await _origin_ctx(transport, pins, solver=solver).get_json(_URL)
+
+    assert out == {"code": 200, "data": []}
+    assert pins.rotate_calls == 1  # exactly ONE rotation
+    assert solver.forced == 1  # re-solved on the rotated IP (D-05)
+    assert len(transport.calls) == 2  # origin-403 + the rotated retry
+
+
+@pytest.mark.asyncio
+async def test_cf_challenge_403_resolves_in_place_without_rotating() -> None:
+    """(b) A CF-challenge 403 re-solves IN PLACE — NO rotation (D-35 unchanged)."""
+    req = httpx.Request("GET", _URL)
+    transport = _RecordingTransport([_cf_403(req), _ok(req)])
+    pins = _CountingPins(available=3, transport=transport)
+    solver = _OnDemandSolver()
+
+    out = await _origin_ctx(transport, pins, solver=solver).get_json(_URL)
+
+    assert out == {"code": 200, "data": []}
+    assert pins.rotate_calls == 0  # CF re-solves in place, never rotates
+    assert solver.forced == 1  # exactly one in-place forced re-solve
+    assert len(transport.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_origin_block_exhaustion_raises_source_unavailable() -> None:
+    """(c) Budget exhaustion (rotate returns None) → terminal source_unavailable."""
+    req = httpx.Request("GET", _URL)
+    # Every send returns an origin-403; the pool exhausts after 1 rotate.
+    transport = _RecordingTransport([_origin_403(req) for _ in range(6)])
+    pins = _CountingPins(available=0, transport=transport)  # first rotate returns None
+    solver = _OnDemandSolver(held=True)
+
+    with pytest.raises(SourceError) as exc:
+        await _origin_ctx(transport, pins, solver=solver).get_json(_URL)
+    assert exc.value.code == "source_unavailable"
+    assert pins.rotate_calls == 1  # tried to rotate once, got None → terminal
+
+
+@pytest.mark.asyncio
+async def test_non_opted_source_origin_403_never_rotates() -> None:
+    """(d) A non-opted source's origin-403 NEVER rotates — it hits the unchanged
+    source_unavailable raise (regression: _is_origin_block_fn is None)."""
+    req = httpx.Request("GET", _URL)
+    transport = _RecordingTransport([_origin_403(req)])
+    pins = _CountingPins(available=3, transport=transport)
+
+    with pytest.raises(SourceError) as exc:
+        await _origin_ctx(transport, pins, opted=False).get_json(_URL)
+    assert exc.value.code == "source_unavailable"
+    assert pins.rotate_calls == 0  # non-opted ⇒ predicate None ⇒ no rotation
+    assert len(transport.calls) == 1  # one request, no retry
