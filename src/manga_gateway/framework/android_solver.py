@@ -50,6 +50,8 @@ if TYPE_CHECKING:
 
     from pydantic import SecretStr
 
+    from .source_pin import SourcePinnedProxies
+
 _log = logging.getLogger("manga_gateway")
 
 # Proactive-refresh tuning (D-35 follow-up: keep the ~11s solve off the request hot
@@ -362,6 +364,15 @@ class AndroidSolver:
         # emit_solve/emit_eval metric events so a solve/eval is attributable to its
         # lane. Defaults to "default" (the sole lane in the single-lane collapse).
         lane: str = "default",
+        # Phase 16 (PROXY-04/PROXY-06): the R1 per-source pinned-proxy singleton + the
+        # set of source keys (this lane's slice) that opted into search+solve proxying.
+        # When a /solve fires for an opted-in key, the body's ``proxy`` is OVERRIDDEN
+        # with that source's CURRENT pin (read via ``current`` — the search/ctx path
+        # acquires it) so the solve egress matches the httpx-fetch egress byte-equal.
+        # Both default None ⇒ no override ⇒ the global ``proxy`` (or none) is used,
+        # byte-for-byte today.
+        source_pins: SourcePinnedProxies | None = None,
+        solve_search_keys: set[str] | frozenset[str] | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
@@ -380,6 +391,10 @@ class AndroidSolver:
         }
         self._timeout_s = timeout_s
         self._proxy = proxy
+        # Phase 16 (PROXY-04/PROXY-06): stored references only — Task 3 wires the /solve
+        # body override. Default None/empty ⇒ no opted-in source ⇒ byte-for-byte today.
+        self._source_pins = source_pins
+        self._solve_search_keys = frozenset(solve_search_keys or ())
         # LANE-02 / OBS-01 (Plan 15-04): this lane's adb target (forwarded as the
         # sidecar ``target`` only when set) + the lane label stamped on metric emits.
         self._adb_target = adb_target
@@ -1113,6 +1128,22 @@ class AndroidSolver:
         body: dict[str, object] = {"challenge_url": challenge_url}
         if self._proxy is not None:
             body["proxy"] = self._proxy
+        # Phase 16 (PROXY-04/PROXY-06, D-07): per-source OVERRIDE. For a source that
+        # opted into search+solve proxying (``solve_search_via_proxy_pool``, this lane's
+        # slice in ``_solve_search_keys``) the /solve egress MUST match the source's
+        # PINNED residential IP — the SAME pin the search/image httpx legs use, so the
+        # cf_clearance is valid on that IP and the sidecar's byte-equal egress-verify
+        # passes (Pitfall 3 / debug mangadot-turnstile-cf / landmine
+        # android-proxied-solve-needs-sticky-session). PEEK the pin via ``current`` (the
+        # search/ctx path is the one that ACQUIRES; the solve reads the SAME pin so both
+        # legs share ONE egress IP — RESEARCH Option A, one source of truth). When a pin
+        # is set it OVERRIDES the global ``self._proxy``; a non-opted source keeps the
+        # global (PROXY-06 / D-07). The dict carries creds via ``as_solve_dict`` and is
+        # passed VERBATIM, NEVER logged (T-16-03 / T-10-04).
+        if source_key in self._solve_search_keys and self._source_pins is not None:
+            pin = self._source_pins.current(source_key)
+            if pin is not None:
+                body["proxy"] = pin.as_solve_dict()
         # LANE-02 (Plan 15-04): drive this lane's own redroid device. Gated like proxy —
         # ``None`` (single-lane collapse) sends NO ``target`` key (byte-for-byte today).
         if self._adb_target is not None:

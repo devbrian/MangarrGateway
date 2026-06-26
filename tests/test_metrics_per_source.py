@@ -33,6 +33,7 @@ from manga_gateway.framework.enum_cache import EnumerationCache
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.framework.ratelimit import RateLimiter
 from manga_gateway.framework.session import SessionManager
+from manga_gateway.framework.source_pin import SourcePinnedProxies
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.metrics.collector import Collector, set_collector
 from manga_gateway.metrics.context import current_request, current_source
@@ -155,6 +156,9 @@ def _deps() -> dict[str, object]:
         "session_prep": None,
         "enum_cache": EnumerationCache(),
         "failure_cooldown": SourceFailureCooldown(base_seconds=30, max_seconds=600),
+        # Phase 16: the route now takes the pinned-proxy singleton; a pool-less
+        # singleton is a no-op (no source opts in here → search/recent unchanged).
+        "source_pins": SourcePinnedProxies(None),
     }
 
 
@@ -191,6 +195,7 @@ async def test_search_emits_per_source_and_final_counts(
             session_prep=cast("object", deps["session_prep"]),  # type: ignore[arg-type]
             enum_cache=cast("EnumerationCache", deps["enum_cache"]),
             failure_cooldown=cast("SourceFailureCooldown", deps["failure_cooldown"]),
+            source_pins=cast("SourcePinnedProxies", deps["source_pins"]),
         )
         # Umbrella request event (middleware emits this after the handler returns;
         # do it here with the stashed contextvar still live).
@@ -251,6 +256,7 @@ async def test_search_bad_request_still_stashes_request_blob(
             session_prep=cast("object", deps["session_prep"]),  # type: ignore[arg-type]
             enum_cache=cast("EnumerationCache", deps["enum_cache"]),
             failure_cooldown=cast("SourceFailureCooldown", deps["failure_cooldown"]),
+            source_pins=cast("SourcePinnedProxies", deps["source_pins"]),
         )
         c.emit_request(outcome="client_error", duration_ms=1.0, status=400)
     finally:
@@ -299,6 +305,7 @@ async def test_recent_emits_per_source_and_final_counts(
             health_map=cast("dict", deps["health_map"]),  # type: ignore[arg-type]
             session_prep=cast("object", deps["session_prep"]),  # type: ignore[arg-type]
             failure_cooldown=cast("SourceFailureCooldown", deps["failure_cooldown"]),
+            source_pins=cast("SourcePinnedProxies", deps["source_pins"]),
             sources=["alpha", "beta"],
             languages=None,
             limit=None,

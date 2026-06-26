@@ -253,6 +253,14 @@ class MangadotSource(Source):
     # fingerprint class that DOES clear it (proven end-to-end). This one-line attr is
     # the only per-source code the engine switch needs.
     solver_engine = "android"
+    # PROXY-08 / D-01 (debug session ``mangadot-turnstile-cf``): route mangadot's
+    # SEARCH + CF-SOLVE egress through the shared residential ``ProxyPool`` (pinned per
+    # source). Root cause: mangadot.net's origin returns an openresty-403 BEYOND
+    # Cloudflare on the gateway's datacenter egress IP (AS26793) — a 403 on the search +
+    # solve legs the image pool never covered; a sticky residential IP shared across
+    # solve+search+image unblocks it. First opt-in; mirrors mangafire's
+    # ``image_fetch_via_proxy_pool = True`` one-line style and is independent of it.
+    solve_search_via_proxy_pool = True
     decrypt_scheme = None
     session_prep = None
     supports_search = True

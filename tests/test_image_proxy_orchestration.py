@@ -20,7 +20,7 @@ from typing import Any
 
 import httpx
 
-from manga_gateway.framework.context import _ACTIVE_IMAGE_PROXY, SourceContext
+from manga_gateway.framework.context import _ACTIVE_PROXY, SourceContext
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.framework.proxy_pool import PooledProxy
 from manga_gateway.framework.ratelimit import RateLimiter
@@ -32,7 +32,7 @@ _HOST = "proxy.invalid"
 
 def _active() -> PooledProxy | None:
     """The in-flight proxy for the CURRENT task (task-local ContextVar)."""
-    return _ACTIVE_IMAGE_PROXY.get()
+    return _ACTIVE_PROXY.get()
 
 
 class _RecordingTransport:

@@ -21,6 +21,8 @@ from ..models.caps import AntibotLevel, SourceCap
 if TYPE_CHECKING:
     from decimal import Decimal
 
+    import httpx
+
     from ..models.search import ExternalLinks, Release, SearchRequest
     from .context import SourceContext
     from .health import SourceHealth
@@ -119,9 +121,25 @@ class Source(ABC):
     # (+cooldown), and routes every inner ``ctx.get_bytes`` (incl. the source's own
     # per-page zone-retry) through that one proxy. The NEXT image-CDN source enables it
     # with this single one-line flip — zero networking code. ``False`` (default) = every
-    # existing source unchanged / DIRECT egress (search + the CF solve are never given a
-    # pool regardless). Mirrors the ``reresolve_manifest_on_403`` opt-out precedent.
+    # existing source unchanged / DIRECT egress for the IMAGE leg. This flag governs
+    # ONLY ``fetch_image``; the SEARCH (``ctx.get_json``/``get_json_array``/
+    # ``post_json``) and the CF-solve (android ``/solve``) legs are governed
+    # INDEPENDENTLY by ``solve_search_via_proxy_pool`` below (default off). Mirrors the
+    # ``reresolve_manifest_on_403`` opt-out precedent.
     image_fetch_via_proxy_pool: bool = False
+    # PROXY-02 / D-01 / D-02 opt-in (debug session ``mangadot-turnstile-cf``): route
+    # THIS source's SEARCH (``ctx.get_json``/``get_json_array``/``post_json``) AND its
+    # CF-SOLVE (android ``/solve``) egress through the shared residential ``ProxyPool``,
+    # pinned PER SOURCE (one IP across solve+search+image while the clearance is valid —
+    # D-04). The framework (Plan 02) reads this via ``getattr(source,
+    # "solve_search_via_proxy_pool", False)`` at the ctx sites + solver dispatch (NEVER
+    # names a source by key) and threads the source's pinned ``SourcePinnedProxies``
+    # proxy into both legs, rotating the pinned IP when ``is_origin_block`` fires.
+    # ``False`` (default) = direct/unchanged. This MIRRORS
+    # ``image_fetch_via_proxy_pool`` and is INDEPENDENT of it (a source may opt into one
+    # and not the other). The mangadot openresty-403 (a 403 BEYOND Cloudflare, on the
+    # search + solve legs the image pool never covered) is the first opt-in.
+    solve_search_via_proxy_pool: bool = False
     # D-30 / WR-02 per-source override: max concurrent download JOBS for THIS source.
     # ``None`` = use the global ``settings.max_concurrent_per_source`` default. A source
     # the rate-limit probe shows tolerates parallel chapter downloads sets this
@@ -249,3 +267,27 @@ class Source(ABC):
         abstract method, no required change.
         """
         return None
+
+    def is_origin_block(self, resp: httpx.Response) -> bool:
+        """True iff ``resp`` is an ORIGIN reputation-block → rotate the pinned IP.
+
+        PROXY-07 / D-08 rotation-trigger policy: the overridable per-source predicate
+        the framework (Plan 02) consults to decide whether a 403 on the proxied
+        search/solve leg means the PINNED residential IP is reputation-blocked at the
+        ORIGIN (beyond Cloudflare) and should be rotated — distinct from a CF challenge
+        (D-35: force-solve + retry) or a CSRF/WAF 403 (D-03: refresh/strip + retry),
+        which keep their OWN branches and are subtracted by the Plan 02 caller BEFORE
+        this hook is consulted.
+
+        Default body: a 403 that is NOT a Cloudflare challenge (``is_cf_challenge``).
+        This matches the documented mangadot openresty origin-403 signature (assumption
+        A1 — a 403 with no ``cf-mitigated`` header and no CF body markers; the signature
+        table proves origin-403 is distinguishable from a CF/CSRF/WAF 403). A source
+        whose origin-block signature differs OVERRIDES this. Pure predicate — no I/O.
+
+        ``is_cf_challenge`` is imported LAZILY here to avoid a base.py <-> context.py
+        import cycle (context.py imports the ``Source`` base for typing).
+        """
+        from .context import is_cf_challenge
+
+        return resp.status_code == 403 and not is_cf_challenge(resp)

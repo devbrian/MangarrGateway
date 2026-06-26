@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .framework.registry import SourceRegistry
     from .framework.session import SessionManager
     from .framework.session_prep import SessionPrep
+    from .framework.source_pin import SourcePinnedProxies
     from .framework.transport import Transport
     from .handles.store import HandleStore
     from .jobs.manager import JobManager
@@ -60,6 +61,25 @@ def get_source_health(request: Request) -> dict[str, SourceHealth]:
     """
     health: dict[str, SourceHealth] = getattr(request.app.state, "source_health", {})
     return health
+
+
+def get_source_pinned_proxies(request: Request) -> SourcePinnedProxies:
+    """The lifespan-owned per-source pinned-proxy singleton (PROXY-03/PROXY-04, R1).
+
+    Mirrors ``get_solver``/``get_handle_store``: a READ-ONLY accessor that only reads
+    the singleton the lifespan built ONCE and stowed on
+    ``app.state.source_pinned_proxies`` — it MUST NOT construct anything per-request
+    (PLAT-02). Tolerates a pre-wired / unit app like ``get_source_health`` does: when
+    the attr is absent it falls back to a ``SourcePinnedProxies(None)`` (a pool-less,
+    method-returns-None singleton) so a unit app that never ran the full lifespan stays
+    green and the search/solve legs egress byte-for-byte as today.
+    """
+    from .framework.source_pin import SourcePinnedProxies  # noqa: PLC0415
+
+    pins: SourcePinnedProxies = getattr(
+        request.app.state, "source_pinned_proxies", None
+    ) or SourcePinnedProxies(None)
+    return pins
 
 
 def get_session_prep(request: Request) -> SessionPrep:

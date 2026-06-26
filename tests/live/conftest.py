@@ -65,6 +65,7 @@ from manga_gateway.framework.antibot import CloudflareSolver
 from manga_gateway.framework.lanes import DEFAULT_LANE
 from manga_gateway.framework.proxy import build_proxy
 from manga_gateway.framework.registry import SourceRegistry
+from manga_gateway.framework.source_pin import SourcePinnedProxies
 from manga_gateway.sources import register_builtin_sources
 
 from .profiles._base import LiveSmokeProfile
@@ -561,6 +562,20 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
     # IP — cf_clearance is IP-bound). app.py passes ``proxy=playwright_proxy``
     # UNCONDITIONALLY (None when unconfigured), so do the same here.
     playwright_proxy, _ = build_proxy(settings)
+    # Phase 16 (PROXY-04/PROXY-06): mirror the lifespan's pinned-proxy wiring. app.py
+    # builds ONE ``SourcePinnedProxies(image_proxy_pool)`` and passes it +
+    # ``solve_search_keys=(solve_search_keys & plan.source_keys)`` to each solver.
+    # The session-shared solver is the single-lane collapse (all android keys on one
+    # lane), so the slice is ``solve_search_keys & android_keys``. The pool is None here
+    # (the live session-shared solver is built without an image_proxy_pool) ⇒ the
+    # singleton is a no-op, byte-for-byte. Mirrored so the lockstep AST guard stays ok.
+    solve_search_keys = frozenset(
+        key
+        for key, cls in registry.items()
+        if getattr(cls, "solve_search_via_proxy_pool", False)
+    )
+    android_solve_search_keys = solve_search_keys & frozenset(android_sources)
+    source_pins = SourcePinnedProxies(None)
     # Lockstep with app.py's lifespan ``AndroidSolver(...)`` build: EVERY kwarg app.py
     # passes must appear here (``test_android_solver_kwargs_lockstep`` AST-asserts the
     # two sets are equal). ``clearance_lifetime_s`` (Lever A) + ``warm_gate_timeout_s``
@@ -586,6 +601,10 @@ def _build_session_android_solver_kwargs() -> dict[str, Any]:
         # AndroidSolver(...) build (which now passes adb_target=plan.adb_target + lane).
         "adb_target": None,
         "lane": DEFAULT_LANE,
+        # Phase 16 (PROXY-04/PROXY-06): the pinned-proxy singleton + this lane's slice
+        # of opted-in source keys, mirroring app.py's per-lane AndroidSolver(...) build.
+        "source_pins": source_pins,
+        "solve_search_keys": android_solve_search_keys,
     }
 
 

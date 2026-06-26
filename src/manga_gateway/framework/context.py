@@ -33,7 +33,7 @@ import inspect
 import json
 import logging
 import time
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
@@ -45,7 +45,7 @@ from .errors import SourceError
 
 _log = logging.getLogger("manga_gateway")
 
-# 260620-4im: the in-flight image proxy is TASK-LOCAL, not a shared ``ctx`` field.
+# 260620-4im: the in-flight active proxy is TASK-LOCAL, not a shared ``ctx`` field.
 # One ``SourceContext`` is shared by up to ``image_fetch_concurrency`` concurrent
 # page tasks (the engine runs ``_one`` under an ``asyncio.TaskGroup``), so a plain
 # ``self._active_proxy`` would let parallel ``fetch_image_via_pool`` calls clobber
@@ -55,9 +55,16 @@ _log = logging.getLogger("manga_gateway")
 # to its own await chain (incl. the inner ``_send_emitting`` read). Module-level
 # (NOT per instance) so frequent job contexts don't leak ContextVars.
 # ``_sticky_proxy`` stays a plain ``ctx`` field — per-JOB shared state, by design.
-_ACTIVE_IMAGE_PROXY: ContextVar[PooledProxy | None] = ContextVar(
-    "active_image_proxy", default=None
-)
+#
+# Phase 16: GENERALIZED from the old image-only contextvar to ``_ACTIVE_PROXY`` — it now
+# carries the active proxy for EITHER the image leg (``fetch_image_via_pool``) OR an
+# opted-in source's search leg (``_request_response`` pins the source's residential
+# IP). The routing semantics are identical (D-04 pins ONE IP across image+search), so
+# the rename is MECHANICAL (Pitfall 5). REGRESSION-CRITICAL: this contextvar is the
+# image dimension's hot path (the #65 / 260620-4im byte-for-byte contract), so the
+# rename was verified in isolation against the full image suite BEFORE any search-leg
+# pinning (STEP B) was layered on top of it.
+_ACTIVE_PROXY: ContextVar[PooledProxy | None] = ContextVar("active_proxy", default=None)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -74,6 +81,7 @@ if TYPE_CHECKING:
     from .ratelimit import RateLimiter
     from .session import SessionManager
     from .session_prep import SessionPrep
+    from .source_pin import SourcePinnedProxies
 
 # Permanent (non-retryable) upstream statuses — STOP, do not retry (Pattern 3).
 _PERMANENT_STATUSES = (401, 403, 404)
@@ -217,6 +225,9 @@ class SourceContext:
         proxy_pool: ProxyPool | None = None,
         image_via_proxy_pool: bool = False,
         image_proxy_max_attempts: int = 3,
+        source_pins: SourcePinnedProxies | None = None,
+        solve_search_via_proxy_pool: bool = False,
+        is_origin_block_fn: Callable[[httpx.Response], bool] | None = None,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -313,9 +324,22 @@ class SourceContext:
         self._image_proxy_max_attempts = image_proxy_max_attempts
         # The job's sticky proxy (reused across pages) — per-job shared state, correct
         # to live on the (per-job) ctx. The proxy currently IN FLIGHT is NOT here: it is
-        # the module-level ``_ACTIVE_IMAGE_PROXY`` ContextVar so concurrent page tasks
+        # the module-level ``_ACTIVE_PROXY`` ContextVar so concurrent page tasks
         # sharing this ctx don't clobber each other's routing (see the note above).
         self._sticky_proxy: PooledProxy | None = None
+        # Phase 16 search+solve proxy seam (PROXY-02..07, default-off ⇒ every existing
+        # caller AND every non-opted source byte-for-byte unchanged). UNLIKE the image
+        # seam above, the pin itself does NOT live on ctx (which is per-request, rebuilt
+        # each search): it lives on the shared R1 ``SourcePinnedProxies`` singleton,
+        # keyed per SOURCE, so the pinned IP OUTLIVES the per-request ctx rebuild (D-04:
+        # the IP the cf_clearance was minted on persists across the search/solve legs).
+        # ctx holds only: a REFERENCE to that singleton, this source's opt-in bool, and
+        # the source's bound ``is_origin_block`` predicate (the D-08 rotation trigger,
+        # threaded here at the four ctx-construction sites; Task 3 only CALLS it). All
+        # three are read via getattr at the call sites so no source is named by key.
+        self._source_pins = source_pins
+        self._solve_search_via_proxy_pool = solve_search_via_proxy_pool
+        self._is_origin_block_fn = is_origin_block_fn
 
     @property
     def handle_store(self) -> HandleStore:
@@ -939,13 +963,12 @@ class SourceContext:
         ``fetch_image`` (260620-4im). When no pool is wired OR this source did not opt
         in (the ``image_fetch_via_proxy_pool`` Source attribute, wired here as
         ``self._image_via_proxy_pool``) — and ALWAYS on the search path, which is
-        never given a pool — this is a transparent ``await fetch()``:
-        ``_ACTIVE_IMAGE_PROXY``
+        never given a pool — this is a transparent ``await fetch()``: ``_ACTIVE_PROXY``
         is never set, so transport routing stays byte-for-byte today (the regression
         contract).
 
         With a pool active it orchestrates, per call: pick the job's sticky proxy (or
-        ``acquire`` a fresh one), set ``_ACTIVE_IMAGE_PROXY`` so every inner
+        ``acquire`` a fresh one), set ``_ACTIVE_PROXY`` so every inner
         ``ctx.get_bytes``
         (incl. the source's per-page zone-retry) egresses through it, and run ``fetch``.
         On a fetch failure (``SourceError`` incl. upstream 403, or any
@@ -975,7 +998,7 @@ class SourceContext:
             tried.add(proxy.selection_key)
             # Set the in-flight proxy task-locally so concurrent page tasks sharing
             # this ctx route independently; ``reset`` in ``finally`` restores it.
-            token = _ACTIVE_IMAGE_PROXY.set(proxy)
+            token = _ACTIVE_PROXY.set(proxy)
             try:
                 result = await fetch()
             except (SourceError, httpx.HTTPError) as exc:
@@ -992,7 +1015,7 @@ class SourceContext:
                 )
                 continue
             finally:
-                _ACTIVE_IMAGE_PROXY.reset(token)
+                _ACTIVE_PROXY.reset(token)
             self._sticky_proxy = proxy  # first success becomes the new sticky
             _log.debug("image proxy %s served the fetch", proxy.identity)
             return result
@@ -1035,6 +1058,86 @@ class SourceContext:
         the SAME machinery as GET; httpx form-encodes ``data=dict`` as
         ``application/x-www-form-urlencoded``. Returns the validated response (after the
         STOP gate + ``raise_for_status``); callers decide whether to decrypt the body.
+
+        Phase 16 (PROXY-02/PROXY-06): for an opted-in source the request egress is
+        PINNED to the source's residential proxy. The set/reset of ``_ACTIVE_PROXY``
+        below makes ``_send_emitting`` pick ``transport_for(pin)`` for the initial
+        ``_send`` AND the forced reconcile retries AND (Task 3) the D-08 rotation retry:
+        ONE choke point covering ``get_json``/``get_json_array``/``post_json``. Guarded
+        so the IMAGE path (which already set ``_ACTIVE_PROXY`` in
+        ``fetch_image_via_pool`` for the download/image leg) WINS: the search-leg set
+        only fires when no proxy is
+        already active, so the image dimension is never double-wrapped (regression
+        contract). A non-opted/unpinned source leaves ``_ACTIVE_PROXY`` unset and falls
+        through to ``download_transport``/``transport`` exactly as today (PROXY-06
+        precedence is structural: a pinned proxy simply wins the transport pick).
+        """
+        pin_token: Token[PooledProxy | None] | None = self._set_search_pin()
+        try:
+            return await self._reconcile_request(
+                url,
+                params=params,
+                limited=limited,
+                method=method,
+                data=data,
+                json_body=json_body,
+                extra_headers=extra_headers,
+                op=op,
+                bucket=bucket,
+            )
+        finally:
+            if pin_token is not None:
+                _ACTIVE_PROXY.reset(pin_token)
+
+    def _set_search_pin(self) -> Token[PooledProxy | None] | None:
+        """Set ``_ACTIVE_PROXY`` to this source's pin for an opted-in search request.
+
+        Phase 16 (PROXY-02/PROXY-06). Returns the contextvar reset token when it set the
+        pin (the caller resets it in a ``finally``), or ``None`` when it set nothing
+        (the caller then skips the reset). Sets NOTHING (returns ``None``) when:
+
+        * this source did not opt in (``_solve_search_via_proxy_pool`` False) or there
+          is no pinned-proxy singleton (``_source_pins`` None) — non-opted regression
+          path; or
+        * a proxy is ALREADY active (``_ACTIVE_PROXY`` set): the image/download leg's
+          ``fetch_image_via_pool`` already pinned it, and that set MUST win (the search
+          leg never double-wraps the image path); or
+        * the pool is exhausted / disabled (``get_or_acquire`` returns ``None``) — the
+          request then egresses unpinned (the D-08 terminal is surfaced by the 403 gate,
+          not here).
+
+        ``_source_pins`` and ``_proxy_pool`` share the SAME underlying pool (both come
+        from the lifespan's one ``image_proxy_pool``), so the ``assert self._proxy_pool
+        is not None`` in ``_send_emitting`` holds whenever a pin is active here.
+        """
+        if not self._solve_search_via_proxy_pool or self._source_pins is None:
+            return None
+        if _ACTIVE_PROXY.get() is not None:
+            return None  # image/download leg already pinned — that set wins
+        pin = self._source_pins.get_or_acquire(self._source_key)
+        if pin is None:
+            return None  # pool exhausted/disabled — egress unpinned
+        return _ACTIVE_PROXY.set(pin)
+
+    async def _reconcile_request(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None,
+        limited: bool,
+        method: str = "GET",
+        data: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+        op: str = "request",
+        bucket: Literal["default", "download"] = "default",
+    ) -> httpx.Response:
+        """The send + CF/CSRF reconcile + permanent-4xx STOP body of a single request.
+
+        Split out of :meth:`_request_response` so the opted-in search pin (set/reset by
+        the caller around this whole body) covers the initial send, the forced reconcile
+        retries, AND the Task-3 D-08 rotation retry from ONE choke point. Behaviour is
+        byte-for-byte the pre-split path for every non-opted caller.
         """
         resp = await self._send(
             url,
@@ -1121,6 +1224,38 @@ class SourceContext:
                     "upstream WAF block (sanitizable query)",
                     status=resp.status_code,
                 )
+            # Phase 16 (PROXY-05/PROXY-07, D-08): an ORIGIN reputation-block 403 on an
+            # opted-in source's PINNED IP → rotate to a fresh IP, re-solve on it, retry.
+            # The per-source ``is_origin_block`` predicate (threaded onto
+            # ``_is_origin_block_fn`` by Task 1) is consulted ONLY here in the 403 path,
+            # so the happy path is untouched. Gated to OPTED-IN sources with a pin, and
+            # SUBTRACTS the CF/CSRF/WAF cases (cf_stale/csrf_stale already reconciled
+            # IN PLACE above on the same pin — D-35 unchanged; WAF raised just above) so
+            # only a SURVIVING non-CF, non-CSRF, non-WAF origin-403 rotates. A non-opted
+            # ctx (``_is_origin_block_fn is None``) skips this entirely and falls to the
+            # unchanged ``source_unavailable`` raise below.
+            origin_block = (
+                self._solve_search_via_proxy_pool
+                and self._source_pins is not None
+                and self._is_origin_block_fn is not None
+                and not cf_stale
+                and not csrf_stale
+                and not is_waf_block(resp)
+                and self._is_origin_block_fn(resp)
+            )
+            if origin_block:
+                return await self._rotate_and_retry_origin_block(
+                    url,
+                    params=params,
+                    limited=limited,
+                    method=method,
+                    data=data,
+                    json_body=json_body,
+                    extra_headers=extra_headers,
+                    op=op,
+                    bucket=bucket,
+                    status=resp.status_code,
+                )
             raise SourceError(
                 "source_unavailable",
                 f"upstream {resp.status_code}",
@@ -1128,6 +1263,101 @@ class SourceContext:
             )
         resp.raise_for_status()  # 5xx → HTTPStatusError → retried by _is_retryable
         return resp
+
+    async def _rotate_and_retry_origin_block(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None,
+        limited: bool,
+        method: str,
+        data: dict[str, Any] | None,
+        json_body: dict[str, Any] | None,
+        extra_headers: dict[str, str] | None,
+        op: str,
+        bucket: Literal["default", "download"],
+        status: int,
+    ) -> httpx.Response:
+        """D-08 origin-403 recovery: rotate the pin + re-solve on the new IP + retry.
+
+        Phase 16 (PROXY-05/PROXY-07, D-05/D-06/D-08). The debug evidence is decisive: a
+        FRESH clearance still origin-403'd 9s later on the SAME IP (debug
+        mangadot-turnstile-cf), so re-solving in place is provably useless — the IP is
+        reputation-blocked at the origin. Rotate FIRST, then ``force_cf=True`` (the next
+        ``_send`` re-mints clearance via the solver's ``force_resolve``, which pops
+        ``_held[source_key]`` and re-solves THROUGH the now-rotated pin — D-05 couples
+        rotation + re-clear), then retry the request through the new pin's transport.
+
+        Budget is ``image_proxy_max_attempts`` (D-06, default 3); exhaustion (``rotate``
+        returns ``None`` — every proxy on cooldown/excluded) raises the terminal
+        ``source_unavailable`` (T-4im-03 pattern). Rotation runs only with a pin active
+        (the caller gated ``_source_pins is not None``); ``_set_search_pin`` already set
+        ``_ACTIVE_PROXY``, so each rotation re-``set``s it to the new pin and the inner
+        ``_send_emitting`` picks ``transport_for(new_pin)``. The CF branch was already
+        tried IN PLACE upstream (cheap re-solve); only a surviving non-CF origin-403
+        reaches here, so the order composes (cheap CF re-solve first, expensive rotate
+        only if it survives).
+        """
+        assert self._source_pins is not None  # caller gated this
+        tried: set[str] = set()
+        current = _ACTIVE_PROXY.get()
+        if current is not None:
+            tried.add(current.selection_key)
+        for _ in range(self._image_proxy_max_attempts):
+            new_pin = self._source_pins.rotate(self._source_key, exclude=tried)
+            if new_pin is None:
+                # Pool exhausted — never re-use a known-bad IP (T-4im-03 terminal).
+                raise SourceError(
+                    "source_unavailable",
+                    "no proxy available for opted-in source (all proxies on cooldown)",
+                    status=status,
+                )
+            tried.add(new_pin.selection_key)
+            token = _ACTIVE_PROXY.set(new_pin)
+            try:
+                # force_cf=True: re-mint clearance on the NEW pin (D-05) + retry through
+                # the new pin's transport (the contextvar set above routes it).
+                resp = await self._send(
+                    url,
+                    params=params,
+                    limited=limited,
+                    force_cf=True,
+                    force_csrf=False,
+                    method=method,
+                    data=data,
+                    json_body=json_body,
+                    extra_headers=extra_headers,
+                    op=op,
+                    bucket=bucket,
+                )
+            finally:
+                _ACTIVE_PROXY.reset(token)
+            # The survivor is already the singleton's ``current(source_key)`` (rotate
+            # set it), so the NEXT request's ``_set_search_pin`` rides the working IP —
+            # no dangling contextvar set needed (the response below is already fetched).
+            if resp.status_code not in _PERMANENT_STATUSES:
+                resp.raise_for_status()  # 5xx → retried by tenacity
+                return resp
+            # Still blocked → if it is ANOTHER origin block, keep rotating; otherwise
+            # the new IP hit a different terminal 4xx (e.g. a 404) — stop rotating.
+            if self._is_origin_block_fn is None or not self._is_origin_block_fn(resp):
+                raise SourceError(
+                    "source_unavailable",
+                    f"upstream {resp.status_code}",
+                    status=resp.status_code,
+                )
+            _log.info(
+                "origin block on %s (source=%s op=%s) — rotated pin, retrying",
+                new_pin.identity,  # host:port only — NEVER creds (T-16-03)
+                self._source_key,
+                op,
+            )
+        # Budget spent, still origin-blocked on every rotated IP.
+        raise SourceError(
+            "source_unavailable",
+            "no proxy available for opted-in source (all proxies on cooldown)",
+            status=status,
+        )
 
     async def _request_bytes(
         self,
@@ -1280,18 +1510,27 @@ class SourceContext:
         5xx to the except branch, this classification is correct + harmless.)
         """
         start = time.perf_counter()
-        # Transport pick (three-way). 260620-4im: while a proxied ``fetch_image`` is in
-        # flight (the task-local ``_ACTIVE_IMAGE_PROXY`` is set), every inner
-        # ``ctx.get_bytes`` — including the source's own per-page zone-retries —
-        # egresses through the SAME proxy (proxy OUTER, source-logic INNER). The read
-        # is task-local so concurrent page fetches never cross-route. Otherwise route to
-        # the download pool on the download path, else the search pool (debug
-        # pool-starves-search-cooldown). All share ONE identity (clearance rides
-        # per-request headers), so this only picks which connection pool/egress.
-        active_proxy = _ACTIVE_IMAGE_PROXY.get()
+        # Transport pick (three-way). 260620-4im / Phase 16: while a proxied
+        # ``fetch_image`` OR an opted-in source's pinned search request is in flight
+        # (the task-local ``_ACTIVE_PROXY`` is set), every inner ``ctx.get_bytes`` /
+        # ``get_json``, incl. the source's per-page zone-retries, egresses the SAME
+        # proxy (proxy OUTER, source-logic INNER). The read is task-local so concurrent
+        # page fetches never cross-route. Otherwise route to the download pool on the
+        # download path, else the search pool (debug pool-starves-search-cooldown). All
+        # share ONE identity (clearance rides per-request headers), so this only picks
+        # which connection pool/egress.
+        active_proxy = _ACTIVE_PROXY.get()
         if active_proxy is not None:
-            assert self._proxy_pool is not None  # set iff a proxy is active
-            transport = self._proxy_pool.transport_for(active_proxy)
+            # The pool that owns the active pin builds its per-proxy transport. On the
+            # image/download leg that is ``self._proxy_pool``; on the opted-in SEARCH
+            # leg the ctx is NOT given a ``proxy_pool``, so fall back to the pool in the
+            # pinned-proxy singleton (Phase 16). Both are the SAME lifespan pool (D-03),
+            # so whichever is present caches one transport per proxy.
+            pool = self._proxy_pool or (
+                self._source_pins.pool if self._source_pins is not None else None
+            )
+            assert pool is not None  # set iff a proxy is active (one of the two pools)
+            transport = pool.transport_for(active_proxy)
         elif self._use_download_transport:
             transport = self._session.download_transport
         else:

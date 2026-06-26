@@ -38,6 +38,7 @@ from .framework.registry import SourceRegistry
 from .framework.session import SessionManager
 from .framework.session_prep import CsrfBootstrap
 from .framework.solver_router import SolverRouter
+from .framework.source_pin import SourcePinnedProxies
 from .framework.transport import HttpxTransport
 from .handles.store import open_handle_store
 from .jobs.manager import JobManager
@@ -178,11 +179,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.image_proxy_pool_file
         else None
     )
+    # Phase 16 (D-03): the SAME ``image_proxy_pool`` now serves BOTH the image leg AND
+    # the per-source search/solve leg — ONE pool, no second file/setting. The variable +
+    # ``app.state`` name are KEPT (not renamed) deliberately to minimize regression
+    # surface (Open Question 1: keep-the-name + comment); only the SCOPE widened.
     app.state.image_proxy_pool = image_proxy_pool
     if image_proxy_pool is not None:
         _log.info(
             "image proxy pool loaded %d proxies", image_proxy_pool.available_count()
         )
+    # Phase 16 (PROXY-03/PROXY-04, R1): the per-source pinned-proxy singleton, built
+    # ONCE over the shared pool and stowed on ``app.state`` — pins ONE residential IP
+    # per opted-in source across its search + CF-solve + image legs (D-04). It holds NO
+    # transports (the pool owns those), so it needs no ``aclose``. A ``None`` pool makes
+    # every method return None ⇒ the search/solve legs egress byte-for-byte as today.
+    source_pinned_proxies = SourcePinnedProxies(image_proxy_pool)
+    app.state.source_pinned_proxies = source_pinned_proxies
     # SRC-01: build the registry first so the rest of the lifespan can inspect
     # per-source metadata (antibot level, decrypt scheme) WITHOUT hardcoding any
     # source key by name. Adding the 50+ planned sources is a register call and
@@ -202,6 +214,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if getattr(cls, "antibot", "none").startswith("cloudflare")
     }
     cloudflare_keys: frozenset[str] = frozenset(cf_sources)
+    # Phase 16 (PROXY-03/PROXY-04): derive the set of sources that opted into per-source
+    # search+solve proxying via the declarative ``solve_search_via_proxy_pool`` attr —
+    # read off the class via getattr, NEVER a source key string literal (CLAUDE.md "the
+    # framework knows no source by name"). Sliced per AndroidSolver lane below.
+    solve_search_keys: frozenset[str] = frozenset(
+        key
+        for key, cls in registry.items()
+        if getattr(cls, "solve_search_via_proxy_pool", False)
+    )
     # Phase 10 (BOT-01/SRC-01/SRC-02): partition the cloudflare-gated sources by
     # ``Source.solver_engine`` (default ``"patchright"``). The PATCHRIGHT leg keeps
     # comix byte-for-byte unchanged; the ANDROID leg routes mangadot/kagane to the
@@ -476,6 +497,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             adb_target=plan.adb_target,
             # OBS-01: the non-secret lane label stamped onto this solver's metric emits.
             lane=lane_id,
+            # Phase 16 (PROXY-04/PROXY-06): the R1 pinned-proxy singleton + THIS lane's
+            # slice of opted-in source keys, so the /solve body reads the SAME pin the
+            # search/image legs use (ONE egress IP, Pitfall 3 egress-verify byte-eq).
+            # Sliced per lane like the other per-source kwargs; default None ⇒ no-op.
+            source_pins=source_pinned_proxies,
+            solve_search_keys=solve_search_keys & plan.source_keys,
         )
     # The eval_backend is the page-holder (comix) lane's AndroidSolver — the
     # off-Protocol eval_in_webview/device_session passthroughs route there so comix's
@@ -612,6 +639,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         source_health=source_health,
         session_prep=session_prep,
         image_proxy_pool=image_proxy_pool,
+        source_pinned_proxies=source_pinned_proxies,
     )
     # download-jobs-failed-23: REQUEUE in-flight jobs (not fail them) + project rows
     # (PLAT-03). The re-spawn happens AFTER the staging sweep below.

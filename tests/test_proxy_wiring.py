@@ -398,3 +398,236 @@ async def test_lifespan_no_proxy_leaves_android_solver_proxy_none() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
         assert app.state.solver._android_by_lane["default"]._proxy is None
+
+
+# ─────────── Phase 16 Task 1: R1 pinned-proxy singleton + read-only dep ───────────
+
+
+async def test_lifespan_builds_source_pinned_proxies_once() -> None:
+    """PROXY-03/R1: ``app.state.source_pinned_proxies`` is built ONCE in lifespan and
+    has stable identity across two reads (never reconstructed per-request)."""
+    from manga_gateway.app import create_app
+    from manga_gateway.framework.source_pin import SourcePinnedProxies
+
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        first = app.state.source_pinned_proxies
+        second = app.state.source_pinned_proxies
+        assert isinstance(first, SourcePinnedProxies)
+        assert first is second  # one identity — built once, never per-request
+
+
+def test_get_source_pinned_proxies_only_reads_never_constructs() -> None:
+    """PLAT-02: the dep READS ``request.app.state.source_pinned_proxies`` — when the
+    attr is present it returns THAT object (no new construction)."""
+    from types import SimpleNamespace
+
+    from manga_gateway.deps import get_source_pinned_proxies
+    from manga_gateway.framework.source_pin import SourcePinnedProxies
+
+    sentinel = SourcePinnedProxies(None)
+    fake_request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(source_pinned_proxies=sentinel))
+    )
+    out = get_source_pinned_proxies(fake_request)  # type: ignore[arg-type]
+    assert out is sentinel  # returned verbatim — read-only, no reconstruction
+
+
+def test_get_source_pinned_proxies_tolerates_unwired_app() -> None:
+    """A pre-wired / unit app (attr absent) falls back to a pool-less singleton so unit
+    apps stay green — every method returns None, search/solve egress unchanged."""
+    from types import SimpleNamespace
+
+    from manga_gateway.deps import get_source_pinned_proxies
+    from manga_gateway.framework.source_pin import SourcePinnedProxies
+
+    fake_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    out = get_source_pinned_proxies(fake_request)  # type: ignore[arg-type]
+    assert isinstance(out, SourcePinnedProxies)
+    assert out.current("mangadot") is None  # pool-less ⇒ no pin
+
+
+# ─────────── Phase 16 Task 1: is_origin_block_fn threaded into ctx sites ───────────
+
+
+def test_ctx_construction_threads_is_origin_block_for_opted_in_source() -> None:
+    """The bound ``is_origin_block`` predicate reaches ``SourceContext`` for an opted-in
+    source (the route/engine thread it; Task 3 only CALLS it). A non-opted source (no
+    such method) threads ``None`` — both via getattr, no source named by key."""
+    from manga_gateway.framework.context import SourceContext, is_cf_challenge
+    from manga_gateway.framework.ratelimit import RateLimiter
+    from manga_gateway.framework.session import SessionManager
+    from manga_gateway.framework.source_pin import SourcePinnedProxies
+    from manga_gateway.handles.store import HandleStore
+
+    class _OptedSource:
+        key = "mangadot"
+        solve_search_via_proxy_pool = True
+
+        def is_origin_block(self, resp: httpx.Response) -> bool:
+            return resp.status_code == 403 and not is_cf_challenge(resp)
+
+    class _PlainSource:
+        key = "mangadex"
+
+    pins = SourcePinnedProxies(None)
+
+    def _build(src: object) -> SourceContext:
+        # Mirror the route/engine getattr threading exactly.
+        return SourceContext(
+            source_key=src.key,  # type: ignore[attr-defined]
+            rate_limit_per_minute=6000,
+            session=SessionManager(_RecordingTransport()),  # type: ignore[arg-type]
+            ratelimiter=RateLimiter(),
+            handle_store=HandleStore(),
+            source_pins=pins,
+            solve_search_via_proxy_pool=getattr(
+                src, "solve_search_via_proxy_pool", False
+            ),
+            is_origin_block_fn=getattr(src, "is_origin_block", None),
+        )
+
+    opted = _build(_OptedSource())
+    assert opted._source_pins is pins
+    assert opted._solve_search_via_proxy_pool is True
+    # The predicate reached ctx and classifies an origin-403 as a block.
+    origin_403 = httpx.Response(403, request=httpx.Request("GET", "https://x/"))
+    assert opted._is_origin_block_fn is not None
+    assert opted._is_origin_block_fn(origin_403) is True
+
+    plain = _build(_PlainSource())
+    assert plain._solve_search_via_proxy_pool is False
+    assert plain._is_origin_block_fn is None  # non-opted ⇒ predicate is None
+
+
+class _RecordingTransport:
+    """Minimal transport so the ctx-threading test can build a SourceContext."""
+
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        return httpx.Response(200, request=httpx.Request(method, url))
+
+    async def aclose(self) -> None:  # pragma: no cover - interface completeness
+        pass
+
+
+# ─────────── Phase 16 Task 3: /solve body carries the pinned proxy override ───────────
+
+
+import json  # noqa: E402
+
+import respx  # noqa: E402
+from pydantic import SecretStr  # noqa: E402
+
+from manga_gateway.framework.android_solver import AndroidSolver  # noqa: E402
+from manga_gateway.framework.proxy_pool import PooledProxy  # noqa: E402
+
+_SIDECAR = "http://android-solver.invalid:8191"
+_SOLVE_PIN_PASS = "NOTAREALSECRET-pin9"  # distinctive sentinel, never a real credential
+_FAKE_SERVER_HOST = "proxy.invalid"
+
+
+class _OnePin:
+    """A SourcePinnedProxies-shaped fake exposing one PEEKED pin for a source."""
+
+    def __init__(self, pin: PooledProxy | None) -> None:
+        self._pin = pin
+
+    def current(self, source_key: str) -> PooledProxy | None:
+        return self._pin
+
+
+def _solve_response() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "cf_clearance": "android-minted-token",
+            "user_agent": "Mozilla/5.0 (Linux; Android 11) Chrome/120 Mobile",
+            "host": "mangadot.net",
+            "cf_clearance_expires": 2000000000.0,
+        },
+    )
+
+
+def _android(**over: object) -> AndroidSolver:
+    kwargs: dict[str, object] = {
+        "base_url": _SIDECAR,
+        "api_key": SecretStr("sidecar-secret"),
+        "challenge_urls": {"mangadot": "https://mangadot.net/"},
+        "timeout_s": 5.0,
+    }
+    kwargs.update(over)
+    return AndroidSolver(**kwargs)  # type: ignore[arg-type]
+
+
+@respx.mock
+async def test_solve_body_carries_pinned_proxy_for_opted_in_source() -> None:
+    """PROXY-04/PROXY-06: an opted-in source's /solve body OVERRIDES the global proxy
+    with the source's pinned ``as_solve_dict()`` so the solve egress matches the
+    search/image httpx egress (one IP)."""
+    bodies: list[dict[str, object]] = []
+
+    async def _capture(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return _solve_response()
+
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_capture)
+
+    pin = PooledProxy(_FAKE_SERVER_HOST, 9000, _FAKE_USER, SecretStr(_SOLVE_PIN_PASS))
+    solver = _android(
+        proxy={"server": "http://global.invalid:1"},  # the global to be overridden
+        source_pins=_OnePin(pin),
+        solve_search_keys={"mangadot"},
+    )
+    try:
+        await solver._solve("mangadot")  # type: ignore[attr-defined]
+    finally:
+        await solver.aclose()
+
+    assert len(bodies) == 1
+    # The pinned dict OVERRODE the global proxy.
+    assert bodies[0]["proxy"] == pin.as_solve_dict()
+    assert bodies[0]["proxy"] != {"server": "http://global.invalid:1"}
+
+
+@respx.mock
+async def test_solve_body_keeps_global_for_non_opted_source() -> None:
+    """PROXY-06/D-07: a source NOT in the opted-in key set keeps the global proxy (no
+    override) — byte-for-byte today."""
+    bodies: list[dict[str, object]] = []
+
+    async def _capture(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return _solve_response()
+
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=_capture)
+
+    pin = PooledProxy(_FAKE_SERVER_HOST, 9000, _FAKE_USER, SecretStr(_SOLVE_PIN_PASS))
+    solver = _android(
+        proxy={"server": "http://global.invalid:1"},
+        source_pins=_OnePin(pin),
+        solve_search_keys=set(),  # mangadot NOT opted in
+    )
+    try:
+        await solver._solve("mangadot")  # type: ignore[attr-defined]
+    finally:
+        await solver.aclose()
+
+    assert bodies[0]["proxy"] == {"server": "http://global.invalid:1"}
+
+
+@respx.mock
+async def test_solve_body_proxy_password_never_logged(caplog: Any) -> None:
+    """T-16-03: the pinned proxy dict carries creds but the password sentinel never
+    appears in ANY log record (host:port identity only)."""
+    respx.post(f"{_SIDECAR}/solve").mock(side_effect=lambda r: _solve_response())
+
+    pin = PooledProxy(_FAKE_SERVER_HOST, 9000, _FAKE_USER, SecretStr(_SOLVE_PIN_PASS))
+    solver = _android(source_pins=_OnePin(pin), solve_search_keys={"mangadot"})
+    try:
+        with caplog.at_level(logging.DEBUG, logger="manga_gateway"):
+            await solver._solve("mangadot")  # type: ignore[attr-defined]
+    finally:
+        await solver.aclose()
+
+    for record in caplog.records:
+        assert _SOLVE_PIN_PASS not in record.getMessage()
