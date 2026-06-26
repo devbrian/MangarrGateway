@@ -172,15 +172,23 @@ class KaganeSource(Source):
     # Predominantly English-translated aggregator; per-series ``translated_language``
     # gates the language filter (see :meth:`_language_wanted`).
     languages = ["en"]
-    # PROBE-MEASURED (2026-06-09, scripts/probe_rate_limits.py --no-proxy, local IP):
-    # the BINDING limit is the manifest token path — ``POST /api/integrity`` /
-    # ``POST /api/v2/books/{id}`` HARD-block above ~30/min with ``Retry-After: 30``
-    # (30 ok then 30 blocked at 60/min). The per-source limiter gates EVERY ``limited``
-    # call (search/series GET + both token POSTs), so it must sit under that ceiling:
-    # 24 = ~80% of the 30/min hard block, real headroom (the old conservative 30 sat
-    # exactly AT the block). search is slow (~3-4s/call) but never 429s; image bytes
-    # are ``get_bytes`` ``limited=False``-exempt (clean to 240/min, the probe cap).
-    rate_limit_per_minute = 24
+    # PROBE-MEASURED (2026-06-25, scripts/probe_rate_limits.py via residential proxies +
+    # the deploy android-solver) — the two paths throttle DIFFERENTLY, so 260625-rom
+    # splits them into two independent buckets (SRC-03 / D-30):
+    #   * SEARCH path — ``POST /api/v2/search/series`` + the chapter-list
+    #     ``GET /api/v2/series/{id}`` — is latency-bound with NO hard throttle (clean
+    #     ≥120/min). ⇒ ``rate_limit_per_minute = 60`` (safely under the clean ceiling).
+    #   * DOWNLOAD/token path — ``POST /api/integrity`` → ``POST /api/v2/books/{id}``
+    #     (inside ``fetch_manifest``) — HARD-blocks ~30/min with ``Retry-After``. ⇒
+    #     ``download_rate_limit_per_minute = 24`` (~80% of the 30/min block) on the
+    #     SEPARATE download bucket (both POSTs tagged ``bucket="download"``).
+    #   * image bytes stay ``get_bytes`` ``limited=False``-exempt (no limiter at all).
+    # WHY the split is clean: the chapter list is part of SEARCH (``GET series/{id}``),
+    # NOT the token path — so a download flood draining the 24/min token bucket can no
+    # longer starve interactive search into 30s timeouts (the old single 24/min bucket
+    # gated BOTH and let downloads exhaust the search budget).
+    rate_limit_per_minute = 60
+    download_rate_limit_per_minute = 24
     # D-30: the token path's tight 30/min bucket is the bottleneck (each job mints 2
     # token calls). 2 keeps concurrent jobs comfortably under it (the limiter paces the
     # 4 token calls of 2 jobs across the budget); image fetch is exempt. The job manager
@@ -376,7 +384,9 @@ class KaganeSource(Source):
             raise SourceError("source_unavailable", "empty kagane chapter id")
 
         # 1. integrity token (cf_clearance is injected by the framework for kagane.to).
-        integ = await ctx.post_json_body(f"{self.base_url}/api/integrity", body={})
+        integ = await ctx.post_json_body(
+            f"{self.base_url}/api/integrity", body={}, bucket="download"
+        )
         token = integ.get("token")
         if not isinstance(token, str) or not token:
             raise SourceError(
@@ -389,6 +399,7 @@ class KaganeSource(Source):
             body={},
             params={"is_datasaver": "false"},
             headers={"x-integrity-token": token},
+            bucket="download",
         )
         access_token = book.get("access_token")
         cache_url = book.get("cache_url")
