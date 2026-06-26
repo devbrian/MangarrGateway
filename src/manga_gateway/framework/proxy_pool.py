@@ -14,10 +14,12 @@ Layering (locked): the proxy is the OUTER, per-job-sticky dimension; a source's 
 per-page logic (e.g. MangaFire's ``mfcdnN`` zone-rewrite) runs INNER — one proxy is
 held for the whole inner fetch and is rotated only when the whole inner fetch fails.
 
-SECURITY (T-4im-01): a proxy password is a ``pydantic.SecretStr``;
-``get_secret_value()`` is unpacked ONLY inside :meth:`PooledProxy.httpx_proxy`, ridden
-on ``httpx.Proxy(auth=...)`` so it never enters a URL string. Logs / observability emit
-``host:port`` identity only (:attr:`PooledProxy.identity`), NEVER credentials. Mirrors
+SECURITY (T-4im-01): a proxy password is a ``pydantic.SecretStr``; its plaintext is
+unpacked ONLY inside :meth:`PooledProxy.httpx_proxy` (the httpx leg, ridden on
+``httpx.Proxy(auth=...)`` so it never enters a URL string) and
+:meth:`PooledProxy.as_solve_dict` (the android ``/solve`` body, Phase 16 — kept out of
+any URL and never logged). Logs / observability emit ``host:port`` identity only
+(:attr:`PooledProxy.identity`), NEVER credentials. Mirrors
 ``framework.proxy.build_proxy``.
 """
 
@@ -84,9 +86,10 @@ class PooledProxy:
     def httpx_proxy(self) -> httpx.Proxy | str:
         """The httpx ``proxy=`` value for this endpoint (mirrors ``build_proxy``).
 
-        With both a username and password set, the SOLE ``get_secret_value()`` unpack
-        site rides the secret on ``httpx.Proxy(auth=...)`` so the password never enters
-        the URL string. Otherwise the plain ``http://{host}:{port}`` URL is returned.
+        With both a username and password set, the secret-unpack rides the password on
+        ``httpx.Proxy(auth=...)`` so it never enters the URL string. Otherwise the plain
+        ``http://{host}:{port}`` URL is returned. (Per-phase unpack-site count is
+        asserted by the Phase 16 grep==2 criterion — this site + ``as_solve_dict``.)
         """
         if self.username is not None and self.password is not None:
             secret = self.password.get_secret_value()  # SOLE unpack site (T-4im-01)
@@ -95,6 +98,33 @@ class PooledProxy:
                 auth=(self.username, secret),
             )
         return f"http://{self.host}:{self.port}"
+
+    def as_solve_dict(self) -> dict[str, str]:
+        """The android ``/solve``-body proxy dict for THIS endpoint (PROXY-04/PROXY-06).
+
+        Produces the SAME ``{"server", "username"?, "password"?}`` shape
+        ``framework.proxy.build_proxy`` emits for its Playwright dict — the shape the
+        android solver's ``/solve`` body consumes — so the CF-solve leg egresses through
+        the same pinned residential IP as the search + image legs (debug session
+        ``mangadot-turnstile-cf``: the solve and search legs MUST share ONE egress dict
+        so the cf_clearance is minted on the IP the cleared requests then ride).
+
+        Key ``"server"`` = ``f"http://{host}:{port}"``; when BOTH a username and
+        password are set, ``"username"``/``"password"`` are added (plaintext). The
+        secret-unpack below is the SOLE NEW unpack site introduced this phase (T-4im-01)
+        — kept inside this method; the creds are NEVER embedded in a URL, and the
+        returned dict is NEVER logged. Mirrors :meth:`httpx_proxy` / ``build_proxy``;
+        consumed by the AndroidSolver ``/solve`` body in Plan 02.
+        """
+        server = f"http://{self.host}:{self.port}"
+        if self.username is not None and self.password is not None:
+            return {
+                "server": server,
+                "username": self.username,
+                # new unpack site (T-4im-01)
+                "password": self.password.get_secret_value(),
+            }
+        return {"server": server}
 
 
 class ProxyPool:
