@@ -267,16 +267,26 @@ async def test_android_solver_opted_in_keys_sliced_per_lane(
         assert "kagane" not in default_keys
 
 
-async def test_android_solver_no_opt_in_means_empty_slice() -> None:
-    """Regression-safe default: with NO source opted in (the pre-Plan-03 state), every
-    AndroidSolver's opted-in slice is empty ⇒ the /solve body keeps the global proxy
-    (byte-for-byte today)."""
+async def test_android_solver_non_opted_source_keeps_global_proxy() -> None:
+    """Regression-safe default: a source that does NOT opt in
+    (``solve_search_via_proxy_pool`` left False) never enters any AndroidSolver's
+    opted-in slice ⇒ its /solve body keeps the global proxy (byte-for-byte today).
+
+    Pre-Plan-03 this asserted EVERY slice was empty; Plan 03 (PROXY-08) opts mangadot
+    in, so the invariant is now the per-source one the slice actually protects: kagane
+    (the no-regression control) is never in any slice, while only opted-in sources are.
+    """
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
         solver = app.state.solver
         assert isinstance(solver, SolverRouter)
+        all_keys: frozenset[str] = frozenset()
         for android in solver._android_by_lane.values():
-            assert android._solve_search_keys == frozenset()
+            all_keys |= android._solve_search_keys
+        # kagane (control) must NOT be opted in — it stays on the global /solve proxy.
+        assert "kagane" not in all_keys
+        # The only opted-in source in the default registry is mangadot (PROXY-08).
+        assert all_keys == frozenset({"mangadot"})
 
 
 async def test_mangadex_resolves_no_clearance_with_real_solver() -> None:
