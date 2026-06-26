@@ -34,7 +34,7 @@ import json
 import logging
 import time
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 import tenacity
@@ -183,6 +183,7 @@ class SourceContext:
         *,
         source_key: str,
         rate_limit_per_minute: int,
+        download_rate_limit_per_minute: int | None = None,
         session: SessionManager,
         ratelimiter: RateLimiter,
         handle_store: HandleStore,
@@ -224,6 +225,21 @@ class SourceContext:
         # Shared across search + (future) download paths (SRC-03).
         self._limiter: AsyncLimiter = ratelimiter.for_source(
             source_key, rate_limit_per_minute
+        )
+        # 260625-rom / SRC-03 / D-30 optional SECOND bucket. Provisioned ONLY when the
+        # source opts in via ``download_rate_limit_per_minute`` (None ⇒ stays None ⇒
+        # single-bucket behavior byte-for-byte unchanged for every other source). The
+        # ``:download`` key suffix keeps the two app-global memoized limiters distinct
+        # (per ``RateLimiter.for_source``), so draining the token/DRM bucket never
+        # consumes the search bucket's tokens. ``_send`` selects this limiter only for a
+        # ``bucket="download"`` call AND only when it exists — a download-tagged call on
+        # a non-opted source falls back to ``self._limiter`` (regression-safe).
+        self._download_limiter: AsyncLimiter | None = (
+            ratelimiter.for_source(
+                f"{source_key}:download", download_rate_limit_per_minute
+            )
+            if download_rate_limit_per_minute is not None
+            else None
         )
         self._handle_store = handle_store
         self._warnings: list[tuple[str, str]] = []
@@ -598,7 +614,13 @@ class SourceContext:
             reraise=True,
         )
 
-    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+    async def get_json(
+        self,
+        url: str,
+        *,
+        bucket: Literal["default", "download"] = "default",
+        **params: Any,
+    ) -> dict[str, Any]:
         """GET ``url`` with ``params`` → parsed JSON, rate-limited + retried.
 
         Gates the limiter at the call site (CLAUDE.md). For a ``cloudflare*`` source it
@@ -613,7 +635,7 @@ class SourceContext:
         async def _attempt() -> dict[str, Any]:
             try:
                 body = await self._request_bytes(
-                    url, params=params, limited=True, op="get_json"
+                    url, params=params, limited=True, op="get_json", bucket=bucket
                 )
                 result = self._parse_json_object(body)
             except SourceError:
@@ -624,7 +646,13 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
-    async def get_json_array(self, url: str, **params: Any) -> list[Any]:
+    async def get_json_array(
+        self,
+        url: str,
+        *,
+        bucket: Literal["default", "download"] = "default",
+        **params: Any,
+    ) -> list[Any]:
         """GET ``url`` with ``params`` → parsed top-level JSON ARRAY, like
         :meth:`get_json` but parsing a bare list body rather than an object.
 
@@ -645,7 +673,7 @@ class SourceContext:
         async def _attempt() -> list[Any]:
             try:
                 body = await self._request_bytes(
-                    url, params=params, limited=True, op="get_json_array"
+                    url, params=params, limited=True, op="get_json_array", bucket=bucket
                 )
                 result = self._parse_json_array(body)
             except SourceError:
@@ -656,7 +684,13 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
-    async def post_json(self, url: str, *, data: dict[str, Any]) -> dict[str, Any]:
+    async def post_json(
+        self,
+        url: str,
+        *,
+        data: dict[str, Any],
+        bucket: Literal["default", "download"] = "default",
+    ) -> dict[str, Any]:
         """POST ``data`` as a form body → parsed JSON, rate-limited + retried.
 
         The form-POST twin of :meth:`get_json` for PHP/Laravel/Django backends whose
@@ -680,6 +714,7 @@ class SourceContext:
                     method="POST",
                     data=data,
                     op="post_json",
+                    bucket=bucket,
                 )
                 result = self._parse_json_object(body)
             except SourceError as exc:
@@ -703,6 +738,7 @@ class SourceContext:
         body: dict[str, Any],
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        bucket: Literal["default", "download"] = "default",
     ) -> dict[str, Any]:
         """POST a JSON request body → parsed JSON object, rate-limited + retried.
 
@@ -737,6 +773,7 @@ class SourceContext:
                     json_body=body,
                     extra_headers=headers,
                     op="post_json_body",
+                    bucket=bucket,
                 )
                 result = self._parse_json_object(raw)
             except SourceError:
@@ -747,7 +784,13 @@ class SourceContext:
 
         return await self._retrying()(_attempt)
 
-    async def get_json_plain(self, url: str, **params: Any) -> dict[str, Any]:
+    async def get_json_plain(
+        self,
+        url: str,
+        *,
+        bucket: Literal["default", "download"] = "default",
+        **params: Any,
+    ) -> dict[str, Any]:
         """Identical to :meth:`get_json` but BYPASSES the decrypt seam (D-39).
 
         Some ``cloudflare+encrypted`` sources mix plaintext + encrypted endpoints —
@@ -763,7 +806,12 @@ class SourceContext:
         async def _attempt() -> dict[str, Any]:
             try:
                 body = await self._request_bytes(
-                    url, params=params, limited=True, decrypt=False, op="get_json_plain"
+                    url,
+                    params=params,
+                    limited=True,
+                    decrypt=False,
+                    op="get_json_plain",
+                    bucket=bucket,
                 )
                 result = self._parse_json_object(body)
             except SourceError:
@@ -952,6 +1000,7 @@ class SourceContext:
         json_body: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         op: str = "request",
+        bucket: Literal["default", "download"] = "default",
     ) -> httpx.Response:
         """Single request → validated ``httpx.Response`` (clearance + 403 reconcile).
 
@@ -983,6 +1032,7 @@ class SourceContext:
             json_body=json_body,
             extra_headers=extra_headers,
             op=op,
+            bucket=bucket,
         )
         # Issue #172: do NOT pre-gate on ``status_code == 403``. ``is_cf_challenge``
         # recognizes Cloudflare 503 interstitials as challenges too, and it carries
@@ -1022,6 +1072,7 @@ class SourceContext:
                 json_body=json_body,
                 extra_headers=extra_headers,
                 op=op,
+                bucket=bucket,
             )
             # debug comix-recent-403 follow-up: distinguish "the re-solve could not
             # clear Cloudflare" from a plain post-refresh 403. When a CF challenge
@@ -1075,6 +1126,7 @@ class SourceContext:
         json_body: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         op: str = "request",
+        bucket: Literal["default", "download"] = "default",
     ) -> bytes:
         """Single request → optionally-decrypted body (delegates to
         :meth:`_request_response`).
@@ -1095,6 +1147,7 @@ class SourceContext:
             json_body=json_body,
             extra_headers=extra_headers,
             op=op,
+            bucket=bucket,
         )
         if not decrypt:
             return resp.content
@@ -1113,6 +1166,7 @@ class SourceContext:
         json_body: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         op: str = "request",
+        bucket: Literal["default", "download"] = "default",
     ) -> httpx.Response:
         """Inject credentials (D-02/D-40) and issue ONE request (gated iff ``limited``).
 
@@ -1164,8 +1218,18 @@ class SourceContext:
         # counts come for free.
         attempt = 2 if force_cf else 1
         if limited:
+            # 260625-rom / SRC-03: pick the bucket. A ``bucket="download"`` call uses the
+            # separate download limiter ONLY when this source opted in (provisioned it);
+            # otherwise it FALLS BACK to the primary limiter — so a download-tagged call
+            # on a non-opted source is byte-for-byte unchanged. Every ``default`` call,
+            # and every call on a single-bucket source, gates the primary ``self._limiter``.
+            selected = (
+                self._download_limiter
+                if (bucket == "download" and self._download_limiter is not None)
+                else self._limiter
+            )
             wait_start = time.perf_counter()
-            async with self._limiter:  # gate at CALL SITE (aiolimiter caveat)
+            async with selected:  # gate at CALL SITE (aiolimiter caveat)
                 wait_ms = (time.perf_counter() - wait_start) * 1000.0
                 self._emit_limiter_wait(wait_ms)
                 return await self._send_emitting(

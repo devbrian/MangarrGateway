@@ -510,6 +510,9 @@ class JobEngine:
         return SourceContext(
             source_key=key,
             rate_limit_per_minute=source.rate_limit_per_minute,  # type: ignore[attr-defined]
+            download_rate_limit_per_minute=getattr(
+                source, "download_rate_limit_per_minute", None
+            ),
             session=self._session,
             ratelimiter=self._ratelimiter,
             handle_store=self._handle_store,
