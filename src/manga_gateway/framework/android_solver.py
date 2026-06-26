@@ -50,6 +50,8 @@ if TYPE_CHECKING:
 
     from pydantic import SecretStr
 
+    from .source_pin import SourcePinnedProxies
+
 _log = logging.getLogger("manga_gateway")
 
 # Proactive-refresh tuning (D-35 follow-up: keep the ~11s solve off the request hot
@@ -362,6 +364,15 @@ class AndroidSolver:
         # emit_solve/emit_eval metric events so a solve/eval is attributable to its
         # lane. Defaults to "default" (the sole lane in the single-lane collapse).
         lane: str = "default",
+        # Phase 16 (PROXY-04/PROXY-06): the R1 per-source pinned-proxy singleton + the
+        # set of source keys (this lane's slice) that opted into search+solve proxying.
+        # When a /solve fires for an opted-in key, the body's ``proxy`` is OVERRIDDEN
+        # with that source's CURRENT pin (read via ``current`` — the search/ctx path
+        # acquires it) so the solve egress matches the httpx-fetch egress byte-equal.
+        # Both default None ⇒ no override ⇒ the global ``proxy`` (or none) is used,
+        # byte-for-byte today.
+        source_pins: SourcePinnedProxies | None = None,
+        solve_search_keys: set[str] | frozenset[str] | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         # Strip a trailing slash so ``f"{base}/solve"`` never doubles it.
@@ -380,6 +391,10 @@ class AndroidSolver:
         }
         self._timeout_s = timeout_s
         self._proxy = proxy
+        # Phase 16 (PROXY-04/PROXY-06): stored references only — Task 3 wires the /solve
+        # body override. Default None/empty ⇒ no opted-in source ⇒ byte-for-byte today.
+        self._source_pins = source_pins
+        self._solve_search_keys = frozenset(solve_search_keys or ())
         # LANE-02 / OBS-01 (Plan 15-04): this lane's adb target (forwarded as the
         # sidecar ``target`` only when set) + the lane label stamped on metric emits.
         self._adb_target = adb_target

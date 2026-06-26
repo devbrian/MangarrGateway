@@ -24,6 +24,7 @@ from ...deps import (
     get_session_prep,
     get_solver,
     get_source_health,
+    get_source_pinned_proxies,
 )
 
 # Runtime imports: FastAPI resolves the route's Annotated[T, Depends(...)] types at
@@ -38,6 +39,7 @@ from ...framework.ratelimit import RateLimiter
 from ...framework.registry import SourceRegistry
 from ...framework.session import SessionManager
 from ...framework.session_prep import SessionPrep
+from ...framework.source_pin import SourcePinnedProxies
 from ...handles.store import HandleStore
 from ...metrics.collector import get_collector
 from ...metrics.context import stash_request_blob, stash_request_result
@@ -137,6 +139,7 @@ async def get_recent(
     health_map: Annotated[dict[str, SourceHealth], Depends(get_source_health)],
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
     failure_cooldown: Annotated[SourceFailureCooldown, Depends(get_failure_cooldown)],
+    source_pins: Annotated[SourcePinnedProxies, Depends(get_source_pinned_proxies)],
     sources: Annotated[
         list[str] | None,
         Query(description="Source keys: repeated param (?sources=a&sources=b) or CSV"),
@@ -194,6 +197,15 @@ async def get_recent(
             # 260606-lyb Change 1: the SEARCH/recent path retries once (2 attempts)
             # so a down source fails fast; downloads/jobs keep the default 4.
             retry_attempts=2,
+            # Phase 16 (PROXY-03/PROXY-04): full kwarg parity with search.py — the R1
+            # pinned-proxy singleton + this source's opt-in flag + its bound
+            # ``is_origin_block`` predicate, all read via getattr (no source named by
+            # key; a non-opted source threads False/None ⇒ byte-for-byte today).
+            source_pins=source_pins,
+            solve_search_via_proxy_pool=getattr(
+                src, "solve_search_via_proxy_pool", False
+            ),
+            is_origin_block_fn=getattr(src, "is_origin_block", None),
         )
         releases = await src.recent(
             languages=language_list,

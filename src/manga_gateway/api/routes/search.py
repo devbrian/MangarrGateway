@@ -26,6 +26,7 @@ from ...deps import (
     get_session_prep,
     get_solver,
     get_source_health,
+    get_source_pinned_proxies,
 )
 from ...errors import _error
 
@@ -42,6 +43,7 @@ from ...framework.ratelimit import RateLimiter
 from ...framework.registry import SourceRegistry
 from ...framework.session import SessionManager
 from ...framework.session_prep import SessionPrep
+from ...framework.source_pin import SourcePinnedProxies
 from ...handles.store import HandleStore
 from ...metrics.collector import get_collector
 from ...metrics.context import stash_request_blob, stash_request_result
@@ -132,6 +134,7 @@ async def search(
     session_prep: Annotated[SessionPrep, Depends(get_session_prep)],
     enum_cache: Annotated[EnumerationCache, Depends(get_enum_cache)],
     failure_cooldown: Annotated[SourceFailureCooldown, Depends(get_failure_cooldown)],
+    source_pins: Annotated[SourcePinnedProxies, Depends(get_source_pinned_proxies)],
 ) -> ReleaseListResponse | JSONResponse:
     """Fan out the search across selected sources; isolate failures into warnings[]."""
     # 260605-e9a deliverable 1: capture the request blob (method/path/query from
@@ -192,6 +195,15 @@ async def search(
             # down source fails fast on a repeat search; downloads/jobs keep the
             # default 4-attempt budget (they never pass retry_attempts).
             retry_attempts=2,
+            # Phase 16 (PROXY-03/PROXY-04): thread the R1 pinned-proxy singleton + this
+            # source's declarative opt-in + its bound ``is_origin_block`` predicate (the
+            # D-08 rotation trigger). Read via getattr so no source is named by key; a
+            # non-opted source threads False/None and egresses byte-for-byte today.
+            source_pins=source_pins,
+            solve_search_via_proxy_pool=getattr(
+                src, "solve_search_via_proxy_pool", False
+            ),
+            is_origin_block_fn=getattr(src, "is_origin_block", None),
         )
         started = time.perf_counter()
         releases = await src.search(req, ctx)

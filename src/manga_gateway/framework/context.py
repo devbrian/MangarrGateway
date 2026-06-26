@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     from .ratelimit import RateLimiter
     from .session import SessionManager
     from .session_prep import SessionPrep
+    from .source_pin import SourcePinnedProxies
 
 # Permanent (non-retryable) upstream statuses — STOP, do not retry (Pattern 3).
 _PERMANENT_STATUSES = (401, 403, 404)
@@ -217,6 +218,9 @@ class SourceContext:
         proxy_pool: ProxyPool | None = None,
         image_via_proxy_pool: bool = False,
         image_proxy_max_attempts: int = 3,
+        source_pins: SourcePinnedProxies | None = None,
+        solve_search_via_proxy_pool: bool = False,
+        is_origin_block_fn: Callable[[httpx.Response], bool] | None = None,
     ) -> None:
         self._source_key = source_key
         self._session = session
@@ -316,6 +320,19 @@ class SourceContext:
         # the module-level ``_ACTIVE_IMAGE_PROXY`` ContextVar so concurrent page tasks
         # sharing this ctx don't clobber each other's routing (see the note above).
         self._sticky_proxy: PooledProxy | None = None
+        # Phase 16 search+solve proxy seam (PROXY-02..07, default-off ⇒ every existing
+        # caller AND every non-opted source byte-for-byte unchanged). UNLIKE the image
+        # seam above, the pin itself does NOT live on ctx (which is per-request, rebuilt
+        # each search): it lives on the shared R1 ``SourcePinnedProxies`` singleton,
+        # keyed per SOURCE, so the pinned IP OUTLIVES the per-request ctx rebuild (D-04:
+        # the IP the cf_clearance was minted on persists across the search/solve legs).
+        # ctx holds only: a REFERENCE to that singleton, this source's opt-in bool, and
+        # the source's bound ``is_origin_block`` predicate (the D-08 rotation trigger,
+        # threaded here at the four ctx-construction sites; Task 3 only CALLS it). All
+        # three are read via getattr at the call sites so no source is named by key.
+        self._source_pins = source_pins
+        self._solve_search_via_proxy_pool = solve_search_via_proxy_pool
+        self._is_origin_block_fn = is_origin_block_fn
 
     @property
     def handle_store(self) -> HandleStore:

@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     from ..framework.registry import SourceRegistry
     from ..framework.session import SessionManager
     from ..framework.session_prep import SessionPrep
+    from ..framework.source_pin import SourcePinnedProxies
     from ..handles.store import HandleStore
     from .store import JobStore
 
@@ -222,6 +223,7 @@ class JobEngine:
         source_health: dict[str, SourceHealth] | None = None,
         session_prep: SessionPrep | None = None,
         image_proxy_pool: ProxyPool | None = None,
+        source_pinned_proxies: SourcePinnedProxies | None = None,
     ) -> None:
         self._store = store
         self._registry = registry
@@ -234,6 +236,12 @@ class JobEngine:
         # source's ``fetch_image`` byte fetches route through it; unconfigured/non-opted
         # sources are byte-for-byte unchanged.
         self._image_proxy_pool = image_proxy_pool
+        # Phase 16 (PROXY-03/PROXY-04): the R1 per-source pinned-proxy singleton,
+        # threaded from app.state through JobManager like ``_image_proxy_pool`` is. The
+        # DOWNLOAD ctx joins it with the source's ``solve_search_via_proxy_pool`` opt-in
+        # + bound ``is_origin_block`` predicate so an opted-in download's manifest/solve
+        # legs pin the SAME residential IP. None ⇒ search/solve egress unchanged today.
+        self._source_pinned_proxies = source_pinned_proxies
         # Phase-4 anti-bot seams (defaulted so app.py without the Plan-04 wiring
         # still constructs; a cloudflare* download injects clearance + decrypts).
         self._solver = solver
@@ -538,6 +546,17 @@ class JobEngine:
             proxy_pool=self._image_proxy_pool,
             image_via_proxy_pool=getattr(source, "image_fetch_via_proxy_pool", False),
             image_proxy_max_attempts=self._settings.image_proxy_max_attempts,
+            # Phase 16 (PROXY-03/PROXY-04): thread the R1 pinned-proxy singleton + this
+            # source's ``solve_search_via_proxy_pool`` opt-in + its bound
+            # ``is_origin_block`` predicate (the D-08 rotation trigger). Read off the
+            # source class exactly like ``image_fetch_via_proxy_pool``/``antibot``; a
+            # non-opted source (flag False / predicate None) or an unconfigured
+            # singleton is byte-for-byte today on the search/solve legs.
+            source_pins=self._source_pinned_proxies,
+            solve_search_via_proxy_pool=getattr(
+                source, "solve_search_via_proxy_pool", False
+            ),
+            is_origin_block_fn=getattr(source, "is_origin_block", None),
         )
 
     async def _transition(self, job: Job, status: JobStatus) -> None:

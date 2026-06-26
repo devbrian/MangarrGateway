@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from ..framework.registry import SourceRegistry
     from ..framework.session import SessionManager
     from ..framework.session_prep import SessionPrep
+    from ..framework.source_pin import SourcePinnedProxies
     from ..handles.store import HandleStore, ResolutionRecord
     from ..models.download import SubmitRequest
     from .store import JobStore
@@ -122,6 +123,7 @@ class JobManager:
         source_health: dict[str, SourceHealth] | None = None,
         session_prep: SessionPrep | None = None,
         image_proxy_pool: ProxyPool | None = None,
+        source_pinned_proxies: SourcePinnedProxies | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -141,6 +143,7 @@ class JobManager:
             source_health=source_health,
             session_prep=session_prep,
             image_proxy_pool=image_proxy_pool,
+            source_pinned_proxies=source_pinned_proxies,
         )
 
     # ─────────────────────────── submit ───────────────────────────

@@ -217,6 +217,68 @@ async def test_disabled_source_in_lane_map_does_not_block_startup() -> None:
         assert isinstance(app.state.solver, SolverRouter)
 
 
+# ─────────── Phase 16 Task 1: pinned-proxy singleton threaded into solvers ───────────
+
+
+async def test_android_solver_receives_pinned_proxy_singleton() -> None:
+    """PROXY-04: every per-lane AndroidSolver is handed the ONE
+    ``app.state.source_pinned_proxies`` singleton (same identity) so the /solve body
+    can read the SAME pin the search/image legs use (one egress IP)."""
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        singleton = app.state.source_pinned_proxies
+        for android in solver._android_by_lane.values():
+            assert android._source_pins is singleton
+
+
+async def test_android_solver_opted_in_keys_sliced_per_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PROXY-04: each AndroidSolver receives only its OWN lane's slice of the opted-in
+    ``solve_search_via_proxy_pool`` source keys, derived via a registry comprehension
+    (never a key literal). Force-opt-in mangadot + kagane, then split kagane onto its
+    own lane and assert each solver carries only its slice."""
+    from manga_gateway.sources.kagane import KaganeSource
+    from manga_gateway.sources.mangadot import MangadotSource
+
+    monkeypatch.setattr(MangadotSource, "solve_search_via_proxy_pool", True)
+    monkeypatch.setattr(KaganeSource, "solve_search_via_proxy_pool", True)
+
+    app = create_app(
+        _settings(
+            android_lanes={
+                "default": "redroid:5555",
+                "kagane": "redroid-kagane:5555",
+            },
+            android_source_lane_map={"kagane": "kagane"},
+        )
+    )
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        # kagane lane carries ONLY kagane; the default lane has mangadot (NOT kagane).
+        assert solver._android_by_lane["kagane"]._solve_search_keys == frozenset(
+            {"kagane"}
+        )
+        default_keys = solver._android_by_lane["default"]._solve_search_keys
+        assert "mangadot" in default_keys
+        assert "kagane" not in default_keys
+
+
+async def test_android_solver_no_opt_in_means_empty_slice() -> None:
+    """Regression-safe default: with NO source opted in (the pre-Plan-03 state), every
+    AndroidSolver's opted-in slice is empty ⇒ the /solve body keeps the global proxy
+    (byte-for-byte today)."""
+    app = create_app(_settings())
+    async with app.router.lifespan_context(app):
+        solver = app.state.solver
+        assert isinstance(solver, SolverRouter)
+        for android in solver._android_by_lane.values():
+            assert android._solve_search_keys == frozenset()
+
+
 async def test_mangadex_resolves_no_clearance_with_real_solver() -> None:
     app = create_app(_settings())
     async with app.router.lifespan_context(app):
