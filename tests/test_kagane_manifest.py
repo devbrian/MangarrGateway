@@ -60,8 +60,19 @@ class _FakeCtxForManifest:
         body: dict[str, Any],
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        bucket: str = "default",
     ) -> dict[str, Any]:
-        self.calls.append((url, {"body": body, "params": params, "headers": headers}))
+        self.calls.append(
+            (
+                url,
+                {
+                    "body": body,
+                    "params": params,
+                    "headers": headers,
+                    "bucket": bucket,
+                },
+            )
+        )
         if url == _INTEGRITY:
             return {"token": "integ-jwt"}
         if url.startswith(f"{_BOOKS}/"):
@@ -93,6 +104,22 @@ async def test_fetch_manifest_three_calls_ordered_urls() -> None:
     assert book_url == f"{_BOOKS}/bookX"
     assert book_call["headers"] == {"x-integrity-token": "integ-jwt"}
     assert book_call["params"] == {"is_datasaver": "false"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_both_token_posts_use_download_bucket() -> None:
+    # 260625-rom / SRC-03: both token POSTs (integrity + book-token) must acquire the
+    # SEPARATE download limiter so a download flood cannot starve interactive search.
+    ctx = _FakeCtxForManifest()
+    await KaganeSource().fetch_manifest("bookX", ctx)  # type: ignore[arg-type]
+    assert len(ctx.calls) == 2
+    integ_url, integ_call = ctx.calls[0]
+    book_url, book_call = ctx.calls[1]
+    assert integ_url == _INTEGRITY
+    assert book_url == f"{_BOOKS}/bookX"
+    # The proof fetch_manifest tags BOTH POSTs onto the download bucket.
+    assert integ_call["bucket"] == "download"
+    assert book_call["bucket"] == "download"
 
 
 @pytest.mark.asyncio

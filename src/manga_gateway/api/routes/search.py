@@ -172,6 +172,9 @@ async def search(
         ctx = SourceContext(
             source_key=src.key,
             rate_limit_per_minute=src.rate_limit_per_minute,
+            download_rate_limit_per_minute=getattr(
+                src, "download_rate_limit_per_minute", None
+            ),
             session=session,
             ratelimiter=ratelimiter,
             handle_store=handle_store,
