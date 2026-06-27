@@ -441,19 +441,20 @@ class MangaFireSource(Source):
     #   * text/AJAX host (mangafire.to — /filter + /ajax/manga/{slug}/chapter): a real
     #     HTTP-429 CEILING. Fully clean at 120/min (0/120 throttled); 429 onset at
     #     300/min (103/300 blocked), worsening at 600 (370) and 960 (718). Parallelism
-    #     stayed clean to concurrency 32 at 120/min. 60 is the harness's conservative
-    #     ~50%-safety-fraction of the 120/min clean ceiling — a MEASURED ceiling, not a
-    #     floor (contrast atsumaru's 480 FLOOR). It governs the LIMITED get_json
-    #     chapter-list path (the high-volume fan-out path) and leaves host headroom for
-    #     the few UNLIMITED get_bytes /filter calls that share the same 429 ceiling.
+    #     stayed clean to concurrency 32 at 120/min. A 2026-06-27 re-probe reproduced
+    #     this exactly (clean at 120, 429 onset at 300). Raised 60→100: ~83% of the
+    #     120/min clean ceiling — still a margin under the edge but more fan-out
+    #     throughput than the prior conservative ~50% fraction. It governs the LIMITED
+    #     get_json chapter-list path (the high-volume fan-out path) and leaves host
+    #     headroom for the few UNLIMITED get_bytes /filter calls on the 429 ceiling.
     #   * image CDN (separate host): NO limit — clean to 960/min at concurrency 8 (a
     #     FLOOR). The get_bytes image path is exempt from this limiter (limited=False);
     #     its throughput is bounded by max_concurrent_jobs, not rate_limit_per_minute.
     #   * reader manifest (issue #314): now PURE httpx — the two signed reader AJAX
     #     calls (`/ajax/read/{slug}/chapter/{lang}` + `/ajax/read/chapter/{itemId}`)
     #     ride the SAME limited get_json path as the chapter list, so they fall under
-    #     the 60/min ceiling above (no separate browser-nav budget).
-    rate_limit_per_minute = 60
+    #     the 100/min ceiling above (no separate browser-nav budget).
+    rate_limit_per_minute = 100
     # D-30 per-source override — bounds concurrent download JOBS only (recent/search/
     # filter HTML use the separate per-source _CHAPTERS_FANOUT_CONCURRENCY semaphore,
     # not this knob). Issue #314 made the manifest BROWSERLESS (two signed httpx AJAX
