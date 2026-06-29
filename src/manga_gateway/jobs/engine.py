@@ -422,37 +422,58 @@ class JobEngine:
         results: list[tuple[str, bytes] | None] = [None] * len(manifest)
 
         async def _one(index: int, url: str) -> None:
-            async with sem:
-                # #70 (fix 3): wrap the page fetch so a genuine transport failure
-                # (httpx timeout/connect error, or a 5xx that exhausted tenacity's
-                # reraise=True retries) surfaces as a STRUCTURED, page-scoped
-                # ``SourceError("source_unavailable", "page N …")`` instead of a
-                # bare httpx exception that escapes the TaskGroup's ``except*
-                # SourceError`` and degrades to the generic "job failed". This is
-                # the realistic ~98s-then-generic-fail escape path from issue #70:
-                # ``ctx.get_bytes_plain`` retries transport errors/5xx and then
-                # re-raises the raw httpx error. The cause is still captured by the
-                # ``except Exception`` traceback log; this just gives the failure a
-                # specific, diagnosable shape.
-                try:
-                    # 260620-4im: wrap the fetch in the proxy-pool orchestration. When
-                    # the pool is inactive (unconfigured OR this source did not opt in)
-                    # ``fetch_image_via_pool`` is a transparent ``await fetch()``, so
-                    # the non-opted/unconfigured path is byte-for-byte unchanged. The
-                    # surrounding try/except stays as-is so a final httpx error from an
-                    # exhausted pool still maps to the page-scoped SourceError.
-                    content = await ctx.fetch_image_via_pool(
-                        lambda: source.fetch_image(url, ctx)  # type: ignore[attr-defined]
-                    )
-                except SourceError:
-                    raise
-                except httpx.HTTPError as exc:
-                    raise SourceError(
-                        "source_unavailable",
-                        f"page {index + 1} fetch failed: {type(exc).__name__}: {exc}",
-                    ) from exc
-            ok = await asyncio.to_thread(is_valid_image, content)
-            if not ok:
+            # 260628-t5u: the is_valid_image check MUST live inside the retry scope.
+            # A payload-integrity truncation is HTTP-complete (the body's
+            # Content-Length matches the delivered bytes — e.g. a WebP whose RIFF
+            # length field over-declares), so neither tenacity in get_bytes nor the
+            # proxy-pool rotation in fetch_image_via_pool ever classifies it as a
+            # failure — only the payload-level Pillow check catches it. Re-fetching
+            # with a short linear backoff lets the httpx keep-alive pool / CDN edge
+            # rotate, so a transient upstream truncation no longer deterministically
+            # fails a whole multi-page job (observed live on mangadot). ``1`` ⇒
+            # historic single-attempt behavior.
+            attempts = self._settings.image_fetch_validate_attempts
+            for attempt in range(attempts):
+                async with sem:
+                    # #70 (fix 3): wrap the page fetch so a genuine transport failure
+                    # (httpx timeout/connect error, or a 5xx that exhausted tenacity's
+                    # reraise=True retries) surfaces as a STRUCTURED, page-scoped
+                    # ``SourceError("source_unavailable", "page N …")`` instead of a
+                    # bare httpx exception that escapes the TaskGroup's ``except*
+                    # SourceError`` and degrades to the generic "job failed". This is
+                    # the realistic ~98s-then-generic-fail escape path from issue #70:
+                    # ``ctx.get_bytes_plain`` retries transport errors/5xx and then
+                    # re-raises the raw httpx error. The cause is still captured by the
+                    # ``except Exception`` traceback log; this just gives the failure a
+                    # specific, diagnosable shape.
+                    try:
+                        # 260620-4im: wrap the fetch in the proxy-pool orchestration.
+                        # When the pool is inactive (unconfigured OR this source did not
+                        # opt in) ``fetch_image_via_pool`` is a transparent
+                        # ``await fetch()``, so the non-opted/unconfigured path is
+                        # byte-for-byte unchanged. The surrounding try/except stays
+                        # as-is so a final httpx error from an exhausted pool still
+                        # maps to the page-scoped SourceError (and raises immediately —
+                        # a transport failure is NOT the truncation case this loop
+                        # retries).
+                        content = await ctx.fetch_image_via_pool(
+                            lambda: source.fetch_image(url, ctx)  # type: ignore[attr-defined]
+                        )
+                    except SourceError:
+                        raise
+                    except httpx.HTTPError as exc:
+                        raise SourceError(
+                            "source_unavailable",
+                            f"page {index + 1} fetch failed: "
+                            f"{type(exc).__name__}: {exc}",
+                        ) from exc
+                ok = await asyncio.to_thread(is_valid_image, content)
+                if ok:
+                    break
+                if attempt < attempts - 1:
+                    # let the keep-alive pool / CDN edge rotate before re-fetching
+                    await asyncio.sleep(0.5 * (attempt + 1))
+            else:
                 # #238: a bare "page N invalid" is undiagnosable — surface a cheap
                 # byte-length + magic-byte sniff + head preview of the non-image
                 # body so a recurrence (CDN HTML error / anti-bot challenge /

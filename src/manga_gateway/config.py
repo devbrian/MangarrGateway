@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     image_fetch_concurrency: int = Field(
         default=6, ge=1
     )  # D-31: per-job image-fetch bound
+    # 260628-t5u: bounded re-fetch attempts when a fetched page body fails
+    # is_valid_image. This is the payload-integrity-truncation case (HTTP-complete
+    # body — Content-Length matches — so neither tenacity in get_bytes nor the
+    # proxy-pool rotation ever see a transport failure; only Pillow's verify()
+    # rejects the truncated frame). Mirrors image_proxy_max_attempts. ``1`` ⇒
+    # historic single-attempt behavior (no re-fetch).
+    image_fetch_validate_attempts: int = Field(default=3, ge=1)
     db_path: str = "gateway.db"  # RESEARCH Open Q2: aiosqlite job store path
     # IN-05: cap the persisted terminal-job history so a long-running gateway
     # does not grow the projection / GET /downloads payload without bound.
