@@ -405,10 +405,17 @@ class MangaFireSource(Source):
 
         GETs ``/api/titles?order[chapter_updated_at]=desc&limit=`` (the bracket param is
         required — a plain ``sort=`` is silently ignored — so the URL is built via
-        ``urlencode``), then fans out the per-title chapter list under a bounded
-        semaphore and mints the NEWEST chapter DIRECT (the chapter id is always present,
-        no ``:DEFERRED``). The route applies the authoritative newest-first sort +
-        ``since`` cut; the source-side ``since`` is left to the route (IN-01).
+        ``urlencode``), then fans out PER TITLE under a bounded semaphore and mints the
+        NEWEST chapter DIRECT (the chapter id is always present, no ``:DEFERRED``).
+
+        Recent fetches ONLY page 1 of each title's chapter list
+        (``_chapters_page(hid, lang, 1)``): the newest chapter is page-1 row 0 in the
+        endpoint's newest-first (number desc) order, so the full ``_chapter_list``
+        pagination that ``search`` needs is pure waste here — it would fetch each
+        series' ENTIRE chapter history (``1 + Σ lastPage`` calls) just to read row 0.
+        Page-1-only holds recent at ``1 + N`` calls. The route applies the
+        authoritative newest-first sort + ``since`` cut; source-side ``since`` is left
+        to the route (IN-01).
         """
         lang = self._filter_language(languages)
         bound = min(_RECENT_TITLE_CAP, limit or _RECENT_TITLE_CAP)
@@ -418,8 +425,10 @@ class MangaFireSource(Source):
         async def _newest_release(
             hid: str, title_id: str, manga_title: str
         ) -> Release | None:
+            # Page 1 ONLY — newest chapter is row 0 (newest-first); never paginate the
+            # whole history for a single row (unlike search's _chapter_list).
             async with sem:
-                rows = await self._chapter_list(hid, lang, ctx)
+                rows, _ = await self._chapters_page(hid, lang, 1, ctx)
             newest = next(
                 (r for r in rows if isinstance(r, dict) and r.get("id") is not None),
                 None,
