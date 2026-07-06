@@ -3,9 +3,9 @@
 MangaFire page-image URLs ride a per-content-varying CDN host (``o48.mfcdn1.xyz``,
 etc.), so the host is NEVER pinned. The allowlist enforces only the STABLE
 invariants (D-10): ``https`` + public-host shape + ``/mf/`` path namespace + image
-extension + no ``..`` traversal. The ``#scr_{offset}`` scramble fragment is stripped
-BEFORE the path is matched, so a malicious fragment can never smuggle a path past the
-regex. These tests pin the accept/reject matrix.
+extension + no ``..`` traversal. Any URL fragment is stripped BEFORE the path is
+matched, so a malicious fragment can never smuggle a path past the regex. These tests
+pin the accept/reject matrix.
 """
 
 from __future__ import annotations
@@ -26,9 +26,9 @@ from manga_gateway.sources.mangafire import _is_allowed_image_url
         "https://l1n.mfcdn3.xyz/mf/deadbeef/h/01.jpg",
         "https://o48.mfcdn1.xyz/mf/abcdef0123/h/p.png",
         "https://o48.mfcdn1.xyz/mf/abcdef0123/h/p.jpeg",
-        # Belt-and-suspenders: a benign #scr_{offset} fragment is stripped first,
-        # so the underlying /mf/ image still ACCEPTS.
-        "https://o48.mfcdn1.xyz/mf/abcdef0123/h/p.jpg#scr_2",
+        # Belt-and-suspenders: a benign URL fragment is stripped first, so the
+        # underlying /mf/ image still ACCEPTS.
+        "https://o48.mfcdn1.xyz/mf/abcdef0123/h/p.jpg#frag",
     ],
 )
 def test_allows_wellformed_mf_image_urls(url: str) -> None:
@@ -62,7 +62,7 @@ def test_allows_wellformed_mf_image_urls(url: str) -> None:
         "https://o48.mfcdn1.xyz/mf/../etc/passwd.jpg",
         # Fragment-smuggled path: the REAL path (/secret.txt) is rejected even though
         # the fragment looks like a valid /mf/ image — the fragment is stripped first.
-        "https://o48.mfcdn1.xyz/secret.txt#scr_/mf/page.jpg",
+        "https://o48.mfcdn1.xyz/secret.txt#/mf/page.jpg",
         "https://o48.mfcdn1.xyz/mf/secret.php#.jpg",
     ],
 )

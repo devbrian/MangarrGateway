@@ -35,8 +35,6 @@ single lifespan path, single failure mode.
 from __future__ import annotations
 
 import asyncio
-import threading
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +43,6 @@ import pytest
 from ._helpers import (
     _assert_cbz_on_disk,
     _poll_until_terminal,
-    assert_descramble_preserves_quality,
     check_response_conforms,
     live_client_for,
 )
@@ -56,61 +53,6 @@ pytestmark = [
     pytest.mark.live,
     pytest.mark.parametrize("source_key", REGISTERED_KEYS),
 ]
-
-# Cap on captured (raw, out) page pairs kept for the post-download quality assertion
-# — the count is unbounded, but a handful of pairs is enough to prove #218 and keeps
-# memory flat if MangaFire ever scrambles a whole chapter.
-_SCRAMBLE_PROBE_SAMPLE_CAP = 5
-
-
-@pytest.fixture(autouse=True)
-def _mangafire_scramble_probe(source_key: str) -> Iterator[None]:
-    """#218 tripwire + regression guard, piggybacked on the real download.
-
-    MangaFire scrambling (``offset>0``) is currently dormant (never observed live),
-    so this never fails the nightly when there's nothing to descramble. When a page
-    IS scrambled, ``_descramble_image`` (invoked only for ``offset>0``) is wrapped to
-    count it and capture a few ``(raw, out)`` pairs; after the download, the count is
-    logged (the operator-visible tripwire) and each captured page is asserted to have
-    kept its quality (source qtables preserved — #218). No-op for non-mangafire
-    sources and when zero scrambled pages were seen.
-    """
-    if source_key != "mangafire":
-        yield
-        return
-
-    from manga_gateway.sources import mangafire
-
-    real = mangafire._descramble_image
-    lock = threading.Lock()
-    count = 0
-    samples: list[tuple[bytes, bytes]] = []
-
-    def _wrapped(content: bytes, offset: int) -> bytes:
-        # Runs inside asyncio.to_thread (fetch_image) — guard the shared state.
-        out = real(content, offset)
-        if offset > 0:
-            nonlocal count
-            with lock:
-                count += 1
-                if len(samples) < _SCRAMBLE_PROBE_SAMPLE_CAP:
-                    samples.append((content, out))
-        return out
-
-    mangafire._descramble_image = _wrapped  # type: ignore[assignment]
-    try:
-        yield
-    finally:
-        mangafire._descramble_image = real  # type: ignore[assignment]
-        guard = "ACTIVE" if count else "dormant (no scrambled pages)"
-        print(
-            f"\n[live mangafire] descramble probe: {count} offset>0 page(s) seen — "
-            f"#218 quality guard {guard}"
-        )
-        # Post-download (off the to_thread workers) so a quality regression surfaces
-        # as a clean assertion, not an opaque mid-download page failure.
-        for raw, out in samples:
-            assert_descramble_preserves_quality(raw, out)
 
 
 async def test_download_full_cycle(

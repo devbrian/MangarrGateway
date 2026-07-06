@@ -1,49 +1,47 @@
-"""MangaFire source — a Comix-class browser-DOM × atsumaru-class fan-out hybrid.
+"""MangaFire source — an atsumaru-class title→chapter fan-out over a plain JSON API.
 
-MangaFire (``https://mangafire.to``) is a PHP/jQuery server-rendered HTML + AJAX
-site whose download + keyword-search AJAX endpoints are gated by a per-request
-``vrf`` token. BOTH the SEARCH ``vrf`` (PR #313) and the DOWNLOAD (reader) ``vrf``
-(issue #314) are now **reverse-engineered** to the SAME pure-Python generator
-(``mangafire_vrf.compute_vrf``, build ``scripts.js?69b68df23``) — the token signs the
-``@``-joined request identifiers (search: the keyword; reader: ``{slug}@chapter@{lang}``
-and ``chapter@{itemId}``) — so MangaFire needs **no browser at all**. It adds **zero
-networking glue** — every outbound call is ``ctx.get_json`` / ``ctx.get_bytes``
-(SRC-01/SRC-02).
+MangaFire (``https://mangafire.to``) rewrote its whole frontend (260706-hgu): it
+dropped the PHP/jQuery server-rendered HTML + AJAX surface (the ``/filter`` HTML, the
+``/ajax/manga/{slug}/chapter/{lang}`` HTML-in-JSON, the build-hash-tied ``vrf`` token,
+and the per-image piece-shuffle descramble) for a React SPA backed by a **plain,
+unsigned ``GET /api/*`` JSON REST API**. There is no token, header, or query signature —
+every outbound call is a bare ``ctx.get_json`` / ``ctx.get_bytes`` (SRC-01/SRC-02), so
+the source needs **no browser and no vrf**.
 
-Each of the four ``Source`` hooks copies a DIFFERENT existing analog:
+Structurally it is now a MangaDex/atsumaru-class source: a title-only search that
+deep-enumerates each candidate's chapter list, DIRECT newest-chapter mint on recent, and
+a manifest that reads server-minted page URLs verbatim. The four ``Source`` hooks:
 
-* **chapter list** — ``GET /ajax/manga/{slugId}/chapter/{lang}`` (JSON-with-HTML-in-
-  ``result``, NO vrf) → ``ctx.get_json`` + lxml-in-``to_thread`` (D-06).
-* **recent** — ``GET /filter?sort=recently_updated`` (HTML, NO vrf) → ``ctx.get_bytes``
-  + lxml + title→chapter fan-out + DIRECT newest-chapter mint (D-07).
-* **fetch_manifest** — pure httpx (issue #314): sign ``GET /ajax/read/{slug}/chapter/
-  {lang}`` → reader chapter list → the chapter's ``itemId``, then sign ``GET /ajax/
-  read/chapter/{itemId}`` → the server-minted ``result.images`` list; each image URL is
-  SSRF-allowlisted; the ``#scr_{offset}`` scramble offset rides as a URL fragment
-  (D-08/D-09/D-10).
-* **fetch_image** — ``ctx.get_bytes`` of the fragment-stripped URL + a geometric
-  piece-shuffle descramble when ``offset>0`` (port of Keiyoushi ``ImageInterceptor.kt``
-  in Pillow, offloaded via ``to_thread``) (D-11/D-12).
-* **search** — compute the per-keyword search ``vrf`` IN-PROCESS via
-  ``compute_vrf(query)`` (a pure stdlib reimplementation of the site's token — no
-  browser, no per-query cache), then ``ctx.get_bytes(/filter?keyword=…&vrf=…)``,
-  parse cards, fan out, GAP-2 mint-after-slice (D-13).
+* **search** — ``GET /api/titles?keyword=&limit=&page=`` → ``{items:[{id,hid,slug,title,
+  …}],meta}`` (TITLE-ONLY) → prune candidates → per-candidate chapter-list fan-out →
+  ``chapter_matches`` filter → slice → GAP-2 mint-after-slice.
+* **recent** — ``GET /api/titles?order[chapter_updated_at]=desc&limit=`` (the bracket
+  param is required; built via ``urlencode``) → per-title newest-chapter DIRECT mint.
+* **chapter list** — ``GET /api/titles/{hid}/chapters?language=&limit=200&page=`` →
+  ``{items:[{id,number,name,createdAt}],meta:{lastPage}}``. Max ``limit`` is 200, so a
+  long series PAGINATES page=1..meta.lastPage (the extra pages fanned out concurrently)
+  for the COMPLETE list (source-onboarding completeness rule). The chapter numeric
+  ``id`` is the resolve unit; ``createdAt`` is a unix-epoch (seconds).
+* **fetch_manifest** — ``GET /api/chapters/{chapterId}`` → ``{data:{pages:[{url,width,
+  height}]}}`` — direct ``mfcdnN.xyz`` CDN URLs, NO scramble offset. Each URL is
+  SSRF-allowlisted (SEC-01) and returned clean (no URL fragment).
+* **fetch_image** — ``ctx.get_bytes`` of the clean URL with adaptive CDN zone-retry
+  (the ``mfcdnN`` WAF-block self-heal); NO descramble anymore.
 
-This module (Task 1) holds ONLY the module-level constants + pure functions; the
-concrete ``MangaFireSource`` class lands in Task 2.
+The image CDN family (``{prefix}.mfcdn{N}.xyz``) is UNCHANGED and still IP-bans direct
+datacenter egress, so the SSRF allowlist, the CDN zone-retry, and ``image_fetch_via_
+proxy_pool`` all stay (see below).
 
-SSRF (D-10): the page-image CDN host VARIES per content (``o48.mfcdn1.xyz``, …) and
+SSRF (SEC-01): the page-image CDN host VARIES per content (``o48.mfcdn1.xyz``, …) and
 is NEVER pinned. ``_is_allowed_image_url`` enforces only the stable invariants
-(``https`` + public-host shape + ``/mf/`` namespace + image extension + no traversal),
-stripping any URL fragment BEFORE the path is matched so a malicious ``#`` fragment
-cannot smuggle a path past the regex.
+(``https`` + the ``mfcdnN.xyz`` CDN-zone host shape + ``/mf/`` namespace + image
+extension + no traversal), stripping any URL fragment BEFORE the path is matched so a
+malicious ``#`` fragment cannot smuggle a path past the regex.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
-import json
 import posixpath
 import re
 from collections.abc import Coroutine
@@ -52,23 +50,18 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urldefrag, urlencode, urlparse
 
-import lxml.html
-from PIL import Image, UnidentifiedImageError
-
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
 from ..framework.errors import SourceError
-from ..framework.external_links import normalize
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
-from .mangafire_vrf import compute_vrf
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
-    from ..models.search import ExternalLinks, SearchRequest
+    from ..models.search import SearchRequest
 
-# ── SSRF allowlist (host-agnostic; copy the mangaball/weebcentral shape, D-10) ──
+# ── SSRF allowlist (host-agnostic; copy the mangaball/weebcentral shape, SEC-01) ──
 # The page-image host is NEVER pinned (it varies per content), so the meaningful
 # invariants carry the trust: https + public-host shape + /mf/ namespace + image
 # extension + no traversal. The internal/metadata suffixes are rejected explicitly
@@ -83,9 +76,8 @@ _MANGAFIRE_IMG_PATH_RE = re.compile(
 # internal address or an attacker host no longer passes the public-host shape — it is a
 # hard validation failure. If MangaFire ever adds a second CDN domain family it will
 # surface here as an immediately-visible rejection rather than silently fetching any
-# host. (The metadata-link detail GET in fetch_external_links targets the MAIN site host
-# via base_url and does NOT route through this image allowlist, so pinning to the CDN
-# family does not affect it.)
+# host. (The JSON API host — base_url / mangafire.to — is never routed through this
+# image allowlist; only the resolved page-image CDN URLs are.)
 _MANGAFIRE_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.mfcdn\d+\.xyz$", re.IGNORECASE)
 _MANGAFIRE_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
 
@@ -94,15 +86,15 @@ _MANGAFIRE_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
 # each host shaped ``{prefix}.mfcdn{N}.xyz`` (prefix ∈ nw8/l1n/k99/m3z/o48; N ∈ the
 # set below). Cloudflare's WAF on SOME zones hard-blocks (403) the gateway's egress
 # IP while OTHERS allow it; the block is egress-IP-dependent, so we do NOT pin a
-# single "good" zone — on a per-page 403 we retry the IDENTICAL signed path with the
+# single "good" zone — on a per-page 403 we retry the IDENTICAL page path with the
 # host's ``mfcdnN`` rewritten to each OTHER known zone until one returns bytes (the
-# live cross-test proved the exact signed path returns 200 on an un-blocked zone),
-# then remember the winning zone for the rest of the job. Extend this tuple if
-# MangaFire adds a zone — no other code change needed.
+# live cross-test proved the exact path returns 200 on an un-blocked zone), then
+# remember the winning zone for the rest of the job. Extend this tuple if MangaFire
+# adds a zone — no other code change needed.
 _MANGAFIRE_CDN_ZONES: tuple[int, ...] = (1, 2, 3)
 # Matches the ``mfcdnN`` label inside a MangaFire image host (``o48.mfcdn1.xyz``) so
 # the zone digit can be rewritten while leaving the subdomain prefix + ``.xyz`` TLD
-# (and the whole path/signature) byte-for-byte intact.
+# (and the whole path) byte-for-byte intact.
 _MANGAFIRE_ZONE_RE = re.compile(r"\.mfcdn(\d+)\.", re.IGNORECASE)
 # Per-job sidecar attr stashed on the SourceContext holding the CDN zone that last
 # answered 200 for THIS job, so subsequent pages try it FIRST and never re-probe the
@@ -111,53 +103,54 @@ _MANGAFIRE_ZONE_RE = re.compile(r"\.mfcdn(\d+)\.", re.IGNORECASE)
 # object is a shared registry singleton).
 _PREFERRED_ZONE_ATTR = "_mangafire_preferred_cdn_zone"
 
-# ── geometric descramble constants (D-12, Keiyoushi ImageInterceptor.kt) ────────
-PIECE_SIZE = 200
-MIN_SPLIT_COUNT = 5
-
 # ── control-flow constants (mirror atsumaru/weebcentral) ───────────────────────
+# search() requests at most this many title results from /api/titles before pruning.
+_SEARCH_RESULT_LIMIT = 30
 # search() deep-enumerates at most this many title candidates (GAP-1 lock).
 _DEFAULT_TITLE_CANDIDATES = 5
-# Bounds the per-candidate chapter-list fan-out (search + recent). Both HTML/JSON
-# paths use the unlimited get_bytes/get_json byte/json primitives, so this semaphore
-# (not the rate limiter) is the real concurrency bound — probe-tune in Plan 03.
+# Bounds the per-candidate chapter-list fan-out (search + recent) AND the per-title
+# chapter-list PAGE fan-out (the >200-chapter pagination). The unlimited get_json
+# chapter-list path is bound by this semaphore, not the rate limiter — probe-tuned.
 _CHAPTERS_FANOUT_CONCURRENCY = 6
 # recent() bounds the per-title fan-out so a poll never balloons into dozens of GETs.
 _RECENT_TITLE_CAP = 20
 # Default chapter language when the request carries no language filter.
 _DEFAULT_LANGUAGE = "en"
-
-# ── fetch_manifest empty-list retry (issue #314 — browserless manifest) ────────
-# The manifest is now derived in pure Python over httpx (NO browser): the reader's
-# two signed AJAX calls (`/ajax/read/{slugId}/chapter/{lang}` → per-chapter item ids,
-# then `/ajax/read/chapter/{itemId}` → the server-minted image list) are reproduced
-# in-process by signing each with `mangafire_vrf.compute_vrf` over the `@`-joined path
-# identifiers (the SAME pipeline PR #313 cracked for search). The image-list JSON
-# carries the per-page URLs + scramble offset directly, so there is nothing to mint
-# client-side. Transport faults / 5xx are already retried by `ctx.get_json` (tenacity);
-# this extra retry only covers a transient EMPTY image list, re-fetching the signed
-# image-list endpoint up to this many extra times with the backoff below. An integrity
-# mismatch on a NON-empty list is a real data problem and is NOT retried.
-_MANIFEST_EMPTY_RETRIES = 2
-# Backoff (seconds) before each extra attempt; index 0 = before the 1st retry, etc.
-_MANIFEST_RETRY_BACKOFF: tuple[float, ...] = (1.0, 2.0)
+# Max page size the chapters endpoint accepts (limit=300 → HTTP 422). A long series
+# has meta.lastPage > 1, so the COMPLETE list paginates page=1..lastPage.
+_CHAPTER_PAGE_LIMIT = 200
 
 
-def _ceil_div(a: int, b: int) -> int:
-    """Integer ceiling division ``ceil(a/b)`` (D-12 ``ceilDiv``)."""
-    return (a + b - 1) // b
+def _iso_from_epoch(raw: Any) -> str | None:
+    """Convert a MangaFire ``createdAt`` unix-epoch (SECONDS) → RFC3339 ``date-time``.
+
+    The new JSON API renders chapter ``createdAt`` as an integer unix epoch in
+    SECONDS (e.g. ``1757308339``), replacing the old ``MMM dd, yyyy`` string. Returns
+    the aware-UTC ISO string, or ``None`` for a missing/unparseable/out-of-range value
+    so the caller can fall back to ``now(UTC)`` (the contract's ``publishDate`` is
+    required RFC3339).
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        secs = int(raw)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return datetime.fromtimestamp(secs, UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _is_allowed_image_url(url: str) -> bool:
-    """True if ``url`` is a well-formed MangaFire ``/mf/`` page image (SSRF, D-10).
+    """True if ``url`` is a well-formed MangaFire ``/mf/`` page image (SSRF, SEC-01).
 
-    Belt-and-suspenders defence on every browser-captured manifest URL before the
-    framework fetches it (T-12-03/T-12-04). The CDN host VARIES per content so it is
-    NEVER pinned — the trust comes from ``https`` + a public-host shape + the ``/mf/``
-    path namespace + an image extension + no traversal. Any URL fragment (the
-    ``#scr_{offset}`` scramble marker, or a hostile ``#`` smuggle) is stripped BEFORE
-    the path is parsed, so a fragment can never sneak a bad path past the regex. We
-    reject internal/metadata host namespaces and validate the
+    Belt-and-suspenders defence on every manifest URL before the framework fetches it.
+    The CDN host VARIES per content so it is NEVER pinned — the trust comes from
+    ``https`` + the ``mfcdnN.xyz`` CDN-zone host shape + the ``/mf/`` namespace + an
+    image extension + no traversal. Any URL fragment (a hostile ``#`` smuggle) is
+    stripped BEFORE the path is parsed, so a fragment can never sneak a bad path past
+    the regex. We reject internal/metadata host namespaces and validate the
     ``posixpath.normpath``-resolved path (httpx normalizes ``..`` before fetching).
     """
     clean, _frag = urldefrag(url)
@@ -191,10 +184,10 @@ def _rewrite_zone(url: str, zone: int) -> str:
     """Return ``url`` with its host's ``mfcdnN`` zone label rewritten to zone ``zone``.
 
     Only the zone digit changes — the subdomain prefix, the ``.xyz`` TLD, and the
-    entire path + query + signature stay byte-for-byte identical (the live cross-test
-    proved the exact signed path returns 200 on an un-blocked zone). A URL with no
-    ``mfcdn`` label is returned unchanged. Operates on the netloc only so a path segment
-    that happened to contain ``mfcdnN`` could never be rewritten.
+    entire path + query stay byte-for-byte identical (the live cross-test proved the
+    exact path returns 200 on an un-blocked zone). A URL with no ``mfcdn`` label is
+    returned unchanged. Operates on the netloc only so a path segment that happened to
+    contain ``mfcdnN`` could never be rewritten.
     """
     parsed = urlparse(url)
     host = parsed.hostname or ""
@@ -207,224 +200,15 @@ def _rewrite_zone(url: str, zone: int) -> str:
     return parsed._replace(netloc=netloc).geturl()
 
 
-def _descramble_image(content: bytes, offset: int) -> bytes:
-    """Un-shuffle a MangaFire scrambled page image (D-12; PKG-02).
-
-    Port of Keiyoushi ``ImageInterceptor.kt``. For ``offset<=0`` the page is NOT
-    scrambled → the bytes pass through byte-for-byte. For ``offset>0`` the image is a
-    ``PIECE_SIZE``-px piece grid whose interior pieces are cyclically shifted; the
-    last row/column stay in place. We decode with Pillow, re-assemble the grid, and
-    re-encode in the SAME format — NEVER recompressing beyond that re-encode (PKG-02).
-    A non-image / truncated / hostile body degrades to a passthrough (the packaging
-    ``is_valid_image`` guard rejects it downstream — T-12-07), never raising.
-    """
-    if offset <= 0:
-        return content
-    try:
-        with Image.open(io.BytesIO(content)) as src_img:
-            fmt = src_img.format or "PNG"
-            # Capture the source JPEG quantization tables BEFORE the context closes
-            # — the reassembled image is built from scratch and carries none, so
-            # ``quality="keep"`` can't preserve fidelity (PKG-02, issue #218). Re-
-            # encoding with the SOURCE qtables keeps the page visually lossless.
-            qtables = getattr(src_img, "quantization", None)
-            img = src_img.convert(src_img.mode)
-        width, height = img.size
-        piece_w = min(PIECE_SIZE, _ceil_div(width, MIN_SPLIT_COUNT))
-        piece_h = min(PIECE_SIZE, _ceil_div(height, MIN_SPLIT_COUNT))
-        x_max = _ceil_div(width, piece_w) - 1
-        y_max = _ceil_div(height, piece_h) - 1
-        dst = Image.new(img.mode, (width, height))
-        for x in range(x_max + 1):
-            for y in range(y_max + 1):
-                x_dst = piece_w * x
-                y_dst = piece_h * y
-                w = min(piece_w, width - x_dst)
-                h = min(piece_h, height - y_dst)
-                # Last row/col stay in place; interior pieces shift by `offset`.
-                x_src = piece_w * (x if x == x_max else (x_max - x + offset) % x_max)
-                y_src = piece_h * (y if y == y_max else (y_max - y + offset) % y_max)
-                region = img.crop((x_src, y_src, x_src + w, y_src + h))
-                dst.paste(region, (x_dst, y_dst))
-        buf = io.BytesIO()
-        # Never recompress at Pillow's defaults (JPEG q75 / WebP ~q80) — that
-        # degrades every offset>0 page (PKG-02, issue #218). JPEG re-encodes with
-        # the captured source qtables (+ no chroma subsampling) for a visually
-        # lossless result; WebP has no qtables so the best we can do is q95/method6.
-        # PNG (and any other format) stays lossless under a plain re-encode.
-        save_kwargs: dict[str, Any] = {}
-        if fmt == "JPEG":
-            if qtables:
-                save_kwargs = {"qtables": qtables, "subsampling": 0}
-            else:
-                save_kwargs = {"quality": 95, "subsampling": 0}
-        elif fmt == "WEBP":
-            save_kwargs = {"quality": 95, "method": 6}
-        dst.save(buf, format=fmt, **save_kwargs)
-        return buf.getvalue()
-    except (UnidentifiedImageError, OSError, ValueError):
-        return content
-
-
-def _parse_chapter_list(html: str) -> list[dict[str, Any]]:
-    """Parse the chapter-list ``result`` HTML → ordered chapter rows (D-06).
-
-    One ``<li data-number="…">`` per chapter (newest-first document order). Each row
-    carries the read ``a@href`` (the resolve unit), the ``data-number`` chapter
-    number, and the 2nd ``<span>`` date (``MMM dd, yyyy``). A row with no read href is
-    skipped; a malformed fragment returns ``[]`` (never raises).
-    """
-    try:
-        doc = lxml.html.fromstring(html)
-    except Exception:
-        return []
-    out: list[dict[str, Any]] = []
-    for li in doc.xpath("//li[@data-number]"):
-        hrefs = li.xpath(".//a/@href")
-        if not hrefs:
-            continue
-        spans = [s.strip() for s in li.xpath(".//a//span/text()") if s.strip()]
-        out.append(
-            {
-                "href": str(hrefs[0]).strip(),
-                "number": str(li.get("data-number") or "").strip(),
-                "date": spans[1] if len(spans) >= 2 else None,
-            }
-        )
-    return out
-
-
-def _parse_read_item_ids(html: str) -> dict[str, str]:
-    """Parse the reader chapter-list ``result.html`` → ``{number: itemId}`` map (#314).
-
-    ``GET /ajax/read/{slugId}/chapter/{lang}?vrf=…`` returns ``{"result":{"html":
-    "<ul>… <a data-id='{itemId}' data-number='{number}'>…</a> …"}}``.
-    Each ``<a>`` carries BOTH the per-chapter reader ``data-id`` (the ``itemId`` the
-    image-list endpoint signs) and the ``data-number`` (matching the read href's
-    ``chapter-{number}`` segment). This maps number→itemId so ``fetch_manifest`` can
-    resolve the href's chapter number to its reader item id with NO browser. A
-    malformed fragment returns ``{}`` (never raises); the FIRST id wins per number
-    (newest-first document order).
-    """
-    try:
-        doc = lxml.html.fromstring(html)
-    except Exception:
-        return {}
-    out: dict[str, str] = {}
-    for a in doc.xpath("//a[@data-id and @data-number]"):
-        number = str(a.get("data-number") or "").strip()
-        item_id = str(a.get("data-id") or "").strip()
-        if number and item_id and number not in out:
-            out[number] = item_id
-    return out
-
-
-def _parse_sync_data(html: bytes | str) -> dict[str, Any]:
-    """Parse the detail page's ``<script id="syncData">`` JSON → raw tracker dict.
-
-    The detail page embeds a single ``<script id="syncData">{…}</script>`` whose body
-    is a JSON object carrying ``anilist_id`` + ``mal_id`` (plus internal keys the
-    normalizer drops). Per RESEARCH Pitfall 6 the WHOLE script body is JSON-parsed —
-    NOT regexed per-id — so a shape change surfaces as a parse miss, not silent
-    mis-extraction.
-
-    On ANY miss (no script, empty body, malformed JSON, non-object) this RAISES — the
-    framework best-effort wrapper (``resolve_external_links``) owns the swallow-to-
-    ``None`` so the chapter releases still return (R6). lxml + ``json.loads`` are
-    blocking, so this runs under ``asyncio.to_thread`` (ruff ASYNC, no loop blocking).
-    """
-    doc = lxml.html.fromstring(html)
-    scripts = doc.xpath("//script[@id='syncData']")
-    if not scripts:
-        raise ValueError("no syncData script on detail page")
-    data = json.loads(scripts[0].text_content())
-    if not isinstance(data, dict):
-        raise ValueError("syncData is not a JSON object")
-    return data
-
-
-def _parse_cards(html: bytes | str) -> list[dict[str, Any]]:
-    """Parse ``.original.card-lg .unit .inner`` cards → ``[{href,title,thumbnail}]``.
-
-    Shared by both ``recent`` (D-07) and ``search`` (D-13) — both feeds render the
-    identical card markup. Each ``.inner`` exposes a ``.info > a`` whose ``href`` is
-    ``/manga/{slug}.{id}`` and whose text is the title, plus a cover ``<img src>``.
-    A card with no ``/manga/`` info link is skipped; a malformed fragment returns
-    ``[]`` (never raises). Deduped by href in document (relevance) order.
-    """
-    try:
-        doc = lxml.html.fromstring(html)
-    except Exception:
-        return []
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    inners = doc.xpath(
-        "//*[contains(concat(' ', normalize-space(@class), ' '), ' original ')"
-        " and contains(concat(' ', normalize-space(@class), ' '), ' card-lg ')]"
-        "//*[contains(concat(' ', normalize-space(@class), ' '), ' inner ')]"
-    )
-    for inner in inners:
-        info_links = inner.xpath(
-            ".//*[contains(concat(' ', normalize-space(@class), ' '), ' info ')]"
-            "//a[contains(@href, '/manga/')]"
-        )
-        if not info_links:
-            continue
-        anchor = info_links[0]
-        href = (anchor.get("href") or "").strip()
-        title = (anchor.text_content() or "").strip()
-        if not href or not title or href in seen:
-            continue
-        seen.add(href)
-        imgs = inner.xpath(".//img/@src")
-        out.append(
-            {
-                "href": href,
-                "title": title,
-                "thumbnail": str(imgs[0]).strip() if imgs else None,
-            }
-        )
-    return out
-
-
-def _manga_token_and_slug_id(href: str) -> tuple[str, str]:
-    """Split a ``/manga/{slug}.{id}`` href → ``(manga_token, slug_id)`` (D-06).
-
-    ``manga_token`` is the full ``{slug}.{id}`` (the stable per-manga identifier used
-    in guids/ids); ``slug_id`` is the trailing token after the last ``.`` (the
-    chapter-list endpoint key). A href with no ``.`` yields an empty ``slug_id`` so the
-    caller skips it.
-    """
-    token = href.rstrip("/").rsplit("/", 1)[-1]
-    slug_id = token.rsplit(".", 1)[-1] if "." in token else ""
-    return token, slug_id
-
-
-def _iso_from_mangafire_date(raw: Any) -> str | None:
-    """Normalize a MangaFire ``MMM dd, yyyy`` date → RFC3339 ``date-time`` (REL-01).
-
-    The chapter-list rows render the date as ``May 21, 2026``. Returns the aware-UTC
-    ISO string, or ``None`` for a missing/unparseable value so the caller can fall
-    back to ``now(UTC)`` (the contract's ``publishDate`` is required RFC3339).
-    """
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        parsed = datetime.strptime(raw.strip(), "%b %d, %Y").replace(tzinfo=UTC)
-    except ValueError:
-        return None
-    return parsed.isoformat()
-
-
 class MangaFireSource(Source):
-    """MangaFire (mangafire.to) — cloudflare browser-DOM × title→chapter fan-out.
+    """MangaFire (mangafire.to) — plain JSON API, title→chapter fan-out (260706-hgu).
 
-    A composite of four existing analogs (one per hook): atsumaru's fan-out/mint
-    control flow, comix's ``fetch_via_browser`` + ``_solver_from_ctx`` browser-DOM
-    manifest, weebcentral/mangaball's lxml-via-``to_thread`` parsing + host-agnostic
-    SSRF allowlist, plus the geometric image descramble (D-12). Zero networking glue —
-    every outbound call is ``ctx.get_json`` / ``ctx.get_bytes`` / ``solver.fetch_via_
-    browser*`` (SRC-01/SRC-02). See the module docstring for the per-hook map.
+    A MangaDex/atsumaru-class source since the site's React-SPA rewrite: a title-only
+    ``/api/titles`` search deep-enumerates each candidate's
+    ``/api/titles/{hid}/chapters`` feed (paginating past the 200-cap), recent the newest
+    chapter DIRECT, and ``/api/chapters/{id}`` yields server-minted CDN page URLs. Zero
+    networking glue — every outbound call is ``ctx.get_json`` / ``ctx.get_bytes``
+    (SRC-01/SRC-02). See the module docstring for the per-hook map.
     """
 
     key = "mangafire"
@@ -432,53 +216,29 @@ class MangaFireSource(Source):
     base_url = "https://mangafire.to"
     # Title-search only — MangaFire exposes no external metadata-id namespace (SRCH-07).
     id_types: list[str] = []
-    # Recon-observed language set (the /filter language[] options). Refine in Plan 03.
+    # Recon-observed language set (the /api/titles/{hid}/chapters language filter).
     languages = ["en", "fr", "es", "es-la", "pt-br", "ja"]
-    # Probe-measured (2026-06-10, scripts/probe_rate_limits.py, residential proxies,
-    # fresh-proxy-per-category, 46/50 healthy) — D-14, replacing the Plan 02
-    # placeholders. Two sweeps found a REAL per-endpoint difference (unlike atsumaru's
-    # uniform floor):
-    #   * text/AJAX host (mangafire.to — /filter + /ajax/manga/{slug}/chapter): a real
-    #     HTTP-429 CEILING. Fully clean at 120/min (0/120 throttled); 429 onset at
-    #     300/min (103/300 blocked), worsening at 600 (370) and 960 (718). Parallelism
-    #     stayed clean to concurrency 32 at 120/min. A 2026-06-27 re-probe reproduced
-    #     this exactly (clean at 120, 429 onset at 300). Raised 60→100: ~83% of the
-    #     120/min clean ceiling — still a margin under the edge but more fan-out
-    #     throughput than the prior conservative ~50% fraction. It governs the LIMITED
-    #     get_json chapter-list path (the high-volume fan-out path) and leaves host
-    #     headroom for the few UNLIMITED get_bytes /filter calls on the 429 ceiling.
-    #   * image CDN (separate host): NO limit — clean to 960/min at concurrency 8 (a
-    #     FLOOR). The get_bytes image path is exempt from this limiter (limited=False);
-    #     its throughput is bounded by max_concurrent_jobs, not rate_limit_per_minute.
-    #   * reader manifest (issue #314): now PURE httpx — the two signed reader AJAX
-    #     calls (`/ajax/read/{slug}/chapter/{lang}` + `/ajax/read/chapter/{itemId}`)
-    #     ride the SAME limited get_json path as the chapter list, so they fall under
-    #     the 100/min ceiling above (no separate browser-nav budget).
+    # Probe-measured (2026-06-10, scripts/probe_rate_limits.py, residential proxies) —
+    # D-14. The mangafire.to API host enforces a real HTTP-429 ceiling: clean at
+    # 120/min, 429 onset at 300/min. 100 is ~83% of the clean ceiling, governing limited
+    # get_json search/chapter-list path. The image CDN (separate host) had NO limit
+    # (clean to 960/min at concurrency 8); the get_bytes image path is exempt from this
+    # limiter and bounded by max_concurrent_jobs.
     rate_limit_per_minute = 100
-    # D-30 per-source override — bounds concurrent download JOBS only (recent/search/
-    # filter HTML use the separate per-source _CHAPTERS_FANOUT_CONCURRENCY semaphore,
-    # not this knob). Issue #314 made the manifest BROWSERLESS (two signed httpx AJAX
-    # calls, no reader nav), which DISSOLVES the `mangafire-manifest-contention` cause
-    # (concurrent reader navs starving each other's in-page capture) that had forced
-    # this to 1. Restored to 3 — the D-14 probe-measured safe value (text/AJAX host
-    # clean to concurrency 32 at 60/min; image CDN unlimited to concurrency 8). A
-    # deploy-host re-probe MAY raise it further, but 3 is the documented measured floor.
+    # D-30 per-source override — bounds concurrent download JOBS only (search/recent use
+    # the separate _CHAPTERS_FANOUT_CONCURRENCY semaphore). 3 is the D-14 probe-measured
+    # safe value; the manifest is a single cheap httpx GET (no reader nav), so there is
+    # no per-job contention to serialize.
     max_concurrent_jobs = 3
-    # D-05: interior + reader pages answer cold over httpx (issue #314: the manifest no
-    # longer needs the browser), but declare cloudflare anyway so the framework keeps a
-    # lazily-solved clearance and degrades gracefully on a datacenter host that trips a
-    # managed challenge on a listing/reader endpoint.
+    # D-05: the JSON API answers cold over plain httpx (search/recent/chapters/read need
+    # no clearance), but declare cloudflare anyway so the framework keeps a lazy-solved
+    # clearance and degrades gracefully on a datacenter host that trips a managed
+    # challenge. Deferred-solve (cloudflare_challenge_optional): cold requests go over
+    # httpx first, and a real challenge (is_cf_challenge) → retried with force_resolve.
     antibot = "cloudflare"
-    # 260623-m5h + #314: search AND the download manifest now compute the vrf in-process
-    # (mangafire_vrf.compute_vrf) and answer cold over httpx (verified: /filter and the
-    # reader AJAX return real results with NO clearance), so do NOT eagerly solve
-    # Cloudflare on the request hot path. Deferred-solve (like mangaball): cold requests
-    # go over httpx first, and a real challenge (is_cf_challenge) → retried with
-    # force_resolve. No path drives `fetch_via_browser` anymore.
     cloudflare_challenge_optional = True
     cloudflare_challenge_url = "https://mangafire.to/"
-    # D-04: the image descramble is geometric (done in fetch_image), NOT the response-
-    # byte decrypt seam; no session bootstrap.
+    # No response-byte decrypt seam and no session bootstrap — the API is plain JSON.
     decrypt_scheme = None
     session_prep = None
     supports_search = True
@@ -486,82 +246,70 @@ class MangaFireSource(Source):
     # Opt OUT of the engine's 403→stale-baseUrl re-resolve recovery (debug
     # ``mangafire-stale-manifest-reresolve-budget``). A MangaFire image 403 is a
     # Cloudflare WAF deny of the gateway's egress IP on a particular CDN zone
-    # (``mfcdnN``), NOT a stale/expired baseUrl: re-resolving re-navigates the reader
-    # and lands the SAME pages on the SAME blocked zone, so the engine's re-resolve is
-    # provably useless and only burns 2 wasted browser navs before failing with the
-    # misleading "stale manifest re-resolve budget exceeded". This source instead
-    # self-heals INSIDE ``fetch_image`` by retrying the identical signed path across
-    # the OTHER CDN zones; a 403 only escapes ``fetch_image`` when ALL zones are
+    # (``mfcdnN``), NOT a stale/expired baseUrl: re-resolving re-fetches the SAME pages
+    # on the SAME blocked zone, so the engine's re-resolve is provably useless. We
+    # instead self-heal INSIDE ``fetch_image`` by retrying the identical page path
+    # across the OTHER CDN zones; a 403 only escapes ``fetch_image`` when ALL zones are
     # blocked, where re-resolve cannot help anyway — so failing fast is correct.
     reresolve_manifest_on_403 = False
     # 260620-4im opt-in: route this source's ``fetch_image`` byte fetches through the
     # framework residential proxy pool. MangaFire's image CDN zones IP-ban the gateway's
-    # DIRECT egress (verified Cloudflare Error-1020 403 on all ``mfcdnN`` zones); a real
-    # browser does not help — the ban is IP-based, not fingerprint-based — and the
-    # signed image-token paths need no ``cf_clearance``. A clean residential proxy
-    # returns ``200 image/jpeg``. LAYERING (locked): the proxy is the OUTER,
-    # per-job-sticky dimension (framework-owned — one sticky proxy spans the WHOLE
-    # ``mfcdnN`` zone-retry below); the zone-rewrite stays MangaFire-specific, INNER
-    # dimension (per-page, same proxy). The framework rotates the proxy ONLY when the
-    # entire zone-retry fails. ``fetch_image``/``_get_bytes_zone_retry`` need NO code
-    # change — the engine now invokes ``fetch_image`` via ``ctx.fetch_image_via_pool``,
-    # so every inner ``ctx.get_bytes`` transparently egresses through the active sticky
-    # proxy. Search + the read-page CF solve are never given a pool (unchanged).
+    # DIRECT egress (verified Cloudflare Error-1020 403 on all ``mfcdnN`` zones); ban
+    # is IP-based, not fingerprint-based. A clean residential proxy returns ``200
+    # image/jpeg``. LAYERING (locked): the proxy is the OUTER, per-job-sticky dimension
+    # (framework-owned — one sticky proxy spans the WHOLE ``mfcdnN`` zone-retry below);
+    # the zone-rewrite stays MangaFire-specific, INNER dimension (per-page, same proxy).
+    # The framework rotates the proxy ONLY when the entire zone-retry fails. Search is
+    # never given a pool (unchanged).
     image_fetch_via_proxy_pool = True
 
     # ─────────────────────────────── search ──────────────────────────────────
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
-        """Keyword search → per-chapter Releases (SRCH-01..07, D-13).
+        """Keyword search → per-chapter Releases (SRCH-01..07).
 
-        Three-step live flow: (1) compute the search ``vrf`` IN-PROCESS via
-        ``compute_vrf(query)`` — a pure stdlib reimplementation of the site's
-        per-keyword token, so there is NO browser nav and NO per-query vrf cache;
-        (2) ``ctx.get_bytes`` the vrf'd ``/filter`` HTML and prune the title-only
-        cards to the candidate cap; (3) deep-enumerate each candidate's chapter list
-        under a bounded semaphore, filter by :meth:`chapter_matches`, slice to
-        ``req.limit``, and ONLY THEN mint (GAP-2 mint-after-slice — a long title would
-        otherwise evict the returned releases' own handles). Zero networking glue
-        (SRC-01/02).
+        Two-call flow (mirrors atsumaru's GAP-1 lock): ``GET /api/titles?keyword=`` is
+        TITLE-ONLY, so ``search`` deep-enumerates the first
+        ``_DEFAULT_TITLE_CANDIDATES`` (relevance-pruned) candidates via a chapter fanout
+        (paginating past the 200-cap for the COMPLETE feed). For each candidate the feed
+        is filtered by :meth:`chapter_matches`, kept NEWEST-FIRST (the API returns
+        number desc), sliced to ``req.limit``, and ONLY THEN minted (GAP-2 — a
+        long title would otherwise evict the returned releases' own handles). Zero
+        networking glue (SRC-01/02).
         """
         query = req.query or ""
         if not query:
             return []
         lang = self._filter_language(req.languages)
+        per_candidate_limit = req.limit or 50
 
         async def _resolve_fn() -> list[dict[str, Any]]:
-            vrf = compute_vrf(query)
-            params = urlencode(
-                {"keyword": query, "language[]": lang, "page": 1, "vrf": vrf}
-            )
-            html = await ctx.get_bytes(f"{self.base_url}/filter?{params}")
-            cards = await asyncio.to_thread(_parse_cards, html)
+            titles = await self._search_titles(query, _SEARCH_RESULT_LIMIT, ctx)
             return prune_candidates(
-                cards,
+                titles,
                 query,
                 keys=lambda d: [d.get("title")],
                 cap=_DEFAULT_TITLE_CANDIDATES,
             )
 
         # Layer 1 (D-01): cache the title→pruned-candidate resolution so a repeat
-        # chapter search on the same (query, languages) skips the /filter fetch.
+        # chapter search on the same (query, languages) skips the /api/titles fetch.
         candidates: list[dict[str, Any]] = await ctx.cached_resolve(
             ctx.cached_resolve_key(_normalize(query), req.languages or []),
             _resolve_fn,
         )
         ctx.candidates_enumerated = len(candidates)
-        per_candidate_limit = req.limit or 50
         sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
 
         async def _fetch_candidate(
-            manga_token: str, slug_id: str, manga_title: str
+            hid: str, title_id: str, manga_title: str
         ) -> list[Release]:
             # Layer 2 (CACHE-02/03): cache the UNFILTERED per-candidate chapter list.
             # The semaphore + the GET live INSIDE ``_enum_fn`` so a cache HIT acquires
             # no fan-out slot.
             async def _enum_fn() -> Enumeration:
                 async with sem:
-                    rows = await self._chapter_list(slug_id, lang, ctx)
+                    rows = await self._chapter_list(hid, lang, ctx)
                 return Enumeration(
                     items=rows,
                     chapter_numbers=tuple(
@@ -574,17 +322,17 @@ class MangaFireSource(Source):
                     requested_limit=per_candidate_limit,
                 )
 
+            # ``_chapter_list`` fetches the ``language=``-scoped feed, so the Layer-2
+            # key MUST be namespaced by ``lang`` — keying on ``hid`` alone lets one
+            # language's warmed rows leak into a later search for another language.
             enum = await ctx.cached_enumerate(
-                # ``_chapter_list`` fetches the ``/{lang}``-scoped chapter feed, so the
-                # Layer-2 key MUST be namespaced by ``lang`` — keying on ``slug_id``
-                # alone lets one language's warmed rows leak into a later search for
-                # the same manga in another language (mismatched releases/handles).
-                ctx.cached_enumerate_key(slug_id, [lang]),
+                ctx.cached_enumerate_key(hid, [lang]),
                 _enum_fn,
             )
-            releases = self._chapters_to_releases(
+            return self._chapters_to_releases(
                 enum.items,
-                manga_token,
+                hid,
+                title_id,
                 manga_title,
                 lang,
                 per_candidate_limit,
@@ -592,31 +340,14 @@ class MangaFireSource(Source):
                 req,
             )
 
-            # Phase-13 (R4/R6/D-02): resolve the series' tracker links ONCE via the
-            # framework wrapper (resolve-once cache + 5s timeout + swallow-all, D-03),
-            # keyed on ``manga_token`` (the stable ``{slug}.{id}`` id that also builds
-            # the detail URL), then stamp the single resolved object onto every release
-            # of the series (identical-object, R4). The detail URL is built from the
-            # gateway-internal ``manga_token`` (this source's OWN card href), never
-            # client input (SSRF-safe, T-13-01).
-            async def _parse_links(t: str = manga_token) -> ExternalLinks | None:
-                return await self.fetch_external_links(t, ctx)
-
-            links = await ctx.resolve_external_links(manga_token, _parse_links)
-            for rel in releases:
-                rel.external_links = links
-            return releases
-
         tasks: list[Coroutine[Any, Any, list[Release]]] = []
-        for card in candidates:
-            href = card.get("href")
-            if not href:
+        for title in candidates:
+            hid = title.get("hid")
+            if not hid:
                 continue
-            manga_token, slug_id = _manga_token_and_slug_id(str(href))
-            if not slug_id:
-                continue
-            manga_title = str(card.get("title") or "Unknown")
-            tasks.append(_fetch_candidate(manga_token, slug_id, manga_title))
+            title_id = str(title.get("id") or "")
+            manga_title = str(title.get("title") or "Unknown")
+            tasks.append(_fetch_candidate(str(hid), title_id, manga_title))
 
         # gather (not TaskGroup): re-raise the FIRST child SourceError UNCHANGED so
         # fanout.py classifies it as the source's own failure (mirror atsumaru).
@@ -626,35 +357,11 @@ class MangaFireSource(Source):
             releases.extend(chunk)
         return releases
 
-    async def fetch_external_links(
-        self, series_id: str, ctx: SourceContext
-    ) -> ExternalLinks | None:
-        """One best-effort detail GET → ``{anilist, myAnimeList}`` (D-02/R6).
-
-        Issues a SINGLE ``GET /manga/{series_id}`` (the detail HTML page) through the
-        framework transport + the source's anti-bot session, parses the
-        ``<script id="syncData">`` JSON off-loop (``asyncio.to_thread`` — lxml +
-        ``json.loads`` are blocking), and routes it through the shared normalizer,
-        which keeps ONLY ``anilist_id``/``mal_id`` and drops MangaFire's internal keys
-        (``manga_id``/``page``/…).
-
-        ``series_id`` is the gateway-internal ``manga_token`` (this source's OWN search
-        card href), so the URL is never a Mangarr-supplied value (SSRF-safe, T-13-01).
-        NO try/except/timeout here — the framework wrapper owns resolve-once + the 5s
-        timeout + swallow-all-to-``None`` (D-03); a raising/slow GET or an
-        absent/malformed ``syncData`` leaves the chapter releases intact (R6).
-        """
-        # CR #289: rate-limit this metadata detail GET (limited=True) so it shares the
-        # per-source per-minute budget (consistent with the weebcentral WR-03 fix) —
-        # the default ``limited=False`` byte path would bypass the source limiter.
-        html = await ctx.get_bytes(f"{self.base_url}/manga/{series_id}", limited=True)
-        sync_data = await asyncio.to_thread(_parse_sync_data, html)
-        return normalize(sync_data, "mangafire")
-
     def _chapters_to_releases(
         self,
         chapters: list[Any],
-        manga_token: str,
+        hid: str,
+        title_id: str,
         manga_title: str,
         lang: str,
         limit: int,
@@ -663,16 +370,15 @@ class MangaFireSource(Source):
     ) -> list[Release]:
         """Walk one candidate's chapter list → per-chapter Releases (GAP-2).
 
-        Filtered by :meth:`chapter_matches`, kept NEWEST-FIRST (the chapter-list
-        document order IS newest-first), sliced to ``limit``, THEN minted — handle
-        count per candidate is bounded by ``limit`` so the returned releases' handles
-        always survive the store cap.
+        Filtered by :meth:`chapter_matches`, kept NEWEST-FIRST (the API returns number
+        desc), sliced to ``limit``, THEN minted — handle count per candidate is bounded
+        by ``limit`` so the returned releases' handles always survive the store cap.
         """
         rows: list[dict[str, Any]] = []
         for chapter in chapters:
             if not isinstance(chapter, dict):
                 continue
-            if not chapter.get("href"):
+            if chapter.get("id") is None:
                 continue  # no resolve unit
             number = self._parse_decimal(chapter.get("number"))
             if not self.chapter_matches(req, number):
@@ -680,17 +386,13 @@ class MangaFireSource(Source):
             rows.append(chapter)
         releases: list[Release] = []
         for chapter in rows[:limit]:  # mint AFTER slice (newest-first preserved)
-            rel = self._to_release(manga_token, manga_title, lang, chapter, ctx)
+            rel = self._to_release(hid, title_id, manga_title, lang, chapter, ctx)
             if rel is not None:
                 releases.append(rel)
         return releases
 
     # ─────────────────────────────── recent ──────────────────────────────────
 
-    # IN-02: recent() intentionally does NOT populate Release.externalLinks. MangaFire
-    # is a DETAIL-FETCH source — populating links would cost one detail GET per distinct
-    # series in the recent feed (not guarded by the resolve-once cache), a deliberate
-    # trade-off; interactive search() carries them. See review finding IN-02.
     async def recent(
         self,
         *,
@@ -699,44 +401,41 @@ class MangaFireSource(Source):
         since: str | None,
         ctx: SourceContext,
     ) -> list[Release]:
-        """Newest-updated /filter cards → DIRECT newest-chapter releases (RCNT-01/02).
+        """Newest-updated titles → DIRECT newest-chapter releases (RCNT-01/02).
 
-        GETs ``/filter?sort=recently_updated&language[]={lang}&page=1`` (HTML, NO vrf),
-        parses the title-only cards, fans out the per-title chapter list under a bounded
-        semaphore, and mints the NEWEST chapter DIRECT (the read href is always present,
+        GETs ``/api/titles?order[chapter_updated_at]=desc&limit=`` (the bracket param is
+        required — a plain ``sort=`` is silently ignored — so the URL is built via
+        ``urlencode``), then fans out the per-title chapter list under a bounded
+        semaphore and mints the NEWEST chapter DIRECT (the chapter id is always present,
         no ``:DEFERRED``). The route applies the authoritative newest-first sort +
-        ``since`` cut; the source-side ``since`` is left to the route (IN-01). Zero
-        networking glue (``get_bytes`` + ``get_json``).
+        ``since`` cut; the source-side ``since`` is left to the route (IN-01).
         """
         lang = self._filter_language(languages)
-        params = urlencode({"sort": "recently_updated", "language[]": lang, "page": 1})
-        html = await ctx.get_bytes(f"{self.base_url}/filter?{params}")
-        cards = await asyncio.to_thread(_parse_cards, html)
         bound = min(_RECENT_TITLE_CAP, limit or _RECENT_TITLE_CAP)
+        titles = await self._recent_titles(bound, ctx)
         sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
 
         async def _newest_release(
-            manga_token: str, slug_id: str, manga_title: str
+            hid: str, title_id: str, manga_title: str
         ) -> Release | None:
             async with sem:
-                rows = await self._chapter_list(slug_id, lang, ctx)
+                rows = await self._chapter_list(hid, lang, ctx)
             newest = next(
-                (r for r in rows if isinstance(r, dict) and r.get("href")), None
+                (r for r in rows if isinstance(r, dict) and r.get("id") is not None),
+                None,
             )
             if newest is None:
                 return None
-            return self._to_release(manga_token, manga_title, lang, newest, ctx)
+            return self._to_release(hid, title_id, manga_title, lang, newest, ctx)
 
         tasks: list[Coroutine[Any, Any, Release | None]] = []
-        for card in cards[:bound]:
-            href = card.get("href")
-            if not href:
+        for title in titles[:bound]:
+            hid = title.get("hid")
+            if not hid:
                 continue
-            manga_token, slug_id = _manga_token_and_slug_id(str(href))
-            if not slug_id:
-                continue
-            manga_title = str(card.get("title") or "Unknown")
-            tasks.append(_newest_release(manga_token, slug_id, manga_title))
+            title_id = str(title.get("id") or "")
+            manga_title = str(title.get("title") or "Unknown")
+            tasks.append(_newest_release(str(hid), title_id, manga_title))
 
         results = await asyncio.gather(*tasks)
         return [rel for rel in results if rel is not None]
@@ -744,47 +443,24 @@ class MangaFireSource(Source):
     # ─────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
 
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
-        """Resolve a read href → ordered SSRF-allowlisted page URLs (PKG-01/R6, #314).
+        """Resolve a chapter id → ordered SSRF-allowlisted page URLs (PKG-01/R6).
 
-        ``chapter_id`` is the read href (``/read/{slug}.{id}/{lang}/chapter-{number}``,
-        D-09) minted by search/recent. Derived in PURE PYTHON over httpx — NO browser
-        (issue #314; the search-vrf crack of PR #313 extended to the reader):
-
-          1. parse the href → ``(slug_id, lang, number)``;
-          2. ``GET /ajax/read/{slug_id}/chapter/{lang}`` signed with
-             ``compute_vrf("{slug_id}@chapter@{lang}")`` → the reader chapter list
-             whose ``<a data-id data-number>`` rows map the href's ``number`` to its
-             reader ``itemId``;
-          3. ``GET /ajax/read/chapter/{itemId}`` signed with
-             ``compute_vrf("chapter@{itemId}")`` → ``{"result":{"images":[[url, _,
-             offset], …]}}`` — the server already mints the per-page CDN URLs, so
-             nothing is derived client-side.
-
-        Each URL is SSRF-allowlisted (fragment stripped first; a non-allowlisted URL
-        raises ``source_unavailable`` pre-fetch — SEC-01); the scramble offset (entry
-        index 2) rides as a ``#scr_{offset}`` fragment when ``offset>0`` (D-10); and the
-        page count is guarded against ``ctx.expected_pages`` when known. Because the
-        manifest is now browserless, concurrent download jobs no longer contend on a
-        shared reader nav (the old ``mangafire-manifest-contention`` cap is lifted).
-
-        A transient EMPTY image list is re-fetched up to ``_MANIFEST_EMPTY_RETRIES``
-        extra times (``_MANIFEST_RETRY_BACKOFF``); the SSRF/offset/``expected_pages``
-        checks run on the FINAL list only — an integrity mismatch is a real data problem
-        and is NOT retried.
+        ``chapter_id`` is the numeric chapter id (the ``/api/chapters/{id}`` key) minted
+        by search/recent. GETs ``/api/chapters/{id}`` → ``{data:{pages:[{url,width,
+        height}]}}``, reads the per-page CDN URLs VERBATIM (array order = page order),
+        strips any fragment, and SSRF-allowlists each (a non-allowlisted URL raises
+        ``source_unavailable`` pre-fetch — SEC-01). The new API carries NO scramble
+        offset, so URLs are returned CLEAN (no URL fragment). The page count is
+        guarded against ``ctx.expected_pages`` when known.
         """
-        slug_id, lang, number = self._parse_read_href(chapter_id)
-        item_id = await self._reader_item_id(slug_id, lang, number, ctx)
-        images = await self._fetch_image_list(item_id, ctx)
+        pages = await self._chapter_pages(chapter_id, ctx)
         urls: list[str] = []
-        for entry in images:
-            if not isinstance(entry, (list, tuple)) or not entry:
-                raise SourceError(
-                    "source_unavailable", "malformed mangafire image entry"
-                )
-            raw_url = entry[0]
+        for page in pages:
+            raw_url = page.get("url") if isinstance(page, dict) else None
             if not isinstance(raw_url, str) or not raw_url:
                 raise SourceError(
-                    "source_unavailable", "mangafire image entry missing url"
+                    "source_unavailable",
+                    f"mangafire page missing url for chapter {chapter_id}",
                 )
             clean, _frag = urldefrag(raw_url)
             if not _is_allowed_image_url(clean):
@@ -793,10 +469,7 @@ class MangaFireSource(Source):
                     "source_unavailable",
                     f"image URL failed the SSRF allowlist: {clean!r}",
                 )
-            # The reader image entry is ``[url, _, offset]`` — the scramble offset is at
-            # index 2 (index 1 is the site's own quality/width flag, unused here).
-            offset = self._parse_int(entry[2]) if len(entry) >= 3 else 0
-            urls.append(f"{clean}#scr_{offset}" if offset and offset > 0 else clean)
+            urls.append(clean)
         if ctx.expected_pages is not None and len(urls) != ctx.expected_pages:
             raise SourceError(
                 "source_unavailable",
@@ -805,150 +478,47 @@ class MangaFireSource(Source):
             )
         return urls
 
-    @staticmethod
-    def _parse_read_href(chapter_id: str) -> tuple[str, str, str]:
-        """Split a read href → ``(slug_id, lang, number)`` for the reader AJAX (#314).
-
-        ``/read/{slug}.{id}/{lang}/chapter-{number}`` → ``({id}, {lang}, {number})``.
-        ``slug_id`` is the trailing token after the manga token's last ``.`` (the same
-        chapter-list key used elsewhere). Raises ``source_unavailable`` for a malformed
-        (non-``/read/``) id so a bad handle never reaches the network.
-        """
-        parts = chapter_id.strip("/").split("/")
-        # ["read", "{slug}.{id}", "{lang}", "chapter-{number}"]
-        if len(parts) < 4 or parts[0] != "read" or not parts[3].startswith("chapter-"):
-            raise SourceError(
-                "source_unavailable",
-                f"malformed mangafire chapter id {chapter_id!r} (want a /read/ href)",
-            )
-        _manga_token, slug_id = _manga_token_and_slug_id(parts[1])
-        lang = parts[2]
-        number = parts[3][len("chapter-") :]
-        if not slug_id or not lang or not number:
-            raise SourceError(
-                "source_unavailable",
-                f"malformed mangafire chapter id {chapter_id!r} (want a /read/ href)",
-            )
-        return slug_id, lang, number
-
-    async def _reader_item_id(
-        self, slug_id: str, lang: str, number: str, ctx: SourceContext
-    ) -> str:
-        """Resolve the reader chapter list → the ``itemId`` for ``number`` (#314).
-
-        Signs ``GET /ajax/read/{slug_id}/chapter/{lang}`` with
-        ``compute_vrf("{slug_id}@chapter@{lang}")`` (the SAME pipeline as search) and
-        parses the returned ``result.html`` rows (``_parse_read_item_ids``) for the
-        ``data-id`` matching the href's ``data-number``. Raises ``source_unavailable``
-        when the list is unreadable or the chapter number is absent.
-        """
-        vrf = compute_vrf(f"{slug_id}@chapter@{lang}")
-        body = await ctx.get_json(
-            f"{self.base_url}/ajax/read/{slug_id}/chapter/{lang}", vrf=vrf
-        )
-        result = body.get("result") if isinstance(body, dict) else None
-        html = result.get("html") if isinstance(result, dict) else result
-        if not isinstance(html, str) or not html:
-            raise SourceError(
-                "source_unavailable",
-                f"mangafire reader chapter list unreadable for {slug_id}/{lang}",
-            )
-        id_by_number = await asyncio.to_thread(_parse_read_item_ids, html)
-        item_id = id_by_number.get(number)
-        if not item_id:
-            raise SourceError(
-                "source_unavailable",
-                f"no reader item-id for chapter {number} of {slug_id}/{lang}",
-            )
-        return item_id
-
-    async def _fetch_image_list(self, item_id: str, ctx: SourceContext) -> list[Any]:
-        """Fetch the signed image-list AJAX → the raw ``[[url, _, offset], …]`` (#314).
-
-        Signs ``GET /ajax/read/chapter/{item_id}`` with
-        ``compute_vrf("chapter@{item_id}")`` and returns the ``result.images`` list. A
-        transient EMPTY list is re-fetched up to ``_MANIFEST_EMPTY_RETRIES`` extra times
-        with ``_MANIFEST_RETRY_BACKOFF`` (transport faults / 5xx are already retried by
-        ``ctx.get_json``); a malformed-shape body raises ``source_unavailable``.
-        """
-        vrf = compute_vrf(f"chapter@{item_id}")
-        url = f"{self.base_url}/ajax/read/chapter/{item_id}"
-        for attempt in range(_MANIFEST_EMPTY_RETRIES + 1):
-            if attempt > 0:
-                backoff_idx = min(attempt - 1, len(_MANIFEST_RETRY_BACKOFF) - 1)
-                await asyncio.sleep(_MANIFEST_RETRY_BACKOFF[backoff_idx])
-            body = await ctx.get_json(url, vrf=vrf)
-            result = body.get("result") if isinstance(body, dict) else None
-            images = result.get("images") if isinstance(result, dict) else None
-            # A malformed envelope (missing/non-dict result, non-list images) is a hard
-            # contract break, NOT a transient empty capture — fail fast instead of
-            # burning the retry budget on a misleading "empty image list" (CodeRabbit
-            # #319). Only an actual empty list ([]) is retryable below.
-            if not isinstance(images, list):
-                raise SourceError(
-                    "source_unavailable",
-                    f"malformed mangafire image list for chapter {item_id}",
-                )
-            if images:
-                return images
-        raise SourceError(
-            "source_unavailable", f"empty mangafire image list for chapter {item_id}"
-        )
-
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
-        """Fetch one page image's bytes + geometric descramble (PKG-02, D-11/D-12).
+        """Fetch one page image's bytes via the shared session (PKG-02).
 
-        Strips the ``#scr_{offset}`` fragment, fetches the CLEAN URL via
-        ``ctx.get_bytes`` (NEVER the browser — CLAUDE.md) with adaptive CDN zone-retry
-        (see :meth:`_get_bytes_zone_retry` / debug
-        ``mangafire-stale-manifest-reresolve-budget``), and when ``offset>0``
-        descrambles in Pillow offloaded via ``asyncio.to_thread`` (ruff ASYNC). An
-        ``offset==0`` page is returned unchanged. The descramble always runs on the
-        bytes from WHICHEVER zone answered, so a zone switch never bypasses the offset
-        un-shuffle.
+        Strips any URL fragment and fetches the CLEAN URL via ``ctx.get_bytes`` (NEVER
+        the browser — CLAUDE.md) with adaptive CDN zone-retry (see
+        :meth:`_get_bytes_zone_retry` / debug ``mangafire-stale-manifest-reresolve-
+        budget``). The new JSON API carries NO scramble offset, so there is nothing to
+        descramble — the fetched bytes are returned as-is (PKG-04, never recompressed).
 
         PROXY LAYERING (260620-4im): this source opts into the framework residential
         proxy pool (``image_fetch_via_proxy_pool``). The engine invokes ``fetch_image``
         via ``ctx.fetch_image_via_pool``, which pins ONE per-job sticky proxy as the
-        OUTER egress dimension for the duration of this call — so every inner
-        ``ctx.get_bytes`` here, including the ``mfcdnN`` zone-retry below, egresses
-        through that SAME proxy. The proxy is the OUTER (per-job-sticky) dimension; the
-        zone-rewrite is INNER (per-page, same proxy). This method needs NO pool-aware
-        code — the routing is transparent at the transport layer.
+        OUTER egress dimension — so every inner ``ctx.get_bytes`` here, including the
+        ``mfcdnN`` zone-retry below, egresses through that SAME proxy. This method needs
+        NO pool-aware code — the routing is transparent at the transport layer.
         """
-        clean, frag = urldefrag(url)
-        offset = 0
-        if frag.startswith("scr_"):
-            offset = self._parse_int(frag[4:]) or 0
-        content = await self._get_bytes_zone_retry(clean, ctx)
-        if offset > 0:
-            return await asyncio.to_thread(_descramble_image, content, offset)
-        return content
+        clean, _frag = urldefrag(url)
+        return await self._get_bytes_zone_retry(clean, ctx)
 
     async def _get_bytes_zone_retry(self, clean_url: str, ctx: SourceContext) -> bytes:
         """``ctx.get_bytes`` the clean URL, retrying across CDN zones on a 403.
 
         MangaFire's per-page 403 is a Cloudflare WAF deny of the gateway's egress IP on
-        a particular ``mfcdnN`` CDN zone, not a stale/expired signed URL (debug
-        ``mangafire-stale-manifest-reresolve-budget``). The IDENTICAL signed path
-        returns 200 on an un-blocked zone, so on a 403 we re-fetch the same path with
-        the host's zone label rewritten to each OTHER known zone
-        (:data:`_MANGAFIRE_CDN_ZONES`) until one answers; the winning zone is remembered
-        on the per-job context (:data:`_PREFERRED_ZONE_ATTR`) so the rest of this job
-        tries it FIRST and never re-probes the blocked zone every page.
+        a particular ``mfcdnN`` CDN zone, not a stale/expired URL (debug
+        ``mangafire-stale-manifest-reresolve-budget``). The IDENTICAL page path returns
+        200 on an un-blocked zone, so on a 403 we re-fetch the same path with the host's
+        zone label rewritten to each OTHER known zone (:data:`_MANGAFIRE_CDN_ZONES`)
+        until one answers; the winning zone is remembered on the per-job context
+        (:data:`_PREFERRED_ZONE_ATTR`) so the rest of this job tries it FIRST and never
+        re-probes the blocked zone every page.
 
         Every rewritten URL is re-validated through :func:`_is_allowed_image_url` (SSRF,
         SEC-01) before it is fetched — a rewrite that somehow failed the allowlist is
         skipped, never fetched blindly. A non-403 ``SourceError`` (a genuine page loss)
         propagates unchanged. When EVERY zone 403s the request raises a clear terminal
-        ``source_unavailable`` naming the blocked host — NOT the old stale-manifest
-        wording (the engine also opts mangafire out of its re-resolve recovery).
+        ``source_unavailable`` naming the blocked host.
 
         PROXY LAYERING (260620-4im): the zone-retry is the INNER dimension. The
-        framework proxy pool holds ONE sticky proxy for this whole call (OUTER), so
-        every ``ctx.get_bytes`` candidate below egresses through the SAME proxy; the
-        framework rotates to a DIFFERENT proxy only when this entire zone-retry raises
-        (e.g. all zones 403 on the current proxy). One proxy spans the whole zone sweep.
+        framework proxy pool holds ONE sticky proxy for this whole call (OUTER), so all
+        ``ctx.get_bytes`` candidate below egresses through the SAME proxy; the framework
+        rotates to a DIFFERENT proxy only when this entire zone-retry raises.
         """
         # Build the zone-attempt order: the job's remembered-good zone first (if any),
         # then the current URL's zone, then every other known zone — de-duplicated,
@@ -996,31 +566,115 @@ class MangaFireSource(Source):
             status=403,
         ) from last_403
 
-    # ─────────────────────────── helpers ──────────────────────────────────────
+    # ─────────────────────────── data access (plain JSON) ─────────────────────
 
-    async def _chapter_list(
-        self, slug_id: str, lang: str, ctx: SourceContext
+    async def _search_titles(
+        self, query: str, limit: int, ctx: SourceContext
     ) -> list[dict[str, Any]]:
-        """GET the per-manga chapter list → ordered chapter rows (D-06).
+        """GET ``/api/titles?keyword=&limit=&page=1`` → the ``items`` title list.
 
-        ``GET /ajax/manga/{slugId}/chapter/{lang}`` returns ``{"result":"<ul>…</ul>"}``
-        (HTML-in-JSON, NO vrf); the ``result`` HTML is lxml-parsed off the event loop
-        via ``asyncio.to_thread``. Consumed by BOTH search and recent.
+        TITLE-ONLY (each item is a series ``{id,hid,slug,title,…}``, not a chapter); the
+        chapter-list key is ``hid``. Returns ``[]`` for a missing/malformed ``items``.
         """
         body = await ctx.get_json(
-            f"{self.base_url}/ajax/manga/{slug_id}/chapter/{lang}"
+            f"{self.base_url}/api/titles", keyword=query, limit=limit, page=1
         )
-        result = body.get("result") if isinstance(body, dict) else None
-        if not isinstance(result, str):
-            return []
-        return await asyncio.to_thread(_parse_chapter_list, result)
+        items = body.get("items")
+        return (
+            [it for it in items if isinstance(it, dict)]
+            if isinstance(items, list)
+            else []
+        )
+
+    async def _recent_titles(
+        self, limit: int, ctx: SourceContext
+    ) -> list[dict[str, Any]]:
+        """GET ``/api/titles?order[chapter_updated_at]=desc&limit=`` → newest titles.
+
+        The ``order[...]`` bracket param is REQUIRED (a plain ``sort=`` is silently
+        ignored) and can't be a Python kwarg, so the URL is built via ``urlencode`` and
+        passed whole to ``ctx.get_json``. Returns ``[]`` for a malformed body.
+        """
+        qs = urlencode({"order[chapter_updated_at]": "desc", "limit": limit})
+        body = await ctx.get_json(f"{self.base_url}/api/titles?{qs}")
+        items = body.get("items")
+        return (
+            [it for it in items if isinstance(it, dict)]
+            if isinstance(items, list)
+            else []
+        )
+
+    async def _chapter_list(
+        self, hid: str, lang: str, ctx: SourceContext
+    ) -> list[dict[str, Any]]:
+        """GET the COMPLETE per-title chapter list, paginating past the 200-cap.
+
+        ``GET /api/titles/{hid}/chapters?language=&limit=200&page=`` → ``{items,meta}``.
+        The endpoint caps ``limit`` at 200, so a long series has ``meta.lastPage > 1``;
+        for the COMPLETE list (source-onboarding completeness rule) the extra pages
+        2..lastPage are fetched concurrently (bounded semaphore) and concatenated in
+        page order — which preserves the endpoint's newest-first (number desc) ordering.
+        """
+        first_items, last_page = await self._chapters_page(hid, lang, 1, ctx)
+        items = list(first_items)
+        if last_page <= 1:
+            return items
+        sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
+
+        async def _page(page: int) -> list[dict[str, Any]]:
+            async with sem:
+                page_items, _ = await self._chapters_page(hid, lang, page, ctx)
+            return page_items
+
+        rest = await asyncio.gather(*[_page(p) for p in range(2, last_page + 1)])
+        for page_items in rest:
+            items.extend(page_items)
+        return items
+
+    async def _chapters_page(
+        self, hid: str, lang: str, page: int, ctx: SourceContext
+    ) -> tuple[list[dict[str, Any]], int]:
+        """One chapters page → ``(items, meta.lastPage)`` (``lastPage`` floors to 1)."""
+        body = await ctx.get_json(
+            f"{self.base_url}/api/titles/{hid}/chapters",
+            language=lang,
+            limit=_CHAPTER_PAGE_LIMIT,
+            page=page,
+        )
+        raw_items = body.get("items")
+        items = (
+            [it for it in raw_items if isinstance(it, dict)]
+            if isinstance(raw_items, list)
+            else []
+        )
+        meta = body.get("meta")
+        last_page = (
+            self._parse_int(meta.get("lastPage")) if isinstance(meta, dict) else None
+        )
+        return items, last_page or 1
+
+    async def _chapter_pages(self, chapter_id: str, ctx: SourceContext) -> list[Any]:
+        """GET ``/api/chapters/{id}`` → the raw ``data.pages`` list (``[{url,…}]``).
+
+        Raises ``source_unavailable`` when ``data``/``pages`` is missing or empty.
+        """
+        body = await ctx.get_json(f"{self.base_url}/api/chapters/{chapter_id}")
+        data = body.get("data")
+        pages = data.get("pages") if isinstance(data, dict) else None
+        if not isinstance(pages, list) or not pages:
+            raise SourceError(
+                "source_unavailable",
+                f"no pages in mangafire chapter {chapter_id}",
+            )
+        return pages
 
     @classmethod
     def _filter_language(cls, languages: list[str] | None) -> str:
-        """The single language threaded into the /filter + chapter-list URLs.
+        """The single language threaded into the chapter-list URLs.
 
-        MangaFire is multi-language and the feeds are language-scoped, so a search/
-        recent request picks the first requested language (or the English default).
+        MangaFire is multi-language and the chapter feed is language-scoped, so a
+        search/recent request picks the first requested language (or the English
+        default).
         """
         if languages:
             return languages[0]
@@ -1030,39 +684,39 @@ class MangaFireSource(Source):
 
     def _to_release(
         self,
-        manga_token: str,
+        hid: str,
+        title_id: str,
         manga_title: str,
         lang: str,
         chapter: dict[str, Any],
         ctx: SourceContext,
     ) -> Release | None:
-        """Mint one Release from a single parsed chapter row (D-08/D-09)."""
-        href = chapter.get("href")
-        if not href:
+        """Mint one Release from a single chapter row (D-08).
+
+        The chapter numeric ``id`` is the resolve unit (the ``/api/chapters/{id}`` key)
+        AND is folded into the guid tail so chapters with a blank ``number`` (ch_str
+        ``"?"``) don't collide and get silently deduped by Mangarr (issue #219).
+        """
+        chapter_id = chapter.get("id")
+        if chapter_id is None:
             return None
-        href = str(href)
+        chapter_id = str(chapter_id)
         chapter_number = self._parse_decimal(chapter.get("number"))
         publish_date = (
-            _iso_from_mangafire_date(chapter.get("date"))
-            or datetime.now(UTC).isoformat()
+            _iso_from_epoch(chapter.get("createdAt")) or datetime.now(UTC).isoformat()
         )
         ch_str = (
             format(chapter_number.normalize(), "f")
             if chapter_number is not None
             else "?"
         )
-        slug_id = manga_token.rsplit(".", 1)[-1] if "." in manga_token else manga_token
         title = self._build_title(manga_title, ch_str, lang)
-        # The read href is the true per-chapter resolve unit — fold its unique tail
-        # into the guid so chapters with a blank data-number (ch_str=="?") don't
-        # collide and get silently deduped away by Mangarr (issue #219).
-        href_slug = href.rstrip("/").rsplit("/", 1)[-1]
-        guid = f"mangafire:{manga_token}:ch-{ch_str}:{lang}:{href_slug}"
+        guid = f"mangafire:{hid}:ch-{ch_str}:{lang}:{chapter_id}"
 
         handle = ctx.handle_store.mint(
             ResolutionRecord(
                 source_key=self.key,
-                chapter_id=href,  # the read href is the resolve unit (D-09)
+                chapter_id=chapter_id,  # the numeric chapter id is the resolve unit
                 language=lang,
                 title=title,
                 manga_title=manga_title,
@@ -1084,7 +738,7 @@ class MangaFireSource(Source):
             language=lang,
             scanlation_group=None,
             page_count=None,
-            ids={"mangafireMangaId": manga_token, "mangafireSlugId": slug_id},
+            ids={"mangafireHid": hid, "mangafireTitleId": title_id},
         )
 
     @staticmethod
