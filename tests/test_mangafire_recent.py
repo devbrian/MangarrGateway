@@ -58,6 +58,9 @@ class _FakeCtx:
         self._chapter_pages = chapter_pages
         self._chapters_body = chapters_body or {}
         self.get_json_calls: list[str] = []
+        # (hid, page) for every /api/titles/{hid}/chapters GET — lets tests assert
+        # recent never paginates past page 1 per title.
+        self.chapter_page_gets: list[tuple[str, int]] = []
         self.candidates_enumerated: int | None = None
         self.expected_pages: int | None = None
 
@@ -84,6 +87,7 @@ class _FakeCtx:
             hid = m.group(1)
             pages = self._chapter_pages.get(hid, [_chapters_body([])])
             page = int(params.get("page", 1))
+            self.chapter_page_gets.append((hid, page))
             return pages[min(page - 1, len(pages) - 1)]
         if "/api/chapters/" in url:
             return self._chapters_body
@@ -173,3 +177,42 @@ async def test_recent_bounds_fanout_by_limit() -> None:
     assert len(releases) == 2
     chapter_gets = [u for u in ctx.get_json_calls if "/chapters" in u]
     assert len(chapter_gets) == 2
+
+
+@pytest.mark.asyncio
+async def test_recent_fetches_only_page_1_per_title() -> None:
+    """Recent must read ONLY page 1 per title — never paginate the full history.
+
+    The newest chapter is page-1 row 0 (newest-first), so even a multi-page series
+    (``lastPage=3`` here) must produce exactly one chapters GET, at ``page=1``.
+    """
+    titles = [{"id": 50, "hid": "l33", "title": "Naruto"}]
+    # A 3-page series: if recent paginated (like search's _chapter_list) it would GET
+    # pages 1, 2 AND 3. Page 1's row 0 (number 700) is the newest and all recent needs.
+    chapter_pages = {
+        "l33": [
+            _chapters_body(
+                [{"id": 4736538, "number": "700", "createdAt": 1757308339}],
+                page=1,
+                last_page=3,
+            ),
+            _chapters_body(
+                [{"id": 111, "number": "400", "createdAt": 2}], page=2, last_page=3
+            ),
+            _chapters_body(
+                [{"id": 222, "number": "1", "createdAt": 3}], page=3, last_page=3
+            ),
+        ]
+    }
+    ctx = _FakeCtx(titles_body=_titles_body(titles), chapter_pages=chapter_pages)
+    releases = await MangaFireSource().recent(
+        languages=None,
+        limit=10,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
+    )
+    # Exactly one chapters GET, and it was page 1 — pages 2/3 never fetched.
+    assert ctx.chapter_page_gets == [("l33", 1)]
+    # The minted release is the newest chapter (page-1 row 0), not a later page.
+    assert len(releases) == 1
+    assert releases[0].chapter_number == Decimal("700")
