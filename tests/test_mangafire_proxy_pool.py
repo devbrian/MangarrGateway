@@ -100,7 +100,7 @@ async def test_clean_proxy_first_zone_no_rewrite() -> None:
     pool.transports[proxies[0].selection_key] = transport
     ctx = _ctx(pool)
     source = MangaFireSource()
-    url = f"{_CDN}/0.jpg"  # offset 0 (no #scr_ fragment) → no descramble
+    url = f"{_CDN}/0.jpg"  # plain CDN url (the new API has no scramble offset)
 
     out = await ctx.fetch_image_via_pool(lambda: source.fetch_image(url, ctx))
     assert out == _IMG

@@ -2,80 +2,62 @@
 
 MangaFire is registered in ``sources/__init__.py``; D-50 requires every registered
 source to ship a ``LiveSmokeProfile`` in the same PR (else the live-collection hook
-fails at collection time). This profile declares the live traits + the live-tune
-items for the deploy-host smoke. Cross-reference
-``src/manga_gateway/sources/mangafire.py`` for the production source metadata — this
-profile is the TEST-ONLY mirror (D-49 keeps profiles structurally separate).
+fails at collection time). This profile declares the live traits for the deploy-host
+smoke. Cross-reference ``src/manga_gateway/sources/mangafire.py`` for the production
+source metadata — this profile is the TEST-ONLY mirror (D-49 keeps profiles
+structurally separate).
+
+New JSON API (260706-hgu)
+-------------------------
+MangaFire rewrote its frontend to a React SPA backed by a plain, unsigned ``GET /api/*``
+JSON REST API. Search (``/api/titles``), the chapter list
+(``/api/titles/{hid}/chapters``), and the manifest (``/api/chapters/{id}``) all answer
+cold over plain httpx — no vrf, no browser, no descramble. The image CDN
+(``mfcdnN.xyz``) is unchanged and still IP-bans datacenter egress, so the download smoke
+exercises the proxy-pool image fetch.
 
 Anti-bot expectations (D-16)
 ----------------------------
-* ``expected_caps_antibot = "cloudflare"`` — matches ``MangaFireSource.antibot``.
-  Interior listing AND reader pages answer cold over plain httpx (issue #314: the
-  manifest is now derived in-process, not navigated), but the source declares
-  ``cloudflare`` anyway (D-05) so the framework keeps a lazily-solved clearance and
-  degrades gracefully on a datacenter host that trips a managed challenge on a
-  listing/reader endpoint.
-* ``needs_solver_warm = True`` — kept as a Cloudflare CLEARANCE FALLBACK only, NOT for
-  the manifest. As of issue #314 NO path drives the browser: search (PR #313) AND the
-  download manifest (#314) now derive their ``vrf`` in-process via ``compute_vrf`` and
-  answer cold over httpx (the reader's two signed AJAX calls). The harness still
-  ``await solver.warm()``s so a datacenter host that trips a managed challenge degrades
-  gracefully; once the nightly confirms the cold reader path holds on the deploy host
-  this can drop to ``False`` (the warm is then unused).
+* ``expected_caps_antibot = "cloudflare"`` — matches ``MangaFireSource.antibot``. The
+  JSON API answers cold, but the source declares ``cloudflare`` (D-05) so the framework
+  keeps a lazily-solved clearance and degrades gracefully on a datacenter host that
+  trips a managed challenge.
+* ``needs_solver_warm = True`` — kept as a Cloudflare CLEARANCE FALLBACK only; NO path
+  drives the browser. The harness still ``await solver.warm()``s so a datacenter host
+  that trips a managed challenge degrades gracefully; once the nightly confirms the cold
+  JSON path holds on the deploy host this can drop to ``False``.
 
-RESIDENTIAL-ONLY caveat + ONE-ATTRIBUTE escalation path (D-12)
---------------------------------------------------------------
-The MangaFire recon (issue #192) was live-verified from a RESIDENTIAL IP; the listing
-pages answered cold and headless Chromium passed Cloudflare. A DATACENTER-IP run MAY
-surface a managed challenge on the listing pages too. The source already declares
-``antibot = "cloudflare"`` so the clearance path is wired; if Chromium's fingerprint
-is flagged on the deploy host, the escalation is the one-attribute engine flip
-(``solver_engine = "android"``) — no networking/glue change, since the framework owns
-the clearance path (CLAUDE.md: Patchright is the gateway's only desktop engine).
-
-Release shape (D-08): MangaFire releases carry the ``{slug}.{id}`` manga token as the
-leading guid segment (``mangafire:{mangaToken}:ch-{number}:{lang}``) and expose it as
-``ids.mangafireMangaId``; the smoke modules key on ``id_field = "mangafireMangaId"``.
+Release shape: MangaFire releases carry the title ``hid`` as the leading guid segment
+(``mangafire:{hid}:ch-{number}:{lang}:{chapterId}``) and expose it as
+``ids.mangafireHid`` (plus the numeric ``ids.mangafireTitleId``); the smoke modules key
+on ``id_field = "mangafireHid"``.
 
 Default-query selection
 -----------------------
-``default_query = "blue lock"`` — a high-traffic, long-running title pinned from the
-issue #192 recon (``/manga/blue-lockk.kw9j9``, live-verified 2026-06-09) with a
+``default_query = "blue lock"`` — a high-traffic, long-running title with a
 deterministic leading hit so ``release[0]`` is well-defined. The first live smoke
 confirms the catalog still returns it; swap if the catalog shifts.
 
-Rate limit (PROBE-MEASURED 2026-06-10 — D-14, Plan 03)
-------------------------------------------------------
-``rate_limit_per_minute = 60`` + ``max_concurrent_jobs = 3`` are now MEASURED, not
-guessed (``scripts/probe_rate_limits.py``, residential proxies). The mangafire.to
-text/AJAX host enforces a real HTTP-429 ceiling — clean at 120/min, 429 onset at
-300/min — so 60 is the conservative ~50%-of-clean-ceiling value governing the limited
-``get_json`` chapter-list path. The image CDN had NO limit (clean to 960/min at
-concurrency 8); images ride the unlimited ``get_bytes`` path bounded by
-``max_concurrent_jobs = 3``. The browser-manifest path was unmeasurable by the httpx
-probe — the live nightly below re-confirms it end-to-end. See the source's
-reconciliation block for the full per-endpoint breakdown.
+Rate limit (PROBE-MEASURED 2026-06-10 — D-14)
+---------------------------------------------
+The mangafire.to API host enforces a real HTTP-429 ceiling (clean at 120/min, 429 onset
+at 300/min), so ``rate_limit_per_minute = 100`` governs the limited ``get_json``
+search/chapter-list path. The image CDN had NO limit (clean to 960/min at concurrency
+8); images ride the unlimited ``get_bytes`` path bounded by ``max_concurrent_jobs = 3``.
 
 LIVE-TUNE items (refine from the first deploy-host smoke)
 ---------------------------------------------------------
 * **default_query stability** — confirm "blue lock" still returns a deterministic
   leading hit with an available short chapter; swap if the catalog shifts.
-* **typed-search vrf capture** (D-13) — the search vrf is minted ONLY by real keyboard
-  typing into ``.search-inner input[name=keyword]``; confirm the captured vrf works on
-  ``/filter`` live and that the LRU cache reuses it within a query.
-* **manifest performance-capture** (D-08) — the reader auto-fires
-  ``/ajax/read/chapter/{itemId}?vrf=…``; confirm the ``performance``-entry poll catches
-  it within the ≤60×500ms budget on the deploy host.
-* **image descramble** (D-12) — confirm ``offset>0`` pages descramble correctly and
-  ``offset==0`` pages pass through unchanged on real CDN images.
-* **rate_limit_per_minute / max_concurrent_jobs** — set to 60 / 3 from the 2026-06-10
-  D-14 probe (real 429 ceiling on the text host; image CDN unlimited). Re-confirm the
-  browser-manifest path (probe-unmeasurable) against the real end-to-end download.
-* **download_timeout_s** — 480.0 (Cloudflare warm + browser-DOM manifest + per-page
-  descramble, matching the comix CF-warm budget). Re-size against the real end-to-end
-  download wall-clock.
-* **fixture_drift_paths** — empty until the first live smoke pins the real chapter-list
-  / card / manifest shapes; add anchors then (mirrors comix.py).
+* **chapter-list completeness** — confirm the ``meta.lastPage`` pagination returns the
+  COMPLETE list for a long series (limit=200 cap).
+* **proxy image fetch** — confirm the ``mfcdnN`` zone-retry + residential proxy returns
+  bytes for real CDN images from the deploy host.
+* **rate_limit_per_minute / max_concurrent_jobs** — set to 100 / 3 from the 2026-06-10
+  D-14 probe; re-confirm against the real end-to-end download.
+* **download_timeout_s** — 480.0 (Cloudflare warm fallback + proxy image fetch);
+  re-size against the real end-to-end download wall-clock.
+* **fixture_drift_paths** — empty until the first live smoke pins the real JSON shapes.
 """
 
 from __future__ import annotations
@@ -87,22 +69,15 @@ LIVE_SMOKE = LiveSmokeProfile(
     default_query="blue lock",
     expected_caps_antibot="cloudflare",
     needs_solver_warm=True,
-    # CF warm + browser-DOM manifest capture + per-page descramble (cf comix 480.0).
+    # CF warm fallback + proxy image fetch (cf comix 480.0).
     download_timeout_s=480.0,
     max_releases_to_try=3,
     min_releases_returned=1,
-    expected_release_pattern={"sourceKey": "mangafire", "id_field": "mangafireMangaId"},
-    # External tracker links (Phase 13, D-08 / R7). REPINNED to the live
-    # ``default_query="blue lock"`` title (USER DECISION, 2026-06-19): MangaFire's
-    # ``<script id="syncData">`` JSON exposes only AniList + MyAnimeList
-    # (``manga_id`` is its OWN internal id and is dropped, R3). Captured live
-    # 2026-06-19 via a headed Patchright CF clear — the Blue Lock release returns
-    # these two keys consistently. (The prior Berserk pins were for a DIFFERENT
-    # title than default_query and could never pass — dropped.)
-    expected_external_links={
-        "anilist": "106130",
-        "myAnimeList": "114745",
-    },
+    expected_release_pattern={"sourceKey": "mangafire", "id_field": "mangafireHid"},
+    # External tracker links: the new ``/api/titles/{hid}`` detail carries NO
+    # anilist/mal id (the SPA's tracker refs are library-import only), so the source no
+    # longer populates ``externalLinks``. Empty map ⇒ test_external_links_smoke SKIPS.
+    expected_external_links={},
     fixture_drift_paths=[],
     perf_budget_s=None,
 )

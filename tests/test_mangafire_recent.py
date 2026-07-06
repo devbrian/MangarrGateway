@@ -1,13 +1,12 @@
-"""Unit tests for ``MangaFireSource.recent`` — /filter cards → DIRECT newest chapter.
+"""Unit tests for ``MangaFireSource.recent`` — JSON /api/titles → DIRECT newest chapter.
 
-``GET /filter?sort=recently_updated&language[]={lang}&page=1`` (HTML, NO vrf) returns
-title-only cards; ``recent`` fans out the per-title chapter list
-(``GET /ajax/manga/{slugId}/chapter/{lang}``, HTML-in-``result``) under a bounded
-semaphore and mints the NEWEST chapter DIRECT (D-07). No ``:DEFERRED`` — the read href
-(the resolve unit) is always present.
+``GET /api/titles?order[chapter_updated_at]=desc&limit=`` returns title-only items;
+``recent`` fans out the per-title chapter list (``GET /api/titles/{hid}/chapters``)
+under a bounded semaphore and mints the NEWEST chapter DIRECT. The chapter numeric id
+is always present, so there is no ``:DEFERRED``.
 
-No network: a fake ``SourceContext`` routes ``get_bytes`` (filter HTML) + ``get_json``
-(chapter-list result) by URL and mints real handles via a ``HandleStore``.
+No network: a fake ``SourceContext`` routes ``get_json`` by URL and mints real handles.
+The ``_titles_body`` / ``_chapters_body`` builders here are shared by the search tests.
 """
 
 from __future__ import annotations
@@ -24,78 +23,98 @@ from manga_gateway.sources.mangafire import MangaFireSource
 _GUID_RE = re.compile(r"^mangafire:[\w.-]+:ch-[\d.?]+:[a-z-]+:[\w.-]+$")
 
 
-def _cards_html(cards: list[tuple[str, str]]) -> bytes:
-    """Build a /filter page: one .original.card-lg .unit .inner per (href, title)."""
-    inners = "\n".join(
-        f"""
-        <div class="inner">
-          <a href="{href}" class="poster">
-            <img src="https://mangafire.to/thumb/{title.replace(" ", "-")}.jpg">
-          </a>
-          <div class="info"><a href="{href}">{title}</a></div>
-        </div>
-        """
-        for href, title in cards
-    )
-    return (
-        f"<div class='original card-lg'><div class='unit'>{inners}</div></div>".encode()
-    )
+def _titles_body(titles: list[dict[str, Any]]) -> dict[str, Any]:
+    """A ``/api/titles`` response: ``{items:[{id,hid,title,…}], meta}``."""
+    return {"items": titles, "meta": {"total": len(titles), "page": 1, "lastPage": 1}}
 
 
-def _chapter_list_html(chapters: list[dict[str, Any]]) -> str:
-    """Build a chapter-list `result` fragment (newest-first), one <li> per chapter."""
-    rows = "".join(
-        f"""
-        <li class="item" data-number="{ch["number"]}">
-          <a href="{ch["href"]}">
-            <span>Chapter {ch["number"]}: </span>
-            <span>{ch.get("date", "May 21, 2026")}</span>
-          </a>
-        </li>
-        """
-        for ch in chapters
-    )
-    return f"<ul>{rows}</ul>"
+def _chapters_body(
+    chapters: list[dict[str, Any]], *, page: int = 1, last_page: int = 1
+) -> dict[str, Any]:
+    """A ``/api/titles/{hid}/chapters`` response page (newest-first items)."""
+    return {
+        "items": chapters,
+        "meta": {"total": len(chapters), "page": page, "lastPage": last_page},
+    }
 
 
 class _FakeCtx:
-    def __init__(self, *, filter_html: bytes, chapter_lists: dict[str, str]) -> None:
-        self.handle_store = HandleStore()
-        self._filter_html = filter_html
-        self._chapter_lists = chapter_lists
-        self.get_bytes_calls: list[str] = []
-        self.get_json_calls: list[str] = []
+    """Routes ``get_json`` for the titles + chapters endpoints from canned bodies.
 
-    async def get_bytes(self, url: str) -> bytes:
-        self.get_bytes_calls.append(url)
-        return self._filter_html
+    ``chapter_pages`` maps ``hid`` → an ordered list of page bodies (one per page
+    number, 1-indexed); a single-page series is a one-element list. ``titles_body``
+    answers the ``/api/titles`` call. ``chapters_body`` answers ``/api/chapters/{id}``.
+    """
+
+    def __init__(
+        self,
+        *,
+        titles_body: dict[str, Any],
+        chapter_pages: dict[str, list[dict[str, Any]]],
+        chapters_body: dict[str, Any] | None = None,
+    ) -> None:
+        self.handle_store = HandleStore()
+        self._titles_body = titles_body
+        self._chapter_pages = chapter_pages
+        self._chapters_body = chapters_body or {}
+        self.get_json_calls: list[str] = []
+        self.candidates_enumerated: int | None = None
+        self.expected_pages: int | None = None
+
+    async def cached_resolve(self, key: Any, fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    async def cached_enumerate(self, key: Any, fetch_fn: Any) -> Any:
+        return await fetch_fn()
+
+    def cached_resolve_key(
+        self, normalized_query: str, languages: list[str], *, extra: object = None
+    ) -> tuple[Any, ...]:
+        return ("mangafire", normalized_query, tuple(sorted(languages)))
+
+    def cached_enumerate_key(
+        self, hid: str, languages: list[str], *, extra: object = None
+    ) -> tuple[Any, ...]:
+        return ("mangafire", hid, tuple(sorted(languages)))
 
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         self.get_json_calls.append(url)
-        slug_id = url.split("/ajax/manga/")[1].split("/")[0]
-        return {"status": 200, "result": self._chapter_lists.get(slug_id, "")}
+        m = re.search(r"/api/titles/([^/]+)/chapters", url)
+        if m:
+            hid = m.group(1)
+            pages = self._chapter_pages.get(hid, [_chapters_body([])])
+            page = int(params.get("page", 1))
+            return pages[min(page - 1, len(pages) - 1)]
+        if "/api/chapters/" in url:
+            return self._chapters_body
+        if "/api/titles" in url:
+            return self._titles_body
+        raise AssertionError(f"unexpected get_json url {url!r}")
 
 
 @pytest.mark.asyncio
 async def test_recent_mints_direct_newest_chapter_per_title() -> None:
-    cards = [
-        ("/manga/blue-lockk.kw9j9", "Blue Lock"),
-        ("/manga/one-piece.abcd", "One Piece"),
+    titles = [
+        {"id": 1, "hid": "kw9", "title": "Blue Lock"},
+        {"id": 2, "hid": "abc", "title": "One Piece"},
     ]
-    chapter_lists = {
-        "kw9j9": _chapter_list_html(
-            [
-                {"number": "346.2", "href": "/read/blue-lockk.kw9j9/en/chapter-346.2"},
-                {"number": "346.1", "href": "/read/blue-lockk.kw9j9/en/chapter-346.1"},
-            ]
-        ),
-        "abcd": _chapter_list_html(
-            [{"number": "1120", "href": "/read/one-piece.abcd/en/chapter-1120"}]
-        ),
+    chapter_pages = {
+        "kw9": [
+            _chapters_body(
+                [
+                    {"id": 5002, "number": "346.2", "createdAt": 1757308339},
+                    {"id": 5001, "number": "346.1", "createdAt": 1757208339},
+                ]
+            )
+        ],
+        "abc": [_chapters_body([{"id": 9001, "number": "1120", "createdAt": 1}])],
     }
-    ctx = _FakeCtx(filter_html=_cards_html(cards), chapter_lists=chapter_lists)
+    ctx = _FakeCtx(titles_body=_titles_body(titles), chapter_pages=chapter_pages)
     releases = await MangaFireSource().recent(
-        languages=None, limit=50, since=None, ctx=ctx
+        languages=None,
+        limit=50,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
     )
 
     assert len(releases) == 2
@@ -109,45 +128,48 @@ async def test_recent_mints_direct_newest_chapter_per_title() -> None:
         assert ":" not in rel.download_handle  # opaque, not a structured composite
         record = await ctx.handle_store.resolve(rel.download_handle)
         assert record is not None
-        # The chapter_id is the read href (the resolve unit, D-09).
-        assert record.chapter_id.startswith("/read/")
+        # The chapter_id is the numeric chapter id (the resolve unit).
+        assert record.chapter_id.isdigit()
         assert rel.language == "en"
-    # The /filter recent feed was fetched with the recently_updated sort.
-    assert any("recently_updated" in u for u in ctx.get_bytes_calls)
+    # The recent feed used the required order[...] bracket param.
+    assert any("order%5Bchapter_updated_at%5D=desc" in u for u in ctx.get_json_calls)
 
 
 @pytest.mark.asyncio
 async def test_recent_skips_title_with_empty_chapter_list() -> None:
-    cards = [
-        ("/manga/blue-lockk.kw9j9", "Blue Lock"),
-        ("/manga/empty.zzzz", "Empty Title"),
+    titles = [
+        {"id": 1, "hid": "kw9", "title": "Blue Lock"},
+        {"id": 2, "hid": "zzz", "title": "Empty Title"},
     ]
-    chapter_lists = {
-        "kw9j9": _chapter_list_html(
-            [{"number": "1", "href": "/read/blue-lockk.kw9j9/en/chapter-1"}]
-        ),
-        "zzzz": "",  # no chapters → skipped, never crashes the whole poll
+    chapter_pages = {
+        "kw9": [_chapters_body([{"id": 1, "number": "1", "createdAt": 1}])],
+        "zzz": [_chapters_body([])],  # no chapters → skipped, never crashes the poll
     }
-    ctx = _FakeCtx(filter_html=_cards_html(cards), chapter_lists=chapter_lists)
+    ctx = _FakeCtx(titles_body=_titles_body(titles), chapter_pages=chapter_pages)
     releases = await MangaFireSource().recent(
-        languages=["en"], limit=50, since=None, ctx=ctx
+        languages=["en"],
+        limit=50,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
     )
     assert [r.manga_title for r in releases] == ["Blue Lock"]
 
 
 @pytest.mark.asyncio
 async def test_recent_bounds_fanout_by_limit() -> None:
-    cards = [(f"/manga/t{i}.s{i}", f"Title {i}") for i in range(5)]
-    chapter_lists = {
-        f"s{i}": _chapter_list_html(
-            [{"number": "1", "href": f"/read/t{i}.s{i}/en/chapter-1"}]
-        )
+    titles = [{"id": i, "hid": f"h{i}", "title": f"Title {i}"} for i in range(5)]
+    chapter_pages = {
+        f"h{i}": [_chapters_body([{"id": 100 + i, "number": "1", "createdAt": 1}])]
         for i in range(5)
     }
-    ctx = _FakeCtx(filter_html=_cards_html(cards), chapter_lists=chapter_lists)
+    ctx = _FakeCtx(titles_body=_titles_body(titles), chapter_pages=chapter_pages)
     releases = await MangaFireSource().recent(
-        languages=None, limit=2, since=None, ctx=ctx
+        languages=None,
+        limit=2,
+        since=None,
+        ctx=ctx,  # type: ignore[arg-type]
     )
     # limit=2 bounds the per-title fan-out → at most 2 chapter-list GETs + 2 releases.
     assert len(releases) == 2
-    assert len(ctx.get_json_calls) == 2
+    chapter_gets = [u for u in ctx.get_json_calls if "/chapters" in u]
+    assert len(chapter_gets) == 2

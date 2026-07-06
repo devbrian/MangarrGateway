@@ -20,7 +20,7 @@ def test_mangafire_class_declares_cloudflare_antibot() -> None:
     assert MangaFireSource.name == "MangaFire"
     assert MangaFireSource.antibot == "cloudflare"
     assert MangaFireSource.cloudflare_challenge_url == "https://mangafire.to/"
-    # The image descramble is geometric in fetch_image, NOT the decrypt seam (D-04).
+    # The JSON API is plaintext — no response-byte decrypt seam (260706-hgu).
     assert MangaFireSource.decrypt_scheme is None
     assert MangaFireSource.session_prep is None
     assert MangaFireSource.supports_search is True
@@ -29,11 +29,10 @@ def test_mangafire_class_declares_cloudflare_antibot() -> None:
 
 
 def test_mangafire_downloads_run_concurrently() -> None:
-    """Download jobs run concurrently again (max_concurrent_jobs == 3): issue #314 made
-    the manifest browserless (two signed httpx AJAX calls, no reader nav), dissolving
-    the mangafire-manifest-contention cause that had forced serialization to 1. Restored
-    to the D-14 probe-measured safe value. Search/recent use the separate fan-out
-    semaphore (_CHAPTERS_FANOUT_CONCURRENCY), not this knob."""
+    """Download jobs run concurrently (max_concurrent_jobs == 3): the manifest is a
+    single cheap httpx GET (/api/chapters/{id}, 260706-hgu) with no reader nav, so there
+    is no per-job contention to serialize. D-14 probe-measured safe value. Search/recent
+    use the separate fan-out semaphore (_CHAPTERS_FANOUT_CONCURRENCY), not this knob."""
     assert MangaFireSource.max_concurrent_jobs == 3
 
 

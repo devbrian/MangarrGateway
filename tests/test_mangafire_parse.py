@@ -1,18 +1,16 @@
-"""Unit tests for the mangafire lxml parsers (D-06 chapter list / D-07+D-13 cards).
+"""Unit tests for the mangafire release-normalization helpers (JSON API, 260706-hgu).
 
-All parsers are blocking-by-design (lxml C-parse) and called via ``asyncio.to_thread``
-by their hooks; here they are exercised directly against recon-shaped HTML fragments.
-A malformed fragment yields ``[]`` (never raises).
+The site's React-SPA rewrite dropped the lxml HTML scraping entirely — data now arrives
+as plain JSON dicts. These tests exercise ``_to_release`` (guid/handle/epoch date) and
+the ``createdAt`` unix-epoch conversion directly against recon-shaped chapter rows.
 """
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from manga_gateway.handles.store import HandleStore
-from manga_gateway.sources.mangafire import (
-    MangaFireSource,
-    _parse_cards,
-    _parse_chapter_list,
-)
+from manga_gateway.sources.mangafire import MangaFireSource, _iso_from_epoch
 
 
 class _HandleOnlyCtx:
@@ -22,118 +20,72 @@ class _HandleOnlyCtx:
         self.handle_store = HandleStore()
 
 
-# ── chapter-list `result` HTML (D-06) ──────────────────────────────────────────
-_CHAPTER_LIST = """
-<ul>
-  <li class="item" data-number="346.2">
-    <a href="/read/blue-lockk.kw9j9/en/chapter-346.2" title="Vol 0 - Chap 346.2">
-      <span>Chapter 346.2: </span><span>May 21, 2026</span>
-    </a>
-  </li>
-  <li class="item" data-number="346.1">
-    <a href="/read/blue-lockk.kw9j9/en/chapter-346.1">
-      <span>Chapter 346.1</span><span>May 14, 2026</span>
-    </a>
-  </li>
-</ul>
-"""
-
-# ── recent / search card HTML (D-07 / D-13): `.original.card-lg .unit .inner` ───
-_CARDS = """
-<div class="original card-lg">
-  <div class="unit">
-    <div class="inner">
-      <a href="/manga/blue-lockk.kw9j9" class="poster">
-        <img src="https://mangafire.to/static/thumb/blue.jpg">
-      </a>
-      <div class="info">
-        <a href="/manga/blue-lockk.kw9j9">Blue Lock</a>
-      </div>
-    </div>
-    <div class="inner">
-      <a href="/manga/one-piece.abcd" class="poster">
-        <img src="https://mangafire.to/static/thumb/op.jpg">
-      </a>
-      <div class="info">
-        <a href="/manga/one-piece.abcd">One Piece</a>
-      </div>
-    </div>
-  </div>
-</div>
-"""
+def test_iso_from_epoch_seconds_to_rfc3339() -> None:
+    # createdAt is a unix epoch in SECONDS (e.g. 1757308339 → 2025-09-08T...).
+    assert _iso_from_epoch(1757308339) == "2025-09-08T05:12:19+00:00"
+    assert _iso_from_epoch("1757308339") == "2025-09-08T05:12:19+00:00"
+    # Missing / unparseable / absurd values fall back to None (caller uses now(UTC)).
+    assert _iso_from_epoch(None) is None
+    assert _iso_from_epoch("") is None
+    assert _iso_from_epoch("not-a-number") is None
+    assert _iso_from_epoch(10**30) is None
 
 
-def test_parse_chapter_list_yields_href_number_date_per_li() -> None:
-    rows = _parse_chapter_list(_CHAPTER_LIST)
-    assert rows == [
-        {
-            "href": "/read/blue-lockk.kw9j9/en/chapter-346.2",
-            "number": "346.2",
-            "date": "May 21, 2026",
-        },
-        {
-            "href": "/read/blue-lockk.kw9j9/en/chapter-346.1",
-            "number": "346.1",
-            "date": "May 14, 2026",
-        },
-    ]
-
-
-def test_parse_cards_yields_href_title_thumbnail_per_inner() -> None:
-    cards = _parse_cards(_CARDS.encode())
-    assert cards == [
-        {
-            "href": "/manga/blue-lockk.kw9j9",
-            "title": "Blue Lock",
-            "thumbnail": "https://mangafire.to/static/thumb/blue.jpg",
-        },
-        {
-            "href": "/manga/one-piece.abcd",
-            "title": "One Piece",
-            "thumbnail": "https://mangafire.to/static/thumb/op.jpg",
-        },
-    ]
-
-
-def test_parse_chapter_list_malformed_returns_empty() -> None:
-    assert _parse_chapter_list("") == []
-    assert _parse_chapter_list("<<<not html>>>") == []
-    # A well-formed fragment with no data-number li yields no rows.
-    assert _parse_chapter_list("<ul><li>no number</li></ul>") == []
-
-
-def test_parse_cards_malformed_returns_empty() -> None:
-    assert _parse_cards(b"") == []
-    assert _parse_cards(b"<<<not html>>>") == []
-    # A card with no /manga/ info link is skipped.
-    no_link = b"<div class='original card-lg'><div class='inner'></div></div>"
-    assert _parse_cards(no_link) == []
-
-
-def test_blank_data_number_chapters_get_distinct_guids() -> None:
-    """#219: two chapters with a blank data-number (ch_str=='?') in the same
-    manga+language must NOT share a guid, or Mangarr dedupes one away. The unique
-    read href disambiguates them."""
+def test_to_release_builds_guid_handle_and_ids() -> None:
     source = MangaFireSource()
     ctx = _HandleOnlyCtx()
-    common = dict(  # noqa: C408 — readability over literal
-        manga_token="blue-lockk.kw9j9",
-        manga_title="Blue Lock",
-        lang="en",
-        ctx=ctx,
+    rel = source._to_release(
+        "l33",
+        "50",
+        "Naruto",
+        "en",
+        {"id": 4736538, "number": "700", "createdAt": 1757308339},
+        ctx,  # type: ignore[arg-type]
     )
+    assert rel is not None
+    assert rel.chapter_number == Decimal("700")
+    assert rel.guid == "mangafire:l33:ch-700:en:4736538"
+    assert rel.ids == {"mangafireHid": "l33", "mangafireTitleId": "50"}
+    assert rel.language == "en"
+    # The handle resolves to the numeric chapter id (the /api/chapters/{id} key).
+    assert rel.download_handle and ":" not in rel.download_handle
+
+
+def test_blank_number_chapters_get_distinct_guids() -> None:
+    """#219: two chapters with a blank ``number`` (ch_str=='?') in the same
+    manga+language must NOT share a guid, or Mangarr dedupes one away. The unique
+    numeric chapter id disambiguates them."""
+    source = MangaFireSource()
+    ctx = _HandleOnlyCtx()
     rel_a = source._to_release(
-        chapter={"href": "/read/blue-lockk.kw9j9/en/chapter-extra-a", "number": ""},
-        **common,
+        "l33",
+        "50",
+        "Naruto",
+        "en",
+        {"id": 111, "number": ""},
+        ctx,  # type: ignore[arg-type]
     )
     rel_b = source._to_release(
-        chapter={"href": "/read/blue-lockk.kw9j9/en/chapter-extra-b", "number": ""},
-        **common,
+        "l33",
+        "50",
+        "Naruto",
+        "en",
+        {"id": 222, "number": ""},
+        ctx,  # type: ignore[arg-type]
     )
     assert rel_a is not None and rel_b is not None
     # Both render the ambiguous "?" chapter number ...
     assert ":ch-?:" in rel_a.guid and ":ch-?:" in rel_b.guid
-    # ... yet the guids are distinct (the href tail disambiguates) → no dedupe loss.
+    # ... yet the guids are distinct (the chapter id tail disambiguates) → no dedupe.
     assert rel_a.guid != rel_b.guid
-    assert rel_a.guid.endswith(":chapter-extra-a")
-    assert rel_b.guid.endswith(":chapter-extra-b")
+    assert rel_a.guid.endswith(":111")
+    assert rel_b.guid.endswith(":222")
+
+
+def test_to_release_missing_id_returns_none() -> None:
+    source = MangaFireSource()
+    ctx = _HandleOnlyCtx()
+    assert (
+        source._to_release("l33", "50", "Naruto", "en", {"number": "1"}, ctx)  # type: ignore[arg-type]
+        is None
+    )
