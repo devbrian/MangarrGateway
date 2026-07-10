@@ -28,6 +28,7 @@ the sidecar image needs no web-framework dependency.
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import ipaddress
 import json
@@ -37,7 +38,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
@@ -193,6 +194,31 @@ _EGRESS_READ_JS = "document.body.innerText"
 # Threads share one process (workers are ``ThreadPoolExecutor``s), so a module ``Lock``
 # is the right primitive. No-op for direct (no-proxy) ops — they never touch the hop.
 _HOP_LOCK = Lock()
+# How long each blocking-acquire slice waits before re-checking cancellation. Reuses the
+# disconnect-poll cadence so a cancel unwinds within one slice (CodeRabbit #350).
+_HOP_LOCK_ACQUIRE_POLL_S = _DISCONNECT_POLL_S
+
+
+@contextlib.contextmanager
+def _hold_hop_lock(cancel: Event | None) -> Iterator[None]:
+    """Own :data:`_HOP_LOCK` for a proxied section, but acquire COOPERATIVELY.
+
+    Because proxied ops are serialized across lanes, a queued op could otherwise block
+    on ``_HOP_LOCK`` for the ACTIVE lane's full proxied budget (240s default) before it
+    ever reaches a cancellation checkpoint — so a client that
+    disconnected while queued would keep a dead worker parked (#207 / CodeRabbit #350).
+    Acquire in bounded slices, re-checking cancellation between them, so a queued cancel
+    unwinds within ~``_HOP_LOCK_ACQUIRE_POLL_S``; a final checkpoint after the acquire
+    catches a cancel that landed during the last slice, releasing the lock before a hop
+    repoint. The lock is released in the ``finally`` (only when actually acquired)."""
+    while not _HOP_LOCK.acquire(timeout=_HOP_LOCK_ACQUIRE_POLL_S):
+        _raise_if_cancelled(cancel)
+    try:
+        _raise_if_cancelled(cancel)
+        yield
+    finally:
+        _HOP_LOCK.release()
+
 
 # Phase 14 bug 4 / Fix A: a NON-DESTRUCTIVE in-page egress probe for the proxied
 # /eval path. The destructive ``_observe_webview_egress`` above navigates the main
@@ -580,8 +606,9 @@ class AndroidSolvePipeline:
         upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
         # 260710-ig1: own the ONE shared hop for the WHOLE proxied section so no other
         # lane can repoint it between this eval's self-probe and its WebView egress read
-        # (the cross-lane clobber that failed egress-verify). Released in the finally.
-        with _HOP_LOCK:
+        # (the cross-lane clobber that failed egress-verify). Cooperative acquire so a
+        # queued cancel unwinds without waiting the active lane's full budget.
+        with _hold_hop_lock(cancel):
             try:
                 # WR-01 parity: the hop repoint AND the device-proxy set both live in
                 # the try so ``finally: self._clear_proxy_quietly()`` ALWAYS idles the
@@ -1102,8 +1129,9 @@ class AndroidSolvePipeline:
         upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
         # 260710-ig1: own the ONE shared hop for the WHOLE proxied section so a
         # concurrent lane cannot repoint it between this solve's self-probe and its
-        # WebView egress read (the cross-lane clobber). Released in the finally.
-        with _HOP_LOCK:
+        # WebView egress read (the cross-lane clobber). Cooperative acquire so a queued
+        # cancel unwinds without waiting the active lane's full budget.
+        with _hold_hop_lock(cancel):
             try:
                 # WR-01: the hop repoint AND the device-proxy set both live INSIDE the
                 # try so the ``finally: self._clear_proxy_quietly()`` ALWAYS idles the

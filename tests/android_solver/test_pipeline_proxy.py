@@ -652,3 +652,29 @@ def test_hop_lock_serializes_concurrent_proxied_evals(
     assert dev_a.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
     assert dev_b.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
     assert service._HOP_LOCK.locked() is False
+
+
+def test_hop_lock_queued_cancel_unwinds_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxied op QUEUED on the hop lock (another lane holds it) with a SET cancel
+    unwinds promptly (SolveCancelled) — it does NOT wait the active lane's full budget
+    (CodeRabbit #350). Nothing on the device is touched (no repoint / proxy set)."""
+    monkeypatch.setattr(service, "_HOP_LOCK_ACQUIRE_POLL_S", 0.01)  # fast poll for test
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch, device=device, clock=FakeClock(), egress_body=_EXPECTED_IP
+    )
+    cancel = threading.Event()
+    cancel.set()  # the request was cancelled while queued on the lock
+    service._HOP_LOCK.acquire()  # simulate the ACTIVE lane owning the hop
+    try:
+        with pytest.raises(service.SolveCancelled):
+            pipeline.eval_in_webview(
+                "https://mangadot.net/", "mangadot.net", "x()", cancel, proxy=_PROXY
+            )
+    finally:
+        service._HOP_LOCK.release()
+    # Unwound at the cooperative acquire — never repointed the hop nor set the proxy.
+    assert device.proxy_set == []
+    assert device.events == []
