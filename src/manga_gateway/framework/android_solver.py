@@ -896,8 +896,18 @@ class AndroidSolver:
             self._warm_complete.set()
         return failed
 
-    async def _prime_webview_page(self, source_key: str) -> None:
+    async def _prime_webview_page(
+        self, source_key: str, *, recycle: bool = False
+    ) -> None:
         """EVAL-PRIME a page-holding source (comix) AND hold its clearance (Bug 5 #3).
+
+        ``recycle`` (260710-ig1) asks the sidecar to force-stop + ``pm clear`` the
+        WebView BEFORE the prime eval — wiping the cache / Service-Worker / the stale
+        cached ``env-*.js`` build — so a comix.to build rotation (whose stale module
+        403s ``c.list`` and which a plain warm re-nav does NOT fix) self-heals by the
+        FRESH build, the in-band equivalent of restarting the redroid-comix container.
+        The gateway sets it ONLY on its ESCALATED 403 self-heal (after a light re-prime
+        failed); the startup/warm prime stays light (``recycle=False``, warm re-nav).
 
         Runs the no-op prime eval (:data:`_WEBVIEW_PRIME_JS`) with
         ``extract_clearance=True`` via :meth:`_mint_clearance_via_eval`, so the
@@ -936,10 +946,14 @@ class AndroidSolver:
         try:
             clearance, expires_at = await self._mint_clearance_via_eval(
                 source_key,
-                # Cap the prime at the startup readiness window so a hung/flaky prime
-                # gives up + frees the device before the warm gate falls through (it
-                # never runs the full ~180s eval op-budget as a startup zombie).
-                timeout=self._warm_gate_timeout_s,
+                # A light prime is capped at the startup readiness window so a
+                # hung/flaky prime frees the device before the warm gate falls (never a
+                # ~180s startup zombie). A RECYCLE does a full cold clear (force-stop +
+                # pm clear + relaunch + CF re-clear + hydrate) and is NOT on the startup
+                # path, so it gets the full eval op-budget — the startup cap would abort
+                # it mid-clear.
+                timeout=self._timeout_s if recycle else self._warm_gate_timeout_s,
+                recycle=recycle,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort prime; never hang/disable
             _log.warning(
@@ -1384,47 +1398,43 @@ class AndroidSolver:
             (k for k, v in self._challenge_urls.items() if v == challenge_url), None
         )
         start = time.perf_counter()
+        # Two independent recovery budgets, decremented as each fires so the loop always
+        # terminates. (1) ``origin_5xx`` — a bounded retry of a transient comix-origin
+        # 5xx in-page throw (a one-off Cloudflare 520-522 on comix's origin). (2) The
+        # page-holder CF-challenge 403 self-heal (260710-ig1), a TWO-STEP escalation for
+        # a warm_last source (comix), whose in-page XHR 403s when either its warm
+        # clearance lapsed OR (the harder case) comix.to rotated its SPA build and the
+        # long-lived WebView serves a STALE cached ``env-*.js`` that signs ``c.list``
+        # wrong. Step 1 is a LIGHT re-prime (warm Page.navigate → clear-if-challenged,
+        # no pm clear) — cheap, fixes a lapsed clearance. If the retry STILL 403s the
+        # light re-nav did NOT bust the SW cache, so step 2 RECYCLES (force-stop + pm
+        # clear + relaunch → fresh build), like restarting the container in-band.
+        # comix is excluded from ``/solve`` and the proactive-refresh horizon map, and
+        # this eval path never reaches the httpx D-35 403 self-heal, so without this
+        # escalation comix stays wedged until a manual restart. The prime takes
+        # ``_device_op`` per-op BETWEEN eval attempts (no re-entrancy) and runs as the
+        # foreground caller's own recovery. A non-page-holder / non-403 re-raises on the
+        # first failure exactly as before.
+        origin_5xx_budget = self._eval_origin_5xx_retry_attempts
+        is_page_holder = source_key is not None and source_key in self._warm_last_keys
+        # Step 1 light re-prime, step 2 recycle; empty for a non-page-holder.
+        cf_403_recoveries = [False, True] if is_page_holder else []
         try:
-            attempts = self._eval_origin_5xx_retry_attempts
-            for attempt in range(attempts + 1):
+            while True:
                 try:
                     payload = await self._post_eval(
                         challenge_url, js, wait_for=wait_for, timeout=timeout
                     )
                 except httpx.HTTPStatusError as exc:
-                    if attempt < attempts and _is_origin_5xx_eval_throw(exc.response):
-                        # Transient comix-origin 5xx — back off briefly and re-eval
-                        # ONCE on the warm device (the busy-503 retry inside _post_eval
-                        # still applies to each attempt). A persistent 5xx exhausts the
-                        # bounded attempts and re-raises on the final pass → a
-                        # per-source warning.
+                    resp = exc.response
+                    if origin_5xx_budget > 0 and _is_origin_5xx_eval_throw(resp):
+                        origin_5xx_budget -= 1
                         await asyncio.sleep(self._eval_origin_5xx_retry_backoff_s)
                         continue
-                    # Reactive eval-re-prime self-heal (live incident 260710-ig1). A
-                    # page-holder (comix) whose in-page XHR hit a Cloudflare-challenge
-                    # 403 means its warm WebView clearance (__cf_bm/cf_clearance) died.
-                    # The sidecar's warm fast-path runs evals on the ALREADY-loaded page
-                    # WITHOUT re-navigating, so the lapsed cookies never self-refresh —
-                    # every eval 403s until a forced re-nav. comix is excluded from
-                    # ``/solve`` (pm clear poisons its warm page) and from the
-                    # proactive-refresh horizon map, and this eval path never reaches
-                    # the httpx D-35 403 self-heal — so WITHOUT this branch comix stays
-                    # wedged until the process restarts. Force ONE eval-re-prime
-                    # (_prime_webview_page: warm Page.navigate → clear-if-challenged, NO
-                    # ``/solve``) then retry the eval ONCE on the re-cleared page. Gated
-                    # to warm_last (page-holder) sources so a clearance-cookie source's
-                    # 403 is untouched. Lock-safe: the prime takes _device_op per-op
-                    # BETWEEN eval attempts (no re-entrancy) and runs as the foreground
-                    # caller's own recovery (never defers). Reuses the bounded
-                    # ``attempts`` budget → exactly one re-prime + one retry; a
-                    # persistent 403 re-raises on the final pass → a per-source warning.
-                    if (
-                        attempt < attempts
-                        and source_key is not None
-                        and source_key in self._warm_last_keys
-                        and _is_cf_challenge_eval_throw(exc.response)
-                    ):
-                        await self._prime_webview_page(source_key)
+                    if cf_403_recoveries and _is_cf_challenge_eval_throw(resp):
+                        assert source_key is not None  # is_page_holder gated this
+                        recycle = cf_403_recoveries.pop(0)  # light, then recycle
+                        await self._prime_webview_page(source_key, recycle=recycle)
                         continue
                     raise
                 _emit_eval(
@@ -1435,9 +1445,6 @@ class AndroidSolver:
                     lane=self._lane,
                 )
                 return payload["value"]
-            # Unreachable: the loop always returns a value or re-raises on the final
-            # attempt (`attempt < attempts` is False on the last pass). Satisfies mypy.
-            raise AssertionError("eval_in_webview retry loop exited without returning")
         except Exception as exc:
             _emit_eval(
                 source_key,
@@ -1456,6 +1463,7 @@ class AndroidSolver:
         wait_for: str | None = None,
         timeout: float | None = None,  # noqa: ASYNC109 — per-call op-budget override
         extract_clearance: bool = False,
+        recycle: bool = False,
     ) -> dict[str, Any]:
         """POST the sidecar ``/eval`` and return the FULL response payload.
 
@@ -1486,6 +1494,11 @@ class AndroidSolver:
         # Present ONLY when requested (an ordinary eval is byte-for-byte unchanged).
         if extract_clearance:
             body["extract_clearance"] = True
+        # 260710-ig1: ask the sidecar to RECYCLE the WebView (force-stop + pm clear)
+        # before this eval so a stale cached ``env-*.js`` build is wiped and the re-nav
+        # loads the fresh one. Present ONLY when set (unchanged body otherwise).
+        if recycle:
+            body["recycle"] = True
         # Req 7 parity with ``_solve``: thread the single static proxy into the
         # /eval body so the eval navigation egresses the SAME residential IP the
         # proxied clearance was minted on — a different egress IP makes the
@@ -1521,8 +1534,14 @@ class AndroidSolver:
         source_key: str,
         *,
         timeout: float | None = None,  # noqa: ASYNC109 — per-call op-budget override
+        recycle: bool = False,
     ) -> tuple[Clearance | None, float | None]:
         """Eval-path re-clear a page-holder (comix); capture a ``cf_clearance`` if any.
+
+        ``recycle`` (260710-ig1) is forwarded to the sidecar so it force-stops + ``pm
+        clear``s the WebView before the prime eval — busting a stale cached ``env-*.js``
+        build so the ensuing full re-nav loads the fresh one (self-heals a comix.to
+        build rotation). Set ONLY on the gateway's escalated 403 self-heal.
 
         Bug 5 follow-on #3 — comix can NEVER be ``/solve``d (``/solve`` runs
         ``pm clear``, cold-wiping the warm WebView its managed challenge + cached
@@ -1546,6 +1565,7 @@ class AndroidSolver:
             wait_for=None,
             timeout=timeout,
             extract_clearance=True,
+            recycle=recycle,
         )
         return self._clearance_from_eval_payload(payload)
 

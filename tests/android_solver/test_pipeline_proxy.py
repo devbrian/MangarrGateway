@@ -678,3 +678,38 @@ def test_hop_lock_queued_cancel_unwinds_without_waiting(
     # Unwound at the cooperative acquire — never repointed the hop nor set the proxy.
     assert device.proxy_set == []
     assert device.events == []
+
+
+# ── 260710-ig1: recycle cold-resets the WebView before the eval (stale-build heal) ───
+
+
+def test_eval_recycle_force_stops_and_clears_before_eval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``recycle=True`` force-stops + pm clears the WebView BEFORE the eval so a stale
+    cached env-*.js build is wiped and the ensuing full re-nav loads the fresh one."""
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch, device=device, clock=FakeClock(), egress_body=_EXPECTED_IP
+    )
+
+    pipeline.eval_in_webview(
+        "https://mangadot.net/", "mangadot.net", "extract()", recycle=True
+    )
+
+    assert device.force_stops == 1  # the WebView was cold-reset (force-stop + pm clear)
+
+
+def test_eval_default_reuses_warm_webview_no_force_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ordinary eval (recycle omitted) REUSES the warm WebView — no force-stop / pm
+    clear — byte-for-byte the pre-recycle path."""
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch, device=device, clock=FakeClock(), egress_body=_EXPECTED_IP
+    )
+
+    pipeline.eval_in_webview("https://mangadot.net/", "mangadot.net", "extract()")
+
+    assert device.force_stops == 0  # warm WebView reused, not recycled

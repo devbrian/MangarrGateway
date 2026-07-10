@@ -387,6 +387,7 @@ class SolvePipeline(Protocol):
         deadline: float | None = None,
         proxy: dict[str, Any] | None = None,
         with_clearance: bool = False,
+        recycle: bool = False,
     ) -> Any: ...
 
     def health(self) -> bool: ...
@@ -515,6 +516,7 @@ class AndroidSolvePipeline:
         deadline: float | None = None,
         proxy: dict[str, Any] | None = None,
         with_clearance: bool = False,
+        recycle: bool = False,
     ) -> Any:
         """Run ``js`` in the warm cleared WebView and return its marshalled value.
 
@@ -582,6 +584,24 @@ class AndroidSolvePipeline:
         # Re-use the warm cleared WebView — connect only (NO force_stop_and_clear).
         self._device.connect()
         _raise_if_cancelled(cancel)
+
+        # 260710-ig1: RECYCLE the WebView before the eval when asked. A page-holder
+        # (comix) runs its evals on the LONG-LIVED warm WebView, which caches the SPA's
+        # ``env-*.js`` build (Service-Worker/HTTP cache). When comix.to rotates that
+        # build, the stale cached module signs ``c.list`` with the OLD algorithm → the
+        # API 403s FOREVER, and a plain warm re-nav does NOT bust the SW cache (the
+        # gateway's light re-prime keeps 403ing). ``force_stop_and_clear`` (am
+        # force-stop + pm clear) wipes the WebView's data — cache, SW, AND the stale
+        # module — so the ensuing ``_drive_eval`` finds NO warm page, full-navigates,
+        # and loads the FRESH
+        # build (its clear-if-challenged re-establishes CF from cold, exactly as the
+        # startup eval-prime does on a fresh device). This is the in-band equivalent of
+        # restarting the redroid-comix container, gated to the gateway's ESCALATED 403
+        # self-heal so it never fires on a transient blip (only after a light re-prime
+        # failed). Independent of ``proxy`` — runs on direct and proxied paths alike.
+        if recycle:
+            self._device.force_stop_and_clear()
+            _raise_if_cancelled(cancel)
 
         if proxy is None:
             # D-08: no-proxy evals run the direct-egress flow byte-for-byte unchanged
@@ -1878,6 +1898,16 @@ class SolverService:
             return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
                 "error": "extract_clearance must be a boolean"
             }
+        # 260710-ig1: when set, RECYCLE the WebView (force-stop + pm clear) before the
+        # eval so a page-holder (comix) whose stale cached ``env-*.js`` build is 403ing
+        # picks up the FRESH build — the in-band equivalent of a container restart. The
+        # gateway sends this ONLY on its escalated 403 self-heal (after a light re-prime
+        # failed). Optional bool; default False keeps every eval byte-for-byte same.
+        recycle = payload.get("recycle", False)
+        if not isinstance(recycle, bool):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "recycle must be a boolean"
+            }
 
         # Req 7 parity with /solve: validate the optional per-eval proxy SHAPE BEFORE
         # any device action — a malformed proxy is a pre-action 422 (no hop repoint,
@@ -1898,6 +1928,7 @@ class SolverService:
             disconnected,
             with_clearance=with_clearance,
             target=target,
+            recycle=recycle,
         )
 
     def _resolve_target(self, raw: Any) -> str | tuple[int, dict[str, Any]]:
@@ -2075,6 +2106,7 @@ class SolverService:
         *,
         with_clearance: bool = False,
         target: str | None = None,
+        recycle: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         """Serialize + timeout-bound one in-WebView eval (mirrors ``_run_solve``).
 
@@ -2113,6 +2145,10 @@ class SolverService:
             eval_kwargs: dict[str, Any] = {"wait_for": wait_for, "proxy": proxy}
             if with_clearance:
                 eval_kwargs["with_clearance"] = True
+            # 260710-ig1: thread ``recycle`` ONLY when requested (the escalated
+            # stale-build self-heal) so an ordinary eval's kwargs stay byte-for-byte.
+            if recycle:
+                eval_kwargs["recycle"] = True
             future = worker.executor.submit(
                 worker.pipeline.eval_in_webview,
                 challenge_url,
