@@ -132,66 +132,61 @@ _SOLVE_BLOCK_DEADLINE_FRACTION = 0.7
 _SOLVE_BLOCK_BACKOFF_S = 300.0
 
 
-def _is_origin_5xx_eval_throw(response: httpx.Response) -> bool:
-    """True iff a sidecar ``/eval`` response is a TRANSIENT origin-5xx in-page throw.
+def _eval_throw_embedded_status(response: httpx.Response) -> int | None:
+    """The embedded axios HTTP status from a sidecar ``504 eval threw``, or ``None``.
 
     The sidecar returns ``504 {"error": "eval threw", "detail": <summary>}`` when the
     in-page promise rejected (Mode-E). The ``detail`` is the bounded, token-free first
-    line of the JS error (built by the sidecar's ``_raise_if_eval_threw``); for a
-    comix-origin failure it carries the axios ``"Request failed with status code NNN"``.
-    Returns ``True`` ONLY when that ``NNN`` is a 5xx (a transient origin blip worth one
-    retry). Any other 504 (a 4xx throw, a non-origin/CF/hydration throw with no status
-    code, ``eval failed``, or ``eval timed out``) and any non-504 returns ``False`` so
-    the caller re-raises immediately. A malformed / unreadable body is also ``False``
-    (never retry on an ambiguous signal). The ``detail`` is matched, never logged."""
+    line of the JS error (built by the sidecar's ``_raise_if_eval_threw``); for an axios
+    failure it carries ``"Request failed with status code NNN"``. Returns that ``NNN``
+    as an int, or ``None`` for any non-504 status, a non-``eval threw`` / malformed /
+    unreadable body, or a ``detail`` with no embedded status (``eval failed`` / ``eval
+    timed out`` / a CF/hydration throw) — so callers never act on an ambiguous signal.
+    The single owner of the envelope parse shared by :func:`_is_origin_5xx_eval_throw`
+    and :func:`_is_cf_challenge_eval_throw`. The ``detail`` is matched, never logged."""
     if response.status_code != _SIDECAR_EVAL_THREW_STATUS:
-        return False
+        return None
     try:
         body = response.json()
     except (ValueError, TypeError):
-        return False
+        return None
     if not isinstance(body, dict) or body.get("error") != "eval threw":
-        return False
+        return None
     detail = body.get("detail")
     if not isinstance(detail, str):
-        return False
+        return None
     match = _EVAL_THROW_STATUS_RE.search(detail)
-    if match is None:
-        return False
-    return 500 <= int(match.group(1)) <= 599
+    return int(match.group(1)) if match is not None else None
+
+
+def _is_origin_5xx_eval_throw(response: httpx.Response) -> bool:
+    """True iff a sidecar ``/eval`` throw is a TRANSIENT origin-5xx (worth ONE retry).
+
+    Matches an embedded axios ``5xx`` (a comix-origin blip / Cloudflare 520-522) in the
+    ``504 eval threw`` envelope (see :func:`_eval_throw_embedded_status`). Any other 504
+    (a 4xx throw, a statusless non-origin/CF/hydration throw, ``eval failed`` / ``eval
+    timed out``), any non-504, and a malformed body all return ``False`` so the caller
+    re-raises immediately (never retry on an ambiguous signal)."""
+    status = _eval_throw_embedded_status(response)
+    return status is not None and 500 <= status <= 599
 
 
 def _is_cf_challenge_eval_throw(response: httpx.Response) -> bool:
     """True iff a sidecar ``/eval`` throw is a Cloudflare-challenge **403** on the XHR.
 
-    Sibling of :func:`_is_origin_5xx_eval_throw`, sharing the same ``504 eval threw``
-    envelope + ``_EVAL_THROW_STATUS_RE`` extraction, but matching a **403**: a page-
-    holder (comix) whose in-page env-module axios (``c.list`` / ``chapters``) hit a
-    Cloudflare re-challenge because its warm WebView clearance (``__cf_bm`` /
-    ``cf_clearance``) lapsed. The sidecar's warm fast-path runs evals on the ALREADY-
-    loaded page WITHOUT re-navigating, so the lapsed cookies never self-refresh and
-    every eval 403s until the page is force re-navigated. :meth:`eval_in_webview` treats
-    this (for a ``warm_last`` source only) as the trigger for ONE eval-re-prime
-    (:meth:`_prime_webview_page`, warm ``Page.navigate`` → clear-if-challenged, NO
-    ``/solve``) + retry — the reactive self-heal the eval data path lacked (it never hit
-    the httpx D-35 403 self-heal, and comix is excluded from ``/solve`` + the proactive-
-    refresh horizon map). Any other status, a non-``eval threw`` body, or a malformed /
-    unreadable body returns ``False``. The ``detail`` is matched, never logged."""
-    if response.status_code != _SIDECAR_EVAL_THREW_STATUS:
-        return False
-    try:
-        body = response.json()
-    except (ValueError, TypeError):
-        return False
-    if not isinstance(body, dict) or body.get("error") != "eval threw":
-        return False
-    detail = body.get("detail")
-    if not isinstance(detail, str):
-        return False
-    match = _EVAL_THROW_STATUS_RE.search(detail)
-    if match is None:
-        return False
-    return int(match.group(1)) == 403
+    Sibling of :func:`_is_origin_5xx_eval_throw` over the same
+    :func:`_eval_throw_embedded_status` parse, but matching a **403**: a page-holder
+    (comix) whose in-page env-module axios (``c.list`` / ``chapters``) hit a Cloudflare
+    re-challenge because its warm WebView clearance (``__cf_bm`` / ``cf_clearance``)
+    lapsed. The sidecar's warm fast-path runs evals on the ALREADY-loaded page WITHOUT
+    re-navigating, so the lapsed cookies never self-refresh and every eval 403s until
+    the page is force re-navigated. :meth:`eval_in_webview` treats this (``warm_last``
+    sources only) as the trigger for ONE eval-re-prime (:meth:`_prime_webview_page`: a
+    warm ``Page.navigate`` → clear-if-challenged, NO ``/solve``) + retry — the reactive
+    self-heal the eval path lacked (it never hit the httpx D-35 403 self-heal, and
+    comix is excluded from ``/solve`` + the proactive-refresh horizon map). Any other
+    status, a non-``eval threw`` body, or a malformed body returns ``False``."""
+    return _eval_throw_embedded_status(response) == 403
 
 
 # Bug 5 follow-on #3 (Option A2): the NO-OP JS expression used to EVAL-PRIME a
