@@ -16,6 +16,9 @@ redroid / WebView / network. Asserts:
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from android_solver.cdp import ClearanceCookie
 from android_solver.device import AdbError
@@ -563,3 +566,89 @@ def test_no_proxy_eval_sets_no_device_proxy(
     assert device.proxy_cleared == 0  # nothing to clear
     assert repoint_calls == []  # hop never repointed
     assert device.events == []  # no proxy + no tap on the eval path
+
+
+# ── 260710-ig1: shared-hop cross-lane serialization (the egress-clobber fix) ─────────
+
+
+def test_proxied_eval_holds_hop_lock_across_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The proxied eval owns the process-wide ``_HOP_LOCK`` across its
+    repoint→self-probe→drive section, so a concurrent lane cannot repoint the shared hop
+    between this eval's self-probe and its WebView egress read. Assert the lock is HELD
+    at the self-probe point (and released after)."""
+    device = FakeDevice()
+    pipeline = _build_pipeline(
+        monkeypatch, device=device, clock=FakeClock(), egress_body=_EXPECTED_IP
+    )
+    locked_at_probe: dict[str, bool] = {}
+
+    def probe(*_a: object, **_k: object) -> str:
+        locked_at_probe["v"] = service._HOP_LOCK.locked()
+        return _EXPECTED_IP
+
+    monkeypatch.setattr(service, "expected_egress", probe)
+    pipeline.eval_in_webview(
+        "https://mangadot.net/", "mangadot.net", "extract()", proxy=_PROXY
+    )
+    assert locked_at_probe["v"] is True  # self-probe ran inside the hop lock
+    assert service._HOP_LOCK.locked() is False  # released in the finally
+
+
+def test_hop_lock_serializes_concurrent_proxied_evals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared ``_HOP_LOCK`` serializes proxied ops ACROSS lanes: while lane A owns
+    the hop section, lane B (its own device/pipeline) BLOCKS before its repoint +
+    device-proxy set — so B can never repoint the hop mid-A (the cross-lane clobber that
+    failed egress-verify). Deterministic via events (no reliance on scheduling)."""
+    dev_a = FakeDevice()
+    dev_b = FakeDevice()
+    pipe_a = _build_pipeline(
+        monkeypatch, device=dev_a, clock=FakeClock(), egress_body=_EXPECTED_IP
+    )
+    pipe_b = _build_pipeline(
+        monkeypatch, device=dev_b, clock=FakeClock(), egress_body=_EXPECTED_IP
+    )
+    a_in_section = threading.Event()
+    release_a = threading.Event()
+    call_n = {"n": 0}
+
+    # Patched AFTER both builds (each sets expected_egress to a lambda) so this wins.
+    # Lane A (first self-probe) parks INSIDE the hop lock until released; B returns.
+    def probe(*_a: object, **_k: object) -> str:
+        call_n["n"] += 1
+        if call_n["n"] == 1:
+            a_in_section.set()
+            release_a.wait(timeout=5.0)
+        return _EXPECTED_IP
+
+    monkeypatch.setattr(service, "expected_egress", probe)
+
+    def run(pipe: AndroidSolvePipeline) -> None:
+        pipe.eval_in_webview(
+            "https://mangadot.net/", "mangadot.net", "extract()", proxy=_PROXY
+        )
+
+    ta = threading.Thread(target=run, args=(pipe_a,))
+    ta.start()
+    assert a_in_section.wait(timeout=5.0)  # A is parked inside the hop lock
+
+    tb = threading.Thread(target=run, args=(pipe_b,))
+    tb.start()
+    time.sleep(0.2)  # give B ample time to reach — and BLOCK on — the hop lock
+    # B is blocked ACQUIRING the lock: it has not repointed the hop nor set its device
+    # proxy (both live inside the locked section, after the acquire).
+    assert dev_b.proxy_set == []
+    assert dev_b.events == []
+
+    release_a.set()  # A finishes, releases the lock → B proceeds
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+    assert not ta.is_alive() and not tb.is_alive()
+    # Both lanes ultimately set + cleared their own device proxy (B only after A freed
+    # the hop) — never overlapping.
+    assert dev_a.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
+    assert dev_b.proxy_set == [(_RESOLVED_HOP_IP, _HOP_PORT)]
+    assert service._HOP_LOCK.locked() is False
