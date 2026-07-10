@@ -161,6 +161,39 @@ def _is_origin_5xx_eval_throw(response: httpx.Response) -> bool:
     return 500 <= int(match.group(1)) <= 599
 
 
+def _is_cf_challenge_eval_throw(response: httpx.Response) -> bool:
+    """True iff a sidecar ``/eval`` throw is a Cloudflare-challenge **403** on the XHR.
+
+    Sibling of :func:`_is_origin_5xx_eval_throw`, sharing the same ``504 eval threw``
+    envelope + ``_EVAL_THROW_STATUS_RE`` extraction, but matching a **403**: a page-
+    holder (comix) whose in-page env-module axios (``c.list`` / ``chapters``) hit a
+    Cloudflare re-challenge because its warm WebView clearance (``__cf_bm`` /
+    ``cf_clearance``) lapsed. The sidecar's warm fast-path runs evals on the ALREADY-
+    loaded page WITHOUT re-navigating, so the lapsed cookies never self-refresh and
+    every eval 403s until the page is force re-navigated. :meth:`eval_in_webview` treats
+    this (for a ``warm_last`` source only) as the trigger for ONE eval-re-prime
+    (:meth:`_prime_webview_page`, warm ``Page.navigate`` → clear-if-challenged, NO
+    ``/solve``) + retry — the reactive self-heal the eval data path lacked (it never hit
+    the httpx D-35 403 self-heal, and comix is excluded from ``/solve`` + the proactive-
+    refresh horizon map). Any other status, a non-``eval threw`` body, or a malformed /
+    unreadable body returns ``False``. The ``detail`` is matched, never logged."""
+    if response.status_code != _SIDECAR_EVAL_THREW_STATUS:
+        return False
+    try:
+        body = response.json()
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(body, dict) or body.get("error") != "eval threw":
+        return False
+    detail = body.get("detail")
+    if not isinstance(detail, str):
+        return False
+    match = _EVAL_THROW_STATUS_RE.search(detail)
+    if match is None:
+        return False
+    return int(match.group(1)) == 403
+
+
 # Bug 5 follow-on #3 (Option A2): the NO-OP JS expression used to EVAL-PRIME a
 # page-holding source (comix) during ``warm()`` via the EVAL path. The sidecar's
 # ``_drive_eval`` warm-navigates → clears-if-challenged (the interactive Turnstile tap,
@@ -1336,6 +1369,16 @@ class AndroidSolver:
         NOT retry a CLEAN empty (a ``200`` ``[]`` genuine no-match), a 4xx, a
         non-origin/CF/hydration throw, or a timeout/cancel — those re-raise on the first
         failure.
+
+        260710-ig1 (live incident): a SEPARATE reactive self-heal for a page-holder
+        (``warm_last_keys`` — comix) whose in-page XHR threw a Cloudflare-challenge
+        **403** (``_is_cf_challenge_eval_throw``). Its warm WebView clearance lapsed and
+        the sidecar's warm fast-path never re-navigates to refresh it, so the eval
+        force-runs ONE :meth:`_prime_webview_page` (warm ``Page.navigate`` →
+        clear-if-challenged, NO ``/solve``) then retries the eval once on the re-cleared
+        page. This is the only runtime clearance-recovery comix has (it is excluded from
+        ``/solve`` + the proactive-refresh horizon map and never hits the httpx D-35 403
+        self-heal). Gated to page-holders, so a clearance-cookie source's 403 re-raises.
         """
         # Reverse-map the challenge_url → source key for comix attribution, the same
         # dict _solve indexes. Emit ONCE per OUTER eval_in_webview call (not per inner
@@ -1361,6 +1404,32 @@ class AndroidSolver:
                         # bounded attempts and re-raises on the final pass → a
                         # per-source warning.
                         await asyncio.sleep(self._eval_origin_5xx_retry_backoff_s)
+                        continue
+                    # Reactive eval-re-prime self-heal (live incident 260710-ig1). A
+                    # page-holder (comix) whose in-page XHR hit a Cloudflare-challenge
+                    # 403 means its warm WebView clearance (__cf_bm/cf_clearance) died.
+                    # The sidecar's warm fast-path runs evals on the ALREADY-loaded page
+                    # WITHOUT re-navigating, so the lapsed cookies never self-refresh —
+                    # every eval 403s until a forced re-nav. comix is excluded from
+                    # ``/solve`` (pm clear poisons its warm page) and from the
+                    # proactive-refresh horizon map, and this eval path never reaches
+                    # the httpx D-35 403 self-heal — so WITHOUT this branch comix stays
+                    # wedged until the process restarts. Force ONE eval-re-prime
+                    # (_prime_webview_page: warm Page.navigate → clear-if-challenged, NO
+                    # ``/solve``) then retry the eval ONCE on the re-cleared page. Gated
+                    # to warm_last (page-holder) sources so a clearance-cookie source's
+                    # 403 is untouched. Lock-safe: the prime takes _device_op per-op
+                    # BETWEEN eval attempts (no re-entrancy) and runs as the foreground
+                    # caller's own recovery (never defers). Reuses the bounded
+                    # ``attempts`` budget → exactly one re-prime + one retry; a
+                    # persistent 403 re-raises on the final pass → a per-source warning.
+                    if (
+                        attempt < attempts
+                        and source_key is not None
+                        and source_key in self._warm_last_keys
+                        and _is_cf_challenge_eval_throw(exc.response)
+                    ):
+                        await self._prime_webview_page(source_key)
                         continue
                     raise
                 _emit_eval(
