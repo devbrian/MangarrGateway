@@ -28,6 +28,7 @@ the sidecar image needs no web-framework dependency.
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import ipaddress
 import json
@@ -37,7 +38,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
@@ -179,6 +180,45 @@ _EGRESS_READ_CMD_ID = 41
 _CHALLENGE_RENAV_CMD_ID = 42
 _EGRESS_READ_TIMEOUT_S = 15.0
 _EGRESS_READ_JS = "document.body.innerText"
+
+# 260710-ig1: PROCESS-WIDE lock serializing the ONE shared proxy hop across ALL lanes.
+# The sidecar runs a SINGLE proxy-hop child (one ``hop_port``); every lane's device
+# routes its WebView egress through it, and a proxied op ``repoint``s the hop to ITS
+# upstream, self-probes, drives the WebView, then idles the hop — a sequence guarded
+# only by the PER-LANE ``worker.lock``. With two+ lanes proxied concurrently (e.g. comix
+# on its own device AND mangadot on the default lane), lane B's ``repoint`` can land
+# BETWEEN lane A's self-probe and its WebView egress read, so A's WebView exits B's
+# proxy IP → the exact-IP egress-verify (T-11-01) fails ``expected≠observed`` (both real
+# pool IPs, neither the home IP). This lock holds the WHOLE proxied section
+# (repoint → self-probe → drive → idle) so only one lane owns the hop at a time.
+# Threads share one process (workers are ``ThreadPoolExecutor``s), so a module ``Lock``
+# is the right primitive. No-op for direct (no-proxy) ops — they never touch the hop.
+_HOP_LOCK = Lock()
+# How long each blocking-acquire slice waits before re-checking cancellation. Reuses the
+# disconnect-poll cadence so a cancel unwinds within one slice (CodeRabbit #350).
+_HOP_LOCK_ACQUIRE_POLL_S = _DISCONNECT_POLL_S
+
+
+@contextlib.contextmanager
+def _hold_hop_lock(cancel: Event | None) -> Iterator[None]:
+    """Own :data:`_HOP_LOCK` for a proxied section, but acquire COOPERATIVELY.
+
+    Because proxied ops are serialized across lanes, a queued op could otherwise block
+    on ``_HOP_LOCK`` for the ACTIVE lane's full proxied budget (240s default) before it
+    ever reaches a cancellation checkpoint — so a client that
+    disconnected while queued would keep a dead worker parked (#207 / CodeRabbit #350).
+    Acquire in bounded slices, re-checking cancellation between them, so a queued cancel
+    unwinds within ~``_HOP_LOCK_ACQUIRE_POLL_S``; a final checkpoint after the acquire
+    catches a cancel that landed during the last slice, releasing the lock before a hop
+    repoint. The lock is released in the ``finally`` (only when actually acquired)."""
+    while not _HOP_LOCK.acquire(timeout=_HOP_LOCK_ACQUIRE_POLL_S):
+        _raise_if_cancelled(cancel)
+    try:
+        _raise_if_cancelled(cancel)
+        yield
+    finally:
+        _HOP_LOCK.release()
+
 
 # Phase 14 bug 4 / Fix A: a NON-DESTRUCTIVE in-page egress probe for the proxied
 # /eval path. The destructive ``_observe_webview_egress`` above navigates the main
@@ -564,28 +604,35 @@ class AndroidSolvePipeline:
         # the proxy up on its next load. The credential-bearing upstream URI is never
         # logged (T-14-04 / T-11-02).
         upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
-        try:
-            # WR-01 parity: the hop repoint AND the device-proxy set both live INSIDE
-            # the try so ``finally: self._clear_proxy_quietly()`` ALWAYS idles the hop
-            # + clears the device, even if either step raises an AdbError mid-flight.
-            repoint(self._hop_control_host, self._hop_control_port, upstream)
-            self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
-            _raise_if_cancelled(cancel)
-            # Learn the egress this SAME upstream should present (stdlib self-probe,
-            # D-05); the WebView's observed egress is asserted against it pre-eval.
-            expected = expected_egress(up_host, up_port, user, pw)
-            return self._drive_eval(
-                challenge_url,
-                host,
-                js,
-                cancel,
-                wait_for=wait_for,
-                deadline=deadline,
-                expected_egress_ip=expected,
-                with_clearance=with_clearance,
-            )
-        finally:
-            self._clear_proxy_quietly()
+        # 260710-ig1: own the ONE shared hop for the WHOLE proxied section so no other
+        # lane can repoint it between this eval's self-probe and its WebView egress read
+        # (the cross-lane clobber that failed egress-verify). Cooperative acquire so a
+        # queued cancel unwinds without waiting the active lane's full budget.
+        with _hold_hop_lock(cancel):
+            try:
+                # WR-01 parity: the hop repoint AND the device-proxy set both live in
+                # the try so ``finally: self._clear_proxy_quietly()`` ALWAYS idles the
+                # hop + clears the device, even if either step raises mid-flight.
+                repoint(self._hop_control_host, self._hop_control_port, upstream)
+                self._device.set_global_http_proxy(
+                    self._device_hop_host(), self._hop_port
+                )
+                _raise_if_cancelled(cancel)
+                # Learn the egress this SAME upstream should present (stdlib self-probe,
+                # D-05); the WebView's observed egress is asserted against it pre-eval.
+                expected = expected_egress(up_host, up_port, user, pw)
+                return self._drive_eval(
+                    challenge_url,
+                    host,
+                    js,
+                    cancel,
+                    wait_for=wait_for,
+                    deadline=deadline,
+                    expected_egress_ip=expected,
+                    with_clearance=with_clearance,
+                )
+            finally:
+                self._clear_proxy_quietly()
 
     @staticmethod
     def _raise_if_eval_threw(result: dict[str, Any]) -> None:
@@ -1080,32 +1127,39 @@ class AndroidSolvePipeline:
         # picks the proxy up on launch (D-02). The credential-bearing upstream URI
         # is never logged (T-10-04 / T-11-02).
         upstream, up_host, up_port, user, pw = _proxy_parts(proxy)
-        try:
-            # WR-01: the hop repoint AND the device-proxy set both live INSIDE the
-            # try so the ``finally: self._clear_proxy_quietly()`` ALWAYS idles the
-            # hop + clears the device — even if ``set_global_http_proxy`` (or the
-            # repoint itself) raises an AdbError mid-flight. Hoisting either above
-            # the try would leak credentialed hop state on that raise: the hop
-            # would stay repointed at the authenticated upstream (its
-            # ``pproxy.Server`` holds ``user:pass``) until the next proxied solve.
-            repoint(self._hop_control_host, self._hop_control_port, upstream)
-            # The DEVICE (redroid Android) must reach the hop by IP, not by the
-            # docker service name: redroid's Android resolver is hardcoded to
-            # 8.8.8.8 and does NOT consult docker's embedded DNS, so ``settings put
-            # global http_proxy android-solver:<port>`` yields
-            # ERR_PROXY_CONNECTION_FAILED ("unknown host"). The sidecar DOES resolve
-            # its own docker name, so resolve it here to the on-network IP the
-            # WebView can actually connect to (Pitfall 1).
-            self._device.set_global_http_proxy(self._device_hop_host(), self._hop_port)
-            _raise_if_cancelled(cancel)
-            # Learn the egress this SAME upstream should present (stdlib self-probe,
-            # D-05); the WebView's observed egress is asserted against it pre-tap.
-            expected = expected_egress(up_host, up_port, user, pw)
-            return self._drive_solve(
-                challenge_url, host, cancel, expected_egress_ip=expected
-            )
-        finally:
-            self._clear_proxy_quietly()
+        # 260710-ig1: own the ONE shared hop for the WHOLE proxied section so a
+        # concurrent lane cannot repoint it between this solve's self-probe and its
+        # WebView egress read (the cross-lane clobber). Cooperative acquire so a queued
+        # cancel unwinds without waiting the active lane's full budget.
+        with _hold_hop_lock(cancel):
+            try:
+                # WR-01: the hop repoint AND the device-proxy set both live INSIDE the
+                # try so the ``finally: self._clear_proxy_quietly()`` ALWAYS idles the
+                # hop + clears the device — even if ``set_global_http_proxy`` (or the
+                # repoint itself) raises an AdbError mid-flight. Hoisting either above
+                # the try would leak credentialed hop state on that raise: the hop
+                # would stay repointed at the authenticated upstream (its
+                # ``pproxy.Server`` holds ``user:pass``) until the next proxied solve.
+                repoint(self._hop_control_host, self._hop_control_port, upstream)
+                # The DEVICE (redroid Android) must reach the hop by IP, not by the
+                # docker service name: redroid's Android resolver is hardcoded to
+                # 8.8.8.8 and does NOT consult docker's embedded DNS, so ``settings put
+                # global http_proxy android-solver:<port>`` yields
+                # ERR_PROXY_CONNECTION_FAILED ("unknown host"). The sidecar DOES resolve
+                # its own docker name, so resolve it here to the on-network IP the
+                # WebView can actually connect to (Pitfall 1).
+                self._device.set_global_http_proxy(
+                    self._device_hop_host(), self._hop_port
+                )
+                _raise_if_cancelled(cancel)
+                # Learn the egress this SAME upstream should present (stdlib self-probe,
+                # D-05); the WebView's observed egress is asserted against it pre-tap.
+                expected = expected_egress(up_host, up_port, user, pw)
+                return self._drive_solve(
+                    challenge_url, host, cancel, expected_egress_ip=expected
+                )
+            finally:
+                self._clear_proxy_quietly()
 
     def _drive_solve(
         self,
