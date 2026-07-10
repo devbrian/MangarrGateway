@@ -721,6 +721,84 @@ async def test_eval_timeout_504_is_not_retried_as_origin_5xx() -> None:
     assert route.call_count == 1
 
 
+# ── Page-holder CF-challenge 403 eval-re-prime self-heal (260710-ig1, live incident) ─
+# comix runs entirely as in-page evals inside the redroid WebView. When its warm CF
+# cookies (__cf_bm/cf_clearance) lapse, the in-page axios XHR throws a 403 → the sidecar
+# surfaces a ``504 eval threw`` whose detail carries ``status code 403``. The sidecar's
+# warm fast-path runs evals on the already-loaded page WITHOUT re-navigating, so the
+# lapsed cookies never self-refresh — comix stays wedged until a forced re-nav. comix is
+# excluded from ``/solve`` + the proactive-refresh horizon map and its eval data path
+# never hits the httpx D-35 403 self-heal, so eval_in_webview force-runs ONE
+# _prime_webview_page (warm Page.navigate → clear-if-challenged, NO /solve) + retry —
+# gated to warm_last (page-holder) sources.
+
+_COMIX_CHALLENGE = {"comix": _EVAL_URL}
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_page_holder_cf_403_reprimes_then_recovers() -> None:
+    """A page-holder (comix) in-page 403 eval-throw triggers ONE eval-re-prime (a warm
+    prime POST /eval) then a retry that recovers — the reactive clearance self-heal."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        side_effect=[
+            _eval_threw(403),  # c.list XHR: warm clearance lapsed → CF 403
+            httpx.Response(200, json={"value": True}),  # the prime re-nav (no cookie)
+            httpx.Response(  # retry c.list on the re-cleared page → recovered
+                200, json={"value": [{"hid": "abc", "title": "Recovered"}]}
+            ),
+        ]
+    )
+    solver = _solver(challenge_urls=dict(_COMIX_CHALLENGE), warm_last_keys={"comix"})
+    try:
+        result = await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert result == [{"hid": "abc", "title": "Recovered"}]
+    assert route.call_count == 3
+    # The middle call is the re-prime — it carries the no-op prime JS, not c.list.
+    prime_body = json.loads(route.calls[1].request.content)
+    assert prime_body["js"] == _WEBVIEW_PRIME_JS
+    assert prime_body["extract_clearance"] is True
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_non_page_holder_cf_403_raises_without_reprime() -> None:
+    """A CF-challenge 403 for a NON-page-holder (comix present but NOT in
+    warm_last_keys) re-raises immediately with NO re-prime — self-heal is page-only."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(return_value=_eval_threw(403))
+    solver = _solver(challenge_urls=dict(_COMIX_CHALLENGE), warm_last_keys=set())
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_persistent_page_holder_cf_403_reprimes_once_then_raises() -> None:
+    """A PERSISTENT page-holder 403 re-primes exactly ONCE then raises (bounded — no
+    loop): eval(403) → prime → retry eval(403) → raise. comix surfaces a per-source
+    warning; the fan-out is never stuck re-navigating."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        side_effect=[
+            _eval_threw(403),  # c.list: 403
+            httpx.Response(200, json={"value": True}),  # the one re-prime
+            _eval_threw(403),  # retry c.list: still 403 → raise (budget exhausted)
+        ]
+    )
+    solver = _solver(challenge_urls=dict(_COMIX_CHALLENGE), warm_last_keys={"comix"})
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert route.call_count == 3
+
+
 @respx.mock
 @pytest.mark.asyncio
 async def test_solve_retries_sidecar_503_busy_then_succeeds() -> None:
