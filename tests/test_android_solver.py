@@ -756,10 +756,39 @@ async def test_eval_page_holder_cf_403_reprimes_then_recovers() -> None:
         await solver.aclose()
     assert result == [{"hid": "abc", "title": "Recovered"}]
     assert route.call_count == 3
-    # The middle call is the re-prime — it carries the no-op prime JS, not c.list.
+    # The middle call is the LIGHT re-prime — no-op prime JS, and NO recycle (step 1).
     prime_body = json.loads(route.calls[1].request.content)
     assert prime_body["js"] == _WEBVIEW_PRIME_JS
     assert prime_body["extract_clearance"] is True
+    assert "recycle" not in prime_body  # step 1 is a light warm re-nav, not a recycle
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_eval_page_holder_cf_403_escalates_to_recycle_then_recovers() -> None:
+    """When the LIGHT re-prime does not clear the 403 (comix.to rotated its build → the
+    warm WebView serves a STALE env-*.js), the self-heal ESCALATES: step 2 recycles the
+    WebView (``recycle: true`` → sidecar force-stop + pm clear → fresh build) and the
+    retry recovers. 260710-ig1 stale-build self-heal."""
+    route = respx.post(f"{_SIDECAR}/eval").mock(
+        side_effect=[
+            _eval_threw(403),  # c.list on the stale build → 403
+            httpx.Response(200, json={"value": True}),  # step 1: LIGHT re-prime
+            _eval_threw(403),  # retry still 403 — warm re-nav did not bust the cache
+            httpx.Response(200, json={"value": True}),  # step 2: RECYCLE re-prime
+            httpx.Response(200, json={"value": [{"hid": "z"}]}),  # retry on fresh build
+        ]
+    )
+    solver = _solver(challenge_urls=dict(_COMIX_CHALLENGE), warm_last_keys={"comix"})
+    try:
+        result = await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
+    finally:
+        await solver.aclose()
+    assert result == [{"hid": "z"}]
+    assert route.call_count == 5
+    # Step 1 (call 1) is light — no recycle; step 2 (call 3) carries recycle=True.
+    assert "recycle" not in json.loads(route.calls[1].request.content)
+    assert json.loads(route.calls[3].request.content)["recycle"] is True
 
 
 @respx.mock
@@ -779,15 +808,17 @@ async def test_eval_non_page_holder_cf_403_raises_without_reprime() -> None:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_eval_persistent_page_holder_cf_403_reprimes_once_then_raises() -> None:
-    """A PERSISTENT page-holder 403 re-primes exactly ONCE then raises (bounded — no
-    loop): eval(403) → prime → retry eval(403) → raise. comix surfaces a per-source
-    warning; the fan-out is never stuck re-navigating."""
+async def test_eval_persistent_page_holder_cf_403_escalates_then_raises() -> None:
+    """A PERSISTENT page-holder 403 escalates through BOTH recovery steps then raises
+    (bounded — no infinite loop): eval(403) → light prime → eval(403) → recycle prime →
+    eval(403) → raise. Five /eval calls, then a per-source warning surfaces."""
     route = respx.post(f"{_SIDECAR}/eval").mock(
         side_effect=[
             _eval_threw(403),  # c.list: 403
-            httpx.Response(200, json={"value": True}),  # the one re-prime
-            _eval_threw(403),  # retry c.list: still 403 → raise (budget exhausted)
+            httpx.Response(200, json={"value": True}),  # step 1: light re-prime
+            _eval_threw(403),  # retry: still 403
+            httpx.Response(200, json={"value": True}),  # step 2: recycle re-prime
+            _eval_threw(403),  # retry: still 403 → raise (both budgets exhausted)
         ]
     )
     solver = _solver(challenge_urls=dict(_COMIX_CHALLENGE), warm_last_keys={"comix"})
@@ -796,7 +827,10 @@ async def test_eval_persistent_page_holder_cf_403_reprimes_once_then_raises() ->
             await solver.eval_in_webview(_EVAL_URL, "return await c.list({})")
     finally:
         await solver.aclose()
-    assert route.call_count == 3
+    assert route.call_count == 5
+    assert "recycle" not in json.loads(route.calls[1].request.content)  # step 1 light
+    # step 2 (call 3) carries recycle=True
+    assert json.loads(route.calls[3].request.content)["recycle"] is True
 
 
 @respx.mock

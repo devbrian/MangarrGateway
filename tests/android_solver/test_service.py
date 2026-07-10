@@ -71,6 +71,9 @@ class FakePipeline:
         # Records whether each eval requested clearance extraction (so a test can assert
         # the flag threaded through ``_run_eval`` → the pipeline).
         self.eval_with_clearance: list[bool] = []
+        # 260710-ig1: records each eval's recycle posture (default False; comix's
+        # escalated stale-build self-heal threads True → force-stop + pm clear).
+        self.eval_recycle: list[bool] = []
         self.eval_wait_for: list[str | None] = []
         self._delay = delay
         self._healthy = healthy
@@ -141,6 +144,7 @@ class FakePipeline:
         deadline: float | None = None,
         proxy: dict[str, object] | None = None,
         with_clearance: bool = False,
+        recycle: bool = False,
     ) -> object:
         # Mirrors ``solve``'s recording + gating (shared counters/events) so the
         # eval-vs-solve serialization test can hold the lock with EITHER endpoint.
@@ -152,6 +156,7 @@ class FakePipeline:
             self.eval_js.append(js)
             self.eval_proxies.append(proxy)
             self.eval_with_clearance.append(with_clearance)
+            self.eval_recycle.append(recycle)
             self.eval_wait_for.append(wait_for)
             if self._started is not None:
                 self._started.set()
@@ -812,6 +817,53 @@ def test_eval_rejects_non_bool_extract_clearance() -> None:
     assert status == 422
     assert pipeline.calls == []
     assert "extract_clearance" in payload["error"]
+
+
+# ── 260710-ig1: /eval recycle (stale-build self-heal → force-stop + pm clear) ────────
+
+
+def test_eval_recycle_threads_flag_to_pipeline() -> None:
+    """``recycle: true`` threads ``recycle=True`` to the pipeline so it force-stops + pm
+    clears the WebView before the eval — busting a stale cached env-*.js build."""
+    pipeline = FakePipeline(eval_result={"ok": 1})
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=json.dumps(
+            {
+                "challenge_url": "https://mangadot.net/",
+                "js": "extract()",
+                "recycle": True,
+            }
+        ).encode(),
+    )
+    assert status == 200
+    assert payload == {"value": {"ok": 1}}
+    assert pipeline.eval_recycle == [True]
+
+
+def test_eval_without_recycle_defaults_false() -> None:
+    """D-08 parity: an ordinary eval defaults ``recycle=False`` — the warm WebView is
+    reused (no force-stop/pm clear), byte-for-byte unchanged."""
+    pipeline = FakePipeline(eval_result=True)
+    status, _ = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()"}',
+    )
+    assert status == 200
+    assert pipeline.eval_recycle == [False]
+
+
+def test_eval_rejects_non_bool_recycle() -> None:
+    """A non-bool ``recycle`` is a pre-device 422 (no device action)."""
+    pipeline = FakePipeline()
+    status, payload = _service(pipeline).eval(
+        api_key="s3cret-solver-key",
+        body=b'{"challenge_url": "https://mangadot.net/", "js": "x()",'
+        b' "recycle": "yes"}',
+    )
+    assert status == 422
+    assert pipeline.calls == []
+    assert "recycle" in payload["error"]
 
 
 def test_eval_extract_clearance_does_not_log_token(
