@@ -226,21 +226,42 @@ class MangadotSource(Source):
     # download in parallel (vs the global per-source default of 1). Clamped to the
     # global max_concurrent_chapters by the job manager.
     max_concurrent_jobs = 3
-    # Cloudflare managed-challenge interstitial — RE-ENABLED 2026-06-09 (debug
-    # mangadot-live-smoke-403, #200), the exact REVERSE of #127/#128 which had recorded
-    # mangadot DROPPING it. As of 2026-06-09 a GET to any mangadot.net/api endpoint with
-    # the gateway's plain-httpx UA returns HTTP 403 + the Cloudflare "Just a moment..."
-    # JS-challenge HTML (verified live through a FRESH residential proxy IP → host-level
-    # CF gating, not proxy-IP reputation; proxy rotation does not help). It is the SAME
-    # interactive-challenge class the Patchright solver already clears for comix/kagane,
-    # and the SAME state mangadot was in pre-#127/#128. ``antibot="cloudflare"`` (NOT
-    # ``+encrypted`` — mangadot serves plain JSON once cleared; it is not encrypted like
-    # comix) re-adds mangadot to the shared CF solver's warm set, so the framework
-    # injects the captured ``cf_clearance`` cookie + UA (D-40) and reconciles a
-    # challenge 403 via a single forced re-solve (D-35). The framework picks this up
-    # PURELY from the classification — no per-source warm-set wiring (CLAUDE.md: adding
-    # a CF source needs zero custom networking glue).
+    # Cloudflare managed-challenge interstitial — declared ``cloudflare`` but the
+    # challenge FLIP-FLOPS (this is the THIRD recorded toggle):
+    #   * #127/#128 (2026-06-05): DROPPED — /api returned plain 200 JSON, no clearance.
+    #   * #200 (2026-06-09): RE-ENABLED — /api returned 403 + "Just a moment..." HTML.
+    #   * debug ``mangadot-stale-cf-solve`` (2026-07-13): DROPPED AGAIN. Live
+    #     ``GET /api/search`` returns HTTP 200 clean JSON through ANY working proxy IP
+    #     (verified 69.30.72.33 AND Linode 45.56.146.72) — NO "Just a moment", NO
+    #     cf_clearance. The android solver waited for a Turnstile OOPIF that no longer
+    #     fires ("OOPIF did not appear before frame-poll deadline" → "clearance not
+    #     minted before deadline"; 0 mints/24h, 38 failures), so the MANDATORY upfront
+    #     solve never completes → search blocks → 30s fan-out timeout → 0 releases.
+    # The gateway's OWN direct datacenter egress still gets an origin openresty-403
+    # (keyed to AS26793), so the proxy is STILL required
+    # (``solve_search_via_proxy_pool`` stays) — but there is NO interactive CF
+    # challenge to solve. Rather than
+    # flip ``antibot`` back and forth on every toggle, ``cloudflare_challenge_optional``
+    # (below) makes the solve LAZY: keep ``antibot="cloudflare"`` so a future re-enable
+    # self-heals via the D-35 reconcile, but don't BLOCK on a solve up front. NOT
+    # ``+encrypted`` — mangadot serves plain JSON once through the proxy. The framework
+    # picks all of this up PURELY from the class-attrs — no per-source warm-set wiring
+    # (CLAUDE.md: adding/retuning a CF source needs zero custom networking glue).
     antibot = "cloudflare"
+    # On-demand clearance (debug ``mangadot-stale-cf-solve``, 2026-07-13): mangadot's CF
+    # challenge is INTERMITTENT (see the toggle history above), and today it is OFF.
+    # Mirrors mangaball.py:610 / mangafire.py:239. With the default eager solve, every
+    # search blocked on the android solver for a cf_clearance it could never mint while
+    # no Turnstile OOPIF was firing → 30s fan-out timeout → empty releases. This flag
+    # makes the CF half LAZY: attach held clearance if the sidecar already has one, but
+    # do NOT block on a fresh solve up front — let the request go out (through the
+    # proxy, which clears the origin openresty-403) and force a real solve ONLY when a
+    # response is an actual challenge (``is_cf_challenge`` → the D-35 reconcile in
+    # ``context._request_response``). Self-heals both directions of the flip-flop; the
+    # framework derives ``on_demand_keys`` from this attr (app.py), so ``warm()`` skips
+    # the eager startup solve. INDEPENDENT of ``solve_search_via_proxy_pool`` (which
+    # STAYS — the proxy is still required for the origin 403).
+    cloudflare_challenge_optional = True
     # Per-source challenge host the solver navigates to earn the cf_clearance cookie
     # (#88 per-domain map; mirrors comix/kagane). mangadot serves plain JSON post-clear,
     # so ``decrypt_scheme``/``session_prep`` stay ``None`` (no encrypted-response path).
