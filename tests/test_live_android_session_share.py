@@ -92,16 +92,21 @@ def test_kwargs_shape_mirrors_app_androidsolver_build() -> None:
 def test_on_demand_keys_mirror_app_so_warm_skips_mangaball() -> None:
     """DRIFT GUARD (debug pooltimeout-recurrence): the session-shared AndroidSolver
     MUST carry ``on_demand_keys`` exactly like app.py, or its ``warm()`` eager-solves
-    mangaball against the contended home sidecar → 504 → D-33 force-disable → every
-    mangaball live test fails (sticky #261) while production skips it correctly.
+    an intermittent-challenge source against the contended home sidecar → 504 → D-33
+    force-disable → every live test for it fails (sticky #261) while production skips
+    it correctly.
 
-    mangaball declares ``cloudflare_challenge_optional=True``, so it MUST be in the
-    mirror's ``on_demand_keys`` — and must never leak a non-on-demand android source
-    (mangadot/kagane) into the skip set.
+    mangaball AND mangadot declare ``cloudflare_challenge_optional=True``, so both MUST
+    be in the mirror's ``on_demand_keys``. mangadot joined 2026-07-13 (debug
+    ``mangadot-stale-cf-solve``): it dropped its CF interstitial again, so its mandatory
+    upfront solve could never mint (0 mints/24h) → the source went on-demand. kagane
+    (eager android CF) must NEVER leak into the skip set. This assertion also fails if
+    ``MangadotSource.cloudflare_challenge_optional`` is un-set (on_demand is derived
+    from that attr via the real registry).
     """
     on_demand = _build_session_android_solver_kwargs()["on_demand_keys"]
     assert "mangaball" in on_demand
-    assert "mangadot" not in on_demand
+    assert "mangadot" in on_demand
     assert "kagane" not in on_demand
 
 
