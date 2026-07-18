@@ -23,6 +23,7 @@ from PIL import Image
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.comix import (
     ComixSource,
+    _grid_seam,
     _scramble_permutation,
     _unscramble_image,
 )
@@ -280,6 +281,65 @@ async def test_fetch_image_unscrambles_scramble_page() -> None:
     )
     out = await ComixSource().fetch_image("https://cdn.example.store/i4/T/04.webp", ctx)
     restored = Image.open(io.BytesIO(out)).convert("RGB")
+    assert restored.tobytes() == original.tobytes()
+
+
+# ── debug comix-scramble-build-02900: seed-independent jigsaw fallback (2026-07-18) ──
+
+
+def _make_gradient_image(cols: int, rows: int, tile: int = 24) -> Image.Image:
+    """A smooth 2-axis RGB gradient — tiles are UNIQUE *and* edge-continuous.
+
+    Unlike ``_make_grid_image`` (solid tiles with hard borders everywhere), a smooth
+    gradient's correct layout is the unique arrangement with continuous tile borders,
+    so the pixel-edge-matching jigsaw can reassemble it exactly and unambiguously —
+    the oracle for the seed-independent recovery path.
+    """
+    w, h = cols * tile, rows * tile
+    img = Image.new("RGB", (w, h))
+    px = img.load()
+    assert px is not None
+    for y in range(h):
+        for x in range(w):
+            px[x, y] = (x * 255 // (w - 1), y * 255 // (h - 1), 128)
+    return img
+
+
+def test_unscramble_jigsaw_recovers_unreversible_scramble() -> None:
+    """A rotated-build scramble the seed PRNG can't reverse is recovered by the jigsaw.
+
+    Scramble a gradient with one seed, then ask ``_unscramble_image`` to reverse it
+    with a DIFFERENT seed — the seed-based un-permute cannot restore it (stands in for
+    comix's rotated ``x-scramble-hash=02900`` build). The gradient is edge-continuous
+    and unique-per-tile, so ONLY the correct arrangement reproduces the original; an
+    exact match therefore proves the seed-independent jigsaw fallback did the recovery.
+    """
+    cols, rows = 5, 5
+    scramble_seed, wrong_seed = 4010719162, 1088147119
+    original = _make_gradient_image(cols, rows)
+    scrambled = _scramble_to_webp(original, scramble_seed, cols, rows, algo=3)
+    # sanity: the wrong seed's un-permute leaves it visibly scrambled (high seam)
+    naive_perm = _scramble_permutation(wrong_seed, cols * rows, 3)
+    assert naive_perm != _scramble_permutation(scramble_seed, cols * rows, 3)
+    restored_bytes = _unscramble_image(scrambled, wrong_seed, cols, rows, algo=3)
+    restored = Image.open(io.BytesIO(restored_bytes)).convert("RGB")
+    assert restored.tobytes() == original.tobytes()
+    assert _grid_seam(restored, cols, rows) < 20.0
+
+
+def test_unscramble_correct_seed_output_not_disturbed_by_jigsaw() -> None:
+    """When the seed path already descrambles coherently, the jigsaw must not override.
+
+    Scramble a gradient and reverse it with the MATCHING seed → the seed-based path is
+    correct; the fallback must leave that output byte-identical to the original (the
+    coherence gate never fires, or the jigsaw is rejected by the margin guard).
+    """
+    cols, rows, seed = 5, 5, 4010719162
+    original = _make_gradient_image(cols, rows)
+    scrambled = _scramble_to_webp(original, seed, cols, rows, algo=3)
+    restored = Image.open(
+        io.BytesIO(_unscramble_image(scrambled, seed, cols, rows, algo=3))
+    ).convert("RGB")
     assert restored.tobytes() == original.tobytes()
 
 

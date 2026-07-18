@@ -113,6 +113,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 from ..framework.base import Source
@@ -300,6 +301,27 @@ _SCRAMBLE_GRID_DEFAULT = (5, 5)  # C# ParseGrid default when the header is absen
 # Cap the tile grid so a hostile ``x-scramble-grid`` can't force a huge tile loop.
 _SCRAMBLE_GRID_MAX = 64
 
+# ── Seed-independent recovery (debug ``comix-scramble-build-02900``, 2026-07-18) ──
+# Comix scrambles every ~10th "teaser" page even when the image fetch sends the
+# ``Origin`` plaintext trick, and it periodically ROTATES its scrambler build: a
+# rotated ``x-scramble-algo=3`` build (live: ``x-scramble-hash=02900``, seed ≥ 2³¹)
+# uses a permutation the spike-017 xorshift-Fisher-Yates ``_scramble_permutation``
+# can NOT reverse (the older ``fdd91`` build still matches). The seed-based
+# un-permute then leaves the page STILL tile-shuffled — a valid WebP that silently
+# passes the packaging ``is_valid_image`` guard and ships corrupt. An exhaustive
+# PRNG/seed-transform search reproduced none of the rotated build's permutations,
+# and the build rotates, so the durable fix is seed-INDEPENDENT: measure tile-seam
+# coherence of the seed output and, when it is still scrambled, reassemble by
+# pixel edge-matching (a greedy jigsaw over the same grid), accepting the jigsaw
+# ONLY when it is clearly coherent AND materially better — so a correctly
+# descrambled but high-contrast page (already the global seam minimum) is never
+# disturbed. Thresholds are per-internal-border mean-abs pixel difference; live
+# data: coherent pages ≈ 5–10, still-scrambled pages ≈ 80–110.
+_SEAM_INCOHERENT = 45.0  # seed output above this ⇒ probably still scrambled → jigsaw
+_SEAM_COHERENT = 20.0  # jigsaw must fall below this to be accepted as coherent
+_JIGSAW_MARGIN = 0.45  # …AND be < seed_seam * this (>= ~2.2x better) to override
+_JIGSAW_MAX_TILES = 64  # skip the O(n³) greedy jigsaw for pathologically large grids
+
 
 def _xorshift32_step(state: int) -> int:
     """One xorshift32 step (Marsaglia 13/17/5, 32-bit). Shared by byte-algo-2 (XOR the
@@ -345,6 +367,121 @@ def _scramble_permutation(seed: int, count: int, algo: int) -> list[int]:
     return values
 
 
+def _grid_seam(img: Image.Image, cols: int, rows: int) -> float:
+    """Mean per-internal-border pixel discontinuity of a ``cols`` x ``rows`` tiling.
+
+    A correctly-assembled page's tile borders are visually continuous (low mean-abs
+    pixel difference across each internal grid line); a still-tile-shuffled page has
+    hard seams (high difference). Returned as the average MAE over the internal
+    borders — the coherence signal the seed-independent recovery gates on. Ignores
+    the sub-tile remainder strip (last row/col) so it measures only whole tiles.
+    """
+    arr = np.asarray(img, dtype=np.int16)
+    height, width = arr.shape[0], arr.shape[1]
+    tile_w, tile_h = width // cols, height // rows
+    if tile_w <= 0 or tile_h <= 0:
+        return float("inf")
+    grid_h, grid_w = rows * tile_h, cols * tile_w
+    diffs: list[float] = []
+    for c in range(1, cols):
+        x = c * tile_w
+        diffs.append(float(np.abs(arr[:grid_h, x - 1, :] - arr[:grid_h, x, :]).mean()))
+    for r in range(1, rows):
+        y = r * tile_h
+        diffs.append(float(np.abs(arr[y - 1, :grid_w, :] - arr[y, :grid_w, :]).mean()))
+    return sum(diffs) / len(diffs) if diffs else float("inf")
+
+
+def _jigsaw_reassemble(img: Image.Image, cols: int, rows: int) -> Image.Image | None:
+    """Reassemble a tile-shuffled page by greedy edge-matching — seed-INDEPENDENT.
+
+    The scramble is a pure ``cols`` x ``rows`` tile permutation (no per-tile rotation/
+    flip), so the original layout is the arrangement whose adjacent tiles have the
+    most continuous shared borders — a jigsaw the pixels alone determine, with no
+    knowledge of comix's (rotated, un-reversed) PRNG. Greedy: seed each of the ``n``
+    tiles as the top-left, fill row 0 by best left→right border match, then each
+    lower cell by best (top border, and left border when present) match; keep the
+    full arrangement with the lowest total border cost.
+
+    Returns ``None`` (⇒ caller keeps the seed output) if the image is too small for
+    the grid. Correctness of the RESULT is not asserted here — the caller's global
+    :func:`_grid_seam` gate is the guard: a wrongly-resolved border tie displaces a
+    tile that then does NOT fit its new slot, raising the overall seam, so the gate
+    rejects it. (A per-placement "reject on any near-tie" guard was tried and dropped:
+    real pages carry benign gap-0 border ties among distinct-interior tiles that the
+    greedy still resolves correctly — page30 of the debug corpus recovers cleanly at
+    seam 4.5 despite one — so it only rejected valid recoveries.) O(n³) in tile count
+    — the caller caps ``n``.
+    """
+    arr = np.asarray(img, dtype=np.int16)
+    height, width = arr.shape[0], arr.shape[1]
+    tile_w, tile_h = width // cols, height // rows
+    if tile_w <= 0 or tile_h <= 0:
+        return None
+    n = cols * rows
+    tiles = [
+        arr[
+            (s // cols) * tile_h : (s // cols) * tile_h + tile_h,
+            (s % cols) * tile_w : (s % cols) * tile_w + tile_w,
+            :,
+        ]
+        for s in range(n)
+    ]
+    # Pairwise border costs (precomputed once): lr[a][b] = a's right edge vs b's left;
+    # tb[a][b] = a's bottom edge vs b's top. Lower = more continuous.
+    lr = [
+        [float(np.abs(tiles[a][:, -1, :] - tiles[b][:, 0, :]).mean()) for b in range(n)]
+        for a in range(n)
+    ]
+    tb = [
+        [float(np.abs(tiles[a][-1, :, :] - tiles[b][0, :, :]).mean()) for b in range(n)]
+        for a in range(n)
+    ]
+    best_grid: list[list[int]] | None = None
+    best_cost = float("inf")
+    for start in range(n):
+        used = [False] * n
+        grid = [[-1] * cols for _ in range(rows)]
+        grid[0][0] = start
+        used[start] = True
+        for c in range(1, cols):
+            prev = grid[0][c - 1]
+            cand = min((t for t in range(n) if not used[t]), key=lambda t: lr[prev][t])
+            grid[0][c] = cand
+            used[cand] = True
+        for r in range(1, rows):
+            for c in range(cols):
+                above = grid[r - 1][c]
+                left = grid[r][c - 1] if c > 0 else -1
+                cand = min(
+                    (t for t in range(n) if not used[t]),
+                    key=lambda t: tb[above][t] + (lr[left][t] if left >= 0 else 0.0),
+                )
+                grid[r][c] = cand
+                used[cand] = True
+        total = 0.0
+        for r in range(rows):
+            for c in range(cols):
+                if c < cols - 1:
+                    total += lr[grid[r][c]][grid[r][c + 1]]
+                if r < rows - 1:
+                    total += tb[grid[r][c]][grid[r + 1][c]]
+        if total < best_cost:
+            best_cost = total
+            best_grid = [row[:] for row in grid]
+    if best_grid is None:
+        return None
+    out = img.copy()  # preserves the sub-tile remainder strip, like the seed path
+    for r in range(rows):
+        for c in range(cols):
+            s = best_grid[r][c]
+            sx, sy = (s % cols) * tile_w, (s // cols) * tile_h
+            out.paste(
+                img.crop((sx, sy, sx + tile_w, sy + tile_h)), (c * tile_w, r * tile_h)
+            )
+    return out
+
+
 def _unscramble_image(
     content: bytes, seed: int, cols: int, rows: int, algo: int
 ) -> bytes:
@@ -357,6 +494,13 @@ def _unscramble_image(
     take an added lossy requant (PKG-02). A non-image / truncated body degrades to a
     passthrough (the downstream ``is_valid_image`` guard rejects it), never raising —
     but an UNKNOWN ``x-scramble-algo`` is allowed to propagate (caller fails loud).
+
+    Seed-independent recovery (debug ``comix-scramble-build-02900``): comix rotates
+    its scrambler build; a rotated ``algo=3`` build the seed PRNG can't reverse leaves
+    the page STILL tile-shuffled after the un-permute above. When the seed output is
+    still incoherent (high :func:`_grid_seam`), reassemble by pixel edge-matching
+    (:func:`_jigsaw_reassemble`) and adopt it ONLY when it is clearly coherent AND
+    materially better — so a correctly descrambled page is never disturbed.
     """
     perm = _scramble_permutation(seed, cols * rows, algo)  # may raise on unknown algo
     try:
@@ -377,6 +521,16 @@ def _unscramble_image(
         sx, sy = (s_idx % cols) * tile_w, (s_idx // cols) * tile_h
         dx, dy = (dst % cols) * tile_w, (dst // cols) * tile_h
         out.paste(img.crop((sx, sy, sx + tile_w, sy + tile_h)), (dx, dy))
+    # Seed-independent fallback: if the seed un-permute is still scrambled (rotated
+    # build), try the jigsaw and adopt it only when clearly coherent AND much better
+    # — so a correct-but-busy page (already the global seam minimum) is never dropped.
+    seed_seam = _grid_seam(out, cols, rows)
+    if seed_seam > _SEAM_INCOHERENT and cols * rows <= _JIGSAW_MAX_TILES:
+        jig = _jigsaw_reassemble(img, cols, rows)
+        if jig is not None:
+            jig_seam = _grid_seam(jig, cols, rows)
+            if jig_seam < _SEAM_COHERENT and jig_seam < seed_seam * _JIGSAW_MARGIN:
+                out = jig
     buf = io.BytesIO()
     out.save(buf, format="WEBP", lossless=True, quality=100, method=6)
     return buf.getvalue()
