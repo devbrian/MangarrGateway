@@ -319,7 +319,7 @@ _SCRAMBLE_GRID_MAX = 64
 # data: coherent pages ≈ 5–10, still-scrambled pages ≈ 80–110.
 _SEAM_INCOHERENT = 45.0  # seed output above this ⇒ probably still scrambled → jigsaw
 _SEAM_COHERENT = 20.0  # jigsaw must fall below this to be accepted as coherent
-_JIGSAW_MARGIN = 0.45  # …AND be < seed_seam * this (≥ ~2.2× better) to override
+_JIGSAW_MARGIN = 0.45  # …AND be < seed_seam * this (>= ~2.2x better) to override
 _JIGSAW_MAX_TILES = 64  # skip the O(n³) greedy jigsaw for pathologically large grids
 
 
@@ -368,7 +368,7 @@ def _scramble_permutation(seed: int, count: int, algo: int) -> list[int]:
 
 
 def _grid_seam(img: Image.Image, cols: int, rows: int) -> float:
-    """Mean per-internal-border pixel discontinuity of a ``cols``×``rows`` tiling.
+    """Mean per-internal-border pixel discontinuity of a ``cols`` x ``rows`` tiling.
 
     A correctly-assembled page's tile borders are visually continuous (low mean-abs
     pixel difference across each internal grid line); a still-tile-shuffled page has
@@ -395,14 +395,23 @@ def _grid_seam(img: Image.Image, cols: int, rows: int) -> float:
 def _jigsaw_reassemble(img: Image.Image, cols: int, rows: int) -> Image.Image | None:
     """Reassemble a tile-shuffled page by greedy edge-matching — seed-INDEPENDENT.
 
-    The scramble is a pure ``cols``×``rows`` tile permutation (no per-tile rotation/
+    The scramble is a pure ``cols`` x ``rows`` tile permutation (no per-tile rotation/
     flip), so the original layout is the arrangement whose adjacent tiles have the
     most continuous shared borders — a jigsaw the pixels alone determine, with no
     knowledge of comix's (rotated, un-reversed) PRNG. Greedy: seed each of the ``n``
     tiles as the top-left, fill row 0 by best left→right border match, then each
     lower cell by best (top border, and left border when present) match; keep the
-    full arrangement with the lowest total border cost. Returns ``None`` if the
-    image is too small for the grid. O(n³) in tile count — the caller caps ``n``.
+    full arrangement with the lowest total border cost.
+
+    Returns ``None`` (⇒ caller keeps the seed output) if the image is too small for
+    the grid. Correctness of the RESULT is not asserted here — the caller's global
+    :func:`_grid_seam` gate is the guard: a wrongly-resolved border tie displaces a
+    tile that then does NOT fit its new slot, raising the overall seam, so the gate
+    rejects it. (A per-placement "reject on any near-tie" guard was tried and dropped:
+    real pages carry benign gap-0 border ties among distinct-interior tiles that the
+    greedy still resolves correctly — page30 of the debug corpus recovers cleanly at
+    seam 4.5 despite one — so it only rejected valid recoveries.) O(n³) in tile count
+    — the caller caps ``n``.
     """
     arr = np.asarray(img, dtype=np.int16)
     height, width = arr.shape[0], arr.shape[1]
