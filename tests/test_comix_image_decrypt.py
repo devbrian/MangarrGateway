@@ -570,6 +570,20 @@ def test_algo_header_parser() -> None:
     assert h("garbage", 1) == -1  # malformed → guaranteed-unknown (fails loud)
 
 
+def test_safe_scramble_hash_bounds_untrusted_header() -> None:
+    # PR #359: x-scramble-hash is an upstream header echoed into the loud-fail
+    # SourceError — accept only the compact build-id shape, else None (→ "unknown").
+    s = ComixSource._safe_scramble_hash
+    assert s("02900") == "02900"  # live 5-hex build id → verbatim
+    assert s("923e0") == "923e0"
+    assert s("  fdd91  ") == "fdd91"  # stripped
+    assert s(None) is None
+    assert s("") is None
+    assert s("a" * 17) is None  # over-long → rejected
+    assert s("bad-hash!") is None  # non-alnum / punctuation → rejected
+    assert s("evil\ninject") is None  # control char (log injection) → rejected
+
+
 # ---- Origin-header plaintext fix (comix-scramble-seed-regression) ----
 
 

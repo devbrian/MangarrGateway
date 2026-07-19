@@ -459,8 +459,9 @@ def _jigsaw_reassemble(img: Image.Image, cols: int, rows: int) -> Image.Image | 
     correctly, so it only rejected valid recoveries.)
 
     Returns ``None`` (⇒ caller keeps the seed output) if the image is too small for the
-    grid or no arrangement scored a finite seam. O(n³) greedy + O(n²·W) beam in tile
-    count — the caller caps ``n`` via ``_JIGSAW_MAX_TILES``.
+    grid or no arrangement scored a finite seam. Both trajectories run from all ``n``
+    start tiles: O(n³) greedy + O(W·n³) beam in tile count — the caller caps ``n`` via
+    ``_JIGSAW_MAX_TILES``.
     """
     arr = np.asarray(img, dtype=np.int16)
     height, width = arr.shape[0], arr.shape[1]
@@ -1952,6 +1953,23 @@ class ComixSource(Source):
         return int(value)
 
     @staticmethod
+    def _safe_scramble_hash(raw: str | None) -> str | None:
+        """Bound + format-check ``x-scramble-hash`` before it reaches a log/error
+        message (CodeRabbit, PR #359). It is an upstream (attacker-influenceable)
+        response header echoed into the loud-fail ``SourceError`` in
+        ``_unscramble_image``, so accept ONLY the observed compact build-id shape
+        (live hashes are 5 hex chars, e.g. ``02900``/``923e0``; alnum-ASCII, 16-char
+        cap leaves room for format drift) and return ``None`` otherwise — a malformed,
+        over-long, or control-char value degrades to ``"unknown"`` at the call site
+        rather than injecting into the message. Cosmetic to the descramble result."""
+        if raw is None:
+            return None
+        value = raw.strip()
+        if not value or len(value) > 16 or not value.isalnum() or not value.isascii():
+            return None
+        return value
+
+    @staticmethod
     def _scramble_grid(raw: str | None) -> tuple[int, int]:
         """Parse ``x-scramble-grid`` (e.g. ``"5x5"`` or ``"5"``) → ``(cols, rows)``.
 
@@ -2050,7 +2068,7 @@ class ComixSource(Source):
             scramble_algo = self._algo_header(
                 headers.get("x-scramble-algo"), _SCRAMBLE_ALGO_LEGACY_LCG[0]
             )
-            build_hash = headers.get("x-scramble-hash")
+            build_hash = self._safe_scramble_hash(headers.get("x-scramble-hash"))
             try:
                 data = await asyncio.to_thread(
                     _unscramble_image,
