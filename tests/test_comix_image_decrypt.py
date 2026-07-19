@@ -327,6 +327,51 @@ def test_unscramble_jigsaw_recovers_unreversible_scramble() -> None:
     assert _grid_seam(restored, cols, rows) < 20.0
 
 
+def _seed_output_seam(
+    scrambled: bytes, seed: int, cols: int, rows: int, algo: int
+) -> float:
+    """Seam of the SEED-only un-permute (no jigsaw) — mirrors the seed path.
+
+    Used by the mod-006 regression to assert the still-scrambled seed output lands in
+    the band the removed entry gate used to SKIP (``seed_seam <= 45``).
+    """
+    img = Image.open(io.BytesIO(scrambled)).convert("RGB")
+    perm = _scramble_permutation(seed, cols * rows, algo)
+    tw, th = img.width // cols, img.height // rows
+    out = img.copy()
+    for s in range(cols * rows):
+        dst = perm[s]
+        sx, sy = (s % cols) * tw, (s // cols) * th
+        dx, dy = (dst % cols) * tw, (dst // cols) * th
+        out.paste(img.crop((sx, sy, sx + tw, sy + th)), (dx, dy))
+    return _grid_seam(out, cols, rows)
+
+
+def test_unscramble_jigsaw_recovers_below_old_entry_gate() -> None:
+    """A still-scrambled page whose SEED-output seam is BELOW the removed 45.0 gate.
+
+    debug ``comix-descramble-mod-006``: comix rotated its scrambler build so that some
+    still-tile-shuffled pages have a seed-descramble seam UNDER the old
+    ``_SEAM_INCOHERENT = 45.0`` entry gate (live: "Master in My Dreams" ch6 shipped
+    pages at seam 43.0/30.0/22.9). The old gate skipped the jigsaw for those, shipping
+    them silently corrupt. This pins a deterministic wrong-seed whose seed-output seam
+    is 43.8 (< 45) and asserts the jigsaw STILL recovers — so reintroducing any
+    seam-based entry gate at/above this value re-breaks the recovery assert here.
+    """
+    cols, rows = 5, 5
+    scramble_seed, wrong_seed = 4010719162, 1000005386
+    original = _make_gradient_image(cols, rows)
+    scrambled = _scramble_to_webp(original, scramble_seed, cols, rows, algo=3)
+    seed_seam = _seed_output_seam(scrambled, wrong_seed, cols, rows, 3)
+    # genuinely still-scrambled, yet UNDER the removed 45.0 entry gate
+    assert 20.0 < seed_seam < 45.0, seed_seam
+    restored = Image.open(
+        io.BytesIO(_unscramble_image(scrambled, wrong_seed, cols, rows, algo=3))
+    ).convert("RGB")
+    assert restored.tobytes() == original.tobytes()
+    assert _grid_seam(restored, cols, rows) < 20.0
+
+
 def test_unscramble_correct_seed_output_not_disturbed_by_jigsaw() -> None:
     """When the seed path already descrambles coherently, the jigsaw must not override.
 
