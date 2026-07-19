@@ -304,20 +304,32 @@ _SCRAMBLE_GRID_MAX = 64
 # ── Seed-independent recovery (debug ``comix-scramble-build-02900``, 2026-07-18) ──
 # Comix scrambles every ~10th "teaser" page even when the image fetch sends the
 # ``Origin`` plaintext trick, and it periodically ROTATES its scrambler build: a
-# rotated ``x-scramble-algo=3`` build (live: ``x-scramble-hash=02900``, seed ≥ 2³¹)
-# uses a permutation the spike-017 xorshift-Fisher-Yates ``_scramble_permutation``
-# can NOT reverse (the older ``fdd91`` build still matches). The seed-based
-# un-permute then leaves the page STILL tile-shuffled — a valid WebP that silently
-# passes the packaging ``is_valid_image`` guard and ships corrupt. An exhaustive
-# PRNG/seed-transform search reproduced none of the rotated build's permutations,
-# and the build rotates, so the durable fix is seed-INDEPENDENT: measure tile-seam
-# coherence of the seed output and, when it is still scrambled, reassemble by
-# pixel edge-matching (a greedy jigsaw over the same grid), accepting the jigsaw
-# ONLY when it is clearly coherent AND materially better — so a correctly
-# descrambled but high-contrast page (already the global seam minimum) is never
-# disturbed. Thresholds are per-internal-border mean-abs pixel difference; live
-# data: coherent pages ≈ 5–10, still-scrambled pages ≈ 80–110.
-_SEAM_INCOHERENT = 45.0  # seed output above this ⇒ probably still scrambled → jigsaw
+# rotated ``x-scramble-algo=3`` build (live: ``x-scramble-hash`` ``02900``/``03632``,
+# seed ≥ 2³¹) uses a permutation the spike-017 xorshift-Fisher-Yates
+# ``_scramble_permutation`` can NOT reverse (the older ``fdd91`` build still matches).
+# The seed-based un-permute then leaves the page STILL tile-shuffled — a valid WebP
+# that silently passes the packaging ``is_valid_image`` guard and ships corrupt. An
+# exhaustive PRNG/seed-transform search reproduced none of the rotated build's
+# permutations, and the build rotates, so the durable fix is seed-INDEPENDENT:
+# reassemble by pixel edge-matching (a greedy jigsaw over the same grid), accepting
+# the jigsaw ONLY when it is clearly coherent AND materially better than the seed
+# output — so a correctly descrambled but high-contrast page (already the global
+# seam minimum) is never disturbed. Thresholds are per-internal-border mean-abs
+# pixel difference.
+#
+# debug ``comix-descramble-mod-006`` (2026-07-18): the jigsaw is now ALWAYS attempted
+# for a bounded grid; there is deliberately NO seam-based ENTRY gate. The prior gate
+# (``seed_seam > 45.0 ⇒ run jigsaw``) was a magic threshold tuned when still-scrambled
+# seed outputs measured ≈ 80–110; a later chapter's still-scrambled seed outputs
+# measured 22.9–54.3 (live: "Master in My Dreams" ch6 p19/p29/p39 shipped scrambled at
+# seam 43.0/30.0/22.9 because they fell UNDER 45 and skipped the jigsaw). Any fixed
+# entry threshold is inherently brittle against comix's build rotation, and it is
+# redundant: the ACCEPTANCE guard below (``jig < _SEAM_COHERENT`` AND
+# ``jig < seed_seam * _JIGSAW_MARGIN``) is the sole correctness mechanism — a correct
+# page is the global seam minimum, so no jigsaw arrangement can be ~2.2x more coherent
+# → it is never adopted (verified: solid-tile correct seam 72.9 vs its jigsaw 50.6,
+# rejected by ``jig < 20``). The only remaining gate is ``_JIGSAW_MAX_TILES`` (bounds
+# the O(n³) greedy search — a real DoS guard, not a correctness heuristic).
 _SEAM_COHERENT = 20.0  # jigsaw must fall below this to be accepted as coherent
 _JIGSAW_MARGIN = 0.45  # …AND be < seed_seam * this (>= ~2.2x better) to override
 _JIGSAW_MAX_TILES = 64  # skip the O(n³) greedy jigsaw for pathologically large grids
@@ -495,12 +507,16 @@ def _unscramble_image(
     passthrough (the downstream ``is_valid_image`` guard rejects it), never raising —
     but an UNKNOWN ``x-scramble-algo`` is allowed to propagate (caller fails loud).
 
-    Seed-independent recovery (debug ``comix-scramble-build-02900``): comix rotates
-    its scrambler build; a rotated ``algo=3`` build the seed PRNG can't reverse leaves
-    the page STILL tile-shuffled after the un-permute above. When the seed output is
-    still incoherent (high :func:`_grid_seam`), reassemble by pixel edge-matching
+    Seed-independent recovery (debug ``comix-scramble-build-02900`` /
+    ``comix-descramble-mod-006``): comix rotates its scrambler build; a rotated
+    ``algo=3`` build the seed PRNG can't reverse leaves the page STILL tile-shuffled
+    after the un-permute above. Reassemble by pixel edge-matching
     (:func:`_jigsaw_reassemble`) and adopt it ONLY when it is clearly coherent AND
-    materially better — so a correctly descrambled page is never disturbed.
+    materially better than the seed output — so a correctly descrambled page is never
+    disturbed. The jigsaw is ALWAYS attempted (bounded by ``_JIGSAW_MAX_TILES``); there
+    is no seam-based entry gate — a fixed "still scrambled?" threshold is brittle
+    against build rotation (it silently shipped sub-threshold scrambled pages), and the
+    adopt-guard is the sole correctness mechanism.
     """
     perm = _scramble_permutation(seed, cols * rows, algo)  # may raise on unknown algo
     try:
@@ -521,11 +537,18 @@ def _unscramble_image(
         sx, sy = (s_idx % cols) * tile_w, (s_idx // cols) * tile_h
         dx, dy = (dst % cols) * tile_w, (dst // cols) * tile_h
         out.paste(img.crop((sx, sy, sx + tile_w, sy + tile_h)), (dx, dy))
-    # Seed-independent fallback: if the seed un-permute is still scrambled (rotated
-    # build), try the jigsaw and adopt it only when clearly coherent AND much better
-    # — so a correct-but-busy page (already the global seam minimum) is never dropped.
-    seed_seam = _grid_seam(out, cols, rows)
-    if seed_seam > _SEAM_INCOHERENT and cols * rows <= _JIGSAW_MAX_TILES:
+    # Seed-independent fallback: comix rotates its scrambler build, so the seed
+    # un-permute above may leave the page STILL tile-shuffled at a build-dependent
+    # seam (live: 22.9–54.3 across one chapter). A fixed "is it still scrambled?"
+    # ENTRY threshold is therefore brittle — it silently shipped sub-threshold
+    # scrambled pages (debug comix-descramble-mod-006). So ALWAYS attempt the jigsaw
+    # for a bounded grid and let the ACCEPTANCE guard decide: adopt only when the
+    # jigsaw is clearly coherent (< _SEAM_COHERENT) AND materially better than the
+    # seed output (< seed_seam * _JIGSAW_MARGIN, ~2.2x). A correctly descrambled page
+    # is already the global seam minimum, so no jigsaw arrangement clears that margin
+    # → it is never disturbed. _JIGSAW_MAX_TILES bounds the O(n³) search (DoS guard).
+    if cols * rows <= _JIGSAW_MAX_TILES:
+        seed_seam = _grid_seam(out, cols, rows)
         jig = _jigsaw_reassemble(img, cols, rows)
         if jig is not None:
             jig_seam = _grid_seam(jig, cols, rows)
