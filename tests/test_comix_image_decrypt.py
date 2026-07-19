@@ -17,13 +17,17 @@ import io
 from typing import Any
 
 import httpx
+import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
 
+import manga_gateway.sources.comix as comix
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.comix import (
+    _SEAM_COHERENT,
     ComixSource,
     _grid_seam,
+    _jigsaw_reassemble,
     _scramble_permutation,
     _unscramble_image,
 )
@@ -241,8 +245,13 @@ def _scramble_to_webp(
 
 @pytest.mark.parametrize("algo", [1, 2, 3])
 def test_unscramble_round_trip_recovers_original(algo: int) -> None:
+    # Edge-continuous gradient, NOT ``_make_grid_image``: the ship-time loud-fail guard
+    # (debug comix-descramble-pansa-069) rejects a FINAL page whose seam stays >= 20;
+    # a correctly-recovered solid-tile grid has hard borders everywhere (seam >> 20) — a
+    # pathology real manga pages never show. A gradient recovers coherently and
+    # exercises the seed round-trip without tripping the guard.
     cols, rows, seed = 5, 5, 4010719162
-    original = _make_grid_image(cols, rows)
+    original = _make_gradient_image(cols, rows)
     scrambled = _scramble_to_webp(original, seed, cols, rows, algo)
     # a non-trivial permutation actually moved tiles (compare DECODED pixels — the raw
     # `scrambled` bytes are compressed WebP, so a byte-compare would be trivially true)
@@ -268,8 +277,11 @@ def test_unscramble_non_image_passthrough() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_image_unscrambles_scramble_page() -> None:
+    # gradient (not solid-tile grid) so the correctly-recovered page is coherent and the
+    # ship-time loud-fail guard (comix-descramble-pansa-069) does not fire — see
+    # ``test_unscramble_round_trip_recovers_original``.
     cols, rows, seed = 5, 5, 4167260734
-    original = _make_grid_image(cols, rows)
+    original = _make_gradient_image(cols, rows)
     scrambled = _scramble_to_webp(original, seed, cols, rows, 3)
     ctx: Any = _FakeCtx(
         scrambled,
@@ -388,6 +400,118 @@ def test_unscramble_correct_seed_output_not_disturbed_by_jigsaw() -> None:
     assert restored.tobytes() == original.tobytes()
 
 
+# ── debug comix-descramble-pansa-069: beam-search jigsaw + ship-time loud-fail guard ──
+
+
+def _greedy_trap_image() -> Image.Image:
+    """A deterministic fractal-noise page whose art traps the raster greedy in a LOCAL
+    OPTIMUM the all-starts restart can't escape — a synthetic stand-in for comix release
+    2479490 pages p39/p69 (build 02900), which shipped corrupt because the greedy
+    ``_jigsaw_reassemble`` stalled at seam 31.9/26.1 (above the bar) from every start.
+
+    Multi-octave Gaussian-blurred noise gives the manga-like mix of large flat regions
+    (ambiguous tile borders that mislead greedy's local pick) and fine detail (a UNIQUE
+    global optimum the beam can still find). Pinned constants (rng seed 52, 5 octaves,
+    gain 0.65) were picked offline as the case with the widest greedy-vs-beam gap;
+    deterministic under the repo's locked Pillow/NumPy. No copyrighted page bytes.
+    """
+    h = w = 100  # 5x5 grid @ tile=20
+    rng = np.random.default_rng(52)
+    acc = np.zeros((h, w, 3))
+    amp, tot = 1.0, 0.0
+    for octave in range(5):
+        radius = max(0.6, 8.0 / (2**octave))
+        noise = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+        acc += amp * np.asarray(
+            Image.fromarray(noise).filter(ImageFilter.GaussianBlur(radius=radius)),
+            dtype=float,
+        )
+        tot += amp
+        amp *= 0.65
+    acc /= tot
+    acc = (acc - acc.min()) / (acc.max() - acc.min() + 1e-9) * 255.0
+    return Image.fromarray(acc.clip(0, 255).astype(np.uint8))
+
+
+def test_jigsaw_beam_recovers_greedy_local_optimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The width-8 beam reassembles a page the all-starts raster greedy alone cannot.
+
+    p39/p69-style regression (debug ``comix-descramble-pansa-069``): scramble a
+    greedy-trapping page, then reassemble it with the beam disabled (width 1 == the
+    historical all-starts greedy pool) vs enabled. Greedy alone lands in a LOCAL OPTIMUM
+    above the coherence bar and mis-reconstructs the page; the beam escapes it and
+    recovers the original byte-exact. Setting ``_JIGSAW_BEAM_WIDTH`` back to 1 re-breaks
+    the recovery assert here — the guard against silently dropping the beam.
+    """
+    cols, rows = 5, 5
+    original = _greedy_trap_image()
+    # lossless-WebP round-trip: exactly the bytes ``fetch_image`` would hand the jigsaw
+    scrambled = Image.open(
+        io.BytesIO(_scramble_to_webp(original, 119, cols, rows, 3))
+    ).convert("RGB")
+    assert scrambled.tobytes() != original.tobytes()  # tiles actually moved
+
+    # (1) beam disabled → all-starts greedy stalls in a local optimum, not recovered
+    monkeypatch.setattr(comix, "_JIGSAW_BEAM_WIDTH", 1)
+    greedy = _jigsaw_reassemble(scrambled, cols, rows)
+    assert greedy is not None
+    greedy_seam = _grid_seam(greedy, cols, rows)
+    assert greedy_seam >= _SEAM_COHERENT  # incoherent → guard would (correctly) reject
+    assert greedy.convert("RGB").tobytes() != original.tobytes()
+
+    # (2) beam enabled → escapes the local optimum, reconstructs the page byte-exact
+    monkeypatch.setattr(comix, "_JIGSAW_BEAM_WIDTH", 8)
+    beam = _jigsaw_reassemble(scrambled, cols, rows)
+    assert beam is not None
+    beam_seam = _grid_seam(beam, cols, rows)
+    assert beam_seam < _SEAM_COHERENT < greedy_seam  # crosses the acceptance boundary
+    assert beam.convert("RGB").tobytes() == original.tobytes()
+
+
+def test_unscramble_loud_fails_on_unrecoverable_scramble() -> None:
+    """A KNOWN-scrambled page no path can descramble must fail LOUD, not ship corrupt.
+
+    debug ``comix-descramble-pansa-069``: the ship-time guard is the trust boundary — a
+    still-scrambled page is a valid WebP that would pass ``is_valid_image`` and package
+    corrupt pixels (the exact bug class). Solid-tile art has hard borders in every
+    arrangement, so neither the (wrong-seed) seed un-permute nor the jigsaw can
+    reach a coherent seam, so the guard raises ``SourceError`` with the build hash +
+    final seam (never the seed) — a future scrambler rotation is diagnosable in logs.
+    Mirrors ``fetch_image``'s existing "invalid x-scramble-seed -> fail loud".
+    """
+    cols, rows = 5, 5
+    grid = _make_grid_image(cols, rows)
+    scrambled = _scramble_to_webp(grid, 4010719162, cols, rows, 3)
+    with pytest.raises(SourceError) as excinfo:
+        _unscramble_image(scrambled, 1088147119, cols, rows, algo=3, build_hash="02900")
+    assert excinfo.value.code == "source_unavailable"
+    message = str(excinfo.value)
+    assert "02900" in message  # build hash echoed for rotation diagnosis
+    assert "seam" in message  # final seam echoed
+    assert "1088147119" not in message  # seeds/keys are NEVER echoed
+
+
+def test_unscramble_guard_silent_on_jigsaw_recovery() -> None:
+    """The ship-time guard must NOT fire on a page the strengthened jigsaw recovers.
+
+    Companion to ``test_unscramble_loud_fails_on_unrecoverable_scramble``: an
+    edge-continuous page scrambled by a rotated build the seed can't reverse recovers
+    via the jigsaw to a coherent seam, so ``_unscramble_image`` returns the exact page
+    WITHOUT raising — the guard fires only on genuine unrecoverable corruption.
+    """
+    cols, rows = 5, 5
+    original = _make_gradient_image(cols, rows)
+    scrambled = _scramble_to_webp(original, 4010719162, cols, rows, 3)
+    restored_bytes = _unscramble_image(
+        scrambled, 1088147119, cols, rows, algo=3, build_hash="02900"
+    )
+    restored = Image.open(io.BytesIO(restored_bytes)).convert("RGB")
+    assert restored.tobytes() == original.tobytes()
+    assert _grid_seam(restored, cols, rows) < _SEAM_COHERENT
+
+
 @pytest.mark.asyncio
 async def test_fetch_image_unknown_scramble_algo_fails_loud() -> None:
     img = _make_grid_image(5, 5)
@@ -446,6 +570,20 @@ def test_algo_header_parser() -> None:
     assert h("garbage", 1) == -1  # malformed → guaranteed-unknown (fails loud)
 
 
+def test_safe_scramble_hash_bounds_untrusted_header() -> None:
+    # PR #359: x-scramble-hash is an upstream header echoed into the loud-fail
+    # SourceError — accept only the compact build-id shape, else None (→ "unknown").
+    s = ComixSource._safe_scramble_hash
+    assert s("02900") == "02900"  # live 5-hex build id → verbatim
+    assert s("923e0") == "923e0"
+    assert s("  fdd91  ") == "fdd91"  # stripped
+    assert s(None) is None
+    assert s("") is None
+    assert s("a" * 17) is None  # over-long → rejected
+    assert s("bad-hash!") is None  # non-alnum / punctuation → rejected
+    assert s("evil\ninject") is None  # control char (log injection) → rejected
+
+
 # ---- Origin-header plaintext fix (comix-scramble-seed-regression) ----
 
 
@@ -494,7 +632,9 @@ async def test_fetch_image_unscrambles_residual_vp8x_with_seed() -> None:
     """The residual VP8X page that survives the Origin header still carries a usable
     ``x-scramble-seed`` and is descrambled via the existing header path."""
     cols, rows, seed, algo = 5, 5, 4167260734, 3
-    original = _make_grid_image(cols, rows)
+    # gradient (not solid-tile grid) so the recovered page is coherent → the ship-time
+    # loud-fail guard (comix-descramble-pansa-069) stays silent on a correct recovery.
+    original = _make_gradient_image(cols, rows)
     scrambled = _scramble_to_vp8x_exif(original, seed, cols, rows, algo)
     ctx = _FakeCtx(
         scrambled,

@@ -334,6 +334,32 @@ _SEAM_COHERENT = 20.0  # jigsaw must fall below this to be accepted as coherent
 _JIGSAW_MARGIN = 0.45  # …AND be < seed_seam * this (>= ~2.2x better) to override
 _JIGSAW_MAX_TILES = 64  # skip the O(n³) greedy jigsaw for pathologically large grids
 
+# Beam width for the reassembly search (debug ``comix-descramble-pansa-069``). The
+# raster greedy fills the grid one tile at a time picking the locally-best neighbour; on
+# some art an early wrong pick cascades into a LOCAL OPTIMUM the greedy can never leave
+# (live: release 2479490 pages p39/p69, build 02900, greedy seam 31.9/26.1 — both above
+# ``_SEAM_COHERENT`` so the acceptance guard correctly rejected them and shipped the
+# still-scrambled seed output as silent corruption). A per-start beam of this width
+# keeps the ``W`` lowest-cumulative-cost partial arrangements at each step, escaping it
+# (same pages recover to seam 0.5/4.9). The greedy trajectories stay in the candidate
+# pool, so the strengthened search never regresses a page greedy already solved.
+_JIGSAW_BEAM_WIDTH = 8
+
+# Ship-time coherence floor (debug ``comix-descramble-pansa-069``). A page reaching this
+# point is KNOWN-scrambled (``x-scramble-seed`` present/nonzero — the ``fetch_image``
+# call site only invokes the unscrambler in that branch). After the strengthened jigsaw
+# every recovered page of the corpus ships <= ~14 (round-trip oracle 13.8) while a
+# genuinely unrecovered page sits far higher (live still-scrambled seed outputs
+# 22.9–114.1). If the FINAL arrangement — after both the seed un-permute AND the
+# strengthened jigsaw — still can't clear this bar, the page is corrupt: fail loud,
+# never package visually-shuffled pixels behind a valid WebP header. Set equal to
+# ``_SEAM_COHERENT`` (the jigsaw-acceptance bar) so we never ship a page the jigsaw
+# itself would reject as incoherent; the ~6-point gap to the legit-recovered max is the
+# margin that keeps a slightly-busy but correctly-recovered page passing. Mirrors
+# ``fetch_image``'s "present-but-invalid ``x-scramble-seed`` -> fail loud" precedent — a
+# scrambled page is a valid WebP, so silently shipping it is the bug class this closes.
+_SHIP_SEAM_MAX = _SEAM_COHERENT
+
 
 def _xorshift32_step(state: int) -> int:
     """One xorshift32 step (Marsaglia 13/17/5, 32-bit). Shared by byte-algo-2 (XOR the
@@ -405,25 +431,37 @@ def _grid_seam(img: Image.Image, cols: int, rows: int) -> float:
 
 
 def _jigsaw_reassemble(img: Image.Image, cols: int, rows: int) -> Image.Image | None:
-    """Reassemble a tile-shuffled page by greedy edge-matching — seed-INDEPENDENT.
+    """Reassemble a tile-shuffled page by edge-matching search — seed-INDEPENDENT.
 
     The scramble is a pure ``cols`` x ``rows`` tile permutation (no per-tile rotation/
     flip), so the original layout is the arrangement whose adjacent tiles have the
     most continuous shared borders — a jigsaw the pixels alone determine, with no
-    knowledge of comix's (rotated, un-reversed) PRNG. Greedy: seed each of the ``n``
-    tiles as the top-left, fill row 0 by best left→right border match, then each
-    lower cell by best (top border, and left border when present) match; keep the
-    full arrangement with the lowest total border cost.
+    knowledge of comix's (rotated, un-reversed) PRNG.
 
-    Returns ``None`` (⇒ caller keeps the seed output) if the image is too small for
-    the grid. Correctness of the RESULT is not asserted here — the caller's global
-    :func:`_grid_seam` gate is the guard: a wrongly-resolved border tie displaces a
-    tile that then does NOT fit its new slot, raising the overall seam, so the gate
-    rejects it. (A per-placement "reject on any near-tie" guard was tried and dropped:
-    real pages carry benign gap-0 border ties among distinct-interior tiles that the
-    greedy still resolves correctly — page30 of the debug corpus recovers cleanly at
-    seam 4.5 despite one — so it only rejected valid recoveries.) O(n³) in tile count
-    — the caller caps ``n``.
+    From every tile as the top-left, two trajectories are explored in raster order and
+    all their arrangements pooled (debug ``comix-descramble-pansa-069``):
+
+    - **raster greedy (width 1):** at each cell take the single tile with the lowest
+      (top, and left when present) border cost — the historical deployed trajectory,
+      kept so the search can never REGRESS a page greedy already solved; and
+    - **beam (width ``_JIGSAW_BEAM_WIDTH``):** keep the ``W`` lowest-cumulative-cost
+      partial arrangements at each cell instead of committing to one — this escapes the
+      LOCAL OPTIMUM an early wrong greedy pick cascades into (release 2479490 p39/p69
+      landed greedy at seam 31.9/26.1, above the acceptance bar, and shipped corrupt).
+
+    The pooled arrangement with the lowest ACTUAL :func:`_grid_seam` is returned —
+    scoring by the same metric the caller's acceptance guard checks, not by cumulative
+    border cost (which the seam and the guard can disagree with). Correctness of the
+    RESULT is not asserted here — the caller's :func:`_grid_seam` gate is the guard: a
+    wrongly-resolved arrangement raises the seam, so the gate rejects it. (A
+    per-placement "reject on any near-tie" guard was tried and dropped: real pages carry
+    benign gap-0 border ties among distinct-interior tiles the search still resolves
+    correctly, so it only rejected valid recoveries.)
+
+    Returns ``None`` (⇒ caller keeps the seed output) if the image is too small for the
+    grid or no arrangement scored a finite seam. Both trajectories run from all ``n``
+    start tiles: O(n³) greedy + O(W·n³) beam in tile count — the caller caps ``n`` via
+    ``_JIGSAW_MAX_TILES``.
     """
     arr = np.asarray(img, dtype=np.int16)
     height, width = arr.shape[0], arr.shape[1]
@@ -449,53 +487,79 @@ def _jigsaw_reassemble(img: Image.Image, cols: int, rows: int) -> Image.Image | 
         [float(np.abs(tiles[a][-1, :, :] - tiles[b][0, :, :]).mean()) for b in range(n)]
         for a in range(n)
     ]
-    best_grid: list[list[int]] | None = None
-    best_cost = float("inf")
-    for start in range(n):
-        used = [False] * n
-        grid = [[-1] * cols for _ in range(rows)]
-        grid[0][0] = start
-        used[start] = True
-        for c in range(1, cols):
-            prev = grid[0][c - 1]
-            cand = min((t for t in range(n) if not used[t]), key=lambda t: lr[prev][t])
-            grid[0][c] = cand
-            used[cand] = True
-        for r in range(1, rows):
-            for c in range(cols):
-                above = grid[r - 1][c]
-                left = grid[r][c - 1] if c > 0 else -1
-                cand = min(
-                    (t for t in range(n) if not used[t]),
-                    key=lambda t: tb[above][t] + (lr[left][t] if left >= 0 else 0.0),
-                )
-                grid[r][c] = cand
-                used[cand] = True
-        total = 0.0
-        for r in range(rows):
-            for c in range(cols):
-                if c < cols - 1:
-                    total += lr[grid[r][c]][grid[r][c + 1]]
-                if r < rows - 1:
-                    total += tb[grid[r][c]][grid[r + 1][c]]
-        if total < best_cost:
-            best_cost = total
-            best_grid = [row[:] for row in grid]
-    if best_grid is None:
-        return None
-    out = img.copy()  # preserves the sub-tile remainder strip, like the seed path
-    for r in range(rows):
-        for c in range(cols):
-            s = best_grid[r][c]
+
+    def _assemble(flat: list[int]) -> Image.Image:
+        """Paint a raster arrangement (``flat[pos]`` = source tile at position ``pos``)
+        into a copy of ``img`` — preserves the sub-tile remainder strip like the seed
+        path."""
+        out = img.copy()
+        for pos, s in enumerate(flat):
+            r, c = divmod(pos, cols)
             sx, sy = (s % cols) * tile_w, (s // cols) * tile_h
             out.paste(
                 img.crop((sx, sy, sx + tile_w, sy + tile_h)), (c * tile_w, r * tile_h)
             )
-    return out
+        return out
+
+    best_img: Image.Image | None = None
+    best_seam = float("inf")
+
+    def _consider(flat: list[int]) -> None:
+        nonlocal best_img, best_seam
+        candidate = _assemble(flat)
+        seam = _grid_seam(candidate, cols, rows)
+        if seam < best_seam:
+            best_img, best_seam = candidate, seam
+
+    for start in range(n):
+        # (1) raster greedy (width 1) — the historical trajectory, kept in the pool.
+        used = 1 << start
+        greedy = [start]
+        for pos in range(1, n):
+            r, c = divmod(pos, cols)
+            left = greedy[pos - 1] if c > 0 else -1
+            above = greedy[pos - cols] if r > 0 else -1
+            cand = min(
+                (t for t in range(n) if not used & (1 << t)),
+                key=lambda t: (
+                    (lr[left][t] if left >= 0 else 0.0)
+                    + (tb[above][t] if above >= 0 else 0.0)
+                ),
+            )
+            greedy.append(cand)
+            used |= 1 << cand
+        _consider(greedy)
+        # (2) width-``_JIGSAW_BEAM_WIDTH`` beam from the same start — escapes greedy's
+        #     local optimum by keeping the W best partial arrangements at each cell.
+        beam: list[tuple[float, tuple[int, ...], int]] = [(0.0, (start,), 1 << start)]
+        for pos in range(1, n):
+            r, c = divmod(pos, cols)
+            nxt: list[tuple[float, tuple[int, ...], int]] = []
+            for cost, placed, used_mask in beam:
+                left = placed[pos - 1] if c > 0 else -1
+                above = placed[pos - cols] if r > 0 else -1
+                for t in range(n):
+                    if used_mask & (1 << t):
+                        continue
+                    inc = (lr[left][t] if left >= 0 else 0.0) + (
+                        tb[above][t] if above >= 0 else 0.0
+                    )
+                    nxt.append((cost + inc, (*placed, t), used_mask | (1 << t)))
+            nxt.sort(key=lambda entry: entry[0])
+            beam = nxt[:_JIGSAW_BEAM_WIDTH]
+        for _, placed, _mask in beam:
+            _consider(list(placed))
+
+    return best_img
 
 
 def _unscramble_image(
-    content: bytes, seed: int, cols: int, rows: int, algo: int
+    content: bytes,
+    seed: int,
+    cols: int,
+    rows: int,
+    algo: int,
+    build_hash: str | None = None,
 ) -> bytes:
     """Un-permute a Comix tile-scrambled page image and re-encode LOSSLESS (spike 017).
 
@@ -517,6 +581,16 @@ def _unscramble_image(
     is no seam-based entry gate — a fixed "still scrambled?" threshold is brittle
     against build rotation (it silently shipped sub-threshold scrambled pages), and the
     adopt-guard is the sole correctness mechanism.
+
+    Ship-time loud-fail guard (debug ``comix-descramble-pansa-069``): every page
+    reaching here is KNOWN-scrambled (the caller only invokes this for a present/nonzero
+    ``x-scramble-seed``). If the FINAL arrangement — after both the seed un-permute and
+    the strengthened jigsaw — still can't clear ``_SHIP_SEAM_MAX``, the page is
+    genuinely corrupt (the build rotated past what either path can reverse), so raise
+    ``SourceError`` rather than package visually-shuffled pixels behind a valid WebP —
+    mirroring ``fetch_image``'s "invalid ``x-scramble-seed`` -> fail loud".
+    ``build_hash`` (``x-scramble-hash``) is echoed in the message so a future rotation
+    is instantly identifiable in logs; seeds/keys are never echoed.
     """
     perm = _scramble_permutation(seed, cols * rows, algo)  # may raise on unknown algo
     try:
@@ -547,13 +621,27 @@ def _unscramble_image(
     # seed output (< seed_seam * _JIGSAW_MARGIN, ~2.2x). A correctly descrambled page
     # is already the global seam minimum, so no jigsaw arrangement clears that margin
     # → it is never disturbed. _JIGSAW_MAX_TILES bounds the O(n³) search (DoS guard).
+    seed_seam = _grid_seam(out, cols, rows)
+    final_seam = seed_seam
     if cols * rows <= _JIGSAW_MAX_TILES:
-        seed_seam = _grid_seam(out, cols, rows)
         jig = _jigsaw_reassemble(img, cols, rows)
         if jig is not None:
             jig_seam = _grid_seam(jig, cols, rows)
             if jig_seam < _SEAM_COHERENT and jig_seam < seed_seam * _JIGSAW_MARGIN:
                 out = jig
+                final_seam = jig_seam
+    # Ship-time loud-fail guard (debug comix-descramble-pansa-069): a KNOWN-scrambled
+    # page whose FINAL arrangement is still incoherent must fail loud, not ship silent
+    # corruption. ``final_seam == inf`` only for a degenerate 1x1 grid (no internal
+    # border to measure — a no-op permutation), which is never really scrambled → skip.
+    if final_seam != float("inf") and final_seam >= _SHIP_SEAM_MAX:
+        raise SourceError(
+            "source_unavailable",
+            f"comix page still scrambled after seed+jigsaw descramble "
+            f"(build {build_hash or 'unknown'}, final seam {final_seam:.1f} "
+            f">= {_SHIP_SEAM_MAX:.0f}) — scrambler build likely rotated "
+            f"(debug comix-descramble-pansa-069)",
+        )
     buf = io.BytesIO()
     out.save(buf, format="WEBP", lossless=True, quality=100, method=6)
     return buf.getvalue()
@@ -1865,6 +1953,23 @@ class ComixSource(Source):
         return int(value)
 
     @staticmethod
+    def _safe_scramble_hash(raw: str | None) -> str | None:
+        """Bound + format-check ``x-scramble-hash`` before it reaches a log/error
+        message (CodeRabbit, PR #359). It is an upstream (attacker-influenceable)
+        response header echoed into the loud-fail ``SourceError`` in
+        ``_unscramble_image``, so accept ONLY the observed compact build-id shape
+        (live hashes are 5 hex chars, e.g. ``02900``/``923e0``; alnum-ASCII, 16-char
+        cap leaves room for format drift) and return ``None`` otherwise — a malformed,
+        over-long, or control-char value degrades to ``"unknown"`` at the call site
+        rather than injecting into the message. Cosmetic to the descramble result."""
+        if raw is None:
+            return None
+        value = raw.strip()
+        if not value or len(value) > 16 or not value.isalnum() or not value.isascii():
+            return None
+        return value
+
+    @staticmethod
     def _scramble_grid(raw: str | None) -> tuple[int, int]:
         """Parse ``x-scramble-grid`` (e.g. ``"5x5"`` or ``"5"``) → ``(cols, rows)``.
 
@@ -1963,9 +2068,16 @@ class ComixSource(Source):
             scramble_algo = self._algo_header(
                 headers.get("x-scramble-algo"), _SCRAMBLE_ALGO_LEGACY_LCG[0]
             )
+            build_hash = self._safe_scramble_hash(headers.get("x-scramble-hash"))
             try:
                 data = await asyncio.to_thread(
-                    _unscramble_image, data, scramble_seed, cols, rows, scramble_algo
+                    _unscramble_image,
+                    data,
+                    scramble_seed,
+                    cols,
+                    rows,
+                    scramble_algo,
+                    build_hash,
                 )
             except ValueError as exc:
                 raise SourceError("source_unavailable", str(exc)) from exc
