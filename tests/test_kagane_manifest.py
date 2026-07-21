@@ -4,7 +4,7 @@
 
 1. ``POST https://kagane.to/api/integrity`` ``{}`` → ``{token}`` (cf_clearance injected
    by the framework).
-2. ``POST https://yuzuki.kagane.to/api/v2/books/{book_id}?is_datasaver=false`` with the
+2. ``POST https://kagane.to/api/v2/books/{book_id}?is_datasaver=false`` with the
    ``x-integrity-token`` header → ``{access_token, cache_url, manifest:{pages:[{page_id,
    ext, page_no}]}}``.
 3. EXTRACT each page URL by joining the server-provided ``cache_url`` + the page path +
@@ -25,7 +25,7 @@ from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.kagane import KaganeSource
 
 _INTEGRITY = "https://kagane.to/api/integrity"
-_BOOKS = "https://yuzuki.kagane.to/api/v2/books"
+_BOOKS = "https://kagane.to/api/v2/books"
 _CACHE = "https://kstatic.to"
 
 

@@ -32,8 +32,8 @@ from manga_gateway.models.search import SearchRequest
 from manga_gateway.sources.kagane import KaganeSource
 
 _GUID_RE = re.compile(r"^kagane:[\w-]+:ch-[\d.?]+:[\w-]+$")
-_SEARCH = "https://yuzuki.kagane.to/api/v2/search/series"
-_SERIES = "https://yuzuki.kagane.to/api/v2/series"
+_SEARCH = "https://kagane.to/api/v2/search/series"
+_SERIES = "https://kagane.to/api/v2/series"
 
 
 class _FakeCtxForSearch:

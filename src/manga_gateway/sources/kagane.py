@@ -1,8 +1,9 @@
 """Kagane source — a ``cloudflare`` Komga-derived JSON-REST source (SRC-01).
 
 Kagane (``https://kagane.to``) is a Next.js SPA whose backend is a **Komga-fork
-JSON-REST API** on a SEPARATE host, ``https://yuzuki.kagane.to/api/v2/...``, with
-page images served from a THIRD host (``https://kstatic.to``, the response-provided
+JSON-REST API** SAME-ORIGIN at ``https://kagane.to/api/v2/...`` (it used to live on a
+separate ``yuzuki.kagane.to`` host, decommissioned ~2026-07-19 — #360), with
+page images served from a SEPARATE host (``https://kstatic.to``, the response-provided
 ``cache_url``). It adds **zero networking glue** — every outbound call is
 ``ctx.post_json_body`` / ``ctx.get_json`` / ``ctx.get_bytes`` (SRC-01/SRC-02); all
 anti-bot/rate-limit/retry/clearance live in the framework.
@@ -10,12 +11,11 @@ anti-bot/rate-limit/retry/clearance live in the framework.
 Two-axis classification (recon 2026-06-09, see the quick-task RECON write-up):
 
 * **Axis A (prep/antibot) = comix** — ``antibot = "cloudflare"`` +
-  ``cloudflare_challenge_url = "https://kagane.to/"``. Only ONE call is actually
-  Cloudflare-gated: ``POST https://kagane.to/api/integrity`` (the download-path token
-  mint). ``yuzuki.kagane.to`` (data API) and ``kstatic.to`` (images) answer cold over
-  plain httpx — but declaring the source ``cloudflare`` is correct: the framework
-  injects the captured ``cf_clearance`` + bound UA on every call (harmless on the open
-  hosts, REQUIRED on ``/api/integrity``). NO comix-style browser-DOM read: the cleared
+  ``cloudflare_challenge_url = "https://kagane.to/"``. The whole ``kagane.to`` origin is
+  Cloudflare-gated — ``POST /api/integrity`` (the download-path token mint) AND the
+  same-origin ``/api/v2/...`` data API — so the framework's captured ``cf_clearance`` +
+  bound UA (injected on every call) is REQUIRED throughout; only ``kstatic.to`` (images)
+  answers cold over plain httpx. NO comix-style browser-DOM read: the cleared
   API is clean JSON over httpx, and the integrity token is a normal server route (not a
   JS-VM-minted token), so ``solver.fetch_via_browser`` is not used.
 * **Axis B (search topology) = atsumaru** — title→chapter fan-out: ``search/series``
@@ -26,7 +26,7 @@ Two-axis classification (recon 2026-06-09, see the quick-task RECON write-up):
 ENDPOINT SHAPES (live-recon-pinned, 2026-06-09):
 
 * base (cf-gated): ``https://kagane.to`` — ``POST /api/integrity`` ``{}`` → ``{token}``.
-* API (open): ``https://yuzuki.kagane.to``
+* API (cf-gated, SAME-ORIGIN on ``https://kagane.to`` — #360):
   - search: ``POST /api/v2/search/series?page=0&size=N`` (no ``sort`` ⇒ relevance),
     JSON body ``{"title": <query>, "content_rating": ["Safe", "Suggestive"]}`` →
     ``{content:[{series_id, title, alternate_titles, current_books, translated_language,
@@ -82,8 +82,14 @@ if TYPE_CHECKING:
     from ..framework.context import SourceContext
     from ..models.search import SearchRequest
 
-# The Komga-derived data API lives on a different host than the cf-gated front-end.
-_API_BASE = "https://yuzuki.kagane.to"
+# The Komga-derived data API is SAME-ORIGIN on ``kagane.to`` (``kagane.to/api/v2/...``
+# — network tab of the live SPA, 260721). It USED to live on ``yuzuki.kagane.to``; that
+# host was decommissioned (now a bare nginx 403 to a browser, CF-flagged to httpx),
+# which took kagane down ~2026-07-19 (debug avif-image-ssrf-allowlist / #360). Being
+# same-origin on the cf-gated ``kagane.to`` means the ONE interactive-Turnstile
+# clearance the framework already mints (``cloudflare_challenge_url``) covers the data
+# API too — no separate host clearance needed.
+_API_BASE = "https://kagane.to"
 
 # Search/recent request body: the keyword rides ``title`` (NOT ``keyword`` — that field
 # is a no-op, falsified live). ``content_rating`` mirrors the site's own default so
@@ -372,8 +378,9 @@ class KaganeSource(Source):
         """Resolve a ``book_id`` → ordered page URLs via the token flow (PKG-01).
 
         Three ``ctx`` calls (zero glue): (1) mint an integrity token on the cf-gated
-        ``kagane.to/api/integrity``; (2) POST it as ``x-integrity-token`` to the open
-        ``yuzuki`` book-token endpoint → ``{access_token, cache_url, manifest.pages}``;
+        ``kagane.to/api/integrity``; (2) POST it as ``x-integrity-token`` to the
+        same-origin ``kagane.to`` book-token endpoint →
+        ``{access_token, cache_url, manifest.pages}``;
         (3) EXTRACT each page URL by joining the server-provided ``cache_url`` (never a
         reconstructed host) + the page path + the ``access_token`` query. Every URL is
         SSRF-allowlisted (T-v7n-02). The extracted count is guarded against the
