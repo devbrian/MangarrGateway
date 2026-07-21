@@ -21,7 +21,7 @@ import pytest
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.sources.kagane import KaganeSource
 
-_SEARCH = "https://yuzuki.kagane.to/api/v2/search/series"
+_SEARCH = "https://kagane.to/api/v2/search/series"
 
 
 class _FakeCtxForRecent:

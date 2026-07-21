@@ -8,9 +8,9 @@ this profile is the TEST-ONLY mirror (D-49).
 Anti-bot expectations
 ---------------------
 * ``expected_caps_antibot = "cloudflare"`` — matches ``KaganeSource.antibot``. Only
-  ``POST https://kagane.to/api/integrity`` (the download-path token mint) is actually
-  Cloudflare-gated; ``yuzuki.kagane.to`` (data API) and ``kstatic.to`` (images) answer
-  cold. The framework still injects ``cf_clearance`` + the bound UA on every call.
+  the whole ``kagane.to`` origin — ``POST /api/integrity`` AND the same-origin
+  ``/api/v2/...`` data API (#360) — is Cloudflare-gated; only ``kstatic.to`` (images)
+  answers cold. The framework injects ``cf_clearance`` + the bound UA on every call.
 * ``needs_solver_warm = True`` — the source engages the Patchright solver so the
   framework can earn ``cf_clearance`` for the ``/api/integrity`` POST.
 
@@ -25,7 +25,8 @@ proven; env knob, not code.)
 
 Topology (recon 2026-06-09)
 ---------------------------
-Komga-fork JSON-REST on ``yuzuki.kagane.to``: ``POST /api/v2/search/series`` (JSON body
+Komga-fork JSON-REST same-origin on ``kagane.to`` (#360).
+``POST /api/v2/search/series`` (JSON body
 ``{"title": q, "content_rating": ["Safe","Suggestive"]}``) is TITLE-ONLY, so ``search``
 fans out ``GET /api/v2/series/{id}`` (complete ``series_books``) per candidate. The
 download path is a 3-call token flow (integrity → book-token → page URL), all clean
