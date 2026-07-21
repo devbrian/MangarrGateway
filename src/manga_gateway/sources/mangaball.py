@@ -248,8 +248,11 @@ def _parse_ts(raw: str) -> datetime:
 # (``/covers/...``) still fail the ``/storage/`` prefix; group icons under
 # ``/storage/`` are same-origin and harmless (and never reach here — extraction scopes
 # to the ``chapterImages`` array, this is defense-in-depth).
+# ``avif`` added 260721: MangaBall's ``*.red-and-blue.net`` CDNs now serve page images
+# as AVIF, and the extension-only pin was false-rejecting every real page at the SSRF
+# allowlist (debug avif-image-ssrf-allowlist). Matches kagane's avif-inclusive pin.
 _MANGABALL_IMG_PATH_RE = re.compile(
-    r"^/storage/[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp)$",
+    r"^/storage/[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp|avif)$",
     re.IGNORECASE,
 )
 _MANGABALL_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECASE)

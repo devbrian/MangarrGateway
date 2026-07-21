@@ -156,6 +156,10 @@ def test_is_allowed_image_url_accepts_varying_filename_shapes() -> None:
     assert _is_allowed_image_url(
         "https://jigglypuff.poke-black-and-white.net/storage/t/0/7/comick/en/6a1c-001.webp"
     )
+    # .avif page — the CDN's live format as of 260721 (debug avif-image-ssrf-allowlist).
+    assert _is_allowed_image_url(
+        "https://ampharos.red-and-blue.net/storage/68521c665cd6b2cdfbcfd79e/0/182/atsu/en/6a5f4e4b235a123b6c66f2f7-001.avif"
+    )
 
 
 def test_is_allowed_image_url_rejects_non_https() -> None:

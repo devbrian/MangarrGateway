@@ -143,8 +143,11 @@ _ATSUMARU_IMAGE_BASE = "https://cdn.atsu.moe"
 # one; both are stable invariants — the per-page filename (``{N}.webp``) is NOT
 # over-pinned beyond the extension.
 _ATSUMARU_IMAGE_HOSTS = frozenset({"cdn.atsu.moe", "atsu.moe", "www.atsu.moe"})
+# ``avif`` added 260721: the cdn.atsu.moe CDN now serves page images as AVIF, and the
+# extension-only pin was false-rejecting every real page at the SSRF allowlist (debug
+# avif-image-ssrf-allowlist). Matches kagane's already-avif-inclusive allowlist.
 _ATSUMARU_IMG_PATH_RE = re.compile(
-    r"^/static/[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp)$",
+    r"^/static/[A-Za-z0-9_./-]+\.(jpg|jpeg|png|webp|avif)$",
     re.IGNORECASE,
 )
 
