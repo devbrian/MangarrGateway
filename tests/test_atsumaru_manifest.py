@@ -166,6 +166,8 @@ async def test_fetch_manifest_pages_integrity_passes_on_match() -> None:
         "https://cdn.atsu.moe/static/pages/cmgz/gGfRS/0.jpg",
         "https://cdn.atsu.moe/static/pages/cmgz/gGfRS/0.jpeg",
         "https://cdn.atsu.moe/static/pages/cmgz/gGfRS/0.png",
+        # AVIF — the CDN's live format as of the 260721 migration.
+        "https://cdn.atsu.moe/static/pages/qcNngN/ac9d49c0665576cd.avif",
         # Legacy host retained (harmless; API host unchanged, future un-migration safe).
         "https://atsu.moe/static/pages/cmgz/gGfRS/0.webp",
         "https://www.atsu.moe/static/pages/cmgz/gGfRS/0.webp",
