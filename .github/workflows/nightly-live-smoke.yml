@@ -160,7 +160,7 @@ jobs:
       # comment, matching ci.yml's supply-chain discipline. No `id-token: write`
       # and no widened `permissions:` — the OAuth-secret flow needs neither.
       - name: Join tailnet (ephemeral, tag:ci) to reach the home android-solver
-        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
