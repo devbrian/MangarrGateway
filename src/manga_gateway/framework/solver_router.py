@@ -113,6 +113,15 @@ class _EvalSolver(Protocol):
         timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
     ) -> Any: ...
 
+    async def fetch_images_in_webview(
+        self,
+        source_key: str,
+        page_url: str,
+        urls: list[str],
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
+    ) -> list[bytes | None]: ...
+
     def device_session(self) -> AbstractAsyncContextManager[None]:
         """The bug-4 Fix C foreground-device lease the android backend exposes.
 
@@ -314,6 +323,30 @@ class SolverRouter:
         backend = cast("_EvalSolver", self._eval_backend)
         return await backend.eval_in_webview(
             challenge_url, js, wait_for=wait_for, timeout=timeout
+        )
+
+    async def fetch_images_in_webview(
+        self,
+        source_key: str,
+        page_url: str,
+        urls: list[str],
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109 — matches the backend's op-budget kwarg
+    ) -> list[bytes | None]:
+        """Delegate a WebView subresource image fetch to the SOURCE's own lane.
+
+        Routes by ``_backend_for(source_key)``, NOT ``_eval_backend``: the page-holder
+        lane is comix's warm WebView, and navigating it to another site would
+        cold-wipe comix's page (261003-mangaball-webview-images, Refs #378).
+        """
+        backend = self._backend_for(source_key)
+        if not hasattr(backend, "fetch_images_in_webview"):
+            raise RuntimeError(
+                f"{source_key} is not on the android solver engine — "
+                "fetch_images_in_webview needs the redroid WebView"
+            )
+        return await cast("_EvalSolver", backend).fetch_images_in_webview(
+            source_key, page_url, urls, timeout=timeout
         )
 
     def device_session(self) -> AbstractAsyncContextManager[None]:

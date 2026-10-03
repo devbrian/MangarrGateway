@@ -2604,3 +2604,103 @@ async def test_eval_emits_lane(monkeypatch: pytest.MonkeyPatch) -> None:
         await solver.aclose()
     assert len(fake.evals) == 1
     assert fake.evals[0]["lane"] == "comix"
+
+
+# ── fetch_images_in_webview (261003-mangaball-webview-images, Refs #378) ──────
+
+_MB_PAGE = "https://mangaball.com/robots.txt"
+_MB_URLS = [
+    "https://a.poke-black-and-white.net/storage/1.webp",
+    "https://a.poke-black-and-white.net/storage/2.webp",
+    "https://a.poke-black-and-white.net/storage/3.webp",
+]
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_fetch_images_posts_contract_and_aligns_results() -> None:
+
+    route = respx.post(f"{_SIDECAR}/fetch-images").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [  # deliberately out of input order
+                    {"url": _MB_URLS[2], "status": 200, "body_b64": "Qw=="},
+                    {"url": _MB_URLS[1], "status": 403, "error": "http status"},
+                    {"url": _MB_URLS[0], "status": 200, "body_b64": "QQ=="},
+                ]
+            },
+        )
+    )
+    solver = _solver(proxy=dict(_PROXY))  # a configured proxy must NOT ride the body
+    try:
+        out = await solver.fetch_images_in_webview("mangaball", _MB_PAGE, _MB_URLS)
+    finally:
+        await solver.aclose()
+    assert out == [b"A", None, b"C"]
+    req = route.calls.last.request
+    assert req.headers["X-Solver-Key"] == "sidecar-secret"
+    assert json.loads(req.content) == {"challenge_url": _MB_PAGE, "urls": _MB_URLS}
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_fetch_images_body_carries_target_when_adb_target_set() -> None:
+    route = respx.post(f"{_SIDECAR}/fetch-images").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    solver = _solver(adb_target="redroid:5555")
+    try:
+        out = await solver.fetch_images_in_webview("mangaball", _MB_PAGE, _MB_URLS[:1])
+    finally:
+        await solver.aclose()
+    assert out == [None]
+    body = json.loads(route.calls.last.request.content)
+    assert body["target"] == "redroid:5555"
+    assert "proxy" not in body
+
+
+@pytest.mark.asyncio
+async def test_fetch_images_without_base_url_raises() -> None:
+    solver = _solver(base_url=None)
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post(f"{_SIDECAR}/fetch-images")
+        with pytest.raises(RuntimeError, match="not configured"):
+            await solver.fetch_images_in_webview("mangaball", _MB_PAGE, _MB_URLS)
+        assert route.call_count == 0
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_fetch_images_retries_sidecar_503_busy_then_succeeds() -> None:
+    route = respx.post(f"{_SIDECAR}/fetch-images").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": "solver busy"}),
+            httpx.Response(
+                200,
+                json={
+                    "results": [{"url": _MB_URLS[0], "status": 200, "body_b64": "QQ=="}]
+                },
+            ),
+        ]
+    )
+    solver = _solver()
+    solver._busy_retry_backoff_s = 0.0
+    try:
+        out = await solver.fetch_images_in_webview("mangaball", _MB_PAGE, _MB_URLS[:1])
+    finally:
+        await solver.aclose()
+    assert out == [b"A"]
+    assert route.call_count == 2
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_fetch_images_504_raises() -> None:
+    respx.post(f"{_SIDECAR}/fetch-images").mock(return_value=httpx.Response(504))
+    solver = _solver()
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await solver.fetch_images_in_webview("mangaball", _MB_PAGE, _MB_URLS)
+    finally:
+        await solver.aclose()

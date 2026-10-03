@@ -29,11 +29,14 @@ green. The ``cf_clearance`` value is NEVER logged (T-10-04).
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import re
 import time
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -308,6 +311,30 @@ def _parse_expiry(raw: object) -> float | None:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
     return float(raw) if raw > 0 else None
+
+
+def _decode_fetch_images(content: bytes, urls: list[str]) -> list[bytes | None]:
+    """Decode a sidecar ``/fetch-images`` body → bytes aligned to ``urls``.
+
+    Entries are matched by ``url`` (response order is not trusted); an error entry or
+    a missing URL → ``None``. Logs host + status only, never bodies (T-es9-03).
+    """
+    entries = json.loads(content).get("results") or []
+    by_url = {e.get("url"): e for e in entries if isinstance(e, dict)}
+    out: list[bytes | None] = []
+    for url in urls:
+        entry = by_url.get(url) or {}
+        body = entry.get("body_b64")
+        if isinstance(body, str) and body:
+            out.append(base64.b64decode(body))
+            continue
+        _log.warning(
+            "webview image fetch failed for host %s (status %s)",
+            urlsplit(url).hostname,
+            entry.get("status"),
+        )
+        out.append(None)
+    return out
 
 
 class AndroidSolver:
@@ -1528,6 +1555,49 @@ class AndroidSolver:
             resp.raise_for_status()
             result: dict[str, Any] = resp.json()
         return result
+
+    async def fetch_images_in_webview(
+        self,
+        source_key: str,
+        page_url: str,
+        urls: list[str],
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109 — per-call op-budget override
+    ) -> list[bytes | None]:
+        """POST the sidecar ``/fetch-images`` → image bytes aligned to ``urls``.
+
+        Loads ``urls`` as subresources of ``page_url`` in this lane's WebView
+        (261003-mangaball-webview-images, Refs #378); a failed URL is ``None``.
+        ``source_key`` is attribution only. ``base_url is None`` raises
+        ``RuntimeError`` (D-33) like ``_post_eval``.
+
+        ponytail: the lane is held for the whole chapter (~20-60s), so concurrent
+        same-lane ``/solve``s queue on ``_device_op`` (90s acquire) or the sidecar's
+        busy-503 retry; a dedicated lane is the upgrade path.
+        """
+        if self._base_url is None:
+            raise RuntimeError(
+                "android_solver_url is not configured — cannot fetch images for "
+                f"{source_key!r} (the android-solver sidecar is unwired)"
+            )
+        headers: dict[str, str] = {}
+        if self._api_key is not None:
+            headers["X-Solver-Key"] = self._api_key.get_secret_value()
+        # Deliberately NO ``proxy``: direct egress on the host IP is the
+        # recon-verified path (261003-mangaball-webview-images).
+        body: dict[str, object] = {"challenge_url": page_url, "urls": urls}
+        if self._adb_target is not None:
+            body["target"] = self._adb_target
+        async with self._device_op():
+            resp = await self._post_sidecar(
+                f"{self._base_url}/fetch-images",
+                json=body,
+                headers=headers,
+                timeout=timeout if timeout is not None else self._timeout_s,
+            )
+            resp.raise_for_status()
+        # A multi-MB base64 JSON decode stays off the event loop.
+        return await asyncio.to_thread(_decode_fetch_images, resp.content, urls)
 
     async def _mint_clearance_via_eval(
         self,

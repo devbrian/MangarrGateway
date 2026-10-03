@@ -87,6 +87,10 @@ class FakePipeline:
         self._active = 0
         self.max_concurrent = 0
         self.cancelled = False
+        self.fetch_calls: list[tuple[str, str, list[str]]] = []
+        self.fetch_results: list[dict[str, object]] = [
+            {"url": "https://a.example/1.webp", "status": 200, "body_b64": "QUJD"}
+        ]
 
     def solve(
         self,
@@ -182,6 +186,21 @@ class FakePipeline:
         finally:
             with self._counter_lock:
                 self._active -= 1
+
+    def fetch_images(
+        self,
+        challenge_url: str,
+        host: str,
+        urls: list[str],
+        cancel: threading.Event | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> list[dict[str, object]]:
+        # 261003-es9: records the /fetch-images call; returns scripted results.
+        self.fetch_calls.append((challenge_url, host, urls))
+        if self._error is not None:
+            raise self._error
+        return self.fetch_results
 
     def health(self) -> bool:
         return self._healthy
@@ -2461,3 +2480,99 @@ def test_concurrent_different_targets_do_not_503_each_other() -> None:
     # Each device was driven by at most one solve at a time.
     assert pipe_a.max_concurrent == 1
     assert pipe_b.max_concurrent == 1
+
+
+# ── /fetch-images (261003-mangaball-webview-images, Refs #378) ───────────────
+
+_MB_KEY = "s3cret-solver-key"
+_MB_HOSTS = frozenset({"mangaball.com"})
+
+
+def _fetch_body(**over: object) -> bytes:
+    body: dict[str, object] = {
+        "challenge_url": "https://mangaball.com/robots.txt",
+        "urls": ["https://a.poke-black-and-white.net/storage/1.webp"],
+    }
+    body.update(over)
+    return json.dumps(body).encode()
+
+
+@pytest.mark.parametrize("key", [None, "wrong"])
+def test_fetch_images_rejects_bad_key(key: str | None) -> None:
+    pipeline = FakePipeline()
+    svc = _service(pipeline, allowed_hosts=_MB_HOSTS)
+    status, _ = svc.fetch_images(api_key=key, body=_fetch_body())
+    assert status == 401
+    assert pipeline.fetch_calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _fetch_body(challenge_url="https://evil.example/robots.txt"),
+        _fetch_body(target="nope:5555"),
+        _fetch_body(urls=None),
+        _fetch_body(urls=[]),
+        _fetch_body(urls="https://a.example/1.webp"),
+        _fetch_body(urls=["http://a.example/1.webp"]),
+        _fetch_body(urls=[f"https://a.example/{i}.webp" for i in range(201)]),
+    ],
+)
+def test_fetch_images_rejects_invalid_body_before_pipeline(body: bytes) -> None:
+    pipeline = FakePipeline()
+    svc = _service(pipeline, allowed_hosts=_MB_HOSTS)
+    status, _ = svc.fetch_images(api_key=_MB_KEY, body=body)
+    assert status == 422
+    assert pipeline.fetch_calls == []
+
+
+def test_fetch_images_busy_lane_is_503() -> None:
+    pipeline = FakePipeline()
+    svc = _service(pipeline, allowed_hosts=_MB_HOSTS)
+    lock = svc._workers[svc._default_target].lock
+    lock.acquire()
+    try:
+        status, payload = svc.fetch_images(api_key=_MB_KEY, body=_fetch_body())
+    finally:
+        lock.release()
+    assert (status, payload) == (503, {"error": "solver busy"})
+    assert pipeline.fetch_calls == []
+
+
+def test_fetch_images_success_passes_results_through() -> None:
+    pipeline = FakePipeline()
+    svc = _service(pipeline, allowed_hosts=_MB_HOSTS)
+    status, payload = svc.fetch_images(api_key=_MB_KEY, body=_fetch_body())
+    assert status == 200
+    assert payload == {"results": pipeline.fetch_results}
+    assert pipeline.fetch_calls == [
+        (
+            "https://mangaball.com/robots.txt",
+            "mangaball.com",
+            ["https://a.poke-black-and-white.net/storage/1.webp"],
+        )
+    ]
+
+
+def test_fetch_images_pipeline_error_is_504() -> None:
+    pipeline = FakePipeline(error=SolveError("boom"))
+    svc = _service(pipeline, allowed_hosts=_MB_HOSTS)
+    status, payload = svc.fetch_images(api_key=_MB_KEY, body=_fetch_body())
+    assert (status, payload) == (504, {"error": "fetch-images failed"})
+
+
+def test_http_fetch_images_route() -> None:
+    pipeline = FakePipeline()
+    with _running_server(pipeline) as port:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request(
+            "POST",
+            "/fetch-images",
+            body=_fetch_body(challenge_url="https://mangadot.net/robots.txt"),
+            headers={"X-Solver-Key": _MB_KEY},
+        )
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+    assert resp.status == 200
+    assert json.loads(data) == {"results": pipeline.fetch_results}

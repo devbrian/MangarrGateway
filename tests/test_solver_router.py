@@ -623,3 +623,73 @@ async def test_single_lane_construction_behaves_like_old_router() -> None:
         "cf_clearance": "pw-comix"
     }
     assert await router.get_clearance("mangadex") is None
+
+
+# ── fetch_images_in_webview (261003-mangaball-webview-images, Refs #378) ──────
+
+
+class _FakeImageBackend:
+    """Records ``fetch_images_in_webview`` calls (an android-lane stand-in)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, list[str]]] = []
+
+    async def fetch_images_in_webview(
+        self,
+        source_key: str,
+        page_url: str,
+        urls: list[str],
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109 — mirrors the backend kwarg
+    ) -> list[bytes | None]:
+        self.calls.append((source_key, page_url, urls))
+        return [b"img"] * len(urls)
+
+
+def _image_router() -> tuple[
+    SolverRouter, _FakeImageBackend, _FakeImageBackend, _FakeImageBackend
+]:
+    patchright = _FakeImageBackend()
+    mangaball_lane = _FakeImageBackend()
+    page_holder = _FakeImageBackend()
+    router = SolverRouter(
+        patchright=patchright,  # type: ignore[arg-type]
+        android_by_lane={"default": mangaball_lane, "comix": page_holder},  # type: ignore[dict-item]
+        source_lane_map={"comix": "comix"},
+        eval_backend=page_holder,  # type: ignore[arg-type]
+        engine_by_source={"mangaball": "android", "comix": "android"},
+    )
+    return router, patchright, mangaball_lane, page_holder
+
+
+@pytest.mark.asyncio
+async def test_fetch_images_routes_to_source_lane_not_eval_backend() -> None:
+    router, patchright, mangaball_lane, page_holder = _image_router()
+    out = await router.fetch_images_in_webview(
+        "mangaball", "https://mangaball.com/robots.txt", ["https://x/1.webp"]
+    )
+    assert out == [b"img"]
+    assert mangaball_lane.calls == [
+        ("mangaball", "https://mangaball.com/robots.txt", ["https://x/1.webp"])
+    ]
+    assert page_holder.calls == []  # comix's warm WebView is never navigated away
+    assert patchright.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_images_non_android_source_raises() -> None:
+    mangaball_lane = _FakeImageBackend()
+    page_holder = _FakeImageBackend()
+    router = SolverRouter(
+        patchright=object(),  # type: ignore[arg-type]  # CloudflareSolver lacks it
+        android_by_lane={"default": mangaball_lane},  # type: ignore[dict-item]
+        source_lane_map={},
+        eval_backend=page_holder,  # type: ignore[arg-type]
+        engine_by_source={"mangaball": "android"},
+    )
+    with pytest.raises(RuntimeError, match="weebcentral is not on the android"):
+        await router.fetch_images_in_webview(
+            "weebcentral", "https://x/", ["https://x/1.webp"]
+        )
+    assert mangaball_lane.calls == []
+    assert page_holder.calls == []

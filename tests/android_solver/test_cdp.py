@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import json
 
-from android_solver.cdp import ClearanceCookie, extract_clearance, webview_user_agent
+from android_solver.cdp import (
+    ClearanceCookie,
+    cdp_call_collecting,
+    extract_clearance,
+    webview_user_agent,
+)
 
 
 class FakeCdpWs:
@@ -145,3 +150,44 @@ def test_webview_user_agent_parses_json_version() -> None:
     result = webview_user_agent("http://localhost:9222/json/version", http_get=fake_get)
 
     assert result == ua
+
+
+class _FrameListWs:
+    """Replays a fixed list of frames; records sent requests (261003-es9)."""
+
+    def __init__(self, frames: list[dict]) -> None:
+        self.frames = [json.dumps(f) for f in frames]
+        self.sent: list[dict] = []
+
+    def send(self, payload: str) -> None:
+        self.sent.append(json.loads(payload))
+
+    def recv(self) -> str:
+        return self.frames.pop(0)
+
+    def close(self) -> None:
+        pass
+
+
+def test_cdp_call_collecting_returns_events_before_matching_response() -> None:
+    ev1 = {"method": "Network.requestWillBeSent", "params": {"requestId": "1"}}
+    ev2 = {"method": "Network.responseReceived", "params": {"requestId": "1"}}
+    after = {"method": "Network.loadingFinished", "params": {}}
+    ws = _FrameListWs(
+        [
+            ev1,
+            {"id": 99, "result": {"other": 1}},
+            ev2,
+            {"id": 7, "result": {"ok": 1}},
+            after,
+        ]
+    )
+    result, events = cdp_call_collecting(
+        ws, "Runtime.evaluate", {"expression": "1"}, command_id=7
+    )
+    assert result == {"ok": 1}
+    assert events == [ev1, ev2]  # the id=99 response is skipped, not an event
+    assert ws.sent == [
+        {"id": 7, "method": "Runtime.evaluate", "params": {"expression": "1"}}
+    ]
+    assert ws.frames == [json.dumps(after)]  # frames after the match are not consumed
