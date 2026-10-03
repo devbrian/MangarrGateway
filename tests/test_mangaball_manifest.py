@@ -1,128 +1,90 @@
-"""Unit tests for MangaBall ``fetch_manifest`` page extract + SSRF (Task 3 / GAP-3).
+"""Unit tests for MangaBall ``fetch_manifest`` + ``fetch_image`` (v2 backend).
 
-The manifest tail: GET ``/chapter-detail/{translation_id}/`` (HTML), extract the
-ordered page URLs from the client-side ``const chapterImages = JSON.parse(`[…]`)``
-array (GAP-3, live W-04 — the page images are NOT ``<img>`` tags; the only ``<img>``
-on the page are the site logo + a group icon, which MUST be ignored), SSRF-allowlist
-each (scheme https + the real ``/storage/.../{lang}/{NN}.jpg`` path shape — the CDN
-host is read from the array, NEVER reconstructed, RECON §4), and guard the extracted
-count against the chapter's ``pages``.
+261003-mangaball-api-v2: the manifest is ``GET /api/v1/chapter-detail?chapter_id=<id>``
+→ ``{"status","code","data":{"chapter":{…,"pages":[absolute URLs in order]},…}}``.
+Each page URL is SSRF-allowlisted (https + public host + ``/storage/`` + image
+extension — the CDN host is read from the response, NEVER reconstructed, RECON §4),
+and the count is guarded against the chapter's expected pages when known.
 
-* A served HTML page whose ``chapterImages`` array has N URLs → N URLs in array
-  order, with hosts that DIFFER from ``base_url`` (proves no host reconstruction)
-  and with the logo/group-icon ``<img>`` chrome ignored.
-* A non-allowlisted array entry (wrong scheme / wrong path shape / internal host) →
-  SourceError, never fetched.
+* N ``pages`` → N URLs in order, with hosts that DIFFER from ``base_url``.
+* A non-allowlisted entry → SourceError, never fetched.
 * A pages≠count mismatch → SourceError (integrity guard).
-* No ``chapterImages`` marker → SourceError.
+* Empty pages / missing ``data`` / missing ``chapter`` → SourceError.
+* ``fetch_image`` sends ``Referer: https://mangaball.com/`` (the CDN hotlink-blocks
+  a bare GET).
 
-No network: a fake ``SourceContext`` serves the chapter-detail HTML via get_bytes.
+No network: a fake ``SourceContext`` serves the chapter-detail JSON via get_json.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
+import httpx
 import pytest
 
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.handles.store import HandleStore
-from manga_gateway.sources.mangaball import (
-    MangaBallSource,
-    _extract_chapter_image_urls,
-    _is_allowed_image_url,
+from manga_gateway.sources.mangaball import MangaBallSource, _is_allowed_image_url
+
+_CHAPTER_DETAIL = "https://mangaball.com/api/v1/chapter-detail"
+
+# The two exact live v2 CDN URL shapes (verified 2026-10-03).
+_LIVE_POKE_URL = (
+    "https://bulbasaur.poke-black-and-white.net/storage/"
+    "689f5dbee93bccbdc8ffd5c7/0/48/harimanga/en/001.jpg"
+)
+_LIVE_RED_BLUE_URL = (
+    "https://chikorita.red-and-blue.net/storage/6aaa08555e43ba036cfe18eb/0/11/"
+    "atsu/en/6ac10263052042d762e1ee0c-001.avif"
 )
 
 
 class _FakeCtxForManifest:
-    """``SourceContext`` stand-in: serves chapter-detail HTML via get_bytes.
+    """``SourceContext`` stand-in: serves the chapter-detail JSON via get_json.
 
     ``expected_pages`` mirrors the real ``SourceContext.expected_pages`` integrity
     hint the engine forwards on the download path (#83/IN-03); ``None`` (the default)
-    matches the search/recent-without-a-count case where the guard is a no-op.
+    is the v2 case (no page count anywhere) where the guard is a no-op.
     """
 
-    def __init__(self, detail_html: bytes, expected_pages: int | None = None) -> None:
+    def __init__(
+        self, detail: dict[str, Any], expected_pages: int | None = None
+    ) -> None:
         self.handle_store = HandleStore()
-        self._detail_html = detail_html
-        self.get_calls: list[str] = []
+        self._detail = detail
+        self.get_calls: list[tuple[str, dict[str, Any]]] = []
         self.expected_pages = expected_pages
 
-    async def get_bytes(self, url: str) -> bytes:
-        self.get_calls.append(url)
-        return self._detail_html
+    async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
+        self.get_calls.append((url, params))
+        return self._detail
 
 
-def _ctx(detail_html: bytes, expected_pages: int | None = None) -> Any:
-    return _FakeCtxForManifest(detail_html, expected_pages)
+def _ctx(detail: dict[str, Any], expected_pages: int | None = None) -> Any:
+    return _FakeCtxForManifest(detail, expected_pages)
 
 
-def _page_url(host: str, tx_id: str, n: int, lang: str = "en") -> str:
-    """A real-shape page URL: /storage/{titleId}/{vol}/{chap}/{tx}/{lang}/{NN}.jpg."""
-    return (
-        f"https://{host}/storage/68515cf3702284f834179a32/0/58/"
-        f"{tx_id}/{lang}/{n:02d}.jpg"
-    )
+def _page_url(host: str, n: int, lang: str = "en") -> str:
+    """A real-shape page URL: /storage/{titleId}/{vol}/{chap}/{group}/{lang}/NNN.jpg."""
+    return f"https://{host}/storage/68515cf3702284f834179a32/0/58/harimanga/{lang}/{n:03d}.jpg"
 
 
-# The site chrome that lives on every chapter-detail page and MUST be ignored by the
-# extractor (these are the ONLY <img> tags the live page renders — GAP-3).
-_CHROME_IMGS = (
-    '<a class="navbar-brand"><img src="/public/frontend/images/logo.svg"></a>'
-    '<span class="chapter-badge"><img class="chapter-badge-icon" '
-    'src="https://mangaball.com/storage/groups/icons/default.png"></span>'
-)
+def _detail(urls: list[str]) -> dict[str, Any]:
+    """The v2 chapter-detail envelope carrying ``urls`` as ``data.chapter.pages``."""
+    return {
+        "status": "success",
+        "code": 200,
+        "data": {
+            "chapter": {"id": "6a1e164ac01e2cf095f75b1a", "pages": urls},
+            "title": {"id": "68515cf3702284f834179a32"},
+            "group": {"id": "g1"},
+        },
+    }
 
 
-def _detail_html(host: str, tx_id: str, pages: int) -> bytes:
-    """Build chapter-detail HTML: chrome <img> tags + the chapterImages JSON array."""
-    urls = [_page_url(host, tx_id, i + 1) for i in range(pages)]
-    arr = json.dumps(urls)
-    return (
-        "<html><head></head><body>"
-        f"{_CHROME_IMGS}"
-        "<script>\n"
-        "    const titleId = `68515cf3702284f834179a32`;\n"
-        f"    const chapterImages = JSON.parse(`{arr}`);\n"
-        "</script></body></html>"
-    ).encode()
-
-
-def _detail_html_with_urls(urls: list[str]) -> bytes:
-    """Build chapter-detail HTML whose chapterImages array is exactly ``urls``."""
-    return (
-        "<html><body>"
-        f"{_CHROME_IMGS}"
-        f"<script>const chapterImages = JSON.parse(`{json.dumps(urls)}`);</script>"
-        "</body></html>"
-    ).encode()
-
-
-# ─────────────────────────── _extract_chapter_image_urls ─────────────────────
-
-
-def test_extract_ignores_logo_and_group_icon_chrome() -> None:
-    """GAP-3: the logo + group-icon <img> chrome is NOT mistaken for page images;
-    only the chapterImages JSON array is returned, in array order."""
-    tx_id = "694f5f8e9b6877256628f2d0"
-    host = "bulbasaur.poke-black-and-white.net"
-    urls = _extract_chapter_image_urls(_detail_html(host, tx_id, 3))
-    assert len(urls) == 3
-    assert urls == [_page_url(host, tx_id, i + 1) for i in range(3)]
-    # The chrome images never appear.
-    assert all("logo.svg" not in u for u in urls)
-    assert all("groups/icons" not in u for u in urls)
-
-
-def test_extract_returns_empty_when_no_marker() -> None:
-    html = b"<html><body><p>no reader here</p></body></html>"
-    assert _extract_chapter_image_urls(html) == []
-
-
-def test_extract_returns_empty_on_malformed_json() -> None:
-    html = b"<script>const chapterImages = JSON.parse(`[not, valid json`);</script>"
-    assert _extract_chapter_image_urls(html) == []
+def _detail_n(host: str, n: int) -> dict[str, Any]:
+    return _detail([_page_url(host, i + 1) for i in range(n)])
 
 
 # ───────────────────────────── _is_allowed_image_url ────────────────────────
@@ -210,122 +172,117 @@ def test_is_allowed_image_url_rejects_internal_metadata_hosts() -> None:
     assert not _is_allowed_image_url(f"https://foo.localhost{base}")
 
 
-# ───────────────────────────── fetch_manifest (search path) ─────────────────
+def test_is_allowed_image_url_accepts_live_v2_cdn_shapes() -> None:
+    """Both exact live v2 page URLs (jpg on poke-black-and-white, avif on
+    red-and-blue) pass the allowlist (261003-mangaball-api-v2)."""
+    assert _is_allowed_image_url(_LIVE_POKE_URL)
+    assert _is_allowed_image_url(_LIVE_RED_BLUE_URL)
+
+
+# ───────────────────────────── fetch_manifest ───────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_fetch_manifest_extracts_absolute_urls_in_order() -> None:
-    tx_id = "6a1e164ac01e2cf095f75b1a"
+async def test_fetch_manifest_returns_pages_in_order() -> None:
+    row_id = "6a1e164ac01e2cf095f75b1a"
     host = "chikorita.red-and-blue.net"
-    ctx = _ctx(_detail_html(host, tx_id, 3))
-    source = MangaBallSource()
-    urls = await source.fetch_manifest(tx_id, ctx)
+    ctx = _ctx(_detail_n(host, 3))
+    urls = await MangaBallSource().fetch_manifest(row_id, ctx)
 
     assert len(urls) == 3
-    # Array order preserved (01, 02, 03).
-    assert urls[0].endswith("/en/01.jpg")
-    assert urls[1].endswith("/en/02.jpg")
-    assert urls[2].endswith("/en/03.jpg")
-    # The hosts come from the array and differ from base_url (no reconstruction).
+    assert urls[0].endswith("/en/001.jpg")
+    assert urls[1].endswith("/en/002.jpg")
+    assert urls[2].endswith("/en/003.jpg")
+    # Hosts come from the response and differ from base_url (no reconstruction).
     for url in urls:
         assert host in url
         assert "mangaball.com" not in url
-    # The chapter-detail GET used the bare translation id.
-    assert len(ctx.get_calls) == 1
-    assert ctx.get_calls[0] == f"https://mangaball.com/chapter-detail/{tx_id}"
+    # Exactly one chapter-detail GET with the row id as a query param.
+    assert ctx.get_calls == [(_CHAPTER_DETAIL, {"chapter_id": row_id})]
 
 
 @pytest.mark.asyncio
 async def test_fetch_manifest_rejects_non_allowlisted_url() -> None:
-    """An off-shape array entry raises SourceError (no blind fetch, SSRF)."""
-    tx_id = "6a1e164ac01e2cf095f75b1a"
+    """An off-shape pages entry raises SourceError (no blind fetch, SSRF)."""
     host = "chikorita.red-and-blue.net"
-    # A poisoned array: two good page URLs + one internal-host entry.
     poisoned = [
-        _page_url(host, tx_id, 1),
+        _page_url(host, 1),
         "https://internal.metadata.server/latest/meta-data/",
-        _page_url(host, tx_id, 2),
+        _page_url(host, 2),
     ]
-    ctx = _ctx(_detail_html_with_urls(poisoned))
-    source = MangaBallSource()
+    ctx = _ctx(_detail(poisoned))
     with pytest.raises(SourceError) as excinfo:
-        await source.fetch_manifest(tx_id, ctx)
+        await MangaBallSource().fetch_manifest("a" * 24, ctx)
     assert excinfo.value.code == "source_unavailable"
-    # The offending URL is named in the error (observability, GAP-3).
+    # The offending URL is named in the error (observability).
     assert "metadata.server" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
 async def test_fetch_manifest_pages_count_mismatch_raises() -> None:
-    """A pages≠extracted-count mismatch raises (integrity guard)."""
-    tx_id = "6a1e164ac01e2cf095f75b1a"
-    ctx = _ctx(_detail_html("chikorita.red-and-blue.net", tx_id, 3))
-    source = MangaBallSource()
+    """A pages≠count mismatch raises (integrity guard)."""
+    ctx = _ctx(_detail_n("chikorita.red-and-blue.net", 3))
     with pytest.raises(SourceError) as excinfo:
-        await source._manifest_for_translation(tx_id, 5, ctx)
+        await MangaBallSource()._manifest_for_translation("a" * 24, 5, ctx)
     assert excinfo.value.code == "source_unavailable"
 
 
 @pytest.mark.asyncio
 async def test_fetch_manifest_engages_pages_guard_via_expected_pages() -> None:
-    """#83/IN-03: ``fetch_manifest`` (the search/recent entry) now engages the
-    integrity guard from ``ctx.expected_pages`` — a mismatch raises. Before the fix
-    ``fetch_manifest`` passed ``pages=None`` so a truncated/over-stuffed
-    chapter-detail DOM on a search-grabbed chapter was never caught."""
-    tx_id = "6a1e164ac01e2cf095f75b1a"
-    # The engine forwards the record's declared 5 pages; the DOM only has 3.
-    ctx = _ctx(_detail_html("chikorita.red-and-blue.net", tx_id, 3), expected_pages=5)
-    source = MangaBallSource()
+    """#83/IN-03: ``fetch_manifest`` engages the guard from ``ctx.expected_pages``."""
+    ctx = _ctx(_detail_n("chikorita.red-and-blue.net", 3), expected_pages=5)
     with pytest.raises(SourceError) as excinfo:
-        await source.fetch_manifest(tx_id, ctx)
+        await MangaBallSource().fetch_manifest("a" * 24, ctx)
     assert excinfo.value.code == "source_unavailable"
     assert "integrity" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
 async def test_fetch_manifest_expected_pages_match_passes() -> None:
-    """The guard is satisfied when ``ctx.expected_pages`` equals the extracted count."""
-    tx_id = "6a1e164ac01e2cf095f75b1a"
-    ctx = _ctx(_detail_html("chikorita.red-and-blue.net", tx_id, 3), expected_pages=3)
-    source = MangaBallSource()
-    urls = await source.fetch_manifest(tx_id, ctx)
+    ctx = _ctx(_detail_n("chikorita.red-and-blue.net", 3), expected_pages=3)
+    urls = await MangaBallSource().fetch_manifest("a" * 24, ctx)
     assert len(urls) == 3
 
 
 @pytest.mark.asyncio
 async def test_fetch_manifest_expected_pages_none_skips_guard() -> None:
-    """``expected_pages=None`` (search recorded no count, or a post-restart rehydrated
-    job) degrades the guard to a no-op — extraction still succeeds."""
-    tx_id = "6a1e164ac01e2cf095f75b1a"
-    ctx = _ctx(_detail_html("chikorita.red-and-blue.net", tx_id, 3))  # expected=None
-    source = MangaBallSource()
-    urls = await source.fetch_manifest(tx_id, ctx)
+    """``expected_pages=None`` (the v2 default) degrades the guard to a no-op."""
+    ctx = _ctx(_detail_n("chikorita.red-and-blue.net", 3))
+    urls = await MangaBallSource().fetch_manifest("a" * 24, ctx)
     assert len(urls) == 3
 
 
 @pytest.mark.asyncio
-async def test_fetch_manifest_empty_page_list_raises() -> None:
-    tx_id = "6a1e164ac01e2cf095f75b1a"
-    ctx = _ctx(b"<html><body><p>no images here</p></body></html>")
-    source = MangaBallSource()
-    with pytest.raises(SourceError) as excinfo:
-        await source.fetch_manifest(tx_id, ctx)
-    assert excinfo.value.code == "source_unavailable"
+async def test_fetch_manifest_empty_or_missing_pages_raises() -> None:
+    """Empty pages / missing ``data`` / missing ``chapter`` → source_unavailable."""
+    for detail in (
+        _detail([]),
+        {"status": "success", "code": 200},
+        {"status": "success", "code": 200, "data": {"title": {}}},
+    ):
+        with pytest.raises(SourceError) as excinfo:
+            await MangaBallSource().fetch_manifest("a" * 24, _ctx(detail))
+        assert excinfo.value.code == "source_unavailable"
+
+
+# ───────────────────────────── fetch_image ──────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_fetch_image_delegates_to_get_bytes() -> None:
+async def test_fetch_image_sends_mangaball_referer() -> None:
+    """The CDN hotlink-blocks a bare GET (403) — the Referer must ride along."""
+
     class _ImgCtx:
         def __init__(self) -> None:
-            self.fetched: list[str] = []
+            self.fetched: list[tuple[str, dict[str, str] | None]] = []
 
-        async def get_bytes(self, url: str) -> bytes:
-            self.fetched.append(url)
-            return b"JPEGDATA"
+        async def get_bytes_plain_with_headers(
+            self, url: str, *, extra_headers: dict[str, str] | None = None
+        ) -> tuple[bytes, httpx.Headers]:
+            self.fetched.append((url, extra_headers))
+            return b"JPEGDATA", httpx.Headers()
 
     ctx = _ImgCtx()
-    source = MangaBallSource()
-    url = "https://chikorita.red-and-blue.net/storage/t/0/58/tx/en/01.jpg"
-    data = await source.fetch_image(url, ctx)  # type: ignore[arg-type]
+    data = await MangaBallSource().fetch_image(_LIVE_RED_BLUE_URL, ctx)  # type: ignore[arg-type]
     assert data == b"JPEGDATA"
-    assert ctx.fetched == [url]
+    assert ctx.fetched == [(_LIVE_RED_BLUE_URL, {"Referer": "https://mangaball.com/"})]

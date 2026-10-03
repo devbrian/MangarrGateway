@@ -35,6 +35,15 @@ zero-networking-glue. The ``rate_limit_per_minute = 480`` is a
 conservative ~50%-of-floor value set from the 2026-06-04 probe (no hard limit found;
 manifest/image sustained 960/min at c=8), mirroring the mangadot precedent (#101).
 
+ponytail: known limit (261003-mangaball-api-v2) — the ``*.poke-black-and-white.net``
+CDN zone serves a Cloudflare managed challenge (403 ``cf-mitigated: challenge``) to
+non-browser TLS fingerprints even with the Referer and via residential proxies, and
+hard-blocks top-level navigation, so the android solver cannot mint a clearance for
+it. Pages on that zone fail with ``upstream 403`` (after one D-35 forced re-solve
+against mangaball.com, since the 403 is a CF challenge) until a WebView-side image
+body capture exists (follow-up issue). ``*.red-and-blue.net`` serves plaintext.
+Upgrade path = WebView-side image body capture.
+
 ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md`` / GAP-1 probe):
 
 * base: ``https://mangaball.com``
@@ -73,7 +82,6 @@ MangaBall does not need it because its recent feed exposes the translation_id.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import posixpath
 import re
@@ -235,15 +243,9 @@ _MANGABALL_HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$", re.IGNORECA
 # literal, so we must reject the non-public namespaces explicitly (CR-01 / SSRF).
 _MANGABALL_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
 
-# Page images are injected client-side as a JS template-literal JSON array (GAP-3,
-# live W-04): ``const chapterImages = JSON.parse(`["https://<cdn>/.../01.jpg", …]`)``.
-# Capture the bracketed JSON array — page-image URLs never contain ``]``, so the
-# non-greedy ``\[.*?\]`` stops exactly at the array close. DOTALL so a multi-line
-# array still matches. See :func:`_extract_chapter_image_urls`.
-_CHAPTER_IMAGES_RE = re.compile(
-    r"chapterImages\s*=\s*JSON\.parse\(\s*`(?P<json>\[.*?\])`",
-    re.DOTALL,
-)
+# 261003-mangaball-api-v2: the CDN hotlink-blocks a bare image GET (403); the reader's
+# Referer is required. Mirrors comix's ``_IMAGE_FETCH_HEADERS``.
+_IMAGE_FETCH_HEADERS = {"Referer": "https://mangaball.com/"}
 
 
 def _items_and_pagination(
@@ -324,7 +326,7 @@ def _split_alt(raw: Any) -> list[str]:
 def _is_allowed_image_url(url: str) -> bool:
     """True if ``url`` looks like a MangaBall CDN page image (SSRF allowlist).
 
-    Belt-and-suspenders defence on every DOM-extracted manifest URL before the
+    Belt-and-suspenders defence on every chapter-detail manifest URL before the
     framework fetches it (T-07-07/T-07-09). Rejects non-HTTPS schemes, empty /
     malformed hosts, internal/metadata hostnames, path-traversal, and any path
     that does not match the observed ``/storage/.../{id}-{NNN}.jpg`` shape. The
@@ -353,38 +355,6 @@ def _is_allowed_image_url(url: str) -> bool:
         and bool(_MANGABALL_HOST_RE.match(host))
         and bool(_MANGABALL_IMG_PATH_RE.match(norm_path))
     )
-
-
-def _extract_chapter_image_urls(html: bytes) -> list[str]:
-    """Extract the ordered page-image URLs from chapter-detail HTML (GAP-3, live).
-
-    The reader is rendered CLIENT-SIDE: the page images are NOT ``<img>`` tags
-    (live W-04 — the recon ``img[data-src]`` assumption was wrong; the only ``<img>``
-    on the page are the site logo + a group icon). The real page URLs live in a JS
-    template-literal JSON array::
-
-        const chapterImages = JSON.parse(`["https://<cdn>/storage/.../en/01.jpg", …]`);
-
-    We capture that array and ``json.loads`` it — the array order IS the page order,
-    so no DOM/document-order walk is needed. The host is taken verbatim from the CDN
-    URL, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF); every URL is allowlisted
-    downstream by :func:`_is_allowed_image_url`. Blocking-free string work, but kept
-    behind ``asyncio.to_thread`` at the call site for parity with the prior lxml path
-    and to stay future-proof if a larger parse is reintroduced. Returns ``[]`` on any
-    miss (no marker / malformed JSON), which the caller turns into a clear
-    ``source_unavailable``.
-    """
-    text = html.decode("utf-8", "replace") if isinstance(html, bytes) else html
-    match = _CHAPTER_IMAGES_RE.search(text)
-    if match is None:
-        return []
-    try:
-        parsed = json.loads(match.group("json"))
-    except (ValueError, TypeError):
-        return []
-    if not isinstance(parsed, list):
-        return []
-    return [u.strip() for u in parsed if isinstance(u, str) and u.strip()]
 
 
 class MangaBallSource(Source):
@@ -481,10 +451,9 @@ class MangaBallSource(Source):
     # config never needs flipping back and forth. ``antibot``/``solver_engine``/
     # ``session_prep`` stay as-is — only the SOLVE is deferred.
     cloudflare_challenge_optional = True
-    # NEW class-attr (Plan 01, D-06): the framework maps this onto the shared
-    # CsrfBootstrap provider (Plan 02). ``post_json`` injects the harvested
-    # X-CSRF-Token + PHPSESSID on every /api/v1 form POST.
-    session_prep = "csrf-bootstrap"
+    # v2 backend has no CSRF token; the API accepts cookie-less, token-less requests
+    # (261003-mangaball-api-v2 retired the csrf-bootstrap prep).
+    session_prep = None
     supports_search = True
     supports_recent = True
 
@@ -816,43 +785,41 @@ class MangaBallSource(Source):
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
         """Resolve a chapter id → ordered page-image URLs, INTERNALLY (PKG-01/R6).
 
-        Both ``search`` and ``recent`` now mint a BARE ``translation_id`` as the
-        ``chapter_id`` (GAP-1 lock — recent no longer defers), so this is a straight
-        ``translation_id`` → chapter-detail HTML → ordered allowlisted page URLs
-        resolve. The ``chapterImages`` JSON-array extract + SSRF allowlist +
-        pages-count guard live in :meth:`_manifest_for_translation`. (The Comix-only
-        ``:DEFERRED`` late-bind pattern does not apply to MangaBall — the chapter id
-        stays a bare ``translation_id``, never a composite.)
+        Both ``search`` and ``recent`` mint the bare listing-row ``id`` as the
+        ``chapter_id``; :meth:`_manifest_for_translation` resolves it via the v2
+        ``chapter-detail`` JSON endpoint (261003-mangaball-api-v2), SSRF-allowlists
+        every page URL, and applies the pages-count guard.
 
-        #83/IN-03: the page-count integrity guard runs on BOTH the search and recent
-        paths. The chapter's declared ``pages`` is captured at search/recent time on
-        the ``ResolutionRecord`` and forwarded here by the engine as
-        ``ctx.expected_pages`` (``None`` only when search never recorded a count, or
-        for a job rehydrated post-restart — the guard then degrades to a no-op). This
-        keeps the chapter id bare while still mirroring ``mangadex.fetch_manifest``'s
-        length check, closing the gap where a search-grabbed chapter skipped it.
+        #83/IN-03: the guard uses ``ctx.expected_pages`` forwarded by the engine. The
+        v2 API exposes no page count, so new records carry ``None`` and the guard
+        degrades to a no-op; it still runs whenever a count is known.
         """
         return await self._manifest_for_translation(chapter_id, ctx.expected_pages, ctx)
 
     async def _manifest_for_translation(
         self, translation_id: str, pages: int | None, ctx: SourceContext
     ) -> list[str]:
-        """``chapterImages`` JSON extract + SSRF allowlist + pages guard (PKG-01).
+        """chapter-detail JSON → pages + SSRF allowlist + pages guard (PKG-01).
 
-        GETs ``/chapter-detail/{translation_id}`` (HTML) via ``ctx.get_bytes``,
-        extracts the ordered page URLs from the client-side ``chapterImages`` JSON
-        array (GAP-3 — NOT ``<img>`` tags), and returns them. The CDN host is taken
-        from that array, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF) — the host
-        varies per content. Every extracted URL is
-        SSRF-allowlisted (:func:`_is_allowed_image_url`) before return; a
-        non-allowlisted URL raises ``SourceError`` (no blind fetch, T-07-07). The
-        extracted count is guarded against the chapter's ``pages`` when known
-        (integrity guard, mirror ``mangadex.fetch_manifest``). The large HTML parse
-        is offloaded via ``asyncio.to_thread`` so it never blocks the event loop
-        (RESEARCH Pitfall 6; ruff ASYNC).
+        GETs ``/api/v1/chapter-detail?chapter_id=<id>`` (261003-mangaball-api-v2) and
+        reads ``data.chapter.pages`` — absolute CDN URLs in reading order. The CDN
+        host is taken verbatim, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF) — it
+        varies per content. Every URL is SSRF-allowlisted
+        (:func:`_is_allowed_image_url`) before return; a non-allowlisted URL raises
+        ``SourceError`` (no blind fetch, T-07-07). The count is guarded against
+        ``pages`` when known (integrity guard, mirror ``mangadex.fetch_manifest``).
         """
-        html = await ctx.get_bytes(f"{self.base_url}/chapter-detail/{translation_id}")
-        urls = await asyncio.to_thread(_extract_chapter_image_urls, html)
+        body = await ctx.get_json(
+            f"{self.base_url}/api/v1/chapter-detail", chapter_id=translation_id
+        )
+        data = body.get("data")
+        chapter = data.get("chapter") if isinstance(data, dict) else None
+        raw_pages = chapter.get("pages") if isinstance(chapter, dict) else None
+        urls = [
+            u.strip()
+            for u in (raw_pages if isinstance(raw_pages, list) else [])
+            if isinstance(u, str) and u.strip()
+        ]
         if not urls:
             raise SourceError(
                 "source_unavailable",
@@ -878,13 +845,16 @@ class MangaBallSource(Source):
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's raw bytes via the shared session (PKG-02).
 
-        Delegates to ``ctx.get_bytes`` (mirror ``mangadex.fetch_image``): bounded by
-        the per-job semaphore (Plan 03), NOT the per-source API limiter. No decrypt
-        — MangaBall serves plain ``.jpg``. A ``Referer: https://mangaball.com/`` is
-        added ONLY if live-verify (Plan 04) shows the CDN hotlink-protects with a
-        bare GET 403 (A7 / D-discretion — default is no Referer).
+        261003-mangaball-api-v2: the CDN hotlink-blocks a bare GET (403), so the
+        reader's ``Referer: https://mangaball.com/`` is required —
+        ``get_bytes_plain_with_headers`` carries it (comix precedent). No decrypt;
+        the response headers are discarded. Bounded by the per-job semaphore, NOT the
+        per-source API limiter.
         """
-        return await ctx.get_bytes(url)
+        data, _headers = await ctx.get_bytes_plain_with_headers(
+            url, extra_headers=_IMAGE_FETCH_HEADERS
+        )
+        return data
 
     # ─────────────────────────── Release normalization ───────────────────────────
 
