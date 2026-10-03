@@ -50,9 +50,9 @@ from .conftest import BASE_URL, TEST_API_KEY
 # deterministic (D-42) while still exercising both sources' contract paths.
 _COMIX_HOST = "comix.to"
 # 07-03: MangaBall is now registered too, so every generated search/getRecent case
-# also fans out to mangaball.net. Stub it to a fast permanent 403 for the same
+# also fans out to mangaball.com. Stub it to a fast permanent 403 for the same
 # reason as Comix — a per-source warnings[] entry, no retry, no real network.
-_MANGABALL_HOST = "mangaball.net"
+_MANGABALL_HOST = "mangaball.com"
 # Mangadot is registered with antibot="cloudflare" again (it RE-ENABLED its Cloudflare
 # interstitial 2026-06-09 — debug mangadot-live-smoke-403, #200, reversing #127/#128).
 # Like Comix it is now in ``_cloudflare_keys``, so the blanket get_clearance

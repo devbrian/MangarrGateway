@@ -39,8 +39,8 @@ from manga_gateway.handles.store import HandleStore
 
 _TOKEN = "a" * 64  # a 64-hex meta csrf-token
 _TOKEN2 = "b" * 64
-_HTML_URL = "https://mangaball.net/"
-_API_URL = "https://mangaball.net/api/v1/title/search-advanced/"
+_HTML_URL = "https://mangaball.com/"
+_API_URL = "https://mangaball.com/api/v1/title/search-advanced"
 
 
 def _html(token: str) -> str:

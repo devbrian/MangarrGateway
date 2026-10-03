@@ -28,7 +28,10 @@ from manga_gateway.config import Settings
 from manga_gateway.framework.base import Source
 from manga_gateway.framework.context import SourceContext
 from manga_gateway.framework.proxy_pool import PooledProxy, ProxyPool
+from manga_gateway.framework.ratelimit import RateLimiter
+from manga_gateway.framework.session import SessionManager
 from manga_gateway.framework.source_pin import SourcePinnedProxies
+from manga_gateway.handles.store import HandleStore
 from manga_gateway.models.search import Release, SearchRequest
 
 TEST_API_KEY = "test-key-deterministic-0123456789"
@@ -242,3 +245,84 @@ def test_is_origin_block_false_for_cf_challenge_403() -> None:
 def test_is_origin_block_false_for_non_403() -> None:
     assert _DummySource().is_origin_block(_resp(200)) is False
     assert _DummySource().is_origin_block(_resp(500)) is False
+
+
+# ───────── pin rotation on transport error (261003-pin-rotate-transport-error) ────────
+
+
+class _ScriptedPinTransport:
+    """Per-proxy transport: the ``dead`` one raises ConnectTimeout, else 200 JSON."""
+
+    def __init__(self, *, dead: bool) -> None:
+        self.dead = dead
+        self.calls = 0
+
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        self.calls += 1
+        req = httpx.Request(method, url)
+        if self.dead:
+            raise httpx.ConnectTimeout("dead pin", request=req)
+        return httpx.Response(200, json={"ok": True}, request=req)
+
+    async def aclose(self) -> None:
+        pass
+
+
+class _ForbiddenTransport:
+    """The non-pinned search transport — a pinned request must never reach it."""
+
+    async def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+        raise AssertionError("pinned request leaked to the base transport")
+
+    async def aclose(self) -> None:  # pragma: no cover - interface completeness
+        pass
+
+
+async def test_pinned_search_rotates_off_dead_pin_on_transport_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # transport_for builds lazily on first use, so creation order == use order: the
+    # first pin used gets the dead transport regardless of the rng's pick.
+    made: list[_ScriptedPinTransport] = []
+
+    def _factory(settings: object, *, proxy_override: object) -> _ScriptedPinTransport:
+        t = _ScriptedPinTransport(dead=not made)
+        made.append(t)
+        return t
+
+    pool = ProxyPool(
+        [
+            PooledProxy(_FAKE_HOST, 8000 + i, _FAKE_USER, SecretStr(_FAKE_PASS))
+            for i in range(2)
+        ],
+        settings=_settings(),
+        cooldown_seconds=300.0,
+        transport_factory=_factory,  # type: ignore[arg-type]
+        rng=random.Random(0),
+    )
+    pins = SourcePinnedProxies(pool)
+    first = pins.get_or_acquire("mangadot")
+    assert first is not None
+    ctx = SourceContext(
+        source_key="mangadot",
+        rate_limit_per_minute=6000,
+        session=SessionManager(_ForbiddenTransport()),  # type: ignore[arg-type]
+        ratelimiter=RateLimiter(),
+        handle_store=HandleStore(),
+        source_pins=pins,
+        solve_search_via_proxy_pool=True,
+        retry_attempts=1,  # prove the rotation is in-request, not a tenacity re-run
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="manga_gateway"):
+            assert await ctx.get_json("https://x/api") == {"ok": True}
+        second = pins.current("mangadot")
+        assert second is not None
+        assert second.selection_key != first.selection_key
+        # The dead proxy is cooled down: nothing left once the live pin is excluded.
+        assert pool.acquire(exclude={second.selection_key}) is None
+        assert [t.calls for t in made] == [1, 1]
+        assert "rotat" in caplog.text
+        assert _FAKE_PASS not in caplog.text  # T-4im-01: host:port only
+    finally:
+        await pool.aclose()

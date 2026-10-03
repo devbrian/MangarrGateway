@@ -301,10 +301,10 @@ services:
       # "Add a solver lane". (env_file/.env may also override this without editing.)
       # SOLVER_ADB_TARGETS: "redroid:5555,redroid-kagane:5555"
       # SSRF allowlist — the only challenge hosts the sidecar will drive a device
-      # against (the strict-Turnstile sources). Anything else → 422. mangaball.net
+      # against (the strict-Turnstile sources). Anything else → 422. mangaball.com
       # joined 2026-06-15 (#243): its managed challenge is unclearable by desktop
       # Chromium from our Linux fingerprint, same as mangadot/kagane.
-      SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to,mangaball.net,comix.to"
+      SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to,mangaball.com,comix.to"
       # Per-solve wall-clock cap (an Android WebView solve is slower than desktop).
       SOLVER_SOLVE_TIMEOUT_S: "120"
     restart: unless-stopped

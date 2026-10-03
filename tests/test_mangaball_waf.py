@@ -1,6 +1,6 @@
 """MangaBall WAF-block detection + sanitize-and-retry tests (260620-5yq).
 
-mangaball.net sits behind a WAF that returns HTTP 403 with body
+mangaball.com sits behind a WAF that returns HTTP 403 with body
 ``{"error":"Malicious payload detected", ... "code":403}`` for ANY search POST whose
 ``search_input`` contains the literal word "System" (a SQL-injection false positive).
 This module covers the two layers of the fix:
@@ -31,7 +31,7 @@ import pytest
 
 from manga_gateway.framework.context import SourceContext, is_waf_block
 
-_API_URL = "https://mangaball.net/api/v1/title/search-advanced/"
+_API_URL = "https://mangaball.com/api/v1/title/search-advanced"
 
 
 def _waf_403(req: httpx.Request | None = None) -> httpx.Response:
@@ -92,9 +92,9 @@ class _RecordingTransport:
     async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.requests.append((method, url, kwargs.get("data")))
         req = httpx.Request(method, url)
-        if url.endswith("/title/search-advanced/"):
+        if url.endswith("/title/search-advanced"):
             resp = self._search.pop(0)
-        elif url.endswith("/chapter-listing-by-title-id/"):
+        elif url.endswith("/chapter-listing-by-title-id"):
             resp = httpx.Response(200, json=self._listing_body, request=req)
         else:  # pragma: no cover - guards against an unexpected call
             raise AssertionError(f"unexpected request url: {url}")
@@ -125,7 +125,7 @@ def _search_posts(transport: _RecordingTransport) -> list[dict[str, Any] | None]
     return [
         data
         for method, url, data in transport.requests
-        if method == "POST" and url.endswith("/title/search-advanced/")
+        if method == "POST" and url.endswith("/title/search-advanced")
     ]
 
 

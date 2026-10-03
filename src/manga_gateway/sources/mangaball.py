@@ -1,6 +1,6 @@
 """MangaBall source — the third declarative source + a third prep style (SRC-01).
 
-MangaBall (``https://mangaball.net``) is a **MangaDex-class** source: a clean
+MangaBall (``https://mangaball.com``) is a **MangaDex-class** source: a clean
 JSON-REST backend with no response encryption and plain-CDN ``.jpg`` images
 (RECON TL;DR). ~90% of this module is the MangaDex shape (guid/mint,
 ``_parse_decimal``, the manifest-integrity guard).
@@ -23,7 +23,7 @@ HTTP 403 on ``/``, ``/manga``, ``/search``), which broke the bare-httpx csrf-boo
 GET: it received the interstitial → no ``meta[name=csrf-token]`` → ``ValueError`` →
 ``source_unavailable`` on every search/recent/download. Per the documented
 one-attribute escalation, ``antibot`` is now ``"cloudflare"`` +
-``cloudflare_challenge_url = "https://mangaball.net/"`` — routing BOTH the
+``cloudflare_challenge_url = "https://mangaball.com/"`` — routing BOTH the
 csrf-bootstrap GET and every data POST through the shared clearance seam. Desktop
 Chromium/Patchright could NOT clear the new managed challenge from our Linux
 fingerprint (CI + the deploy both timed out at 60s), so ``solver_engine = "android"``
@@ -37,22 +37,25 @@ manifest/image sustained 960/min at c=8), mirroring the mangadot precedent (#101
 
 ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md`` / GAP-1 probe):
 
-* base: ``https://mangaball.net``
-* search: ``POST /api/v1/title/search-advanced/`` (form) →
+* base: ``https://mangaball.com``
+  (moved from the ``.net`` host 2026-10-03, ``261003-mangaball-dotcom``: the old host
+  301s every request and the new host 308s trailing-slash paths; the transport does
+  NOT follow redirects, so every request path below is slash-free).
+* search: ``POST /api/v1/title/search-advanced`` (form) →
   ``{code,message,data:[Title…],pagination}``. **TITLE-ONLY** — a Title carries
   NO ``chapters`` key (GAP-1 ground truth). Chapters/translations live ONLY in
   ``chapter-listing-by-title-id``; ``search`` deep-enumerates each candidate.
-* recent: ``POST /api/v1/title/search/`` (form,
+* recent: ``POST /api/v1/title/search`` (form,
   ``search_type=getRecentlyUpdatedChapter``) → same TITLE-ONLY shape, newest-first.
   The newest chapter is an HTML blob in each title's ``last_chapter`` field — it
   carries the real ``translation_id`` (``href=".../chapter-detail/{id}/"``),
   number, language flag, and group anchor. ``recent`` parses it and mints DIRECT
   releases (no deferral — MangaBall exposes the stable id, unlike Comix).
-* chapter listing: ``POST /api/v1/chapter/chapter-listing-by-title-id/`` (form,
+* chapter listing: ``POST /api/v1/chapter/chapter-listing-by-title-id`` (form,
   ``title_id``) → the FLAT ``{code,message,ALL_CHAPTERS:[…],…}`` envelope (NOT
   the standard ``data`` envelope — :func:`_items_and_pagination` dispatches both,
   D-09).
-* manifest: ``GET /chapter-detail/{translation_id}/`` (HTML) → the ordered page
+* manifest: ``GET /chapter-detail/{translation_id}`` (HTML) → the ordered page
   URLs in the client-side ``const chapterImages = JSON.parse(`[…]`)`` array (GAP-3,
   live — NOT ``<img>`` tags). The CDN host VARIES per content
   (``chikorita.red-and-blue.net``, ``bulbasaur.poke-black-and-white.net``, …) —
@@ -111,7 +114,7 @@ _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
     "filters[userSettingsEnabled]": "false",
 }
 
-# WAF trigger-word denylist (260620-5yq). mangaball.net's WAF 403s ANY search POST
+# WAF trigger-word denylist (260620-5yq). mangaball.com's WAF 403s ANY search POST
 # whose ``search_input`` contains a SQL-injection-flavoured token with the
 # ``Malicious payload detected`` body; the framework turns that into a catchable
 # ``waf_blocked`` SourceError (context.is_waf_block). Only ``"system"`` is
@@ -518,7 +521,7 @@ def _extract_chapter_image_urls(html: bytes) -> list[str]:
 
 
 class MangaBallSource(Source):
-    """MangaBall (mangaball.net) — antibot cloudflare + csrf-bootstrap session prep.
+    """MangaBall (mangaball.com) — antibot cloudflare + csrf-bootstrap session prep.
 
     A MangaDex-class clean-JSON source whose requirements are the ``csrf-bootstrap``
     session-prep style (D-06: the framework GETs an HTML page, harvests the
@@ -532,7 +535,7 @@ class MangaBallSource(Source):
 
     key = "mangaball"
     name = "MangaBall"
-    base_url = "https://mangaball.net"
+    base_url = "https://mangaball.com"
     # Title-search only — MangaBall has no external metadata-id namespace (SRCH-07).
     id_types: list[str] = []
     # ALL_LANGUAGES recon set (14 langs; chapter-listing-by-title-id §3).
@@ -584,8 +587,8 @@ class MangaBallSource(Source):
     # Host the shared CloudflareSolver solves the managed challenge against (#88
     # per-domain challenge URL), mirroring comix's "https://comix.to/". Required for a
     # cloudflare source — without it the solver falls back to the framework placeholder
-    # host and never earns clearance for mangaball.net.
-    cloudflare_challenge_url = "https://mangaball.net/"
+    # host and never earns clearance for mangaball.com.
+    cloudflare_challenge_url = "https://mangaball.com/"
     # #243: route clearance to the Android-WebView solver, NOT desktop Patchright.
     # MangaBall's 2026-06-15 managed-challenge escalation is the same strict Turnstile
     # that desktop Chromium cannot clear from our Linux fingerprint — both the branch
@@ -643,13 +646,13 @@ class MangaBallSource(Source):
                 # Keep the form construction EXACTLY as before — only which
                 # ``search_input`` value is posted ever changes (the retry).
                 return await ctx.post_json(
-                    f"{self.base_url}/api/v1/title/search-advanced/",
+                    f"{self.base_url}/api/v1/title/search-advanced",
                     data={"search_input": search_input, **_SEARCH_DEFAULT_FILTERS},
                 )
 
             # 260620-5yq: single sanitize-and-retry on a WAF false-positive 403. The
             # framework mints a distinct ``waf_blocked`` code (context.is_waf_block) for
-            # mangaball.net's "Malicious payload" block — a SQL-injection false positive
+            # mangaball.com's "Malicious payload" block — a SQL-injection false positive
             # on common tokens like "System". The SOURCE fully ABSORBS that signal
             # (returns releases or []), so it NEVER reaches fanout and fanout stays
             # unchanged. Any OTHER SourceError re-raises (still a real failure →
@@ -770,7 +773,7 @@ class MangaBallSource(Source):
             async def _enum_fn() -> Enumeration:
                 async with sem:
                     listing = await ctx.post_json(
-                        f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id/",
+                        f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id",
                         data={"title_id": title_id, "userSettingsEnabled": "false"},
                     )
                 all_chapters, _ = _items_and_pagination(listing)
@@ -900,7 +903,7 @@ class MangaBallSource(Source):
     ) -> list[Release]:
         """Newest-first recent chapters → DIRECT releases (RCNT-01/02, GAP-1 lock).
 
-        POSTs ``/api/v1/title/search/`` with ``search_type=getRecentlyUpdatedChapter``
+        POSTs ``/api/v1/title/search`` with ``search_type=getRecentlyUpdatedChapter``
         (TITLE-ONLY shape — no ``chapters`` key). For each title the newest chapter
         is an HTML blob in ``last_chapter`` carrying the real ``translation_id``,
         number, language flag, and group anchor; :func:`_parse_last_chapter` (lxml,
@@ -919,7 +922,7 @@ class MangaBallSource(Source):
         networking glue — ``ctx.post_json`` owns the transport (SRC-02).
         """
         form: dict[str, Any] = {"search_type": "getRecentlyUpdatedChapter", "page": 1}
-        body = await ctx.post_json(f"{self.base_url}/api/v1/title/search/", data=form)
+        body = await ctx.post_json(f"{self.base_url}/api/v1/title/search", data=form)
         titles, _pagination = _items_and_pagination(body)
 
         wanted_langs = set(languages) if languages else None
@@ -1000,7 +1003,7 @@ class MangaBallSource(Source):
     ) -> list[str]:
         """``chapterImages`` JSON extract + SSRF allowlist + pages guard (PKG-01).
 
-        GETs ``/chapter-detail/{translation_id}/`` (HTML) via ``ctx.get_bytes``,
+        GETs ``/chapter-detail/{translation_id}`` (HTML) via ``ctx.get_bytes``,
         extracts the ordered page URLs from the client-side ``chapterImages`` JSON
         array (GAP-3 — NOT ``<img>`` tags), and returns them. The CDN host is taken
         from that array, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF) — the host
@@ -1012,7 +1015,7 @@ class MangaBallSource(Source):
         is offloaded via ``asyncio.to_thread`` so it never blocks the event loop
         (RESEARCH Pitfall 6; ruff ASYNC).
         """
-        html = await ctx.get_bytes(f"{self.base_url}/chapter-detail/{translation_id}/")
+        html = await ctx.get_bytes(f"{self.base_url}/chapter-detail/{translation_id}")
         urls = await asyncio.to_thread(_extract_chapter_image_urls, html)
         if not urls:
             raise SourceError(
@@ -1041,7 +1044,7 @@ class MangaBallSource(Source):
 
         Delegates to ``ctx.get_bytes`` (mirror ``mangadex.fetch_image``): bounded by
         the per-job semaphore (Plan 03), NOT the per-source API limiter. No decrypt
-        — MangaBall serves plain ``.jpg``. A ``Referer: https://mangaball.net/`` is
+        — MangaBall serves plain ``.jpg``. A ``Referer: https://mangaball.com/`` is
         added ONLY if live-verify (Plan 04) shows the CDN hotlink-protects with a
         bare GET 403 (A7 / D-discretion — default is no Referer).
         """

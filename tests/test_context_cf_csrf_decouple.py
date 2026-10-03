@@ -3,7 +3,7 @@
 The forced-retry path in ``_request_response`` historically threaded ONE
 ``force_resolve`` flag through ``_send`` → ``_clearance_kwargs``, driving BOTH
 seams of a cf+csrf union source at once. When only the CSRF token went stale on a
-``cloudflare_challenge_optional`` source (mangaball.net homepage 200, no live CF
+``cloudflare_challenge_optional`` source (mangaball.com homepage 200, no live CF
 challenge), the forced retry still called the solver with ``force_resolve=True``,
 firing a doomed Android solve (no Turnstile → 120s WebView timeout → 30s fan-out
 timeout → MangaBall cooldown).
@@ -149,7 +149,7 @@ def _ctx(
     )
 
 
-_URL = "https://mangaball.net/api/v1/title/search-advanced/"
+_URL = "https://mangaball.com/api/v1/title/search-advanced"
 
 
 def _csrf_403(req: httpx.Request) -> httpx.Response:

@@ -56,10 +56,10 @@ _ENV_HOP_HOST = "SOLVER_HOP_HOST"
 _DEFAULT_ADB_TARGET = "redroid:5555"
 # The ONLY challenge hosts the sidecar will ever drive a device against — the
 # strict-Turnstile sources proven by the debug spike. A request for any other
-# host is rejected before any device action (SSRF guard, T-10-09). mangaball.net
+# host is rejected before any device action (SSRF guard, T-10-09). mangaball.com
 # joined 2026-06-15 (#243) after its managed-challenge escalation proved unclearable
 # by desktop Chromium from our Linux fingerprint (CI + deploy both timed out).
-_DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("mangadot.net", "kagane.to", "mangaball.net")
+_DEFAULT_ALLOWED_HOSTS: tuple[str, ...] = ("mangadot.net", "kagane.to", "mangaball.com")
 _DEFAULT_TIMEOUT_S = 120.0
 # Debug ``kagane-search-timeout`` part 1: 13s = just above the 11.2s max successful
 # solve and below the 21s fastest in-window failure (the empirical gap), so it aborts

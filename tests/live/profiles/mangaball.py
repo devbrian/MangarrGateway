@@ -41,7 +41,7 @@ ESCALATION HISTORY (D-12): ``MangaBallSource.antibot`` flipped ``"none"`` →
 ``"cloudflare"`` + a ``cloudflare_challenge_url``, then ``solver_engine = "android"``
 once desktop Chromium proved unable to clear it (above). The only glue beyond those
 attrs was threading cf_clearance into the bootstrap GET (the framework already owned
-the clearance path) — and adding ``mangaball.net`` to the sidecar SSRF allowlist
+the clearance path) — and adding ``mangaball.com`` to the sidecar SSRF allowlist
 (``SOLVER_ALLOWED_HOSTS`` / ``android_solver/config.py``), without which the sidecar
 422s the solve.
 
@@ -52,7 +52,7 @@ smoke modules key on ``id_field = "title_id"``.
 Default-query selection
 -----------------------
 ``default_query = "one piece"`` — chosen as a high-traffic, long-running title that
-reliably returns at least one hit from ``POST /api/v1/title/search-advanced/``
+reliably returns at least one hit from ``POST /api/v1/title/search-advanced``
 (``search_input=one piece`` is the literal recon-probed example, 07-RECON-mangaball.md
 §1 — ``name="One Piece"``, a stable ``_id``). Selection criteria, mirroring
 mangadex.py's discipline:
@@ -77,7 +77,7 @@ confirms / tunes:
 * **Referer on the CDN image GET (A5; RECON §4 / Open Q4)** — the
   ``chikorita.red-and-blue.net/storage/...`` CDN likely enforces hotlink
   protection. If the bare image GET 403s live, ``MangaBallSource.fetch_image`` must
-  add ``Referer: https://mangaball.net/`` (the fetch_image comment flags this).
+  add ``Referer: https://mangaball.com/`` (the fetch_image comment flags this).
 * **rate_limit_per_minute / search + recent shapes (A2/A3)** — confirm the
   form-POST ``search-advanced`` + ``getRecentlyUpdatedChapter`` envelopes and the
   ``chapter-listing-by-title-id`` flat shape match the recon (A7 fixture anchors).
@@ -87,7 +87,7 @@ confirms / tunes:
 Alt-title live smoke (#139)
 ---------------------------
 ``alt_title_query`` / ``alt_title_expected_substring`` populated (#139): a
-2026-06-05 live recon (CSRF-bootstrap + ``POST /api/v1/title/search-advanced/``)
+2026-06-05 live recon (CSRF-bootstrap + ``POST /api/v1/title/search-advanced``)
 confirmed mangaball matches native/alt names server-side and the ``alternateName``
 ``/``-separated HTML blob carries them — querying the Korean native title of Solo
 Leveling (``나 혼자만 레벨업``) returns the "Solo Leveling" series (its

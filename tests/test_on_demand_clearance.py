@@ -117,7 +117,7 @@ def _ctx(
     )
 
 
-_URL = "https://mangaball.net/api/v1/title/search-advanced/"
+_URL = "https://mangaball.com/api/v1/title/search-advanced"
 
 
 def _cf_challenge(req: httpx.Request) -> httpx.Response:

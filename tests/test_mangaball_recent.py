@@ -1,6 +1,6 @@
 """Unit tests for MangaBall ``/recent`` DIRECT releases (Task 2, rebuilt for GAP-1).
 
-The LIVE recent flow is TITLE-ONLY: ``POST /api/v1/title/search/``
+The LIVE recent flow is TITLE-ONLY: ``POST /api/v1/title/search``
 (``search_type=getRecentlyUpdatedChapter``) returns titles with NO ``chapters``
 key — the newest chapter is an HTML blob in each title's ``last_chapter`` field.
 ``_parse_last_chapter`` extracts the real ``translation_id``
@@ -52,7 +52,7 @@ def _last_chapter_html(
     """A realistic ``last_chapter`` HTML blob (GAP-1 locked structure)."""
     return (
         '<div class="d-flex align-items-center">'
-        f'<a href="https://mangaball.net/chapter-detail/{translation_id}/">'
+        f'<a href="https://mangaball.com/chapter-detail/{translation_id}/">'
         f"Ch. {number}</a>"
         f'<img class="flag" alt="{language}" title="{language}" '
         'src="/storage/flags/x.png">'
@@ -133,7 +133,7 @@ def test_parse_last_chapter_language_falls_back_to_en() -> None:
     """No flag <img> → language degrades gracefully to ``en``."""
     tx_id = "6a1e164ac01e2cf095f75b1a"
     html = (
-        f'<div><a href="https://mangaball.net/chapter-detail/{tx_id}/">Ch. 5</a></div>'
+        f'<div><a href="https://mangaball.com/chapter-detail/{tx_id}/">Ch. 5</a></div>'
     )
     parsed = _parse_last_chapter(html)
     assert parsed is not None
@@ -157,7 +157,7 @@ def test_parse_last_chapter_skips_non_flag_img_before_flag() -> None:
         "<div>"
         '<img class="group-icon" alt="Rayquaza Group" title="Rayquaza Group" '
         'src="/storage/groups/r.png">'
-        f'<a href="https://mangaball.net/chapter-detail/{tx_id}/">Ch. 12</a>'
+        f'<a href="https://mangaball.com/chapter-detail/{tx_id}/">Ch. 12</a>'
         '<img class="flag" alt="vi" title="vi" src="/storage/flags/vi.png">'
         "</div>"
     )
@@ -171,7 +171,7 @@ def test_parse_last_chapter_region_subtag_language_accepted() -> None:
     tx_id = "6a1e164ac01e2cf095f75b1a"
     html = (
         "<div>"
-        f'<a href="https://mangaball.net/chapter-detail/{tx_id}/">Ch. 7</a>'
+        f'<a href="https://mangaball.com/chapter-detail/{tx_id}/">Ch. 7</a>'
         '<img class="flag" alt="pt-br" src="/storage/flags/ptbr.png">'
         "</div>"
     )
@@ -189,7 +189,7 @@ def test_parse_last_chapter_rejects_trailing_double_dot_number() -> None:
     """
     tx_id = "6a1e164ac01e2cf095f75b1a"
     html = (
-        f'<div><a href="https://mangaball.net/chapter-detail/{tx_id}/">'
+        f'<div><a href="https://mangaball.com/chapter-detail/{tx_id}/">'
         "Ch. 1.2.3</a></div>"
     )
     parsed = _parse_last_chapter(html)
@@ -201,7 +201,7 @@ def test_parse_last_chapter_trailing_dot_number_clean() -> None:
     """WR-04: ``Ch. 23.`` captures a clean ``"23"`` (no trailing dot)."""
     tx_id = "6a1e164ac01e2cf095f75b1a"
     html = (
-        f'<div><a href="https://mangaball.net/chapter-detail/{tx_id}/">'
+        f'<div><a href="https://mangaball.com/chapter-detail/{tx_id}/">'
         "Ch. 23.</a></div>"
     )
     parsed = _parse_last_chapter(html)
@@ -251,7 +251,7 @@ async def test_recent_posts_search_with_recently_updated_type() -> None:
 
     assert len(ctx.calls) == 1
     url, body = ctx.calls[0]
-    assert url == "https://mangaball.net/api/v1/title/search/"
+    assert url == "https://mangaball.com/api/v1/title/search"
     assert body["search_type"] == "getRecentlyUpdatedChapter"
     assert body["page"] == 1
 
