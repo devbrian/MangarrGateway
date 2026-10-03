@@ -1071,20 +1071,55 @@ class SourceContext:
         contract). A non-opted/unpinned source leaves ``_ACTIVE_PROXY`` unset and falls
         through to ``download_transport``/``transport`` exactly as today (PROXY-06
         precedence is structural: a pinned proxy simply wins the transport pick).
+        An ``httpx.TransportError`` on the active pin rotates to a different pin and
+        re-sends, bounded by ``image_proxy_max_attempts`` (261003-pin-rotate-transport-
+        error); with no pin the error propagates unchanged.
         """
         pin_token: Token[PooledProxy | None] | None = self._set_search_pin()
         try:
-            return await self._reconcile_request(
-                url,
-                params=params,
-                limited=limited,
-                method=method,
-                data=data,
-                json_body=json_body,
-                extra_headers=extra_headers,
-                op=op,
-                bucket=bucket,
-            )
+            # 261003-pin-rotate-transport-error — the transport-failure analog of the
+            # D-08 origin-block rotation (``_rotate_and_retry_origin_block``). Tenacity
+            # wraps this whole method and ``_set_search_pin`` → ``get_or_acquire``
+            # returns the SAME sticky pin on every attempt, so a dead proxy
+            # (ConnectTimeout / 407 ProxyError) was re-hit forever. ``rotate`` →
+            # ``mark_failed`` cools it down, so the NEXT request's ``_set_search_pin``
+            # also rides the new pin. No per-rotation reset token is needed: the outer
+            # ``finally`` resets ``pin_token``, discarding the intermediate sets.
+            # ponytail: concurrent requests failing on the same dead pin may each
+            # rotate and briefly cool a good proxy (same race as D-08); upgrade = only
+            # rotate while ``current(source_key)`` is still the failed pin.
+            tried: set[str] = set()
+            while True:
+                try:
+                    return await self._reconcile_request(
+                        url,
+                        params=params,
+                        limited=limited,
+                        method=method,
+                        data=data,
+                        json_body=json_body,
+                        extra_headers=extra_headers,
+                        op=op,
+                        bucket=bucket,
+                    )
+                except httpx.TransportError as exc:
+                    old = _ACTIVE_PROXY.get()
+                    if pin_token is None or old is None:
+                        raise  # no pin → unchanged; tenacity sees the raw error
+                    tried.add(old.selection_key)
+                    if len(tried) >= self._image_proxy_max_attempts:
+                        raise
+                    assert self._source_pins is not None  # a pin token implies pins
+                    new_pin = self._source_pins.rotate(self._source_key, exclude=tried)
+                    if new_pin is None:
+                        raise  # pool exhausted — surface the last transport error
+                    _log.info(
+                        "search proxy %s failed (%s) — rotating to %s",
+                        old.identity,
+                        type(exc).__name__,
+                        new_pin.identity,
+                    )
+                    _ACTIVE_PROXY.set(new_pin)
         finally:
             if pin_token is not None:
                 _ACTIVE_PROXY.reset(pin_token)
