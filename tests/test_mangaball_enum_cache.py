@@ -3,8 +3,9 @@
 MangaBall is a title-only fan-out source: Layer 1 (``cached_resolve``) caches the
 pruned candidate list (the ``search-advanced`` POST) and Layer 2
 (``cached_enumerate``) caches each candidate's RAW ``chapter-listing-by-title-id``
-ALL_CHAPTERS enumeration. The headline win is that a repeat same-(query, languages)
-chapter search issues ZERO upstream POSTs on the second search (both layers HIT).
+flat v2 rows (261003-mangaball-api-v2). The headline win is that a repeat
+same-(query, languages) chapter search issues ZERO upstream POSTs on the second
+search (both layers HIT).
 
 Three assertions, all network-free (a call-counting ``SourceContext`` stand-in
 that delegates the cache seam to a REAL ``EnumerationCache``):
@@ -29,84 +30,32 @@ from manga_gateway.framework.enum_cache import EnumerationCache
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.models.search import SearchRequest
 from manga_gateway.sources.mangaball import MangaBallSource
+from tests.test_mangaball_search import (
+    _chapter,
+    _chapter_listing,
+    _search_envelope,
+    _title,
+)
 
 _SEARCH_ADVANCED = "https://mangaball.com/api/v1/title/search-advanced"
 _CHAPTER_LISTING = "https://mangaball.com/api/v1/chapter/chapter-listing-by-title-id"
 _TITLE_ID = "0123456789abcdef01234567"  # 24-hex (guid contract)
 
 
-def _translation(*, tx_id: str, language: str = "en") -> dict[str, Any]:
-    return {
-        "id": tx_id,
-        "name": "Chapter English",
-        "language": language,
-        "languageName": "English",
-        "group": {"_id": "daomeoden", "name": "Rayquaza", "icon": "/x.png"},
-        "date": "2026-06-01 23:33:42",
-        "pages": 66,
-        "url": f"http://mangaball.com/chapter-detail/{tx_id}/",
-        "volume": 0,
-    }
-
-
-def _chapter(*, number_float: float, tx_id: str) -> dict[str, Any]:
-    return {
-        "number": f"Ch. {number_float}",
-        "number_float": number_float,
-        "title": "",
-        "translations": [_translation(tx_id=tx_id)],
-    }
-
-
 def _chapter_rows() -> list[dict[str, Any]]:
     """A 10.x floor family (``10`` + ``10.5``) so the post-cache filter is visible."""
     return [
-        _chapter(number_float=10.0, tx_id="aaaaaaaaaaaaaaaaaaaaaa10"),
-        _chapter(number_float=10.5, tx_id="aaaaaaaaaaaaaaaaaaaaa105"),
-        _chapter(number_float=11.0, tx_id="aaaaaaaaaaaaaaaaaaaaaa11"),
-        _chapter(number_float=12.0, tx_id="aaaaaaaaaaaaaaaaaaaaaa12"),
+        _chapter(row_id="aaaaaaaaaaaaaaaaaaaaaa10", number=10, title_id=_TITLE_ID),
+        _chapter(row_id="aaaaaaaaaaaaaaaaaaaaa105", number=10.5, title_id=_TITLE_ID),
+        _chapter(row_id="aaaaaaaaaaaaaaaaaaaaaa11", number=11.0, title_id=_TITLE_ID),
+        _chapter(row_id="aaaaaaaaaaaaaaaaaaaaaa12", number=12.0, title_id=_TITLE_ID),
     ]
 
 
-def _title(*, title_id: str = _TITLE_ID, name: str = "One Piece") -> dict[str, Any]:
-    return {
-        "_id": title_id,
-        "name": name,
-        "alternateName": 'ワンピース<span class="text-muted">/</span>OP',
-        "status": '<span class="badge">Ongoing</span>',
-        "last_chapter": '<div class="lc"><a href="/x">Ch. 12</a></div>',
-        "url": f"http://mangaball.com/title-detail/one-piece-{title_id}/",
-        "updated_at": "2026-06-01 23:33:42",
-    }
-
-
-def _search_envelope(titles: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "code": 200,
-        "message": "ok",
-        "data": titles,
-        "pagination": {
-            "total": len(titles),
-            "limit": 28,
-            "current_page": 1,
-            "last_page": 1,
-        },
-    }
-
-
-def _chapter_listing(chapters: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "code": 200,
-        "message": "ok",
-        "TOTAL_CHAPTERS": len(chapters),
-        "ALL_CHAPTERS": chapters,
-        "ALL_LANGUAGES": ["en"],
-    }
-
-
 class _CountingCtx:
-    """``SourceContext`` stand-in: counts the two POSTs + delegates the cache seam to
-    a REAL ``EnumerationCache`` (so the cache behavior, not a stub, is exercised).
+    """``SourceContext`` stand-in: counts the search-advanced form POST
+    (``post_json``) + the JSON-body listing POST (``post_json_body``) and delegates
+    the cache seam to a REAL ``EnumerationCache`` (so the cache, not a stub, runs).
     """
 
     def __init__(
@@ -151,11 +100,15 @@ class _CountingCtx:
         if url == _SEARCH_ADVANCED:
             self.search_calls += 1
             return _search_envelope(self._titles)
+        raise AssertionError(f"unexpected post_json url: {url}")
+
+    async def post_json_body(
+        self, url: str, *, body: dict[str, Any], **_kw: Any
+    ) -> dict[str, Any]:
         if url == _CHAPTER_LISTING:
             self.listing_calls += 1
-            title_id = str(data.get("title_id"))
-            return _chapter_listing(self._listings.get(title_id, []))
-        raise AssertionError(f"unexpected post_json url: {url}")
+            return _chapter_listing(self._listings.get(str(body["title_id"]), []))
+        raise AssertionError(f"unexpected post_json_body url: {url}")
 
 
 # ──────────── headline: zero upstream POSTs on the repeat chapter search ────────────
@@ -166,7 +119,7 @@ async def test_repeat_same_series_chapter_search_zero_upstream_calls() -> None:
     """A manga search then a same-series chapter search → 0 ``search-advanced`` POSTs
     AND 0 ``chapter-listing`` POSTs on the second search; floor family right."""
     ctx = _CountingCtx(
-        titles=[_title()],
+        titles=[_title(title_id=_TITLE_ID)],
         listings={_TITLE_ID: _chapter_rows()},
         enum_cache=EnumerationCache(),
     )
@@ -189,10 +142,10 @@ async def test_repeat_same_series_chapter_search_zero_upstream_calls() -> None:
     assert ctx.listing_calls - listing_after_first == 0
 
     # The floor filter is applied post-cache (in _chapters_to_releases): chapter=10
-    # keeps the whole-number/floor family (10.0 and 10.5), nothing else (the source
-    # parses the float ``number_float`` so 10.0 keeps its trailing zero).
+    # keeps the whole-number/floor family (10 and 10.5), nothing else (the int 10
+    # row normalizes to "10").
     nums = sorted(str(r.chapter_number) for r in second)
-    assert nums == ["10.0", "10.5"]
+    assert nums == ["10", "10.5"]
     # Fresh handle per serve (CACHE-03/05) — every served release resolves.
     assert all(r.download_handle for r in second)
     for rel in second:
@@ -206,7 +159,7 @@ async def test_repeat_same_series_chapter_search_zero_upstream_calls() -> None:
 async def test_kill_switch_reissues_both_upstream_calls() -> None:
     """``enabled=False`` (D-08): the repeat chapter search re-fires both POSTs."""
     ctx = _CountingCtx(
-        titles=[_title()],
+        titles=[_title(title_id=_TITLE_ID)],
         listings={_TITLE_ID: _chapter_rows()},
         enum_cache=EnumerationCache(enabled=False),
     )

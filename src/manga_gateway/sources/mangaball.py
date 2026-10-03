@@ -79,13 +79,11 @@ import posixpath
 import re
 import string
 from collections.abc import Coroutine
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
-
-import lxml.html
 
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
@@ -99,7 +97,9 @@ if TYPE_CHECKING:
     from ..models.search import SearchRequest
 
 # Default content rating + sort filters observed on the live search-advanced XHR
-# (RECON §1). The keyword rides ``search_input``; the rest are the page's defaults.
+# (RECON §1). The keyword rides ``keyword`` (261003-mangaball-api-v2: the v2 backend
+# IGNORES the old ``search_input`` key and returns every title); the rest are the
+# page's defaults.
 _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
     "filters[sort]": "updated_chapters_desc",
     "filters[page]": 1,
@@ -115,7 +115,7 @@ _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
 }
 
 # WAF trigger-word denylist (260620-5yq). mangaball.com's WAF 403s ANY search POST
-# whose ``search_input`` contains a SQL-injection-flavoured token with the
+# whose ``keyword`` contains a SQL-injection-flavoured token with the
 # ``Malicious payload detected`` body; the framework turns that into a catchable
 # ``waf_blocked`` SourceError (context.is_waf_block). Only ``"system"`` is
 # live-confirmed — add tokens here as more false-positives surface (a small frozenset
@@ -173,44 +173,15 @@ _CHAPTERS_FANOUT_CONCURRENCY = 6
 # `since` comparison (mirrors recent.py:_TS_FLOOR / _parse_ts).
 _TS_FLOOR = datetime.min.replace(tzinfo=UTC)
 
-# Relative-time parse for the recent feed's ``last_chapter`` dates ("1d ago",
-# "3h ago", "5m ago"). Best-effort → absolute ISO publishDate (see
-# :func:`_relative_to_iso`). Dates in the recent feed are RELATIVE (GAP-1 probe).
-# WR-02: the unit alternation tries the LONGER tokens first (``mo``/``min`` before
-# the bare ``m``) so ``"2mo ago"`` → months and ``"5min ago"`` → minutes regardless
-# of the bare-``m`` mapping. OBSERVED convention (GAP-1 recon TL;DR sampled
-# ``1d/3h/5m``): a bare ``m`` is MINUTES on MangaBall, months render as ``mo``. If a
-# live re-run shows MangaBall rendering months as a bare ``2m`` instead, remap the
-# bare ``"m"`` below to months — the explicit ``min`` token already covers minutes
-# so the swap is isolated to one entry. The approximation is intentional and coarse
-# (units like ``mo`` ≈ 30d); the route's ``since`` cut is the authoritative filter.
-_RELATIVE_AGO_RE = re.compile(r"(\d+)\s*(mo|min|[smhdwy])\b", re.IGNORECASE)
-_RELATIVE_UNIT_SECONDS: dict[str, int] = {
-    "s": 1,
-    "m": 60,  # OBSERVED: bare ``m`` = minutes on MangaBall (recon ``5m``); see WR-02
-    "min": 60,
-    "h": 3600,
-    "d": 86400,
-    "w": 604800,
-    "mo": 2592000,  # ~30d
-    "y": 31536000,  # ~365d
-}
+# 261003-mangaball-api-v2: the v2 rows carry site language codes that are mostly
+# BCP-47 already; only these two diverge from the codes Mangarr expects.
+_LANG_MAP = {"kr": "ko", "cn": "zh"}
 
-# ``last_chapter`` HTML: the chapter-detail anchor carries the real translation_id.
-# Extract it, NEVER reconstruct (CLAUDE.md SSRF) — fetch_manifest re-uses it as the
-# chapter-detail path segment, then SSRF-allowlists every resulting image URL.
-_CHAPTER_DETAIL_HREF_RE = re.compile(r"/chapter-detail/([^/?#]+)/?")
-# Chapter number after a ``Ch.`` / ``Chapter`` label in the anchor text. Anchored to
-# a clean ``N`` / ``N.M`` shape (WR-04): a greedy ``[\d.]+`` accepted ``"1.2.3"`` /
-# trailing dots, which ``_parse_decimal`` then rejects → a ``ch-?`` guid or a silent
-# title drop. ``\d+(?:\.\d+)?`` guarantees a ``_parse_decimal``-clean capture.
-_CHAPTER_NUMBER_RE = re.compile(r"(?:ch(?:apter)?\.?)\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
-# Flag-image language token: a BCP-47-ish ``xx`` / ``xx-yy`` code (WR-01). The
-# ``last_chapter`` blob is NOT guaranteed to hold only a flag <img> — a preceding
-# group-icon img (``alt="Rayquaza Group"``) would otherwise poison ``language``
-# (breaking the ``[a-z-]`` guid shape and wrongly failing the recent language
-# filter). Validate the token shape before accepting it as a language.
-_LANG_TOKEN_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2,})?$")
+
+def _row_language(row: dict[str, Any]) -> str:
+    """A v2 listing/recent row's ``lang`` → release language (lowercased, mapped)."""
+    lang = str(row.get("lang") or "en").lower()
+    return _LANG_MAP.get(lang, lang)
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -294,113 +265,6 @@ def _items_and_pagination(
     return (data if isinstance(data, list) else []), body.get("pagination")
 
 
-# ─────────────────────── recent() last_chapter HTML parse (GAP-1) ────────────
-
-
-def _relative_to_iso(raw: str) -> str | None:
-    """Best-effort convert a relative ``last_chapter`` date → absolute ISO-8601.
-
-    The recent feed renders chapter dates RELATIVE ("1d ago", "3h ago", "5m ago",
-    "2mo ago"; GAP-1 probe), so there is no absolute timestamp to read. We subtract
-    the parsed offset from ``now(UTC)`` to get an APPROXIMATE absolute publishDate
-    — close enough for the route's newest-first sort + ``since`` cut (which is the
-    authoritative filter). Returns ``None`` when no relative token is found so the
-    caller can fall back to the title's ``updated_at`` or ``now``. The approximation
-    is intentional and documented (units are coarse, e.g. "mo" ≈ 30d).
-    """
-    if not raw:
-        return None
-    match = _RELATIVE_AGO_RE.search(raw)
-    if match is None:
-        return None
-    amount = int(match.group(1))
-    unit = match.group(2).lower()
-    seconds = _RELATIVE_UNIT_SECONDS.get(unit)
-    if seconds is None:
-        return None
-    moment = datetime.now(UTC) - timedelta(seconds=amount * seconds)
-    return moment.isoformat()
-
-
-def _parse_last_chapter(html: str) -> dict[str, Any] | None:
-    """Parse ONE recent-feed ``last_chapter`` HTML blob → release fields (GAP-1).
-
-    Blocking (lxml C-parse) by design — the caller offloads it via
-    ``asyncio.to_thread`` (RESEARCH Pitfall 6 / ruff ASYNC), mirroring
-    :func:`_extract_chapter_image_urls`. Extracts, defensively:
-
-    * ``translation_id`` — the trailing path segment of the ``chapter-detail/{id}/``
-      anchor href (regex-captured, NEVER reconstructed — CLAUDE.md SSRF). REQUIRED;
-      returns ``None`` when absent.
-    * ``number`` — the digits/decimal after ``Ch.``/``Chapter`` in the anchor text.
-      REQUIRED; returns ``None`` when absent (a chapter without a number cannot mint
-      a sane guid).
-    * ``language`` — the ``alt``/``title`` of the flag ``<img>``, accepted ONLY when
-      it matches a BCP-47-ish ``xx``/``xx-yy`` token (a preceding non-flag img must
-      not poison it — WR-01); falls back to ``"en"``.
-    * ``group`` — the ``title`` (or text) of the ``/group/{slug}/`` anchor; ``None``
-      when absent.
-    * ``date_raw`` — the raw relative date text (e.g. "1d ago"), for
-      :func:`_relative_to_iso`.
-
-    Returns the field dict, or ``None`` when the blob has no resolvable
-    chapter-detail id or no parseable chapter number.
-    """
-    if not html:
-        return None
-    try:
-        doc = lxml.html.fragment_fromstring(html, create_parent="div")
-    except Exception:
-        return None
-
-    translation_id: str | None = None
-    number: str | None = None
-    group: str | None = None
-    date_raw = ""
-    language = "en"
-
-    for anchor in doc.iter("a"):
-        href = anchor.get("href") or ""
-        detail = _CHAPTER_DETAIL_HREF_RE.search(href)
-        if detail is not None and translation_id is None:
-            translation_id = detail.group(1)
-            # The chapter number rides the chapter-detail anchor's text.
-            num_match = _CHAPTER_NUMBER_RE.search(anchor.text_content())
-            if num_match is not None:
-                number = num_match.group(1)
-        elif "/group/" in href and group is None:
-            group = _strip_html(anchor.get("title")) or _strip_html(
-                anchor.text_content()
-            )
-
-    if translation_id is None or number is None:
-        return None
-
-    # Language flag: alt/title on a flag <img>. Accept ONLY a BCP-47-ish token
-    # (WR-01) — a preceding non-flag img (e.g. a group icon ``alt="Rayquaza Group"``)
-    # must not poison ``language`` (which flows into the guid + the recent language
-    # filter). Off-shape alt/title values are skipped; ``language`` stays ``"en"``.
-    for img in doc.iter("img"):
-        flag = (img.get("alt") or img.get("title") or "").strip().lower()
-        if flag and _LANG_TOKEN_RE.match(flag):
-            language = flag
-            break
-
-    # Best-effort relative date text anywhere in the blob.
-    text = doc.text_content()
-    ago = _RELATIVE_AGO_RE.search(text)
-    if ago is not None:
-        date_raw = ago.group(0)
-
-    return {
-        "translation_id": translation_id,
-        "number": number,
-        "language": language,
-        "group": group,
-        "date_raw": date_raw,
-    }
-
-
 class _TextExtractor(HTMLParser):
     """Stdlib HTML→text stripper for the HTML-string Title fields (RECON Gotchas).
 
@@ -443,11 +307,14 @@ def _strip_html(raw: Any) -> str | None:
 def _split_alt(raw: Any) -> list[str]:
     """Split the ``alternateName`` HTML field into plain-text alt titles (#139).
 
-    ``alternateName`` arrives as a ``/``-separated HTML string (e.g.
-    ``ワンピース<span>/</span>OP``). Strip the HTML, split on ``/``, strip each
-    piece, and drop empties. Returns ``[]`` for ``None``/empty input so the
-    candidate simply carries no alt titles (behavior unchanged).
+    The v2 backend sends ``alternateName`` as a LIST of plain strings
+    (261003-mangaball-api-v2) — return its stripped non-empty items. The legacy
+    shape (a ``/``-separated HTML string, e.g. ``ワンピース<span>/</span>OP``) is still
+    accepted: strip the HTML, split on ``/``, strip each piece, drop empties.
+    Returns ``[]`` for ``None``/empty input so the candidate carries no alt titles.
     """
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if isinstance(x, str) and x.strip()]
     stripped = _strip_html(raw)
     if not stripped:
         return []
@@ -622,32 +489,33 @@ class MangaBallSource(Source):
     supports_recent = True
 
     async def search(self, req: SearchRequest, ctx: SourceContext) -> list[Release]:
-        """Keyword search → per-(chapter×translation) Releases (SRCH-01..07, D-08).
+        """Keyword search → per-listing-row Releases (SRCH-01..07, D-08).
 
         Two-call live flow (GAP-1 lock): ``search-advanced`` is TITLE-ONLY, so
         ``search`` ALWAYS deep-enumerates the first ``_DEFAULT_TITLE_CANDIDATES``
-        title candidates via a per-candidate ``chapter-listing-by-title-id`` POST.
+        title candidates via a per-candidate ``chapter-listing-by-title-id`` JSON POST.
         The MangaDex 15-interactive escalation is DROPPED — ``req.interactive``
         does NOT change the candidate count for MangaBall.
 
-        For each candidate the flat ``ALL_CHAPTERS`` listing is walked and ONE
-        Release is minted per ``(chapter × translation)`` via :meth:`_to_release`
-        (preserving multi-group-same-language: two ``en`` translations of one
-        chapter → two distinct guids). Releases are language-filtered by
-        ``req.languages``, ordered NEWEST-FIRST by translation ``date``, and sliced
-        to ``req.limit`` PER candidate (mirror MangaDex's per-candidate feed bound).
-        ZERO networking glue — both POSTs are ``ctx.post_json`` (SRC-01/02).
+        261003-mangaball-api-v2: the listing is FLAT — one row per (chapter ×
+        language × group) — and ONE Release is minted per row via
+        :meth:`_to_release` (two ``en`` groups of one chapter → two distinct guids).
+        Releases are language-filtered by ``req.languages``, ordered NEWEST-FIRST by
+        row ``created_at``, and sliced to ``req.limit`` PER candidate (mirror
+        MangaDex's per-candidate feed bound). ZERO networking glue — the POSTs are
+        ``ctx.post_json`` / ``ctx.post_json_body`` (SRC-01/02).
         """
 
         async def _resolve_fn() -> list[dict[str, Any]]:
             original = req.query or ""
 
-            async def _post_search(search_input: str) -> dict[str, Any]:
-                # Keep the form construction EXACTLY as before — only which
-                # ``search_input`` value is posted ever changes (the retry).
+            async def _post_search(keyword: str) -> dict[str, Any]:
+                # Only which ``keyword`` value is posted ever changes (the retry).
+                # 261003-mangaball-api-v2: ``keyword`` is the v2 query key and
+                # ``limit`` (max 50) sets the page size.
                 return await ctx.post_json(
                     f"{self.base_url}/api/v1/title/search-advanced",
-                    data={"search_input": search_input, **_SEARCH_DEFAULT_FILTERS},
+                    data={"keyword": keyword, "limit": 50, **_SEARCH_DEFAULT_FILTERS},
                 )
 
             # 260620-5yq: single sanitize-and-retry on a WAF false-positive 403. The
@@ -763,41 +631,42 @@ class MangaBallSource(Source):
         sem = asyncio.Semaphore(_CHAPTERS_FANOUT_CONCURRENCY)
 
         async def _fetch_candidate(title_id: str, manga_title: str) -> list[Release]:
-            # Layer 2 (CACHE-02/03): cache the UNFILTERED per-candidate ALL_CHAPTERS
-            # listing per (title_id, languages). The ``async with sem:`` + the
-            # chapter-listing POST + the ``_items_and_pagination`` extraction live
-            # INSIDE ``_enum_fn`` so a HIT acquires NEITHER the fan-out semaphore NOR
-            # a rate-limit token (the limiter lives inside ``post_json``, one level
-            # below the cache check). ``exhausted=True``: the ALL_CHAPTERS listing is
-            # the COMPLETE feed, so ``covers_floor`` is always True (no refetch).
+            # Layer 2 (CACHE-02/03): cache the UNFILTERED per-candidate listing rows
+            # per (title_id, languages). The ``async with sem:`` + the chapter-listing
+            # POST + the ``_items_and_pagination`` extraction live INSIDE ``_enum_fn``
+            # so a HIT acquires NEITHER the fan-out semaphore NOR a rate-limit token
+            # (the limiter lives inside ``post_json_body``, one level below the cache
+            # check). ``exhausted=True``: the v2 listing is the COMPLETE flat feed (no
+            # pagination), so ``covers_floor`` is always True (no refetch).
+            # 261003-mangaball-api-v2: the listing now takes a JSON body (a form POST
+            # returns 400).
             async def _enum_fn() -> Enumeration:
                 async with sem:
-                    listing = await ctx.post_json(
+                    listing = await ctx.post_json_body(
                         f"{self.base_url}/api/v1/chapter/chapter-listing-by-title-id",
-                        data={"title_id": title_id, "userSettingsEnabled": "false"},
+                        body={"title_id": title_id},
                     )
-                all_chapters, _ = _items_and_pagination(listing)
+                rows, _ = _items_and_pagination(listing)
                 return Enumeration(
-                    items=all_chapters,
+                    items=rows,
                     chapter_numbers=tuple(
                         d
-                        for c in all_chapters
-                        if isinstance(c, dict)
-                        and (d := self._parse_decimal(c.get("number_float")))
-                        is not None
+                        for r in rows
+                        if isinstance(r, dict)
+                        and (d := self._row_number(r)) is not None
                     ),
                     exhausted=True,
                     requested_limit=per_candidate_limit,
                 )
 
-            # IN-02: the ALL_CHAPTERS listing is the whole title's feed and does NOT
+            # IN-02: the listing is the whole title's feed and does NOT
             # depend on ``languages`` (the language filter is applied post-cache), so
             # key on ``[]`` — different-language requests for one title share the
             # cached listing instead of re-fetching byte-identical data per language.
             enum = await ctx.cached_enumerate(
                 ctx.cached_enumerate_key(title_id, []), _enum_fn
             )
-            # _chapters_to_releases is UNCHANGED — the chapter_matches filter +
+            # _chapters_to_releases keeps the chapter_matches filter +
             # newest-first sort + [:limit] + GAP-2 mint-after-slice all stay; it
             # simply consumes ``enum.items`` (the cached raw rows) instead of the
             # raw fetch result.
@@ -816,7 +685,7 @@ class MangaBallSource(Source):
         # ``if not title_id: continue`` skip).
         tasks: list[Coroutine[Any, Any, list[Release]]] = []
         for title in candidates:
-            title_id = title.get("_id")
+            title_id = title.get("_id") or title.get("id")
             if not title_id:
                 continue
             title_id = str(title_id)
@@ -840,7 +709,7 @@ class MangaBallSource(Source):
 
     def _chapters_to_releases(
         self,
-        all_chapters: list[Any],
+        listing_rows: list[Any],
         title_id: str,
         manga_title: str,
         wanted_langs: set[str] | None,
@@ -848,47 +717,38 @@ class MangaBallSource(Source):
         ctx: SourceContext,
         req: SearchRequest,
     ) -> list[Release]:
-        """Walk one candidate's flat ``ALL_CHAPTERS`` → per-translation Releases.
+        """Walk one candidate's flat v2 listing rows → per-row Releases.
 
-        Language-filtered, NEWEST-FIRST by translation ``date`` (parsed via
-        :func:`_parse_ts`), sliced to ``limit``. Multi-group-same-language is
-        preserved: distinct translation ids → distinct guids.
+        261003-mangaball-api-v2: each row is one (chapter × language × group) — the
+        download unit. Rows are ``chapter_matches``-gated, language-filtered (on the
+        mapped code), sorted NEWEST-FIRST by ``created_at`` (parsed via
+        :func:`_parse_ts`), and sliced to ``limit``. Multi-group-same-language is
+        preserved: distinct row ids → distinct guids.
 
         GAP-2 (live): mint handles ONLY for the post-slice survivors. A long-running
-        title (One Piece ≈ 1382 chapters × thousands of translations) would otherwise
-        mint tens of thousands of handles per candidate — blowing past the
-        ``HandleStore`` ``maxsize`` (default 200_000, GATEWAY_HANDLE_MAXSIZE) so the
-        TTLCache EVICTS the very handles
-        attached to the releases we return, and a later ``POST /downloads`` for
-        ``releases[0]`` resolves to a miss ("release no longer resolvable"). Collect
-        sort keys first, slice to ``limit``, THEN mint — handle count per candidate is
-        bounded by ``limit`` and the returned releases' handles always survive.
+        title (One Piece ≈ 1382 chapters × many languages/groups) would otherwise mint
+        tens of thousands of handles per candidate — blowing past the ``HandleStore``
+        ``maxsize`` (default 200_000, GATEWAY_HANDLE_MAXSIZE) so the TTLCache EVICTS
+        the very handles attached to the releases we return. Collect sort keys first,
+        slice to ``limit``, THEN mint.
         """
         rows: list[tuple[datetime, Decimal | None, dict[str, Any]]] = []
-        for chapter in all_chapters:
-            if not isinstance(chapter, dict):
-                continue
-            number = self._parse_decimal(chapter.get("number_float"))
-            # 260606-2ff: drop a non-matching chapter (all its translations) BEFORE it
-            # enters `rows` → before the newest-first sort / [:limit] slice / mint
-            # (preserves the GAP-2 mint-after-slice ordering). Gate-off = pass-through.
+        for row in listing_rows:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue  # no download unit → _to_release would drop it anyway
+            number = self._row_number(row)
+            # 260606-2ff: drop a non-matching chapter BEFORE it enters `rows` →
+            # before the newest-first sort / [:limit] slice / mint (preserves the
+            # GAP-2 mint-after-slice ordering). Gate-off = pass-through.
             if not self.chapter_matches(req, number):
                 continue
-            for translation in chapter.get("translations") or []:
-                if not isinstance(translation, dict):
-                    continue
-                if not translation.get("id"):
-                    continue  # no resolve unit → _to_release would drop it anyway
-                language = str(translation.get("language") or "en")
-                if wanted_langs is not None and language not in wanted_langs:
-                    continue
-                rows.append(
-                    (_parse_ts(str(translation.get("date") or "")), number, translation)
-                )
-        rows.sort(key=lambda row: row[0], reverse=True)  # newest-first
+            if wanted_langs is not None and _row_language(row) not in wanted_langs:
+                continue
+            rows.append((_parse_ts(str(row.get("created_at") or "")), number, row))
+        rows.sort(key=lambda r: r[0], reverse=True)  # newest-first
         releases: list[Release] = []
-        for _ts, number, translation in rows[:limit]:  # mint AFTER slice (GAP-2)
-            rel = self._to_release(title_id, manga_title, number, translation, ctx)
+        for _ts, number, row in rows[:limit]:  # mint AFTER slice (GAP-2)
+            rel = self._to_release(title_id, manga_title, number, row, ctx)
             if rel is not None:
                 releases.append(rel)
         return releases
@@ -901,79 +761,55 @@ class MangaBallSource(Source):
         since: str | None,
         ctx: SourceContext,
     ) -> list[Release]:
-        """Newest-first recent chapters → DIRECT releases (RCNT-01/02, GAP-1 lock).
+        """Newest-first recent chapters → DIRECT releases (RCNT-01/02).
 
-        POSTs ``/api/v1/title/search`` with ``search_type=getRecentlyUpdatedChapter``
-        (TITLE-ONLY shape — no ``chapters`` key). For each title the newest chapter
-        is an HTML blob in ``last_chapter`` carrying the real ``translation_id``,
-        number, language flag, and group anchor; :func:`_parse_last_chapter` (lxml,
-        offloaded via ``asyncio.to_thread`` per ruff ASYNC) extracts them and we mint
-        a DIRECT Release whose ``ResolutionRecord.chapter_id`` is the bare
-        translation_id (NOT a ``:DEFERRED`` composite — MangaBall does not need the
-        Comix late-bind because the recent feed exposes the stable id).
-
-        Dates in the recent feed are RELATIVE ("1d ago") so the absolute
-        ``publishDate`` is a best-effort approximation (:func:`_relative_to_iso`,
-        falling back to the title's ``updated_at`` then ``now``). The route applies
-        the authoritative newest-first sort + ``since`` cut (recent.py); the
-        source-side ``since`` comparison is therefore best-effort and is left to the
-        route (a release always carries a parseable publishDate so the route keeps
-        it). ``languages`` filters by the parsed flag language when supplied. Zero
-        networking glue — ``ctx.post_json`` owns the transport (SRC-02).
+        POSTs ``/api/v1/title/search`` with ``search_type=getRecentlyUpdatedChapter``.
+        261003-mangaball-api-v2: each title carries ``recent_chapters`` rows of the
+        SAME shape as the chapter listing (no HTML to parse), so ONE DIRECT Release is
+        minted per row via :meth:`_to_release` — ``ResolutionRecord.chapter_id`` is
+        the row id. ``publishDate`` comes from the row ``created_at``, falling back to
+        the title ``updated_at``, then now. ``languages`` filters on the mapped code.
+        The route applies the authoritative newest-first sort + ``since`` cut
+        (recent.py). Zero networking glue — ``ctx.post_json`` owns the transport.
         """
         form: dict[str, Any] = {"search_type": "getRecentlyUpdatedChapter", "page": 1}
         body = await ctx.post_json(f"{self.base_url}/api/v1/title/search", data=form)
         titles, _pagination = _items_and_pagination(body)
 
         wanted_langs = set(languages) if languages else None
-        releases: list[Release] = []
+        rows: list[tuple[datetime, str, str, dict[str, Any]]] = []
         for title in titles:
             if not isinstance(title, dict):
                 continue
-            title_id = title.get("_id")
+            title_id = title.get("_id") or title.get("id")
             if not title_id:
                 continue
-            title_id = str(title_id)
             manga_title = _strip_html(title.get("name")) or "Unknown"
-            last = await asyncio.to_thread(
-                _parse_last_chapter, str(title.get("last_chapter") or "")
-            )
-            if last is None:
-                continue
-            language = last["language"]
-            if wanted_langs is not None and language not in wanted_langs:
-                continue
-            publish_date = (
-                _relative_to_iso(last["date_raw"])
-                or self._title_updated_iso(title)
-                or datetime.now(UTC).isoformat()
-            )
-            translation = {
-                "id": last["translation_id"],
-                "language": language,
-                "group": {"name": last["group"]} if last["group"] else None,
-                "date": publish_date,
-                "pages": None,
-            }
-            number = self._parse_decimal(last["number"])
-            rel = self._to_release(title_id, manga_title, number, translation, ctx)
-            if rel is not None:
-                releases.append(rel)
+            for row in title.get("recent_chapters") or []:
+                if not isinstance(row, dict):
+                    continue
+                if wanted_langs is not None and _row_language(row) not in wanted_langs:
+                    continue
+                if not row.get("created_at"):
+                    # Fallback publishDate: the title's updated_at (then now, via
+                    # _normalize_publish_date).
+                    row = {**row, "created_at": title.get("updated_at")}
+                ts = _parse_ts(str(row.get("created_at") or ""))
+                rows.append((ts, str(title_id), manga_title, row))
             # WR-03: do NOT break at ``limit`` over raw feed order. The route
             # (recent.py) applies the authoritative newest-first sort + ``since``
             # cut, then re-trims to the merged limit — an in-loop break in FEED
-            # order would (a) hide a genuinely-newer title sitting past position
-            # ``limit`` from that sort, and (b) combined with skip-on-unparseable
-            # (the ``continue`` above), shrink the result below ``limit`` even when
-            # more parseable titles exist further down. Consume the whole page;
-            # ``since`` is intentionally ignored source-side (IN-01).
+            # order would hide a genuinely-newer row sitting past position
+            # ``limit`` from that sort. Consume the whole page; ``since`` is
+            # intentionally ignored source-side (IN-01).
+        rows.sort(key=lambda r: r[0], reverse=True)  # newest-first
+        releases: list[Release] = []
+        for _ts, title_id, manga_title, row in rows:
+            number = self._row_number(row)
+            rel = self._to_release(title_id, manga_title, number, row, ctx)
+            if rel is not None:
+                releases.append(rel)
         return releases
-
-    @staticmethod
-    def _title_updated_iso(title: dict[str, Any]) -> str | None:
-        """Best-effort absolute publishDate from the title's ``updated_at``."""
-        parsed = _parse_ts(str(title.get("updated_at") or ""))
-        return None if parsed == _TS_FLOOR else parsed.isoformat()
 
     # ───────────────────────── R6 fetch/package hooks (PKG-01/02) ────────────────
 
@@ -1057,24 +893,29 @@ class MangaBallSource(Source):
         title_id: str,
         manga_title: str,
         chapter_number: Decimal | None,
-        translation: dict[str, Any],
+        row: dict[str, Any],
         ctx: SourceContext,
     ) -> Release | None:
-        """Mint one Release from a single ``translation`` (D-08)."""
-        translation_id = translation.get("id")
-        if not translation_id:
-            return None
-        translation_id = str(translation_id)
+        """Mint one Release from a single v2 listing/recent row (D-08).
 
-        language = str(translation.get("language") or "en")
-        page_count = self._parse_int(translation.get("pages"))  # reliable; size is not
-        # REL-03: display-only votes from translation views. Locked decision
-        # (live recon): translations[].likes is ~always 0; views carries the
-        # real signal. NOT added to the minted ResolutionRecord (display-only).
-        votes = self._parse_int(translation.get("views"))
-        publish_date = self._normalize_publish_date(translation.get("date"))
-        group = translation.get("group")
-        group_name = _strip_html(group.get("name")) if isinstance(group, dict) else None
+        261003-mangaball-api-v2: the row ``id`` is the download unit
+        (``chapter-detail?chapter_id=``); the v2 API exposes no page count anywhere,
+        so ``page_count`` is ``None`` (the manifest count guard then no-ops).
+        """
+        row_id = row.get("id")
+        if not row_id:
+            return None
+        row_id = str(row_id)
+
+        language = _row_language(row)
+        # REL-03: display-only votes from row views (recent rows lack it → None).
+        votes = self._parse_int(row.get("views"))
+        publish_date = self._normalize_publish_date(row.get("created_at"))
+        group = row.get("group")
+        group_name = _strip_html(row.get("group_name")) or (
+            _strip_html(group.get("name")) if isinstance(group, dict) else None
+        )
+        volume = self._parse_int(row.get("volume")) or None  # 0 means "no volume"
 
         ch_str = (
             format(chapter_number.normalize(), "f")
@@ -1084,21 +925,21 @@ class MangaBallSource(Source):
         title = self._build_title(
             manga_title, ch_str, language=language, group=group_name
         )
-        # D-08: language + translation id needed — one chapter number maps to N
-        # translations (one per language/group).
-        guid = f"mangaball:{title_id}:ch-{ch_str}:{language}:{translation_id}"
+        # D-08: language + row id needed — one chapter number maps to N rows (one
+        # per language/group).
+        guid = f"mangaball:{title_id}:ch-{ch_str}:{language}:{row_id}"
 
         handle = ctx.handle_store.mint(
             ResolutionRecord(
                 source_key=self.key,
-                chapter_id=translation_id,  # the chapter-detail/download unit
+                chapter_id=row_id,  # the chapter-detail/download unit
                 language=language,
                 title=title,
                 manga_title=manga_title,
                 chapter_number=chapter_number,
-                volume=self._parse_int(translation.get("volume")),
+                volume=volume,
                 scanlation_group=group_name,
-                page_count=page_count,
+                page_count=None,
             )
         )
 
@@ -1110,14 +951,16 @@ class MangaBallSource(Source):
             publish_date=publish_date,
             manga_title=manga_title,
             chapter_number=chapter_number,
-            volume=self._parse_int(translation.get("volume")),
+            volume=volume,
             language=language,
             scanlation_group=group_name,
-            page_count=page_count,
+            page_count=None,
             votes=votes,
+            # Keys kept from v1 (the row id is still the translation-level download
+            # unit) — renaming would churn consumers.
             ids={
                 "mangaballTitleId": title_id,
-                "mangaballTranslationId": translation_id,
+                "mangaballTranslationId": row_id,
             },
         )
 
@@ -1139,7 +982,7 @@ class MangaBallSource(Source):
 
     @staticmethod
     def _normalize_publish_date(raw: Any) -> str:
-        """Normalize a translation ``date`` → RFC3339 ``date-time`` (REL-03, GAP-2).
+        """Normalize a row ``created_at`` → RFC3339 ``date-time`` (REL-03, GAP-2).
 
         The contract's ``Release.publishDate`` is ``format: date-time`` (RFC3339, ``T``
         separator). The live ``chapter-listing-by-title-id`` ``date`` is
@@ -1155,6 +998,10 @@ class MangaBallSource(Source):
         if parsed == _TS_FLOOR:
             return datetime.now(UTC).isoformat()
         return parsed.isoformat()
+
+    def _row_number(self, row: dict[str, Any]) -> Decimal | None:
+        """A v2 row's chapter number (``chapter_number``, else ``number``)."""
+        return self._parse_decimal(row.get("chapter_number") or row.get("number"))
 
     @staticmethod
     def _parse_decimal(raw: Any) -> Decimal | None:
