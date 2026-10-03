@@ -130,6 +130,36 @@ def cdp_call(
     return _recv_result(ws, command_id)
 
 
+def cdp_call_collecting(
+    ws: WebSocketLike,
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    command_id: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Like ``cdp_call``, but also return the CDP events seen before the response.
+
+    Returns ``(result, events)`` — ``events`` are the event frames (a ``method`` and
+    no ``id``) that arrived before the matching ``command_id`` response: the events
+    ``_recv_result`` drops (261003-mangaball-webview-images). Responses to other ids
+    are skipped; frames after the match are left unread.
+    """
+    request: dict[str, Any] = {"id": command_id, "method": method}
+    if params:
+        request["params"] = params
+    ws.send(json.dumps(request))
+    events: list[dict[str, Any]] = []
+    while True:
+        raw = ws.recv()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        message = json.loads(raw)
+        if message.get("id") == command_id:
+            return cast(dict[str, Any], message.get("result", {})), events
+        if "method" in message and "id" not in message:
+            events.append(message)
+
+
 def extract_clearance(
     devtools_ws_url: str,
     host: str,

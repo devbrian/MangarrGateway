@@ -6,6 +6,8 @@ Wraps the Plan 10-01 pipeline pieces (``device`` driver + ``turnstile`` locator 
 
   * ``GET  /healthz`` → 200 when the redroid adb target answers.
   * ``POST /solve``   → mint a Cloudflare clearance for an ALLOWLISTED host.
+  * ``POST /fetch-images`` → load image URLs as subresources of an ALLOWLISTED page
+    and return their bytes (261003-mangaball-webview-images).
 
 Security posture (SEC-01):
   * T-10-08 — every ``/solve`` requires the ``X-Solver-Key`` header to equal the
@@ -54,6 +56,7 @@ from android_solver.cdp import (
     WebSocketFactory,
     WebSocketLike,
     cdp_call,
+    cdp_call_collecting,
     extract_clearance,
     webview_user_agent,
 )
@@ -274,6 +277,21 @@ _EVAL_HYDRATION_JS = (
 # launch-settle before the devtools socket is driven.
 _EVAL_HYDRATION_TIMEOUT_S = 20.0
 
+# ── /fetch-images (261003-mangaball-webview-images, Refs #378) ────────────────
+# Load image URLs as SUBRESOURCES of an allowlisted document in the WebView and
+# read each body back over CDP — for CDN zones that CF-challenge every httpx egress
+# and block top-level navigation. Fresh 500-range cmd ids (never alias /eval's 400s).
+_FETCH_PAGE_ENABLE_CMD_ID = 500
+_FETCH_NETWORK_ENABLE_CMD_ID = 501
+_FETCH_CACHE_CMD_ID = 502
+_FETCH_READY_CMD_ID = 503
+_FETCH_NAV_CMD_ID = 504
+_FETCH_BATCH_CMD_ID = 505
+_FETCH_BODY_CMD_ID = 506
+_FETCH_BATCH_SIZE = 4
+_MAX_FETCH_IMAGE_URLS = 200
+_FETCH_READY_TIMEOUT_S = 15.0
+
 
 class SolveError(RuntimeError):
     """The solve pipeline could not mint a clearance (surfaces as 504)."""
@@ -389,6 +407,16 @@ class SolvePipeline(Protocol):
         with_clearance: bool = False,
         recycle: bool = False,
     ) -> Any: ...
+
+    def fetch_images(
+        self,
+        challenge_url: str,
+        host: str,
+        urls: list[str],
+        cancel: Event | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     def health(self) -> bool: ...
 
@@ -884,6 +912,154 @@ class AndroidSolvePipeline:
                 ws.close()
         finally:
             self._remove_forward_quietly(port)
+
+    def fetch_images(
+        self,
+        challenge_url: str,
+        host: str,
+        urls: list[str],
+        cancel: Event | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load ``urls`` as subresources of ``challenge_url`` and return their bodies.
+
+        Returns one entry per URL in input order: ``{url, status, body_b64}`` on a 200
+        with a body, else ``{url, status, error}``. One failed URL never fails the
+        batch. Re-uses the warm WebView (no recycle) and direct egress (no proxy) —
+        the recon-verified path (261003-mangaball-webview-images, Refs #378).
+        """
+        if deadline is None:
+            deadline = time.monotonic() + self._timeout_s
+        self._device.connect()
+        _raise_if_cancelled(cancel)
+        return self._drive_fetch_images(challenge_url, host, urls, cancel, deadline)
+
+    def _drive_fetch_images(
+        self,
+        challenge_url: str,
+        host: str,
+        urls: list[str],
+        cancel: Event | None,
+        deadline: float,
+    ) -> list[dict[str, Any]]:
+        pid = self._ensure_webview_alive(challenge_url, cancel, deadline)
+        _raise_if_cancelled(cancel)
+        port = self._device.forward_devtools(pid)
+        try:
+            _raise_if_cancelled(cancel)
+            ws_url = self._discover_page_ws(port)
+            _raise_if_cancelled(cancel)
+            ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
+            try:
+                cdp_call(ws, "Page.enable", command_id=_FETCH_PAGE_ENABLE_CMD_ID)
+                cdp_call(ws, "Network.enable", command_id=_FETCH_NETWORK_ENABLE_CMD_ID)
+                # A repeat URL must hit the network so it emits Network.* events.
+                cdp_call(
+                    ws,
+                    "Network.setCacheDisabled",
+                    {"cacheDisabled": True},
+                    command_id=_FETCH_CACHE_CMD_ID,
+                )
+                self._ensure_on_page(ws, challenge_url, cancel, deadline)
+                results: list[dict[str, Any]] = []
+                for i in range(0, len(urls), _FETCH_BATCH_SIZE):
+                    _raise_if_cancelled(cancel)
+                    if time.monotonic() >= deadline:
+                        raise SolveError("fetch-images deadline expired mid-batch")
+                    results.extend(
+                        self._fetch_batch(ws, urls[i : i + _FETCH_BATCH_SIZE])
+                    )
+            finally:
+                ws.close()
+        finally:
+            self._remove_forward_quietly(port)
+        ok = sum(1 for r in results if "body_b64" in r)
+        # Redacted: host + counts only, never URLs or bodies (T-es9-03).
+        _log.info("fetched %d/%d images in webview for host %s", ok, len(urls), host)
+        return results
+
+    def _ensure_on_page(
+        self,
+        ws: WebSocketLike,
+        challenge_url: str,
+        cancel: Event | None,
+        deadline: float,
+    ) -> None:
+        """Navigate to ``challenge_url`` only when the WebView is not already on it."""
+        ready = (
+            f"location.href === {json.dumps(challenge_url)} "
+            '&& document.readyState === "complete"'
+        )
+        if self._eval_bool(ws, ready, _FETCH_READY_CMD_ID):
+            return
+        cdp_call(
+            ws, "Page.navigate", {"url": challenge_url}, command_id=_FETCH_NAV_CMD_ID
+        )
+        # A tiny text document — no hydration wait / challenge clear needed.
+        limit = min(deadline, time.monotonic() + _FETCH_READY_TIMEOUT_S)
+        while time.monotonic() < limit:
+            _raise_if_cancelled(cancel)
+            if self._eval_bool(ws, ready, _FETCH_READY_CMD_ID):
+                return
+            time.sleep(self._poll_interval_s)
+        raise SolveError("mangaball page did not load before the fetch-images deadline")
+
+    def _fetch_batch(self, ws: WebSocketLike, batch: list[str]) -> list[dict[str, Any]]:
+        # 261003-mangaball-webview-images / Refs #378: ``new Image()``, not an opaque
+        # no-cors fetch — onload/onerror fire only after the FULL body has loaded, so
+        # Network.getResponseBody has the data. Default referrer → the page origin.
+        js = (
+            f"Promise.all({json.dumps(batch)}.map(u => new Promise(r => {{ "
+            "const i = new Image(); i.onload = () => r(true); "
+            "i.onerror = () => r(false); i.src = u; })))"
+        )
+        _, events = cdp_call_collecting(
+            ws,
+            "Runtime.evaluate",
+            {"expression": js, "awaitPromise": True, "returnByValue": True},
+            command_id=_FETCH_BATCH_CMD_ID,
+        )
+        request_ids: dict[str, str] = {}
+        statuses: dict[str, int] = {}
+        for event in events:
+            params = event.get("params") or {}
+            if event.get("method") == "Network.requestWillBeSent":
+                url = (params.get("request") or {}).get("url")
+                if isinstance(url, str):
+                    request_ids.setdefault(url, str(params.get("requestId")))
+            elif event.get("method") == "Network.responseReceived":
+                status = (params.get("response") or {}).get("status")
+                if isinstance(status, int):
+                    statuses[str(params.get("requestId"))] = status
+        out: list[dict[str, Any]] = []
+        for url in batch:
+            rid = request_ids.get(url)
+            if rid is None:
+                out.append(
+                    {"url": url, "status": None, "error": "no network request observed"}
+                )
+                continue
+            status = statuses.get(rid)
+            if status != 200:
+                out.append({"url": url, "status": status, "error": "http status"})
+                continue
+            try:
+                body = cdp_call(
+                    ws,
+                    "Network.getResponseBody",
+                    {"requestId": rid},
+                    command_id=_FETCH_BODY_CMD_ID,
+                )
+            except Exception:  # noqa: BLE001 — one URL never fails the batch
+                out.append({"url": url, "status": 200, "error": "body unavailable"})
+                continue
+            data = body.get("body")
+            if body.get("base64Encoded") is True and isinstance(data, str) and data:
+                out.append({"url": url, "status": 200, "body_b64": data})
+            else:
+                out.append({"url": url, "status": 200, "error": "body unavailable"})
+        return out
 
     def _extract_clearance_after_eval(
         self,
@@ -1931,6 +2107,72 @@ class SolverService:
             recycle=recycle,
         )
 
+    def fetch_images(
+        self,
+        *,
+        api_key: str | None,
+        body: bytes,
+        disconnected: Callable[[], bool] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Capture image bytes as WebView subresources (261003-es9, Refs #378).
+
+        Same rails as ``eval`` (auth → JSON → scheme-pinned, host-allowlisted
+        ``challenge_url`` → target), then a ``urls`` SHAPE check. Like ``/eval``'s
+        ``js`` the ``urls`` are sidecar-trusted — the gateway SSRF-allowlists them.
+        """
+        if not self._authenticate(api_key):
+            return int(HTTPStatus.UNAUTHORIZED), {
+                "error": "invalid or missing X-Solver-Key"
+            }
+        try:
+            payload = json.loads(body or b"{}")
+        except (ValueError, TypeError):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "malformed JSON body"}
+        if not isinstance(payload, dict):
+            return int(HTTPStatus.BAD_REQUEST), {"error": "body must be a JSON object"}
+
+        challenge_url = payload.get("challenge_url")
+        if not isinstance(challenge_url, str) or not challenge_url:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge_url is required"
+            }
+        split = urlsplit(challenge_url)
+        host = (split.hostname or "").lower()
+        if split.scheme not in ("http", "https"):
+            _log.warning("rejected non-http(s) fetch-images scheme %r", split.scheme)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge url scheme not allowed"
+            }
+        target_err = self._resolve_target(payload.get("target"))
+        if isinstance(target_err, tuple):
+            return target_err
+        target = target_err
+        if host not in self._config.allowed_hosts_for(target):
+            _log.warning("rejected non-allowlisted fetch-images host %r", host)
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "challenge host not allowlisted"
+            }
+
+        urls = payload.get("urls")
+        if (
+            not isinstance(urls, list)
+            or not urls
+            or not all(
+                isinstance(u, str)
+                and urlsplit(u).scheme == "https"
+                and urlsplit(u).hostname
+                for u in urls
+            )
+        ):
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {
+                "error": "urls must be a non-empty list of https URLs"
+            }
+        if len(urls) > _MAX_FETCH_IMAGE_URLS:
+            return int(HTTPStatus.UNPROCESSABLE_ENTITY), {"error": "too many urls"}
+        return self._run_fetch_images(
+            challenge_url, host, urls, disconnected, target=target
+        )
+
     def _resolve_target(self, raw: Any) -> str | tuple[int, dict[str, Any]]:
         """Resolve the optional body ``target`` to a configured worker (LANE-03).
 
@@ -2217,6 +2459,53 @@ class SolverService:
         finally:
             worker.lock.release()
 
+    def _run_fetch_images(
+        self,
+        challenge_url: str,
+        host: str,
+        urls: list[str],
+        disconnected: Callable[[], bool] | None = None,
+        *,
+        target: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Serialize + timeout-bound one ``/fetch-images`` (mirrors ``_run_eval``)."""
+        worker = self._workers[target or self._default_target]
+        cancel = Event()
+        if not worker.lock.acquire(blocking=False):
+            _log.info("solver busy; rejecting concurrent /fetch-images for %s", host)
+            return int(HTTPStatus.SERVICE_UNAVAILABLE), {"error": "solver busy"}
+        try:
+            future = worker.executor.submit(
+                worker.pipeline.fetch_images, challenge_url, host, urls, cancel
+            )
+            deadline = time.monotonic() + self._config.solve_timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _log.warning("fetch-images timed out for host %s", host)
+                    self._cancel_and_drain(future, cancel, host)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {
+                        "error": "fetch-images timed out"
+                    }
+                try:
+                    outcome = future.result(timeout=min(_DISCONNECT_POLL_S, remaining))
+                except FuturesTimeout:
+                    if disconnected is not None and disconnected():
+                        _log.info(
+                            "caller disconnected mid-fetch-images for host %s", host
+                        )
+                        self._cancel_and_drain(future, cancel, host)
+                        return _CLIENT_CLOSED_REQUEST, {"error": "client disconnected"}
+                    continue
+                except Exception:  # noqa: BLE001 — any pipeline failure ⇒ 504
+                    _log.warning("fetch-images failed for host %s", host, exc_info=True)
+                    return int(HTTPStatus.GATEWAY_TIMEOUT), {
+                        "error": "fetch-images failed"
+                    }
+                return int(HTTPStatus.OK), {"results": outcome}
+        finally:
+            worker.lock.release()
+
     def _cancel_and_drain(self, future: Any, cancel: Event, host: str) -> None:
         """Signal cancellation and wait (bounded) for the orphan to unwind (#207).
 
@@ -2296,7 +2585,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
         # Phase 14: /eval shares /solve's pre-auth + body-cap rails verbatim — only
         # the service method dispatched at the end differs.
-        if self.path not in ("/solve", "/eval"):
+        if self.path not in ("/solve", "/eval", "/fetch-images"):
             self._send_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
             return
         # CR-01: authenticate BEFORE reading the body. An unauthenticated caller
@@ -2336,8 +2625,14 @@ class _Handler(BaseHTTPRequestHandler):
                 body=body,
                 disconnected=lambda: _peer_disconnected(self.connection),
             )
-        else:  # /eval
+        elif self.path == "/eval":
             status, payload = self.server.service.eval(
+                api_key=api_key,
+                body=body,
+                disconnected=lambda: _peer_disconnected(self.connection),
+            )
+        else:  # /fetch-images
+            status, payload = self.server.service.fetch_images(
                 api_key=api_key,
                 body=body,
                 disconnected=lambda: _peer_disconnected(self.connection),
