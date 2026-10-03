@@ -217,8 +217,9 @@ async def test_recent_repeated_source_params_select_all_sources(
             ),
         )
     )
-    # MangaBall (antibot=none, csrf-bootstrap) → fast permanent 403 → a per-source
-    # warnings[] entry (no browser, no retry) — mirrors the contract harness stub.
+    # MangaBall (antibot=cloudflare with on-demand clearance, no session prep) → fast
+    # permanent 403 → a per-source warnings[] entry (no retry) — mirrors the contract
+    # harness stub.
     respx.route(host="mangaball.com").mock(return_value=httpx.Response(403))
 
     # httpx encodes a list value as repeated params: ?sources=mangadex&sources=mangaball
@@ -410,7 +411,7 @@ def test_mangaball_class_declares_cloudflare_android_antibot() -> None:
     assert MangaBallSource.antibot == "cloudflare"
     assert MangaBallSource.solver_engine == "android"
     assert MangaBallSource.cloudflare_challenge_url == "https://mangaball.com/"
-    assert MangaBallSource.session_prep == "csrf-bootstrap"
+    assert MangaBallSource.session_prep is None
     assert MangaBallSource.key == "mangaball"
     assert MangaBallSource.rate_limit_per_minute > 0
     assert MangaBallSource.languages  # non-empty ALL_LANGUAGES set

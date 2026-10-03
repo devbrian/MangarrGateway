@@ -16,14 +16,11 @@ Anti-bot expectations (ESCALATED 2026-06-15 — debug mangaball-cloudflare-csrf-
   MangaBall ORIGINALLY served passive Cloudflare only (``antibot="none"``), but on
   2026-06-15 it enabled a site-wide managed challenge (``cf-mitigated: challenge``,
   HTTP 403 on /, /manga, /search). The escalation documented below was executed: the
-  source is now ``cloudflare`` with ``solver_engine = "android"`` and the
-  search/recent/manifest API rides the cf_clearance seam UNDER the httpx
-  ``csrf-bootstrap`` session-prep.
-* ``needs_solver_warm = True`` — MangaBall now needs a cleared Cloudflare session
-  (cf_clearance) BEFORE the csrf-bootstrap GET, so the harness must warm the solver.
-  The bootstrap GET itself carries the captured cf_clearance cookie + bound UA
-  (framework ``session_prep.py:CsrfBootstrap``), then the X-CSRF-Token + PHPSESSID
-  ride on top — the cf + csrf-bootstrap union.
+  source is now ``cloudflare`` with ``solver_engine = "android"`` and on-demand
+  clearance (``cloudflare_challenge_optional``). The v2 API (261003-mangaball-api-v2)
+  needs NO CSRF token or session cookie — the csrf-bootstrap prep is retired.
+* ``needs_solver_warm = True`` — the harness warms the android solver so a cleared
+  session is available if the intermittent challenge is live.
 
 CF-CLEARABILITY (RESOLVED 2026-06-15 — Android solver, NOT desktop Chromium)
 ---------------------------------------------------------------------------
@@ -40,21 +37,20 @@ clearance for source 'mangaball'`` → search returned 50 releases). CI has no r
 ESCALATION HISTORY (D-12): ``MangaBallSource.antibot`` flipped ``"none"`` →
 ``"cloudflare"`` + a ``cloudflare_challenge_url``, then ``solver_engine = "android"``
 once desktop Chromium proved unable to clear it (above). The only glue beyond those
-attrs was threading cf_clearance into the bootstrap GET (the framework already owned
-the clearance path) — and adding ``mangaball.com`` to the sidecar SSRF allowlist
+attrs was adding ``mangaball.com`` to the sidecar SSRF allowlist
 (``SOLVER_ALLOWED_HOSTS`` / ``android_solver/config.py``), without which the sidecar
 422s the solve.
 
 Release shape (D-08): MangaBall releases carry ``title_id`` as the leading guid
-segment (``mangaball:{title_id}:ch-{number}:{language}:{translation_id}``); the
+segment (``mangaball:{title_id}:ch-{number}:{lang}:{row_id}``); the
 smoke modules key on ``id_field = "title_id"``.
 
 Default-query selection
 -----------------------
 ``default_query = "one piece"`` — chosen as a high-traffic, long-running title that
 reliably returns at least one hit from ``POST /api/v1/title/search-advanced``
-(``search_input=one piece`` is the literal recon-probed example, 07-RECON-mangaball.md
-§1 — ``name="One Piece"``, a stable ``_id``). Selection criteria, mirroring
+(``keyword=one piece`` — the v2 query key, 261003-mangaball-api-v2; the title is
+``name="One Piece"`` with a stable ``_id``). Selection criteria, mirroring
 mangadex.py's discipline:
 
 * stable / long-running (won't disappear or get de-listed mid-test)
@@ -74,22 +70,22 @@ confirms / tunes:
   the per-chapter wall-clock is still the plaintext CDN ``.jpg`` fetch (far shorter
   than Comix's 480s; matches MangaDex's 180s). Re-size against the real end-to-end
   download wall-clock; bump if a cold CF re-solve mid-download pushes past 180s.
-* **Referer on the CDN image GET (A5; RECON §4 / Open Q4)** — the
-  ``chikorita.red-and-blue.net/storage/...`` CDN likely enforces hotlink
-  protection. If the bare image GET 403s live, ``MangaBallSource.fetch_image`` must
-  add ``Referer: https://mangaball.com/`` (the fetch_image comment flags this).
+* **Referer on the CDN image GET (A5) — RESOLVED** (261003-mangaball-api-v2): the
+  CDN hotlink-blocks a bare GET, so ``MangaBallSource.fetch_image`` sends
+  ``Referer: https://mangaball.com/``. Known limit: the
+  ``*.poke-black-and-white.net`` zone still CF-challenges non-browser fetches.
 * **rate_limit_per_minute / search + recent shapes (A2/A3)** — confirm the
   form-POST ``search-advanced`` + ``getRecentlyUpdatedChapter`` envelopes and the
-  ``chapter-listing-by-title-id`` flat shape match the recon (A7 fixture anchors).
+  v2 ``chapter-listing-by-title-id`` JSON-body flat rows match the recon.
 * **fixture_drift_paths** — empty until the first live smoke pins the real
   chapter-detail / search shapes; add anchors then (mirrors comix.py).
 
 Alt-title live smoke (#139)
 ---------------------------
 ``alt_title_query`` / ``alt_title_expected_substring`` populated (#139): a
-2026-06-05 live recon (CSRF-bootstrap + ``POST /api/v1/title/search-advanced``)
-confirmed mangaball matches native/alt names server-side and the ``alternateName``
-``/``-separated HTML blob carries them — querying the Korean native title of Solo
+2026-06-05 live recon (``POST /api/v1/title/search-advanced``) confirmed mangaball
+matches native/alt names server-side and ``alternateName`` carries them (a list of
+plain strings in v2) — querying the Korean native title of Solo
 Leveling (``나 혼자만 레벨업``) returns the "Solo Leveling" series (its
 ``alternateName`` leads with that exact string). High-traffic, stable → a
 deterministic alt-title smoke. The query matches ONLY via the alt name (the
@@ -104,8 +100,8 @@ from ._base import LiveSmokeProfile
 
 LIVE_SMOKE = LiveSmokeProfile(
     source_key="mangaball",
-    # High-traffic, long-running title; literal recon-probed search_input
-    # (07-RECON-mangaball.md §1). Live-tune for a deterministic short-chapter
+    # High-traffic, long-running title; posted as the v2 ``keyword``
+    # (261003-mangaball-api-v2). Live-tune for a deterministic short-chapter
     # leading hit if the catalog shifts (see docstring "Default-query selection").
     default_query="one piece",
     # ESCALATED 2026-06-15 (debug mangaball-cloudflare-csrf-243): site-wide managed

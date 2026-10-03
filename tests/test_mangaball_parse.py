@@ -2,12 +2,11 @@
 
 Covers the source-agnostic plumbing that does NOT need a ``SourceContext``:
 
-* :func:`_items_and_pagination` — the D-07/D-09 two-envelope dispatch: the
-  standard ``{code,message,data,pagination}`` envelope vs the FLAT
-  ``ALL_CHAPTERS`` chapter-listing response.
-* :func:`_strip_html` — the RECON-Gotchas HTML-string-field stripper applied to
-  ``alternateName`` / ``status`` / ``last_chapter`` (HTML strings that must never
-  flow raw into a Release field).
+* :func:`_items_and_pagination` — ``(data list, pagination)`` from the v2
+  ``{data, pagination}`` envelope (261003-mangaball-api-v2 dropped the old flat
+  chapter-listing shape).
+* :func:`_strip_html` — the defensive HTML stripper for name fields (HTML must
+  never flow raw into a Release field).
 * :meth:`MangaBallSource._parse_decimal` — the SRCH-06 Decimal round-trip copied
   verbatim from MangaDex (``"23"`` and ``"23.0"`` both normalize so
   ``format(d.normalize(), "f")`` is stable).
@@ -25,7 +24,7 @@ from manga_gateway.sources.mangaball import (
     _strip_html,
 )
 
-# ─────────────────── _items_and_pagination (D-07 / D-09) ────────────────────
+# ─────────────────────── _items_and_pagination (D-07) ───────────────────────
 
 
 def test_items_and_pagination_standard_envelope() -> None:
@@ -41,31 +40,6 @@ def test_items_and_pagination_standard_envelope() -> None:
     assert pagination == {"total": 2, "current_page": 1, "last_page": 1}
 
 
-def test_items_and_pagination_flat_all_chapters_envelope() -> None:
-    """Flat ``ALL_CHAPTERS`` chapter-listing response → (ALL_CHAPTERS, None)."""
-    body = {
-        "code": 200,
-        "message": "ok",
-        "TOTAL_CHAPTERS": 2,
-        "ALL_CHAPTERS": [
-            {"number": "Ch. 23", "number_float": 23.0, "translations": []},
-            {"number": "Ch. 24", "number_float": 24.0, "translations": []},
-        ],
-        "ALL_LANGUAGES": ["en", "vi"],
-    }
-    items, pagination = _items_and_pagination(body)
-    assert items == body["ALL_CHAPTERS"]
-    assert pagination is None
-
-
-def test_items_and_pagination_all_chapters_takes_precedence() -> None:
-    """A body carrying BOTH keys is treated as the flat shape (ALL_CHAPTERS wins)."""
-    body = {"data": [{"_id": "x"}], "ALL_CHAPTERS": [{"number_float": 1.0}]}
-    items, pagination = _items_and_pagination(body)
-    assert items == [{"number_float": 1.0}]
-    assert pagination is None
-
-
 def test_items_and_pagination_non_list_data_yields_empty() -> None:
     """A malformed ``data`` (non-list) degrades to an empty item list, no raise."""
     items, pagination = _items_and_pagination({"data": {"oops": True}})
@@ -74,7 +48,7 @@ def test_items_and_pagination_non_list_data_yields_empty() -> None:
 
 
 def test_items_and_pagination_missing_all_keys() -> None:
-    """A body with neither key → empty items + None pagination."""
+    """A body with no ``data``/``pagination`` → empty items + None pagination."""
     items, pagination = _items_and_pagination({"code": 200, "message": "ok"})
     assert items == []
     assert pagination is None

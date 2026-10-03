@@ -2,7 +2,7 @@
 
 mangaball.com sits behind a WAF that returns HTTP 403 with body
 ``{"error":"Malicious payload detected", ... "code":403}`` for ANY search POST whose
-``search_input`` contains the literal word "System" (a SQL-injection false positive).
+``keyword`` contains the literal word "System" (a SQL-injection false positive).
 This module covers the two layers of the fix:
 
 * Group (a) — the framework :func:`is_waf_block` predicate, mirroring
@@ -265,9 +265,9 @@ async def test_search_with_system_sanitize_retries_and_returns_results() -> None
     # Two search-advanced POSTs: the WAF block + the single sanitized retry.
     posts = _search_posts(transport)
     assert len(posts) == 2
-    # The retry carried the STRIPPED search_input.
-    assert posts[0] is not None and posts[0]["search_input"] == "Solo Leveling System"
-    assert posts[1] is not None and posts[1]["search_input"] == "Solo Leveling"
+    # The retry carried the STRIPPED keyword.
+    assert posts[0] is not None and posts[0]["keyword"] == "Solo Leveling System"
+    assert posts[1] is not None and posts[1]["keyword"] == "Solo Leveling"
     # The candidate was deep-enumerated and releases minted (pruned vs the ORIGINAL).
     assert releases
     assert all(rel.manga_title == "Solo Leveling" for rel in releases)
