@@ -1,39 +1,17 @@
-"""MangaBall source — the third declarative source + a third prep style (SRC-01).
+"""MangaBall source — a clean JSON-REST source over mangaball.com's v2 API (SRC-01).
 
-MangaBall (``https://mangaball.com``) is a **MangaDex-class** source: a clean
-JSON-REST backend with no response encryption and plain-CDN ``.jpg`` images
-(RECON TL;DR). ~90% of this module is the MangaDex shape (guid/mint,
-``_parse_decimal``, the manifest-integrity guard).
+MangaBall (``https://mangaball.com``) is a **MangaDex-class** source: a FastAPI
+JSON backend (rewritten 2026-10, ``261003-mangaball-api-v2``) with no response
+encryption and plain-CDN images. This module adds **ZERO networking glue**: every
+outbound call is a ``ctx.*`` helper (SRC-01/SRC-02).
 
-The one genuinely-new framework capability MangaBall exercises is an
-**HTML→CSRF/session bootstrap**: its ``POST /api/v1/...`` form endpoints reject
-any call lacking a session-bound ``X-CSRF-Token`` (harvested from a
-``<meta name="csrf-token">`` on any HTML page, alongside the ``PHPSESSID``
-cookie). That bootstrap is declared here purely as the ``session_prep =
-"csrf-bootstrap"`` class-attr (D-06) — the framework (Plans 01/02) owns the
-GET-HTML, token harvest, header injection, and CSRF-403 refresh-and-retry. This
-module adds **ZERO networking glue**: every outbound call is ``ctx.post_json`` /
-``ctx.get_bytes``, exactly like MangaDex's ``ctx.get_json`` (SRC-01/SRC-02).
-
-Anti-bot (D-12; debug mangaball-cloudflare-csrf-243, 2026-06-15): MangaBall
-ORIGINALLY fronted Cloudflare in **passive** mode only on the residential recon IP —
-no interactive challenge fired, so ``antibot = "none"`` was correct. As of 2026-06-15
-MangaBall enabled a **site-wide managed challenge** (``cf-mitigated: challenge``,
-HTTP 403 on ``/``, ``/manga``, ``/search``), which broke the bare-httpx csrf-bootstrap
-GET: it received the interstitial → no ``meta[name=csrf-token]`` → ``ValueError`` →
-``source_unavailable`` on every search/recent/download. Per the documented
-one-attribute escalation, ``antibot`` is now ``"cloudflare"`` +
-``cloudflare_challenge_url = "https://mangaball.com/"`` — routing BOTH the
-csrf-bootstrap GET and every data POST through the shared clearance seam. Desktop
-Chromium/Patchright could NOT clear the new managed challenge from our Linux
-fingerprint (CI + the deploy both timed out at 60s), so ``solver_engine = "android"``
-routes clearance to the redroid-WebView solver that already clears kagane/mangadot
-(resolved debug ``mangadot-cf-linux-fingerprint``). The framework already unions cf +
-csrf-bootstrap (``context.py:_clearance_kwargs``); ``session_prep.py:CsrfBootstrap``
-now threads cf_clearance into the bootstrap GET too, so MangaBall stays
-zero-networking-glue. The ``rate_limit_per_minute = 480`` is a
-conservative ~50%-of-floor value set from the 2026-06-04 probe (no hard limit found;
-manifest/image sustained 960/min at c=8), mirroring the mangadot precedent (#101).
+Anti-bot: ``antibot = "cloudflare"`` + ``solver_engine = "android"`` (debug
+mangaball-cloudflare-csrf-243 — desktop Chromium cannot clear its managed challenge
+from Linux; the redroid WebView can) with ``cloudflare_challenge_optional = True``
+(the site-wide challenge is intermittent, so clearance is on-demand — solved only
+when a response is an actual challenge). The CSRF bootstrap is retired: the v2 API
+needs no token or session cookie (``session_prep = None``). ``rate_limit_per_minute
+= 480`` is the conservative ~50%-of-floor value from the 2026-06-04 probe (#101).
 
 ponytail: known limit (261003-mangaball-api-v2) — the ``*.poke-black-and-white.net``
 CDN zone serves a Cloudflare managed challenge (403 ``cf-mitigated: challenge``) to
@@ -44,39 +22,31 @@ against mangaball.com, since the 403 is a CF challenge) until a WebView-side ima
 body capture exists (follow-up issue). ``*.red-and-blue.net`` serves plaintext.
 Upgrade path = WebView-side image body capture.
 
-ENDPOINT SHAPES (live-recon-pinned, ``07-RECON-mangaball.md`` / GAP-1 probe):
+ENDPOINT MAP (v2, verified live 2026-10-03, ``261003-mangaball-api-v2``):
 
-* base: ``https://mangaball.com``
-  (moved from the ``.net`` host 2026-10-03, ``261003-mangaball-dotcom``: the old host
-  301s every request and the new host 308s trailing-slash paths; the transport does
-  NOT follow redirects, so every request path below is slash-free).
-* search: ``POST /api/v1/title/search-advanced`` (form) →
-  ``{code,message,data:[Title…],pagination}``. **TITLE-ONLY** — a Title carries
-  NO ``chapters`` key (GAP-1 ground truth). Chapters/translations live ONLY in
-  ``chapter-listing-by-title-id``; ``search`` deep-enumerates each candidate.
+* base: ``https://mangaball.com`` — the transport does NOT follow redirects and the
+  host 308s trailing-slash paths, so every path below is slash-free
+  (``261003-mangaball-dotcom``).
+* search: ``POST /api/v1/title/search-advanced`` (form; query key ``keyword``,
+  ``limit`` ≤ 50) → ``{data:[title], pagination}``. Title-only; ``alternateName`` is
+  a list of plain strings.
+* listing: ``POST /api/v1/chapter/chapter-listing-by-title-id`` (JSON body
+  ``{"title_id": <_id>}``) → ``{"status","data":[row]}`` — FLAT and complete, one row
+  per (chapter × language × group); the row ``id`` is the download unit. No page
+  count anywhere.
 * recent: ``POST /api/v1/title/search`` (form,
-  ``search_type=getRecentlyUpdatedChapter``) → same TITLE-ONLY shape, newest-first.
-  The newest chapter is an HTML blob in each title's ``last_chapter`` field — it
-  carries the real ``translation_id`` (``href=".../chapter-detail/{id}/"``),
-  number, language flag, and group anchor. ``recent`` parses it and mints DIRECT
-  releases (no deferral — MangaBall exposes the stable id, unlike Comix).
-* chapter listing: ``POST /api/v1/chapter/chapter-listing-by-title-id`` (form,
-  ``title_id``) → the FLAT ``{code,message,ALL_CHAPTERS:[…],…}`` envelope (NOT
-  the standard ``data`` envelope — :func:`_items_and_pagination` dispatches both,
-  D-09).
-* manifest: ``GET /chapter-detail/{translation_id}`` (HTML) → the ordered page
-  URLs in the client-side ``const chapterImages = JSON.parse(`[…]`)`` array (GAP-3,
-  live — NOT ``<img>`` tags). The CDN host VARIES per content
-  (``chikorita.red-and-blue.net``, ``bulbasaur.poke-black-and-white.net``, …) —
-  the host is read from that array, NEVER reconstructed (RECON §4 / CLAUDE.md SSRF).
-* image: plain httpx ``GET`` of each absolute CDN ``.jpg``.
+  ``search_type=getRecentlyUpdatedChapter``) → titles carrying ``recent_chapters``
+  rows of the listing shape → DIRECT releases.
+* manifest: ``GET /api/v1/chapter-detail?chapter_id=<id>`` → ``data.chapter.pages``
+  (absolute CDN URLs in order; the host varies per content and is NEVER
+  reconstructed — CLAUDE.md SSRF).
+* image: ``GET`` of each CDN URL with ``Referer: https://mangaball.com/`` (a bare GET
+  403s).
 
-guid (D-08): ``mangaball:{title_id}:ch-{number_float}:{language}:{translation_id}``
-— the language + translation id are required because one chapter number maps to N
-translations (one per language/group). Both ``search`` and ``recent`` now mint a
-real ``translation_id`` into ``ResolutionRecord.chapter_id`` (DIRECT). The
-``:DEFERRED`` late-bind pattern remains a **Comix-only** technique (see comix.py);
-MangaBall does not need it because its recent feed exposes the translation_id.
+guid (D-08): ``mangaball:{title_id}:ch-{number}:{lang}:{row_id}`` — the language +
+row id are required because one chapter number maps to N rows (one per
+language/group). Both ``search`` and ``recent`` mint the row id into
+``ResolutionRecord.chapter_id`` (DIRECT; the ``:DEFERRED`` late-bind is Comix-only).
 """
 
 from __future__ import annotations
@@ -104,10 +74,9 @@ if TYPE_CHECKING:
     from ..framework.context import SourceContext
     from ..models.search import SearchRequest
 
-# Default content rating + sort filters observed on the live search-advanced XHR
-# (RECON §1). The keyword rides ``keyword`` (261003-mangaball-api-v2: the v2 backend
-# IGNORES the old ``search_input`` key and returns every title); the rest are the
-# page's defaults.
+# Default content rating + sort filters posted with every search-advanced call. The
+# query rides ``keyword`` (261003-mangaball-api-v2: the v2 backend IGNORES the old
+# ``search_input`` key and returns every title).
 _SEARCH_DEFAULT_FILTERS: dict[str, Any] = {
     "filters[sort]": "updated_chapters_desc",
     "filters[page]": 1,
@@ -214,7 +183,7 @@ def _parse_ts(raw: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
-# SSRF allowlist for the extracted page-image URLs (T-07-07/T-07-09, CLAUDE.md).
+# SSRF allowlist for the manifest page-image URLs (T-07-07/T-07-09, CLAUDE.md).
 # The CDN host VARIES per content (RECON §4, live e.g. ``chikorita.red-and-blue.net``,
 # ``bulbasaur.poke-black-and-white.net``, ``jigglypuff.poke-black-and-white.net``) so
 # — unlike Comix — it cannot be pinned to one literal. GAP-3 (live W-04): the PAGE
@@ -228,8 +197,8 @@ def _parse_ts(raw: str) -> datetime:
 # :func:`_is_allowed_image_url`) + the ``/storage/`` namespace + an image extension.
 # The site logo (``/public/.../logo.svg`` — not ``/storage/``) and covers
 # (``/covers/...``) still fail the ``/storage/`` prefix; group icons under
-# ``/storage/`` are same-origin and harmless (and never reach here — extraction scopes
-# to the ``chapterImages`` array, this is defense-in-depth).
+# ``/storage/`` are same-origin and harmless (and never reach here — the manifest is
+# only ``data.chapter.pages``; this is defense-in-depth).
 # ``avif`` added 260721: MangaBall's ``*.red-and-blue.net`` CDNs now serve page images
 # as AVIF, and the extension-only pin was false-rejecting every real page at the SSRF
 # allowlist (debug avif-image-ssrf-allowlist). Matches kagane's avif-inclusive pin.
@@ -251,30 +220,21 @@ _IMAGE_FETCH_HEADERS = {"Referer": "https://mangaball.com/"}
 def _items_and_pagination(
     body: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    """Two-envelope dispatch (D-07/D-09): standard ``data`` vs flat ``ALL_CHAPTERS``.
+    """``(data list, pagination)`` from a v2 envelope (D-07).
 
-    Most MangaBall endpoints return the standard ``{code,message,data,pagination}``
-    envelope, but ``chapter-listing-by-title-id`` is FLAT — the chapter list is a
-    top-level ``ALL_CHAPTERS`` key with no ``pagination`` (RECON §3, Pitfall 5).
-    Returns ``(items, pagination)``; ``ALL_CHAPTERS`` takes precedence and yields a
-    ``None`` pagination. A non-list ``data`` degrades to ``[]`` rather than raising
-    (defensive — a malformed envelope must not crash the parse).
+    A non-list ``data`` degrades to ``[]`` rather than raising (defensive — a
+    malformed envelope must not crash the parse).
     """
-    if "ALL_CHAPTERS" in body:
-        items = body.get("ALL_CHAPTERS", [])
-        return (items if isinstance(items, list) else []), None
     data = body.get("data")
     return (data if isinstance(data, list) else []), body.get("pagination")
 
 
 class _TextExtractor(HTMLParser):
-    """Stdlib HTML→text stripper for the HTML-string Title fields (RECON Gotchas).
+    """Stdlib HTML→text stripper for name fields (RECON Gotchas).
 
-    ``alternateName`` / ``status`` / ``last_chapter`` arrive as HTML strings; they
-    must be stripped to plain text before flowing into a Release field. stdlib
-    ``html.parser`` matches the Plan-01 session-prep parser choice (cheap, no new
-    dependency for the small field strip — lxml is reserved for the large manifest
-    parse). Collapses inter-tag whitespace to single spaces.
+    Defensive: v2 names are plain text, but a legacy HTML string (e.g. an old
+    ``alternateName``) must still never flow raw into a Release field. Collapses
+    inter-tag whitespace to single spaces.
     """
 
     def __init__(self) -> None:
@@ -295,8 +255,7 @@ def _strip_html(raw: Any) -> str | None:
     """Strip HTML tags from a Title string field → plain text (or None).
 
     Returns ``None`` for ``None`` / empty / whitespace-only input so callers can
-    fall back. Never raises (RECON Gotchas: ``alternateName`` / ``status`` /
-    ``last_chapter`` are HTML and must never flow raw into a Release).
+    fall back. Never raises (HTML must never flow raw into a Release).
     """
     if raw is None:
         return None
@@ -358,16 +317,11 @@ def _is_allowed_image_url(url: str) -> bool:
 
 
 class MangaBallSource(Source):
-    """MangaBall (mangaball.com) — antibot cloudflare + csrf-bootstrap session prep.
+    """MangaBall (mangaball.com) — v2 JSON API, on-demand android CF clearance.
 
-    A MangaDex-class clean-JSON source whose requirements are the ``csrf-bootstrap``
-    session-prep style (D-06: the framework GETs an HTML page, harvests the
-    ``meta[name=csrf-token]`` + ``PHPSESSID``, and injects ``X-CSRF-Token`` + the
-    cookie on every ``/api/v1`` POST) AND — since the 2026-06-15 site-wide Cloudflare
-    managed-challenge escalation (debug mangaball-cloudflare-csrf-243) — the shared
-    Patchright cf_clearance seam. It is the FIRST source to use the cf + csrf-bootstrap
-    UNION; the framework still owns BOTH (this source adds zero networking glue — see
-    the module docstring).
+    A MangaDex-class clean-JSON source (261003-mangaball-api-v2): no session prep,
+    clearance via the shared android-solver seam only when a response is an actual
+    Cloudflare challenge. Zero networking glue — see the module docstring.
     """
 
     key = "mangaball"
@@ -394,31 +348,21 @@ class MangaBallSource(Source):
     ]
     # Probe-tuned (2026-06-04, PR #102 harness): two sweeps, ~6000 requests across
     # 6 residential proxy IPs found NO hard limit on MangaBall — zero
-    # 429/403/Cloudflare-challenge/Retry-After on any endpoint (consistent with
-    # ``antibot = "none"``). The manifest + image endpoints sustained 960/min cleanly
-    # at concurrency 8 (a FLOOR — the true ceiling is higher). ``480`` is the
-    # conservative ~50%-of-floor value, the same shape as the mangadot precedent
-    # (#101). The CSRF-bootstrap ``search`` path (~3-5.5s/call) was latency/proxy-bound,
-    # NOT a site throttle, so ``480`` here is gated by latency, not a rate ceiling.
+    # 429/403/Cloudflare-challenge/Retry-After on any endpoint. The manifest + image
+    # endpoints sustained 960/min cleanly at concurrency 8 (a FLOOR — the true
+    # ceiling is higher). ``480`` is the conservative ~50%-of-floor value, the same
+    # shape as the mangadot precedent (#101); search was latency-bound, not throttled.
     rate_limit_per_minute = 480
     # Per-source download-job concurrency (D-30 override): the 2026-06-04 probe
     # found manifest + image sustaining 960/min cleanly at concurrency 8 with zero
     # throttling, so chapter downloads (manifest/image paths) parallelize safely.
     # 3 mirrors the mangadot precedent (#101); the job manager clamps it to the
-    # global max_concurrent_chapters. (The CSRF-bootstrap search path stays
-    # sequential — this override governs downloads, not search.)
+    # global max_concurrent_chapters. (This override governs downloads, not search.)
     max_concurrent_jobs = 3
     # Cloudflare ESCALATION (debug mangaball-cloudflare-csrf-243, 2026-06-15):
-    # MangaBall enabled a SITE-WIDE managed challenge (``cf-mitigated: challenge``,
-    # HTTP 403 on /, /manga, /search — direct-probe confirmed). The D-07/D-12
-    # residential-IP "passive Cloudflare" classification no longer holds: a bare httpx
-    # GET now receives the interstitial, so the csrf-bootstrap GET failed with "no
-    # meta[name=csrf-token]" → source_unavailable. Flipped "none" → "cloudflare" per
-    # the documented one-attribute escalation (module docstring + the live profile):
-    # this routes BOTH the csrf-bootstrap GET and every data POST through the shared
-    # Patchright cf_clearance seam. MangaBall is the first source to use the cf +
-    # csrf-bootstrap UNION (framework/context.py:_clearance_kwargs +
-    # session_prep.py:CsrfBootstrap). No decrypt (plain .jpg, D-06).
+    # MangaBall enabled a SITE-WIDE managed challenge (``cf-mitigated: challenge``),
+    # so ``antibot`` flipped "none" → "cloudflare", routing every data call through the
+    # shared clearance seam. No decrypt (plain images, D-06).
     antibot = "cloudflare"
     decrypt_scheme = None
     # Host the shared CloudflareSolver solves the managed challenge against (#88
@@ -427,29 +371,20 @@ class MangaBallSource(Source):
     # host and never earns clearance for mangaball.com.
     cloudflare_challenge_url = "https://mangaball.com/"
     # #243: route clearance to the Android-WebView solver, NOT desktop Patchright.
-    # MangaBall's 2026-06-15 managed-challenge escalation is the same strict Turnstile
-    # that desktop Chromium cannot clear from our Linux fingerprint — both the branch
-    # nightly AND the 192.168.0.246 deploy timed out at 60s (``cf_clearance not
-    # captured``), exactly like kagane/mangadot (resolved debug
-    # ``mangadot-cf-linux-fingerprint``); the real Android WebView clears it. The shared
-    # ``get_clearance`` wiring dispatches the csrf-bootstrap GET + every data POST via
-    # this engine, so MangaBall is the first android + csrf-bootstrap UNION source. CI
-    # has no redroid sidecar, so the nightly disables mangaball (with kagane/mangadot).
+    # The managed challenge is the same strict Turnstile desktop Chromium cannot clear
+    # from our Linux fingerprint (both nightly + deploy timed out at 60s, like
+    # kagane/mangadot — resolved debug ``mangadot-cf-linux-fingerprint``); the real
+    # Android WebView clears it. CI reaches the home android-solver over Tailscale or
+    # skips the source.
     solver_engine = "android"
     # On-demand clearance (debug pooltimeout-recurrence, 2026-06-18): MangaBall's
-    # site-wide managed challenge is INTERMITTENT — it was off pre-2026-06-15, switched
-    # ON 06-15 (the escalation above), and was OFF again by 06-18 (direct probe: GET /
-    # returns 200 + the real csrf-token page, NO ``cf-mitigated`` header). With eager
-    # clearance, every request blocked on the android-solver for a cf_clearance it could
-    # never mint while no challenge was firing (the WebView found no
-    # ``challenges.cloudflare.com`` OOPIF → solve timed out → every download
-    # ReadTimeout-failed). This flag makes the cf half LAZY: attach held clearance if
-    # the sidecar already has one, but do NOT block on a fresh solve up front — let the
-    # request go out and only force a real solve when a response is an actual challenge
-    # (``is_cf_challenge`` → the D-35 reconcile in context._request_response). So
-    # MangaBall now self-heals whether or not the challenge is live, and the antibot
-    # config never needs flipping back and forth. ``antibot``/``solver_engine``/
-    # ``session_prep`` stay as-is — only the SOLVE is deferred.
+    # site-wide managed challenge is INTERMITTENT. With eager clearance every request
+    # blocked on an android solve that could never mint while no challenge was firing
+    # (→ every download ReadTimeout-failed). This flag makes clearance LAZY: attach
+    # held clearance if the sidecar has one, and only force a real solve when a
+    # response is an actual challenge (``is_cf_challenge`` → the D-35 reconcile in
+    # context._request_response). So MangaBall self-heals whether or not the
+    # challenge is live; the antibot config never needs flipping back and forth.
     cloudflare_challenge_optional = True
     # v2 backend has no CSRF token; the API accepts cookie-less, token-less requests
     # (261003-mangaball-api-v2 retired the csrf-bootstrap prep).
