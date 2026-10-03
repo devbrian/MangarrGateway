@@ -71,7 +71,7 @@ def _page_url(host: str, tx_id: str, n: int, lang: str = "en") -> str:
 _CHROME_IMGS = (
     '<a class="navbar-brand"><img src="/public/frontend/images/logo.svg"></a>'
     '<span class="chapter-badge"><img class="chapter-badge-icon" '
-    'src="https://mangaball.net/storage/groups/icons/default.png"></span>'
+    'src="https://mangaball.com/storage/groups/icons/default.png"></span>'
 )
 
 
@@ -171,7 +171,7 @@ def test_is_allowed_image_url_rejects_off_shape_path() -> None:
     # Wrong path prefix (not /storage/...).
     assert not _is_allowed_image_url("https://evil.example.net/etc/passwd")
     # The site logo lives under /public/, not /storage/ — rejected by the namespace.
-    assert not _is_allowed_image_url("https://mangaball.net/public/frontend/logo.svg")
+    assert not _is_allowed_image_url("https://mangaball.com/public/frontend/logo.svg")
     # Covers live under /covers/, not /storage/ — rejected by the namespace.
     assert not _is_allowed_image_url(
         "https://bulbasaur.poke-black-and-white.net/covers/t/cover_1.webp"
@@ -180,7 +180,7 @@ def test_is_allowed_image_url_rejects_off_shape_path() -> None:
     # (an HTML/JSON exfil target must never be fetched as a "page image").
     assert not _is_allowed_image_url("https://cdn.example.net/storage/t/chapter.html")
     assert not _is_allowed_image_url("https://cdn.example.net/storage/t/data.json")
-    assert not _is_allowed_image_url("https://mangaball.net/storage/x/logo.svg")
+    assert not _is_allowed_image_url("https://mangaball.com/storage/x/logo.svg")
 
 
 def test_is_allowed_image_url_rejects_empty_host() -> None:
@@ -229,10 +229,10 @@ async def test_fetch_manifest_extracts_absolute_urls_in_order() -> None:
     # The hosts come from the array and differ from base_url (no reconstruction).
     for url in urls:
         assert host in url
-        assert "mangaball.net" not in url
+        assert "mangaball.com" not in url
     # The chapter-detail GET used the bare translation id.
     assert len(ctx.get_calls) == 1
-    assert ctx.get_calls[0] == f"https://mangaball.net/chapter-detail/{tx_id}/"
+    assert ctx.get_calls[0] == f"https://mangaball.com/chapter-detail/{tx_id}"
 
 
 @pytest.mark.asyncio

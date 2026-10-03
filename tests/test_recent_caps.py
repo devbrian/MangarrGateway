@@ -219,7 +219,7 @@ async def test_recent_repeated_source_params_select_all_sources(
     )
     # MangaBall (antibot=none, csrf-bootstrap) → fast permanent 403 → a per-source
     # warnings[] entry (no browser, no retry) — mirrors the contract harness stub.
-    respx.route(host="mangaball.net").mock(return_value=httpx.Response(403))
+    respx.route(host="mangaball.com").mock(return_value=httpx.Response(403))
 
     # httpx encodes a list value as repeated params: ?sources=mangadex&sources=mangaball
     resp = await client.get(
@@ -253,7 +253,7 @@ async def test_recent_csv_source_param_still_works(client: httpx.AsyncClient) ->
             ),
         )
     )
-    respx.route(host="mangaball.net").mock(return_value=httpx.Response(403))
+    respx.route(host="mangaball.com").mock(return_value=httpx.Response(403))
 
     resp = await client.get("/recent", params={"sources": "mangadex,mangaball"})
     assert resp.status_code == 200
@@ -409,7 +409,7 @@ def test_mangaball_class_declares_cloudflare_android_antibot() -> None:
     # solver detail — ``antibot`` stays the "cloudflare" /caps classification.
     assert MangaBallSource.antibot == "cloudflare"
     assert MangaBallSource.solver_engine == "android"
-    assert MangaBallSource.cloudflare_challenge_url == "https://mangaball.net/"
+    assert MangaBallSource.cloudflare_challenge_url == "https://mangaball.com/"
     assert MangaBallSource.session_prep == "csrf-bootstrap"
     assert MangaBallSource.key == "mangaball"
     assert MangaBallSource.rate_limit_per_minute > 0

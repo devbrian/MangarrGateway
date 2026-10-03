@@ -147,7 +147,7 @@ def is_waf_block(resp: httpx.Response) -> bool:
     """True when ``resp`` is a WAF "malicious payload" false-positive block (D-03).
 
     The query-rewrite sibling of :func:`is_cf_challenge` / :func:`is_csrf_failure`:
-    mangaball.net sits behind a WAF that returns a 403 carrying
+    mangaball.com sits behind a WAF that returns a 403 carrying
     ``{"error":"Malicious payload detected", … "code":403}`` for ANY search POST whose
     ``search_input`` contains a SQL-injection-flavoured token (the literal word
     "System" is the one live-confirmed trigger). The word is extremely common in

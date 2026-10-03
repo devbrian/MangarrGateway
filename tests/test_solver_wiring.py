@@ -66,7 +66,7 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
     cf_clearance; the redroid WebView is the only fingerprint that clears it). The
     Android leg covers comix (``https://comix.to/``) plus the other android sources
     (mangadot ``https://mangadot.net/``, kagane ``https://kagane.to/``, mangaball
-    ``https://mangaball.net/``), all routed to the redroid-WebView sidecar. Guards
+    ``https://mangaball.com/``), all routed to the redroid-WebView sidecar. Guards
     against drift that would let a source leak into the wrong engine's challenge map.
     """
     app = create_app(_settings())
@@ -83,7 +83,7 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
             "comix": "https://comix.to/",
             "mangadot": "https://mangadot.net/",
             "kagane": "https://kagane.to/",
-            "mangaball": "https://mangaball.net/",
+            "mangaball": "https://mangaball.com/",
         }
 
 

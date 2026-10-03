@@ -30,8 +30,8 @@ from manga_gateway.handles.store import HandleStore
 from manga_gateway.models.search import SearchRequest
 from manga_gateway.sources.mangaball import MangaBallSource
 
-_SEARCH_ADVANCED = "https://mangaball.net/api/v1/title/search-advanced/"
-_CHAPTER_LISTING = "https://mangaball.net/api/v1/chapter/chapter-listing-by-title-id/"
+_SEARCH_ADVANCED = "https://mangaball.com/api/v1/title/search-advanced"
+_CHAPTER_LISTING = "https://mangaball.com/api/v1/chapter/chapter-listing-by-title-id"
 _TITLE_ID = "0123456789abcdef01234567"  # 24-hex (guid contract)
 
 
@@ -44,7 +44,7 @@ def _translation(*, tx_id: str, language: str = "en") -> dict[str, Any]:
         "group": {"_id": "daomeoden", "name": "Rayquaza", "icon": "/x.png"},
         "date": "2026-06-01 23:33:42",
         "pages": 66,
-        "url": f"http://mangaball.net/chapter-detail/{tx_id}/",
+        "url": f"http://mangaball.com/chapter-detail/{tx_id}/",
         "volume": 0,
     }
 
@@ -75,7 +75,7 @@ def _title(*, title_id: str = _TITLE_ID, name: str = "One Piece") -> dict[str, A
         "alternateName": 'ワンピース<span class="text-muted">/</span>OP',
         "status": '<span class="badge">Ongoing</span>',
         "last_chapter": '<div class="lc"><a href="/x">Ch. 12</a></div>',
-        "url": f"http://mangaball.net/title-detail/one-piece-{title_id}/",
+        "url": f"http://mangaball.com/title-detail/one-piece-{title_id}/",
         "updated_at": "2026-06-01 23:33:42",
     }
 

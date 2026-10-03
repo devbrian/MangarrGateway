@@ -3,9 +3,9 @@
 The LIVE flow is TWO calls (the old fixtures fabricated a ``title["chapters"]``
 shape the API never returns — that false shape is RETIRED here):
 
-1. ``POST /api/v1/title/search-advanced/`` → a TITLE-ONLY envelope (no ``chapters``
+1. ``POST /api/v1/title/search-advanced`` → a TITLE-ONLY envelope (no ``chapters``
    key). ``search`` slices the first ``_DEFAULT_TITLE_CANDIDATES`` candidates.
-2. ``POST /api/v1/chapter/chapter-listing-by-title-id/`` per candidate → the FLAT
+2. ``POST /api/v1/chapter/chapter-listing-by-title-id`` per candidate → the FLAT
    ``{code,message,ALL_CHAPTERS:[…]}`` envelope whose ``translations`` are the
    release granularity.
 
@@ -34,8 +34,8 @@ from manga_gateway.sources.mangaball import MangaBallSource
 # guid contract (D-08): mangaball:{24-hex title}:ch-{float}:{lang}:{24-hex tx}
 _GUID_RE = re.compile(r"^mangaball:[0-9a-f]{24}:ch-[\d.]+:[a-z-]{2,}:[0-9a-f]{24}$")
 
-_SEARCH_ADVANCED = "https://mangaball.net/api/v1/title/search-advanced/"
-_CHAPTER_LISTING = "https://mangaball.net/api/v1/chapter/chapter-listing-by-title-id/"
+_SEARCH_ADVANCED = "https://mangaball.com/api/v1/title/search-advanced"
+_CHAPTER_LISTING = "https://mangaball.com/api/v1/chapter/chapter-listing-by-title-id"
 
 
 class _FakeCtxForSearch:
@@ -124,7 +124,7 @@ def _translation(
         "date": date,
         "pages": pages,
         "size": "0MB",  # unreliable — recon Gotchas
-        "url": f"http://mangaball.net/chapter-detail/{tx_id}/",
+        "url": f"http://mangaball.com/chapter-detail/{tx_id}/",
         "volume": 0,
     }
 
@@ -167,7 +167,7 @@ def _title(
         "alternateName": alternate_name,
         "status": '<span class="badge">Ongoing</span>',
         "last_chapter": '<div class="lc"><a href="/x">Ch. 1184.1</a></div>',
-        "url": f"http://mangaball.net/title-detail/one-piece-{title_id}/",
+        "url": f"http://mangaball.com/title-detail/one-piece-{title_id}/",
         "updated_at": "2026-06-01 23:33:42",
     }
 

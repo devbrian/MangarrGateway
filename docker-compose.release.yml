@@ -151,7 +151,7 @@ services:
       SOLVER_ADB_TARGET: "redroid:5555"
       # SSRF allowlist — the only challenge hosts the sidecar will drive a device
       # against (the strict-Turnstile sources). Anything else → 422.
-      SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to,mangaball.net,comix.to"
+      SOLVER_ALLOWED_HOSTS: "mangadot.net,kagane.to,mangaball.com,comix.to"
       # Per-solve wall-clock cap (an Android WebView solve is slower than desktop).
       SOLVER_SOLVE_TIMEOUT_S: "120"
     restart: unless-stopped
