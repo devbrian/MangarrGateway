@@ -25,6 +25,7 @@ import pytest
 
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.handles.store import HandleStore
+from manga_gateway.sources import mangaball
 from manga_gateway.sources.mangaball import MangaBallSource, _is_allowed_image_url
 
 _CHAPTER_DETAIL = "https://mangaball.com/api/v1/chapter-detail"
@@ -286,3 +287,133 @@ async def test_fetch_image_sends_mangaball_referer() -> None:
     data = await MangaBallSource().fetch_image(_LIVE_RED_BLUE_URL, ctx)  # type: ignore[arg-type]
     assert data == b"JPEGDATA"
     assert ctx.fetched == [(_LIVE_RED_BLUE_URL, {"Referer": "https://mangaball.com/"})]
+
+
+# ──────── challenged-zone WebView images (261003-mangaball-webview-images) ────────
+
+_ZONE1 = "bulbasaur.poke-black-and-white.net"
+_ZONE2 = "chikorita.red-and-blue.net"
+_WEBVIEW_PAGE = "https://mangaball.com/robots.txt"
+
+
+@pytest.fixture(autouse=True)
+def _clear_webview_stash() -> Any:
+    mangaball._webview_image_stash.clear()
+    yield
+    mangaball._webview_image_stash.clear()
+
+
+class _FakeWebviewSolver:
+    """Records ``fetch_images_in_webview`` calls; scripted bytes or exception."""
+
+    def __init__(
+        self, data: dict[str, bytes | None], error: Exception | None = None
+    ) -> None:
+        self.data = data
+        self.error = error
+        self.calls: list[tuple[str, str, list[str]]] = []
+
+    async def fetch_images_in_webview(
+        self,
+        source_key: str,
+        page_url: str,
+        urls: list[str],
+        *,
+        timeout: float | None = None,  # noqa: ASYNC109 — mirrors the router kwarg
+    ) -> list[bytes | None]:
+        self.calls.append((source_key, page_url, urls))
+        if self.error is not None:
+            raise self.error
+        return [self.data.get(u) for u in urls]
+
+
+class _WebviewCtx(_FakeCtxForManifest):
+    def __init__(self, detail: dict[str, Any], solver: object | None) -> None:
+        super().__init__(detail)
+        if solver is not None:
+            self._solver = solver
+        self.fetched: list[tuple[str, dict[str, str] | None]] = []
+
+    async def get_bytes_plain_with_headers(
+        self, url: str, *, extra_headers: dict[str, str] | None = None
+    ) -> tuple[bytes, httpx.Headers]:
+        self.fetched.append((url, extra_headers))
+        return b"HTTPX", httpx.Headers()
+
+
+_MIXED = [_page_url(_ZONE1, 1), _page_url(_ZONE2, 2), _page_url(_ZONE1, 3)]
+
+
+@pytest.mark.asyncio
+async def test_mixed_chapter_batches_zone1_once_and_serves_from_stash() -> None:
+    solver = _FakeWebviewSolver({_MIXED[0]: b"P1", _MIXED[2]: b"P3"})
+    ctx = _WebviewCtx(_detail(_MIXED), solver)
+    src = MangaBallSource()
+
+    assert await src.fetch_manifest("a" * 24, ctx) == _MIXED  # type: ignore[arg-type]
+    assert solver.calls == [("mangaball", _WEBVIEW_PAGE, [_MIXED[0], _MIXED[2]])]
+
+    assert await src.fetch_image(_MIXED[0], ctx) == b"P1"  # type: ignore[arg-type]
+    assert len(solver.calls) == 1  # stash hit — no solver call
+    assert ctx.fetched == []  # and no httpx GET for a zone-1 URL
+
+    # Already popped → exactly one single-URL WebView refetch.
+    assert await src.fetch_image(_MIXED[0], ctx) == b"P1"  # type: ignore[arg-type]
+    assert solver.calls[-1] == ("mangaball", _WEBVIEW_PAGE, [_MIXED[0]])
+    assert len(solver.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_zone2_chapter_makes_no_solver_call_and_uses_referer() -> None:
+    urls = [_page_url(_ZONE2, 1), _page_url(_ZONE2, 2)]
+    solver = _FakeWebviewSolver({})
+    ctx = _WebviewCtx(_detail(urls), solver)
+    src = MangaBallSource()
+    assert await src.fetch_manifest("a" * 24, ctx) == urls  # type: ignore[arg-type]
+    assert await src.fetch_image(urls[0], ctx) == b"HTTPX"  # type: ignore[arg-type]
+    assert solver.calls == []
+    assert ctx.fetched == [(urls[0], {"Referer": "https://mangaball.com/"})]
+
+
+@pytest.mark.asyncio
+async def test_none_body_is_not_stashed_and_raises_on_fetch() -> None:
+    url = _page_url(_ZONE1, 1)
+    solver = _FakeWebviewSolver({url: None})
+    ctx = _WebviewCtx(_detail([url]), solver)
+    src = MangaBallSource()
+    await src.fetch_manifest("a" * 24, ctx)  # type: ignore[arg-type]
+    assert url not in mangaball._webview_image_stash
+    with pytest.raises(SourceError) as excinfo:
+        await src.fetch_image(url, ctx)  # type: ignore[arg-type]
+    assert excinfo.value.code == "source_unavailable"
+    assert _ZONE1 in str(excinfo.value)
+    assert solver.calls[-1] == ("mangaball", _WEBVIEW_PAGE, [url])
+
+
+@pytest.mark.parametrize(
+    "solver",
+    [
+        None,
+        _FakeWebviewSolver({}, error=RuntimeError("not on the android engine")),
+        _FakeWebviewSolver(
+            {},
+            error=httpx.HTTPStatusError(
+                "504",
+                request=httpx.Request("POST", "http://s/fetch-images"),
+                response=httpx.Response(504),
+            ),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_zone1_solver_missing_or_failing_is_source_unavailable(
+    solver: object | None,
+) -> None:
+    url = _page_url(_ZONE1, 1)
+    ctx = _WebviewCtx(_detail([url]), solver)
+    with pytest.raises(SourceError) as excinfo:
+        await MangaBallSource().fetch_manifest("a" * 24, ctx)  # type: ignore[arg-type]
+    assert excinfo.value.code == "source_unavailable"
+    with pytest.raises(SourceError):
+        await MangaBallSource().fetch_image(url, ctx)  # type: ignore[arg-type]
+    assert ctx.fetched == []

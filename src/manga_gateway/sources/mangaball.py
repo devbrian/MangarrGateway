@@ -13,14 +13,18 @@ when a response is an actual challenge). The CSRF bootstrap is retired: the v2 A
 needs no token or session cookie (``session_prep = None``). ``rate_limit_per_minute
 = 480`` is the conservative ~50%-of-floor value from the 2026-06-04 probe (#101).
 
-ponytail: known limit (261003-mangaball-api-v2) — the ``*.poke-black-and-white.net``
-CDN zone serves a Cloudflare managed challenge (403 ``cf-mitigated: challenge``) to
-non-browser TLS fingerprints even with the Referer and via residential proxies, and
-hard-blocks top-level navigation, so the android solver cannot mint a clearance for
-it. Pages on that zone fail with ``upstream 403`` (after one D-35 forced re-solve
-against mangaball.com, since the 403 is a CF challenge) until a WebView-side image
-body capture exists (follow-up issue). ``*.red-and-blue.net`` serves plaintext.
-Upgrade path = WebView-side image body capture.
+Challenged image zone (261003-mangaball-webview-images, Refs #378): the
+``*.poke-black-and-white.net`` CDN zone serves a Cloudflare managed challenge to every
+httpx egress the gateway has and hard-blocks top-level navigation, so no clearance can
+be minted for it. Its pages are instead loaded as SUBRESOURCES of
+``mangaball.com/robots.txt`` inside the redroid WebView via the sidecar
+``/fetch-images`` — one batch per chapter in ``fetch_manifest``, stashed for
+``fetch_image``. ``*.red-and-blue.net`` serves plaintext and stays on httpx (+ the
+Referer below).
+
+Ops note: the default lane is held ~20-60s per zone-1 chapter, so concurrent mangadot
+``/solve``s see ``_device_op`` queueing / sidecar ``503 busy`` backpressure, which the
+gateway client already retries.
 
 ENDPOINT MAP (v2, verified live 2026-10-03, ``261003-mangaball-api-v2``):
 
@@ -40,8 +44,9 @@ ENDPOINT MAP (v2, verified live 2026-10-03, ``261003-mangaball-api-v2``):
 * manifest: ``GET /api/v1/chapter-detail?chapter_id=<id>`` → ``data.chapter.pages``
   (absolute CDN URLs in order; the host varies per content and is NEVER
   reconstructed — CLAUDE.md SSRF).
-* image: ``GET`` of each CDN URL with ``Referer: https://mangaball.com/`` (a bare GET
-  403s).
+* image: ``*.red-and-blue.net`` → ``GET`` of each CDN URL with
+  ``Referer: https://mangaball.com/`` (a bare GET 403s);
+  ``*.poke-black-and-white.net`` → the WebView ``/fetch-images`` batch (above).
 
 guid (D-08): ``mangaball:{title_id}:ch-{number}:{lang}:{row_id}`` — the language +
 row id are required because one chapter number maps to N rows (one per
@@ -62,6 +67,9 @@ from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+import httpx
+from cachetools import TTLCache
 
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
@@ -215,6 +223,22 @@ _MANGABALL_INTERNAL_HOST_SUFFIXES = (".internal", ".local", ".localhost")
 # 261003-mangaball-api-v2: the CDN hotlink-blocks a bare image GET (403); the reader's
 # Referer is required. Mirrors comix's ``_IMAGE_FETCH_HEADERS``.
 _IMAGE_FETCH_HEADERS = {"Referer": "https://mangaball.com/"}
+
+# 261003-mangaball-webview-images (Refs #378): CDN zones CF-challenged for every httpx
+# egress → fetched as WebView subresources. The leading dot = a true subdomain match.
+# ponytail: the zone list is a constant; when the site adds a challenged zone, add it
+# here — detecting it on a challenge-403 is the upgrade path.
+_WEBVIEW_IMAGE_HOST_SUFFIXES = (".poke-black-and-white.net",)
+# A 273-byte text document; the heavy Next.js pages replace the WebView target and
+# drop the CDP socket.
+_WEBVIEW_PAGE_URL = "https://mangaball.com/robots.txt"
+# Page bytes fetched in the per-chapter batch, popped by ``fetch_image``.
+# ponytail: bounded by entry count, not bytes; a byte-bounded cache if memory matters.
+_webview_image_stash: TTLCache[str, bytes] = TTLCache(maxsize=512, ttl=900)
+
+
+def _is_webview_image_url(url: str) -> bool:
+    return (urlparse(url).hostname or "").lower().endswith(_WEBVIEW_IMAGE_HOST_SUFFIXES)
 
 
 def _items_and_pagination(
@@ -728,8 +752,39 @@ class MangaBallSource(Source):
         #83/IN-03: the guard uses ``ctx.expected_pages`` forwarded by the engine. The
         v2 API exposes no page count, so new records carry ``None`` and the guard
         degrades to a no-op; it still runs whenever a count is known.
+
+        Challenged-zone pages are fetched in ONE WebView batch here and stashed for
+        :meth:`fetch_image` (261003-mangaball-webview-images).
         """
-        return await self._manifest_for_translation(chapter_id, ctx.expected_pages, ctx)
+        urls = await self._manifest_for_translation(chapter_id, ctx.expected_pages, ctx)
+        zone = [u for u in urls if _is_webview_image_url(u)]
+        if zone:
+            for url, data in zip(
+                zone, await self._webview_fetch(ctx, zone), strict=True
+            ):
+                if data is not None:
+                    _webview_image_stash[url] = data
+        return urls
+
+    async def _webview_fetch(
+        self, ctx: SourceContext, urls: list[str]
+    ) -> list[bytes | None]:
+        """Fetch ``urls`` as WebView subresources via the solver router (Refs #378)."""
+        solver = getattr(ctx, "_solver", None)
+        if solver is None or not hasattr(solver, "fetch_images_in_webview"):
+            raise SourceError(
+                "source_unavailable",
+                "mangaball challenged-zone images need the android solver",
+            )
+        try:
+            return list(
+                await solver.fetch_images_in_webview(self.key, _WEBVIEW_PAGE_URL, urls)
+            )
+        except (httpx.HTTPError, RuntimeError) as exc:
+            raise SourceError(
+                "source_unavailable",
+                f"webview image fetch failed: {type(exc).__name__}",
+            ) from exc
 
     async def _manifest_for_translation(
         self, translation_id: str, pages: int | None, ctx: SourceContext
@@ -785,7 +840,21 @@ class MangaBallSource(Source):
         ``get_bytes_plain_with_headers`` carries it (comix precedent). No decrypt;
         the response headers are discarded. Bounded by the per-job semaphore, NOT the
         per-source API limiter.
+
+        Challenged-zone URLs (261003-mangaball-webview-images) are served from the
+        ``fetch_manifest`` stash; a miss (eviction, restart, or the engine's
+        Pillow-invalid refetch) re-fetches that one URL through the WebView.
         """
+        if _is_webview_image_url(url):
+            webview_data = _webview_image_stash.pop(url, None)
+            if webview_data is None:
+                webview_data = (await self._webview_fetch(ctx, [url]))[0]
+            if webview_data is None:
+                raise SourceError(
+                    "source_unavailable",
+                    f"webview image fetch failed for {urlparse(url).hostname}",
+                )
+            return webview_data
         data, _headers = await ctx.get_bytes_plain_with_headers(
             url, extra_headers=_IMAGE_FETCH_HEADERS
         )
