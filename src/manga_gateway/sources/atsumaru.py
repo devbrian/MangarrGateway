@@ -35,7 +35,8 @@ ENDPOINT SHAPES (live-recon-pinned, 2026-06-08):
   resolves each chapter's ``scanlationMangaId`` → ``scanlationGroup``. (``manga.page``
   itself is title-only-windowed via ``hasMoreChapters`` — NOT a complete chapter
   source — so it is used ONLY for the scanlators map, never for enumeration.)
-* recent: ``GET /api/infinite/recentlyUpdated?page=&types=`` →
+* recent: ``GET /api/home2/recentlyUpdated?offset=&limit=&types=&mediums=
+  &contentRatings=`` (moved 2026-11-01, 261101-plw) →
   ``{items:[{id,title,type,…}]}`` — a TITLE-ONLY newest-updated feed (no embedded
   chapter), so ``recent`` fans out ONE ``GET /api/manga/page?id=`` per title
   (``mangaPage.chapters`` newest-first window + ``mangaPage.scanlators`` in a single
@@ -116,11 +117,11 @@ _DEFAULT_TITLE_CANDIDATES = 5
 # poll's cumulative wall-clock spanned ~4 sequential waves and could exceed fanout.py's
 # 30s per-source ``asyncio.timeout``, cancelling the source → ``source_unavailable /
 # "timed out"`` despite every call returning 200. A single wave keeps the worst case at
-# ~recentlyUpdated + the slowest single page, well under 30s. The shared 480/min (8/s)
-# limiter still paces issuance, so atsu.moe never sees more than ~8 concurrent — inside
-# the probe-validated concurrency-32 ceiling (2026-06-08 parallelism sweep, zero
-# throttling). search() enumerates ≤5 candidates, so the wider bound is a harmless
-# ceiling there (already one wave).
+# ~home2/recentlyUpdated + the slowest single page, well under 30s. The shared
+# 480/min (8/s) limiter still paces issuance, so atsu.moe never sees more than ~8
+# concurrent — inside the probe-validated concurrency-32 ceiling (2026-06-08
+# parallelism sweep, zero throttling). search() enumerates ≤5 candidates, so the
+# wider bound is a harmless ceiling there (already one wave).
 _CHAPTERS_FANOUT_CONCURRENCY = 20
 # recent() fans out one allChapters call per recently-updated title; bound the title
 # count so a single recent poll can never balloon into dozens of full-feed fetches.
@@ -423,7 +424,7 @@ class AtsumaruSource(Source):
     ) -> list[Release]:
         """Newest-updated titles → DIRECT newest-chapter releases (RCNT-01/02).
 
-        GETs ``/api/infinite/recentlyUpdated`` (TITLE-ONLY — no embedded chapter), then
+        GETs ``/api/home2/recentlyUpdated`` (TITLE-ONLY — no embedded chapter), then
         fans out exactly ONE ``GET /api/manga/page?id=`` per title — that detail
         endpoint returns the newest-first chapter WINDOW *and* the scanlators map in a
         single response, so recent needs no separate ``allChapters`` (it only wants the
@@ -435,10 +436,19 @@ class AtsumaruSource(Source):
         """
         if not self._language_wanted(languages):
             return []
+        # 261101-plw: the old ``/api/infinite/recentlyUpdated`` 404s since
+        # 2026-11-01 (its 404 streak tripped the shared cooldown and also blocked
+        # search). Params mirror the live SPA; ``mediums=Comic`` because novels have no
+        # page images; ``contentRatings`` is the SPA's full default because search
+        # applies no content-rating filter (``_SEARCH_FILTER_BY`` is
+        # ``hidden:!=true``), so recent must not narrow what search can find.
         body = await ctx.get_json(
-            f"{self.base_url}/api/infinite/recentlyUpdated",
-            page=1,
+            f"{self.base_url}/api/home2/recentlyUpdated",
+            offset=0,
+            limit=_RECENT_TITLE_CAP,
             types=_RECENT_TYPES,
+            mediums="Comic",
+            contentRatings="Safe,Suggestive,Erotica",
         )
         items = body.get("items")
         titles = [

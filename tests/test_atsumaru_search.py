@@ -492,7 +492,7 @@ async def test_search_non_english_language_filter_returns_empty() -> None:
 # chapter + scanlator map) ALSO carries the tracker-link fields — so recent Releases
 # carry externalLinks with ZERO added HTTP, mirroring the search path.
 
-_RECENTLY_UPDATED = "https://atsu.moe/api/infinite/recentlyUpdated"
+_RECENTLY_UPDATED = "https://atsu.moe/api/home2/recentlyUpdated"
 
 
 class _FakeCtxForRecent:
