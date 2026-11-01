@@ -2,14 +2,18 @@
 
 ``fetch_manifest(book_id)`` (live recon 2026-06-09):
 
-1. ``POST https://kagane.to/api/integrity`` ``{}`` → ``{token}`` (cf_clearance injected
-   by the framework).
-2. ``POST https://kagane.to/api/v2/books/{book_id}?is_datasaver=false`` with the
+1. ``POST https://kagane.moe/api/integrity`` ``{}`` → ``{token}`` (cf_clearance attached
+   by the framework when held — on-demand since 261101-plw).
+2. ``POST https://kagane.moe/api/v2/books/{book_id}?intent=Read`` with the
    ``x-integrity-token`` header → ``{access_token, cache_url, manifest:{pages:[{page_id,
    ext, page_no}]}}``.
 3. EXTRACT each page URL by joining the server-provided ``cache_url`` + the page path +
    the ``access_token`` query, ordered by ``page_no``, SSRF-allowlisted, and guarded
-   against ``ctx.expected_pages``.
+   against ``ctx.expected_pages``. A ``jxl`` page is emitted with a ``.jpg`` suffix (the
+   CDN transcodes; 261101-plw).
+
+``fetch_image`` must send ``Origin: https://kagane.moe`` — the CDN 404s without it
+(261101-plw).
 
 No network: a fake ``SourceContext`` returns canned integrity + book-token bodies via
 ``post_json_body`` and records params/headers for assertions.
@@ -19,13 +23,14 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 
 from manga_gateway.framework.errors import SourceError
 from manga_gateway.sources.kagane import KaganeSource
 
-_INTEGRITY = "https://kagane.to/api/integrity"
-_BOOKS = "https://kagane.to/api/v2/books"
+_INTEGRITY = "https://kagane.moe/api/integrity"
+_BOOKS = "https://kagane.moe/api/v2/books"
 _CACHE = "https://kstatic.to"
 
 
@@ -85,6 +90,12 @@ class _FakeCtxForManifest:
             }
         raise AssertionError(f"unexpected post_json_body url: {url}")
 
+    async def get_bytes_plain_with_headers(
+        self, url: str, *, extra_headers: dict[str, str] | None = None
+    ) -> tuple[bytes, httpx.Headers]:
+        self.calls.append((url, {"extra_headers": extra_headers}))
+        return b"jpegbytes", httpx.Headers()
+
 
 @pytest.mark.asyncio
 async def test_fetch_manifest_three_calls_ordered_urls() -> None:
@@ -92,8 +103,8 @@ async def test_fetch_manifest_three_calls_ordered_urls() -> None:
     urls = await KaganeSource().fetch_manifest("bookX", ctx)  # type: ignore[arg-type]
     # Ordered by page_no (p1 then p2 despite reversed input).
     assert urls == [
-        f"{_CACHE}/api/v2/books/page/bookX/p1.jxl?token=drmtok&is_datasaver=false",
-        f"{_CACHE}/api/v2/books/page/bookX/p2.jxl?token=drmtok&is_datasaver=false",
+        f"{_CACHE}/api/v2/books/page/bookX/p1.jpg?token=drmtok",
+        f"{_CACHE}/api/v2/books/page/bookX/p2.jpg?token=drmtok",
     ]
     # Exactly two outbound calls — page URLs are constructed, not fetched —
     # so a future unintended extra HTTP call in the happy path fails this test.
@@ -103,7 +114,7 @@ async def test_fetch_manifest_three_calls_ordered_urls() -> None:
     book_url, book_call = ctx.calls[1]
     assert book_url == f"{_BOOKS}/bookX"
     assert book_call["headers"] == {"x-integrity-token": "integ-jwt"}
-    assert book_call["params"] == {"is_datasaver": "false"}
+    assert book_call["params"] == {"intent": "Read"}
 
 
 @pytest.mark.asyncio
@@ -165,9 +176,37 @@ async def test_fetch_manifest_non_https_cache_url_raises_ssrf() -> None:
 
 @pytest.mark.asyncio
 async def test_fetch_manifest_subdomain_cache_url_allowed() -> None:
-    ctx = _FakeCtxForManifest(cache_url="https://cdn.kagane.to")
+    ctx = _FakeCtxForManifest(cache_url="https://cdn.kagane.moe")
     urls = await KaganeSource().fetch_manifest("bookX", ctx)  # type: ignore[arg-type]
-    assert all(u.startswith("https://cdn.kagane.to/api/v2/books/page/") for u in urls)
+    assert all(u.startswith("https://cdn.kagane.moe/api/v2/books/page/") for u in urls)
+
+
+@pytest.mark.asyncio
+async def test_fetch_manifest_non_jxl_ext_preserved() -> None:
+    """261101-plw: only ``jxl`` maps to ``.jpg``; other exts pass through."""
+    ctx = _FakeCtxForManifest(pages=[{"page_id": "p1", "ext": "png", "page_no": 1}])
+    urls = await KaganeSource().fetch_manifest("bookX", ctx)  # type: ignore[arg-type]
+    assert urls == [f"{_CACHE}/api/v2/books/page/bookX/p1.png?token=drmtok"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_sends_origin_header() -> None:
+    """261101-plw: the kstatic.to CDN 404s without ``Origin: https://kagane.moe``."""
+    ctx = _FakeCtxForManifest()
+    url = f"{_CACHE}/api/v2/books/page/bookX/p1.jpg?token=drmtok"
+    data = await KaganeSource().fetch_image(url, ctx)  # type: ignore[arg-type]
+    assert data == b"jpegbytes"
+    assert ctx.calls == [
+        (
+            url,
+            {
+                "extra_headers": {
+                    "Origin": "https://kagane.moe",
+                    "Referer": "https://kagane.moe/",
+                }
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

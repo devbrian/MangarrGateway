@@ -1,48 +1,45 @@
 """Kagane source — a ``cloudflare`` Komga-derived JSON-REST source (SRC-01).
 
-Kagane (``https://kagane.to``) is a Next.js SPA whose backend is a **Komga-fork
-JSON-REST API** SAME-ORIGIN at ``https://kagane.to/api/v2/...`` (it used to live on a
-separate ``yuzuki.kagane.to`` host, decommissioned ~2026-07-19 — #360), with
-page images served from a SEPARATE host (``https://kstatic.to``, the response-provided
-``cache_url``). It adds **zero networking glue** — every outbound call is
-``ctx.post_json_body`` / ``ctx.get_json`` / ``ctx.get_bytes`` (SRC-01/SRC-02); all
-anti-bot/rate-limit/retry/clearance live in the framework.
+Kagane (``https://kagane.moe`` — moved 2026-11-01, 261101-plw) is a Next.js SPA whose
+backend is a **Komga-fork JSON-REST API** SAME-ORIGIN at ``https://kagane.moe/api/v2/...``,
+with page images served from a SEPARATE host (``https://kstatic.to``, the
+response-provided ``cache_url``). It adds **zero networking glue** — every outbound call
+is ``ctx.post_json_body`` / ``ctx.get_json`` / ``ctx.get_bytes_plain_with_headers``
+(SRC-01/SRC-02); all anti-bot/rate-limit/retry/clearance live in the framework.
 
 Two-axis classification (recon 2026-06-09, see the quick-task RECON write-up):
 
-* **Axis A (prep/antibot) = comix** — ``antibot = "cloudflare"`` +
-  ``cloudflare_challenge_url = "https://kagane.to/"``. The whole ``kagane.to`` origin is
-  Cloudflare-gated — ``POST /api/integrity`` (the download-path token mint) AND the
-  same-origin ``/api/v2/...`` data API — so the framework's captured ``cf_clearance`` +
-  bound UA (injected on every call) is REQUIRED throughout; only ``kstatic.to`` (images)
-  answers cold over plain httpx. NO comix-style browser-DOM read: the cleared
-  API is clean JSON over httpx, and the integrity token is a normal server route (not a
-  JS-VM-minted token), so ``solver.fetch_via_browser`` is not used.
+* **Axis A (prep/antibot) = mangaball** — ``antibot = "cloudflare"`` +
+  ``cloudflare_challenge_url = "https://kagane.moe/"`` with
+  ``cloudflare_challenge_optional = True``: from the deploy egress the kagane.moe API
+  answers 200 with no challenge (261101-plw), so clearance is ON-DEMAND — attached if
+  held, solved only on a real challenge. NO browser-DOM read: the API is clean JSON over
+  httpx and the integrity token is a normal server route.
 * **Axis B (search topology) = atsumaru** — title→chapter fan-out: ``search/series``
-  returns TITLES; the COMPLETE chapter list lives in a separate per-series
-  ``GET /api/v2/series/{id}`` call (``series_books``). ``recent`` is a title-only feed
+  returns TITLES; the COMPLETE chapter list is a separate per-series cursor-paginated
+  ``GET /api/v2/series/{id}/books`` feed (261101-plw). ``recent`` is a title-only feed
   with the newest chapter EMBEDDED (``latest_chapters``) → DIRECT mint (no fan-out).
 
-ENDPOINT SHAPES (live-recon-pinned, 2026-06-09):
+ENDPOINT SHAPES (live-recon-pinned 2026-06-09, re-pinned 2026-11-01 for 261101-plw):
 
-* base (cf-gated): ``https://kagane.to`` — ``POST /api/integrity`` ``{}`` → ``{token}``.
-* API (cf-gated, SAME-ORIGIN on ``https://kagane.to`` — #360):
+* base: ``https://kagane.moe`` — ``POST /api/integrity`` ``{}`` → ``{token}``.
+* API (SAME-ORIGIN on ``https://kagane.moe``):
   - search: ``POST /api/v2/search/series?page=0&size=N`` (no ``sort`` ⇒ relevance),
     JSON body ``{"title": <query>, "content_rating": ["Safe", "Suggestive"]}`` →
     ``{content:[{series_id, title, alternate_titles, current_books, translated_language,
     latest_chapters:[{book_id, chapter_no, created_at, ...}]}]}`` — TITLE-ONLY.
   - recent: same endpoint, ``?sort=updated_at,desc``, body ``{"content_rating":[...]}``;
     each row's ``latest_chapters[0]`` mints a DIRECT release (the book_id is present).
-  - chapter list: ``GET /api/v2/series/{series_id}`` → ``{series_books:[{book_id,
-    chapter_no, volume_no, page_count, groups:[{title}], became_visible_at, ...}],
-    current_books}`` — the COMPLETE feed (verified 1182/1182 for One Piece, one call,
-    no page/offset param).
-  - book token + manifest: ``POST /api/v2/books/{book_id}?is_datasaver=false`` with
-    the ``x-integrity-token`` header → ``{access_token, cache_url,
+  - chapter list: ``GET /api/v2/series/{series_id}/books?limit=500[&before=<cursor>]``
+    → ``{items:[{book_id, chapter_no, volume_no, sort_no, page_count, groups:[{title}],
+    created_at, ...}], next_cursor}`` — walked until ``next_cursor`` is null.
+  - book token + manifest: ``POST /api/v2/books/{book_id}?intent=Read`` with the
+    ``x-integrity-token`` header → ``{access_token, cache_url,
     manifest:{pages:[{page_id, ext, page_no, ...}]}}``.
-* image (open): ``GET {cache_url}/api/v2/books/page/{book_id}/{page_id}.{ext}
-  ?token={access_token}&is_datasaver=false`` → plaintext ``image/jpeg`` (the manifest
-  declares ``ext=jxl`` but the CDN serves decoded JPEG; ``decrypt_scheme = None``).
+* image: ``GET {cache_url}/api/v2/books/page/{book_id}/{page_id}.jpg
+  ?token={access_token}`` with ``Origin: https://kagane.moe`` (404 without it) →
+  plaintext JPEG (pages are ``ext=jxl``; the ``page/`` namespace transcodes for a
+  ``.jpg`` suffix; ``decrypt_scheme = None``).
 
 guid (D-08): ``kagane:{series_id}:ch-{chapter_no}:{book_id}``. The
 ``ResolutionRecord.chapter_id`` is the bare ``book_id`` — ``fetch_manifest`` keys the
@@ -54,10 +51,9 @@ the form-encoded ``ctx.post_json`` supports. They ride the additive
 ``ctx.post_json_body(url, *, body, params, headers)`` seam (added with this source);
 the source still adds ZERO networking glue.
 
-Anti-bot caveat: the same managed challenge as comix gates ``kagane.to``; the solver
-almost certainly must run HEADED (``GATEWAY_CLOUDFLARE_HEADLESS=false``) — confirmed
-cleared headed in recon. A "captured clearance" that still yields ``upstream 403`` is
-the stale-cookie false positive (headless-blocked).
+Anti-bot caveat: CF clearance is on-demand (261101-plw) — if kagane.moe starts
+challenging again, the reactive D-35 solve routes to the android WebView sidecar
+(``solver_engine = "android"``), whose ``SOLVER_ALLOWED_HOSTS`` must carry kagane.moe.
 """
 
 from __future__ import annotations
@@ -82,14 +78,10 @@ if TYPE_CHECKING:
     from ..framework.context import SourceContext
     from ..models.search import SearchRequest
 
-# The Komga-derived data API is SAME-ORIGIN on ``kagane.to`` (``kagane.to/api/v2/...``
-# — network tab of the live SPA, 260721). It USED to live on ``yuzuki.kagane.to``; that
-# host was decommissioned (now a bare nginx 403 to a browser, CF-flagged to httpx),
-# which took kagane down ~2026-07-19 (debug avif-image-ssrf-allowlist / #360). Being
-# same-origin on the cf-gated ``kagane.to`` means the ONE interactive-Turnstile
-# clearance the framework already mints (``cloudflare_challenge_url``) covers the data
-# API too — no separate host clearance needed.
-_API_BASE = "https://kagane.to"
+# 261101-plw: the old host went NXDOMAIN 2026-11-01 and the site moved to kagane.moe
+# (kagane.net 301s there). The data API is still SAME-ORIGIN
+# (``kagane.moe/api/v2/...``); page images are still on ``kstatic.to``.
+_API_BASE = "https://kagane.moe"
 
 # Search/recent request body: the keyword rides ``title`` (NOT ``keyword`` — that field
 # is a no-op, falsified live). ``content_rating`` mirrors the site's own default so
@@ -108,13 +100,23 @@ _CHAPTERS_FANOUT_CONCURRENCY = 6
 # embedded ``latest_chapters`` — no per-title fan-out — so the only bound is the page
 # size; cap it so a single recent poll stays cheap.
 _RECENT_PAGE_SIZE = 50
+# 261101-plw: the ``/books`` feed server-caps ``limit`` at 500 per page.
+_BOOKS_PAGE_LIMIT = 500
+# 261101-plw: the kstatic.to CDN returns 404 ``{"error": -7}`` without the Origin
+# (Origin alone suffices; Referer kept for parity with the reader). Mirrors the
+# mangaball/comix ``_IMAGE_FETCH_HEADERS``.
+_IMAGE_FETCH_HEADERS = {
+    "Origin": "https://kagane.moe",
+    "Referer": "https://kagane.moe/",
+}
 
 # SSRF allowlist for the EXTRACTED page-image URLs (T-v7n-02, CLAUDE.md). The CDN host
 # is the response-provided ``cache_url`` (``kstatic.to``, live); the path namespace is
 # ``/api/v2/books/page/`` and the extension is an image one. Host + namespace +
 # extension are the stable invariants — the per-page ``{page_id}`` filename is NOT
-# over-pinned beyond the extension. ``*.kagane.to`` is allowed too in case ``cache_url``
-# moves onto a kagane subdomain (live-tune item).
+# over-pinned beyond the extension. ``*.kagane.moe`` is allowed too in case
+# ``cache_url`` moves onto a kagane subdomain (261101-plw: replaces the dead old host's
+# suffix).
 _KAGANE_IMAGE_HOSTS = frozenset({"kstatic.to", "www.kstatic.to"})
 _KAGANE_IMG_PATH_RE = re.compile(
     r"^/api/v2/books/page/[A-Za-z0-9_./-]+\.(jxl|jpg|jpeg|png|webp|avif|gif)$",
@@ -144,7 +146,7 @@ def _is_allowed_image_url(url: str) -> bool:
     """True if ``url`` is a Kagane page-image URL (SSRF allowlist, T-v7n-02).
 
     Belt-and-suspenders defence on every extracted manifest URL before the framework
-    fetches it: ``https`` + host ``kstatic.to`` (or any ``*.kagane.to``) + the
+    fetches it: ``https`` + host ``kstatic.to`` (or any ``*.kagane.moe``) + the
     ``/api/v2/books/page/`` namespace + an image extension. Rejects non-HTTPS, off-host,
     off-namespace, and traversal URLs. Validates the ``posixpath.normpath``-resolved
     path (httpx normalizes ``..`` first) and rejects any literal ``..`` segment.
@@ -153,7 +155,7 @@ def _is_allowed_image_url(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https":
         return False
-    if not (host in _KAGANE_IMAGE_HOSTS or host.endswith(".kagane.to")):
+    if not (host in _KAGANE_IMAGE_HOSTS or host.endswith(".kagane.moe")):
         return False
     if ".." in parsed.path.split("/"):
         return False
@@ -162,17 +164,17 @@ def _is_allowed_image_url(url: str) -> bool:
 
 
 class KaganeSource(Source):
-    """Kagane (kagane.to) — antibot cloudflare, Komga-fork JSON-REST, title fan-out.
+    """Kagane (kagane.moe) — on-demand cloudflare, Komga-fork JSON-REST, title fan-out.
 
-    A clean-JSON ``cloudflare`` source: ``search/series`` is title-only so ``search``
-    deep-enumerates each candidate's complete ``series_books`` feed (atsumaru fan-out
-    shape), and the download path mints a per-book DRM token (integrity → book-token →
-    page URL) entirely through ``ctx`` (zero networking glue; module docstring).
+    A clean-JSON source: ``search/series`` is title-only so ``search`` deep-enumerates
+    each candidate's complete cursor-paginated ``/books`` feed (atsumaru fan-out shape),
+    and the download path mints a per-book DRM token (integrity → book-token → page URL)
+    entirely through ``ctx`` (zero networking glue; module docstring, 261101-plw).
     """
 
     key = "kagane"
     name = "Kagane"
-    base_url = "https://kagane.to"
+    base_url = "https://kagane.moe"
     # Title-search only — Kagane exposes no external metadata-id namespace to mint on.
     id_types: list[str] = []
     # Predominantly English-translated aggregator; per-series ``translated_language``
@@ -182,14 +184,15 @@ class KaganeSource(Source):
     # the deploy android-solver) — the two paths throttle DIFFERENTLY, so 260625-rom
     # splits them into two independent buckets (SRC-03 / D-30):
     #   * SEARCH path — ``POST /api/v2/search/series`` + the chapter-list
-    #     ``GET /api/v2/series/{id}`` — is latency-bound with NO hard throttle (clean
-    #     ≥120/min). ⇒ ``rate_limit_per_minute = 60`` (safely under the clean ceiling).
+    #     ``GET /api/v2/series/{id}/books`` (261101-plw) — is latency-bound with NO
+    #     hard throttle (clean ≥120/min). ⇒ ``rate_limit_per_minute = 60`` (safely
+    #     under the clean ceiling).
     #   * DOWNLOAD/token path — ``POST /api/integrity`` → ``POST /api/v2/books/{id}``
     #     (inside ``fetch_manifest``) — HARD-blocks ~30/min with ``Retry-After``. ⇒
     #     ``download_rate_limit_per_minute = 24`` (~80% of the 30/min block) on the
     #     SEPARATE download bucket (both POSTs tagged ``bucket="download"``).
-    #   * image bytes stay ``get_bytes`` ``limited=False``-exempt (no limiter at all).
-    # WHY the split is clean: the chapter list is part of SEARCH (``GET series/{id}``),
+    #   * image bytes stay limiter-exempt (no limiter at all).
+    # WHY the split is clean: the chapter list is part of SEARCH (``GET .../books``),
     # NOT the token path — so a download flood draining the 24/min token bucket can no
     # longer starve interactive search into 30s timeouts (the old single 24/min bucket
     # gated BOTH and let downloads exhaust the search budget).
@@ -201,13 +204,20 @@ class KaganeSource(Source):
     # clamps this to the global max_concurrent_chapters (8).
     max_concurrent_jobs = 2
     antibot = "cloudflare"
-    cloudflare_challenge_url = "https://kagane.to/"
+    cloudflare_challenge_url = "https://kagane.moe/"
     # Phase 10 (SRC-02): route clearance to the Android-WebView solver sidecar, NOT
-    # the desktop Patchright solver. kagane.to gates ``POST /api/integrity`` behind the
-    # same strict Cloudflare Turnstile that desktop automation cannot clear from Linux
-    # (resolved debug ``mangadot-cf-linux-fingerprint``); the real Android WebView
+    # the desktop Patchright solver. kagane (on its old host) gated
+    # ``POST /api/integrity`` behind the same strict Cloudflare Turnstile that desktop
+    # automation cannot clear from Linux (resolved debug
+    # ``mangadot-cf-linux-fingerprint``); the real Android WebView
     # clears it. This one-line attr is the only per-source code the engine switch needs.
     solver_engine = "android"
+    # On-demand clearance (261101-plw): from the deploy egress the kagane.moe API
+    # answers 200 with no challenge (verified 2026-11-01), so clearance is LAZY —
+    # held clearance is attached if present and a real solve only fires on an actual
+    # challenge response (D-35 reconcile) — so kagane never blocks on an android solve
+    # that cannot mint while no challenge is firing (mangaball precedent).
+    cloudflare_challenge_optional = True
     decrypt_scheme = None
     session_prep = None
     supports_search = True
@@ -221,7 +231,8 @@ class KaganeSource(Source):
         Two-call live flow (atsumaru fan-out): ``POST /api/v2/search/series`` is
         TITLE-ONLY, so ``search`` deep-enumerates the first
         ``_DEFAULT_TITLE_CANDIDATES`` (relevance-pruned) candidates via a per-series
-        ``GET /api/v2/series/{id}``. Each candidate's COMPLETE ``series_books`` feed is
+        cursor walk of ``GET /api/v2/series/{id}/books`` (261101-plw). Each candidate's
+        COMPLETE ``/books`` feed is
         filtered by :meth:`chapter_matches`, ordered newest-first, sliced to
         ``req.limit``, and ONLY THEN minted (GAP-2). ZERO glue — both calls are ``ctx``.
         """
@@ -258,16 +269,32 @@ class KaganeSource(Source):
 
             async def _enum_fn() -> Enumeration:
                 # Semaphore + GET INSIDE the cached fn so a HIT takes no slot/token.
+                # 261101-plw: walk the ``/books`` cursor feed via ``before`` until
+                # ``next_cursor`` is null; a repeated cursor or an empty page also
+                # stops the walk (T-plw-02 loop guard).
+                rows: list[dict[str, Any]] = []
+                cursor: str | None = None
                 async with sem:
-                    detail = await ctx.get_json(
-                        f"{_API_BASE}/api/v2/series/{series_id}"
-                    )
-                books = detail.get("series_books")
-                rows = [
-                    b
-                    for b in (books if isinstance(books, list) else [])
-                    if isinstance(b, dict)
-                ]
+                    while True:
+                        params: dict[str, Any] = {"limit": _BOOKS_PAGE_LIMIT}
+                        if cursor is not None:
+                            params["before"] = cursor
+                        page = await ctx.get_json(
+                            f"{_API_BASE}/api/v2/series/{series_id}/books", **params
+                        )
+                        items = page.get("items")
+                        page_rows = [
+                            b
+                            for b in (items if isinstance(items, list) else [])
+                            if isinstance(b, dict)
+                        ]
+                        rows.extend(page_rows)
+                        nxt = page.get("next_cursor")
+                        if not (isinstance(nxt, str) and nxt) or nxt == cursor:
+                            break
+                        if not page_rows:
+                            break
+                        cursor = nxt
                 return Enumeration(
                     items=rows,
                     chapter_numbers=tuple(
@@ -275,7 +302,9 @@ class KaganeSource(Source):
                         for b in rows
                         if (d := self._parse_decimal(b.get("chapter_no"))) is not None
                     ),
-                    exhausted=True,  # series_books is the COMPLETE feed
+                    # the cursor walk ends only at a null ``next_cursor`` →
+                    # the list is complete (261101-plw)
+                    exhausted=True,
                     requested_limit=per_candidate_limit,
                 )
 
@@ -305,7 +334,7 @@ class KaganeSource(Source):
         ctx: SourceContext,
         req: SearchRequest,
     ) -> list[Release]:
-        """Walk one series' ``series_books`` → per-chapter Releases (GAP-2).
+        """Walk one series' ``/books`` feed items → per-chapter Releases (GAP-2).
 
         Filtered by :meth:`chapter_matches`, ordered NEWEST-FIRST by ``sort_no`` (the
         monotonic chapter ordinal), sliced to ``limit``, THEN minted — so the handle
@@ -377,9 +406,9 @@ class KaganeSource(Source):
     async def fetch_manifest(self, chapter_id: str, ctx: SourceContext) -> list[str]:
         """Resolve a ``book_id`` → ordered page URLs via the token flow (PKG-01).
 
-        Three ``ctx`` calls (zero glue): (1) mint an integrity token on the cf-gated
-        ``kagane.to/api/integrity``; (2) POST it as ``x-integrity-token`` to the
-        same-origin ``kagane.to`` book-token endpoint →
+        Two ``ctx`` calls (zero glue): (1) mint an integrity token on
+        ``kagane.moe/api/integrity``; (2) POST it as ``x-integrity-token`` to the
+        same-origin book-token endpoint with ``intent=Read`` (261101-plw) →
         ``{access_token, cache_url, manifest.pages}``;
         (3) EXTRACT each page URL by joining the server-provided ``cache_url`` (never a
         reconstructed host) + the page path + the ``access_token`` query. Every URL is
@@ -390,7 +419,7 @@ class KaganeSource(Source):
         if not book_id:
             raise SourceError("source_unavailable", "empty kagane chapter id")
 
-        # 1. integrity token (cf_clearance is injected by the framework for kagane.to).
+        # 1. integrity token (cf_clearance attached by the framework when held).
         integ = await ctx.post_json_body(
             f"{self.base_url}/api/integrity", body={}, bucket="download"
         )
@@ -404,7 +433,8 @@ class KaganeSource(Source):
         book = await ctx.post_json_body(
             f"{_API_BASE}/api/v2/books/{book_id}",
             body={},
-            params={"is_datasaver": "false"},
+            # replaces the retired datasaver param (261101-plw)
+            params={"intent": "Read"},
             headers={"x-integrity-token": token},
             bucket="download",
         )
@@ -438,15 +468,17 @@ class KaganeSource(Source):
                     "source_unavailable",
                     f"book {book_id} page missing page_id/ext",
                 )
-            url = (
-                f"{base}/api/v2/books/page/{book_id}/{page_id}.{ext}"
-                f"?token={access_token}&is_datasaver=false"
-            )
+            # 261101-plw: the plain ``page/`` namespace transcodes JXL to JPEG for a
+            # ``.jpg`` suffix, so the CBZ entry name derived from the URL suffix
+            # matches the bytes (``page/original/`` would serve raw JXL Pillow cannot
+            # validate).
+            suffix = "jpg" if ext.lower() == "jxl" else ext
+            path = f"{base}/api/v2/books/page/{book_id}/{page_id}.{suffix}"
+            url = f"{path}?token={access_token}"
             if not _is_allowed_image_url(url):
                 raise SourceError(
                     "source_unavailable",
-                    f"page URL failed the SSRF allowlist: "
-                    f"{base}/api/v2/books/page/{book_id}/{page_id}.{ext}",
+                    f"page URL failed the SSRF allowlist: {path}",
                 )
             urls.append(url)
         if ctx.expected_pages is not None and len(urls) != ctx.expected_pages:
@@ -460,11 +492,14 @@ class KaganeSource(Source):
     async def fetch_image(self, url: str, ctx: SourceContext) -> bytes:
         """Fetch one page image's raw bytes (PKG-02).
 
-        A one-line delegate: the ``?token=`` query is the gate, the CDN serves plaintext
-        ``image/jpeg`` (no decrypt). Bounded by the per-job semaphore, not the API
-        limiter (``get_bytes`` is ``limited=False``).
+        The ``?token=`` query plus ``Origin: https://kagane.moe`` gate the CDN
+        (261101-plw — 404 without the Origin); it serves plaintext JPEG (no decrypt).
+        Bounded by the per-job semaphore, not the API limiter.
         """
-        return await ctx.get_bytes(url)
+        data, _headers = await ctx.get_bytes_plain_with_headers(
+            url, extra_headers=_IMAGE_FETCH_HEADERS
+        )
+        return data
 
     # ─────────────────────────── Release normalization ───────────────────────────
 
@@ -476,7 +511,7 @@ class KaganeSource(Source):
     ) -> Release | None:
         """Mint one Release from a series row + a book/chapter row (D-08).
 
-        ``book`` is a ``series_books`` row (search — has ``page_count``/``groups``) OR a
+        ``book`` is a ``/books`` feed item (search — has ``page_count``/``groups``) OR a
         ``latest_chapters`` row (recent — no page_count/groups); both carry ``book_id``,
         ``chapter_no``, ``volume_no``.
         """
