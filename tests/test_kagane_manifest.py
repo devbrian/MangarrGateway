@@ -9,8 +9,9 @@
    ext, page_no}]}}``.
 3. EXTRACT each page URL by joining the server-provided ``cache_url`` + the page path +
    the ``access_token`` query, ordered by ``page_no``, SSRF-allowlisted, and guarded
-   against ``ctx.expected_pages``. A ``jxl`` page is emitted with a ``.jpg`` suffix (the
-   CDN transcodes; 261101-plw).
+   against ``ctx.expected_pages``. A ``jxl`` page keeps its ``.jxl`` suffix (the CDN
+   transcodes to JPEG on the wire; the packager names the entry from the bytes —
+   261101-plw).
 
 ``fetch_image`` must send ``Origin: https://kagane.moe`` — the CDN 404s without it
 (261101-plw).
@@ -103,8 +104,8 @@ async def test_fetch_manifest_three_calls_ordered_urls() -> None:
     urls = await KaganeSource().fetch_manifest("bookX", ctx)  # type: ignore[arg-type]
     # Ordered by page_no (p1 then p2 despite reversed input).
     assert urls == [
-        f"{_CACHE}/api/v2/books/page/bookX/p1.jpg?token=drmtok",
-        f"{_CACHE}/api/v2/books/page/bookX/p2.jpg?token=drmtok",
+        f"{_CACHE}/api/v2/books/page/bookX/p1.jxl?token=drmtok",
+        f"{_CACHE}/api/v2/books/page/bookX/p2.jxl?token=drmtok",
     ]
     # Exactly two outbound calls — page URLs are constructed, not fetched —
     # so a future unintended extra HTTP call in the happy path fails this test.
@@ -182,8 +183,8 @@ async def test_fetch_manifest_subdomain_cache_url_allowed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_manifest_non_jxl_ext_preserved() -> None:
-    """261101-plw: only ``jxl`` maps to ``.jpg``; other exts pass through."""
+async def test_fetch_manifest_ext_preserved() -> None:
+    """261101-plw: the manifest ``ext`` is kept verbatim (no jxl→jpg substitution)."""
     ctx = _FakeCtxForManifest(pages=[{"page_id": "p1", "ext": "png", "page_no": 1}])
     urls = await KaganeSource().fetch_manifest("bookX", ctx)  # type: ignore[arg-type]
     assert urls == [f"{_CACHE}/api/v2/books/page/bookX/p1.png?token=drmtok"]

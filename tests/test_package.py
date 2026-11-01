@@ -167,6 +167,22 @@ def test_write_cbz_preserves_original_extension(tmp_path: Path) -> None:
     assert names[2].endswith(".jpg")  # no extension → default .jpg
 
 
+def test_write_cbz_names_entry_from_magic_bytes(tmp_path: Path) -> None:
+    """261101-plw: the bytes win over the URL suffix — kagane's ``.jxl`` manifest URL
+    serves transcoded JPEG, so the entry must be ``.jpg``; unknown magic keeps the
+    URL suffix."""
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 8
+    webp = b"RIFF\x00\x00\x00\x00WEBPVP8 "
+    pages = [("p1.jxl", jpeg), ("p2.jxl", webp), ("p3.jxl", b"\x00unknown")]
+    final = tmp_path / "out.cbz"
+
+    package.write_cbz(pages, final, job_id="j_test")
+
+    with zipfile.ZipFile(final) as zf:
+        names = zf.namelist()
+    assert names == ["01.jpg", "02.webp", "03.jxl"]
+
+
 def test_write_cbz_contains_no_comicinfo_or_xml(tmp_path: Path) -> None:
     # PKG-04: page images ONLY — no metadata file.
     pages = [("a.jpg", b"a"), ("b.jpg", b"b")]

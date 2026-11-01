@@ -36,10 +36,11 @@ ENDPOINT SHAPES (live-recon-pinned 2026-06-09, re-pinned 2026-11-01 for 261101-p
   - book token + manifest: ``POST /api/v2/books/{book_id}?intent=Read`` with the
     ``x-integrity-token`` header → ``{access_token, cache_url,
     manifest:{pages:[{page_id, ext, page_no, ...}]}}``.
-* image: ``GET {cache_url}/api/v2/books/page/{book_id}/{page_id}.jpg
+* image: ``GET {cache_url}/api/v2/books/page/{book_id}/{page_id}.{ext}
   ?token={access_token}`` with ``Origin: https://kagane.moe`` (404 without it) →
-  plaintext JPEG (pages are ``ext=jxl``; the ``page/`` namespace transcodes for a
-  ``.jpg`` suffix; ``decrypt_scheme = None``).
+  plaintext JPEG (pages are ``ext=jxl``; the plain ``page/`` namespace transcodes
+  them — a ``.jpg`` suffix 404s on most books — and the packager names the CBZ
+  entry from the JPEG magic bytes, not the URL suffix; ``decrypt_scheme = None``).
 
 guid (D-08): ``kagane:{series_id}:ch-{chapter_no}:{book_id}``. The
 ``ResolutionRecord.chapter_id`` is the bare ``book_id`` — ``fetch_manifest`` keys the
@@ -468,12 +469,12 @@ class KaganeSource(Source):
                     "source_unavailable",
                     f"book {book_id} page missing page_id/ext",
                 )
-            # 261101-plw: the plain ``page/`` namespace transcodes JXL to JPEG for a
-            # ``.jpg`` suffix, so the CBZ entry name derived from the URL suffix
-            # matches the bytes (``page/original/`` would serve raw JXL Pillow cannot
-            # validate).
-            suffix = "jpg" if ext.lower() == "jxl" else ext
-            path = f"{base}/api/v2/books/page/{book_id}/{page_id}.{suffix}"
+            # 261101-plw: keep the manifest's own ``ext`` (``jxl``) — the plain
+            # ``page/`` namespace transcodes it to JPEG (``page/original/`` would serve
+            # raw JXL Pillow cannot validate), and a substituted ``.jpg`` suffix 404s
+            # ("Page not found") on most books. The packager names the CBZ entry from
+            # the bytes' magic, not this suffix (``package._sniff_ext``).
+            path = f"{base}/api/v2/books/page/{book_id}/{page_id}.{ext}"
             url = f"{path}?token={access_token}"
             if not _is_allowed_image_url(url):
                 raise SourceError(
