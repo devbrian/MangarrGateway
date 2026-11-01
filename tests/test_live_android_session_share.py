@@ -100,14 +100,15 @@ def test_on_demand_keys_mirror_app_so_warm_skips_mangaball() -> None:
     be in the mirror's ``on_demand_keys``. mangadot joined 2026-07-13 (debug
     ``mangadot-stale-cf-solve``): it dropped its CF interstitial again, so its mandatory
     upfront solve could never mint (0 mints/24h) → the source went on-demand. kagane
-    (eager android CF) must NEVER leak into the skip set. This assertion also fails if
+    joined the on-demand set 2026-11-01 (261101-plw) because the kagane.moe API answers
+    without a challenge from the deploy egress. This assertion also fails if
     ``MangadotSource.cloudflare_challenge_optional`` is un-set (on_demand is derived
     from that attr via the real registry).
     """
     on_demand = _build_session_android_solver_kwargs()["on_demand_keys"]
     assert "mangaball" in on_demand
     assert "mangadot" in on_demand
-    assert "kagane" not in on_demand
+    assert "kagane" in on_demand
 
 
 def test_app_module_androidsolver_is_the_monkeypatch_target() -> None:

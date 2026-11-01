@@ -65,7 +65,7 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
     in Phase 14 (comix.to 403s the Patchright-Linux fingerprint even WITH a
     cf_clearance; the redroid WebView is the only fingerprint that clears it). The
     Android leg covers comix (``https://comix.to/``) plus the other android sources
-    (mangadot ``https://mangadot.net/``, kagane ``https://kagane.to/``, mangaball
+    (mangadot ``https://mangadot.net/``, kagane ``https://kagane.moe/``, mangaball
     ``https://mangaball.com/``), all routed to the redroid-WebView sidecar. Guards
     against drift that would let a source leak into the wrong engine's challenge map.
     """
@@ -82,7 +82,7 @@ async def test_engine_partition_splits_patchright_and_android_challenge_urls() -
         assert solver._android_by_lane["default"]._challenge_urls == {
             "comix": "https://comix.to/",
             "mangadot": "https://mangadot.net/",
-            "kagane": "https://kagane.to/",
+            "kagane": "https://kagane.moe/",
             "mangaball": "https://mangaball.com/",
         }
 
@@ -168,7 +168,7 @@ async def test_two_lanes_slice_kagane_onto_its_own_solver() -> None:
         # kagane lane: its own device target + lane label + ONLY its challenge_url
         assert kagane._adb_target == "redroid-kagane:5555"
         assert kagane._lane == "kagane"
-        assert kagane._challenge_urls == {"kagane": "https://kagane.to/"}
+        assert kagane._challenge_urls == {"kagane": "https://kagane.moe/"}
         # default lane: the other android sources, its own device target
         assert default._adb_target == "redroid:5555"
         assert default._lane == "default"
