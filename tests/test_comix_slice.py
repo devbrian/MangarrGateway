@@ -169,7 +169,7 @@ async def comix_client(
 def _mock_comix_search(solver: _ComixSolver) -> None:
     """Mock Comix search (homepage ``c.list`` eval) + the series chapter-list eval.
 
-    Phase 14: search runs the env-module ``c.list({keyword})`` eval on the homepage
+    Phase 14: search runs the signed-client ``/manga?keyword`` eval on the homepage
     and gets the decrypted ``result.items[{hid, url, …}]`` envelope back directly —
     staged via ``stage_search``. The chapter list is enumerated via comix's own
     internal ``chapters()`` loader run through ``eval_in_webview`` on the series page
@@ -490,12 +490,12 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert fetched_url == expected
     # Spike 019 (debug comix-cdn-scheme-rotation): the chapter-pages read runs
     # comix's OWN internal ``chapters/{id}`` API loader in-page instead of scraping
-    # the lazy reader DOM. It discovers the env-*.js module at runtime, imports it,
-    # finds the axios instance, reads the chapter id from the path, and GETs
+    # the lazy reader DOM. It uses the sidecar-captured signed axios client
+    # (``window.__comixApi``, 261101-ryv), takes the interpolated chapter id, and GETs
     # ``/chapters/{id}`` → decrypted ``pages.items[].url``. Assert the load-bearing
     # API-read markers are present (so a regression back to DOM scraping is caught
     # offline, not only by the live nightly).
-    assert "import(" in extract_body
+    assert "window.__comixApi" in extract_body
     assert "/chapters/" in extract_body
     assert ".get(" in extract_body
     assert "pages" in extract_body
@@ -515,9 +515,9 @@ async def test_comix_fetch_manifest_routes_through_browser(
     # Bug 5b: wait_for is None. The prior ``.rpage-page[data-page]`` reader-scaffold
     # predicate renders ONLY on a navigated chapter-reader page, so on whatever warm
     # page the in-page fast-path leaves loaded it never went truthy and burned the
-    # full ~20s hydration budget. The extract is API-based (it import()s the env
-    # module and calls /chapters/{id} directly — never the reader DOM), so the DOM
-    # gate was vestigial; the sidecar's env-*.js hydration signal is the real gate.
+    # full ~20s hydration budget. The extract is API-based (it calls /chapters/{id}
+    # on the captured signed client — never the reader DOM), so the DOM gate was
+    # vestigial; the sidecar's env-/apicore-*.js hydration signal is the real gate.
     assert wait_for is None
 
     # The series-page chapter-list enumeration runs comix's OWN internal
@@ -539,11 +539,10 @@ async def test_comix_fetch_manifest_routes_through_browser(
     assert f'"{_SERIES_ID}"' in series_extract
     assert "location.pathname.match" not in series_extract
     # The comix-side spike-019 literals live in the extract JS (the framework stays
-    # source-agnostic): runtime env-*.js discovery, the dynamic import, and the
-    # internal ``chapters()`` call at ``LIMIT = 100``.
-    assert "env-" in series_extract
-    assert "import(" in series_extract
-    assert ".chapters(" in series_extract
+    # source-agnostic): the sidecar-captured signed client (261101-ryv) and the
+    # ``/manga/{hid}/chapters`` call at ``LIMIT = 100``.
+    assert "window.__comixApi" in series_extract
+    assert "/chapters'" in series_extract
     assert "LIMIT = 100" in series_extract
 
 
@@ -551,20 +550,20 @@ async def test_comix_fetch_manifest_routes_through_browser(
 
 
 def test_chapter_list_api_extract_js_maps_votes_to_likes() -> None:
-    """The chapter-list extractor runs comix's own internal ``chapters()`` loader
-    (spike 019) — discovered via a runtime ``env-*.js`` import — and maps the API
+    """The chapter-list extractor runs comix's own signed ``/manga/{hid}/chapters``
+    call (spike 019) on the sidecar-captured client (261101-ryv) and maps the API
     row's ``votes`` → ``likes`` so per-chapter likes flow into ``Release.votes``
     (REL-03)."""
     from manga_gateway.sources.comix import _CHAPTER_LIST_API_EXTRACT_JS
 
-    assert "import(" in _CHAPTER_LIST_API_EXTRACT_JS
-    assert ".chapters(" in _CHAPTER_LIST_API_EXTRACT_JS
+    assert "window.__comixApi" in _CHAPTER_LIST_API_EXTRACT_JS
+    assert "/chapters'" in _CHAPTER_LIST_API_EXTRACT_JS
     assert "votes" in _CHAPTER_LIST_API_EXTRACT_JS
     assert "likes" in _CHAPTER_LIST_API_EXTRACT_JS
 
 
 def test_chapter_list_api_extract_js_retries_only_axios_timeouts() -> None:
-    """The chapter-list extractor wraps its per-page ``api.chapters()`` calls in a
+    """The chapter-list extractor wraps its per-page ``ax.get(...)`` calls in a
     timeout-ONLY retry guard. Comix's own axios instance bakes in a 15s timeout we
     can't set; an intermittently-slow comix backend throws ``AxiosError: timeout of
     15000ms exceeded`` (``e.code === 'ECONNABORTED'``) on a cold (uncached) page
@@ -614,8 +613,8 @@ def test_chapter_extractors_are_page_agnostic_no_location_pathname_read() -> Non
     whatever warm comix page is already loaded (the homepage after the search eval),
     which is NOT the ``/title/{hid}`` series page nor the ``{id}-chapter-{n}`` reader
     page. An extractor that read its id from ``location.pathname`` would throw there
-    (``could not read hid from /``). The env-module axios is a page-independent
-    cached singleton, so interpolating the id keeps the API read correct regardless
+    (``could not read hid from /``). The captured signed client is
+    page-independent, so interpolating the id keeps the API read correct regardless
     of the loaded page. A regression back to a path read would resurrect bug 5b's
     30s timeout under any future fast-path edit, so it is pinned offline here."""
     from manga_gateway.sources.comix import (

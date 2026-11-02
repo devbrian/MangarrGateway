@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import urllib.request
 from typing import Any, NamedTuple, Protocol, cast
 
@@ -159,6 +160,30 @@ def cdp_call_collecting(
             return cast(dict[str, Any], message.get("result", {})), events
         if "method" in message and "id" not in message:
             events.append(message)
+
+
+def wait_for_event(
+    ws: WebSocketLike, method: str, *, timeout_s: float
+) -> dict[str, Any] | None:
+    """Read CDP frames until an event named ``method`` arrives; return its ``params``.
+
+    Responses (id frames) and other events are skipped. Returns ``None`` once
+    ``timeout_s`` elapses (immediately when it is ``0``). Socket/websocket timeouts
+    propagate — the caller swallows them (261101-ryv: waits for ``Debugger.paused``
+    after the comix signed-client XHR breakpoint trigger).
+    """
+    # ponytail: one recv can block up to the socket timeout (_WS_TIMEOUT_S, 15 s) —
+    # the deadline is only checked between frames; fine because Debugger.enable
+    # floods scriptParsed events. Use a select()-based wait if that ever bites.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        raw = ws.recv()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        message = json.loads(raw)
+        if message.get("method") == method:
+            return cast(dict[str, Any], message.get("params", {}))
+    return None
 
 
 def extract_clearance(

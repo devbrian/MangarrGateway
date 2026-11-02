@@ -89,15 +89,16 @@ Spike 019 (debug comix-cdn-scheme-rotation, 2026-06): the chapter-list AND
 chapter-pages reads both switched from scraping the rendered DOM to running
 comix's OWN internal API loaders in the warm tab. The series enumeration calls
 ``chapters(hid, {limit:100})`` (``_CHAPTER_LIST_API_EXTRACT_JS``) and the
-manifest calls ``/chapters/{id}`` (``_CHAPTER_PAGES_API_EXTRACT_JS``) via the
-env module's axios instance, whose ``ro(ri)`` interceptors sign the ``_=`` token
-AND decrypt the ``{"e":...}`` envelope. This replaced a long line of lazy-reader-
-DOM heuristics (issue #20 scrollIntoView, #32 silent truncation, the
-scaffold-counter wait of comix-scaffold-partial-capture, and the Step-4 filename
-synthesis) which finally became untenable when comix rotated the image-CDN URL
-scheme to a per-page opaque token with NO filename — breaking both the capture
-regex and synthesis at once. The internal API returns the full decrypted page
-list regardless of the CDN URL shape, so it is robust to the next rotation.
+manifest calls ``/chapters/{id}`` (``_CHAPTER_PAGES_API_EXTRACT_JS``) via
+the sidecar-captured signed client (``window.__comixApi``, 261101-ryv), whose
+interceptors sign the ``_=`` token AND decrypt the ``{"e":...}`` envelope. This
+replaced a long line of lazy-reader-DOM heuristics (issue #20 scrollIntoView,
+#32 silent truncation, the scaffold-counter wait of comix-scaffold-partial-capture,
+and the Step-4 filename synthesis) which finally became untenable when comix
+rotated the image-CDN URL scheme to a per-page opaque token with NO filename —
+breaking both the capture regex and synthesis at once. The internal API returns
+the full decrypted page list regardless of the CDN URL shape, so it is robust
+to the next rotation.
 """
 
 from __future__ import annotations
@@ -141,22 +142,21 @@ _DEFAULT_SERIES_CANDIDATES = 5
 # Comix chapter-feed page-size ceiling (live recon: server default limit=20).
 _MAX_FEED_LIMIT = 100
 
-# ── Search token gate (Phase 14 / spike 021 — env-module ``c.list({keyword})``) ─
+# ── Search token gate (Phase 14 / 261101-ryv — the sidecar-captured signed client) ─
 # Comix moved the plaintext search API ``GET /api/v1/manga`` behind a JS-minted
 # ``_=`` request token — exactly as it did to the chapter-list / chapter-pages
 # endpoints. A plain httpx call carrying a valid cf_clearance 403s
 # ``{"message":"Missing token."}``; the token is a SIGNATURE bound to the EXACT
 # query string minted by the VM-obfuscated ``secure-*.js`` (so it can be neither
-# minted statically NOR replayed with different params). The PRIOR fix typed the
-# keyword into the SPA's real search box (a desktop real-keyboard primitive) and
-# scraped the tokenized URL off Resource-Timing — that desktop-Patchright path is DEAD:
-# comix.to now 403s the Patchright-Linux fingerprint even WITH a cf_clearance
-# (debug ``comix-search-fails-on-server``). Spike 021 proved the env-module's OWN
-# signed axios mints the token for arbitrary params with NO keyboard and NO DOM
-# event: ``c.list({keyword, limit})`` returns the decrypted (plaintext) search
-# envelope directly. So search now runs ENTIRELY in-page via ``eval_in_webview``
-# inside the Turnstile-cleared redroid WebView. The envelope shape
-# ``_result_items`` parses — incl. ``altTitles``/``hasChapters`` — is unchanged.
+# minted statically NOR replayed with different params). Spike 021 proved comix's
+# OWN signed axios mints the token for arbitrary params with NO keyboard and NO DOM
+# event, so search runs ENTIRELY in-page via ``eval_in_webview`` inside the
+# Turnstile-cleared redroid WebView. 261101-ryv: comix's 2026-11 build dropped the
+# importable ``env-*.js`` module — the signed axios (sign + decrypt interceptors) is
+# now module-private inside ``apicore-*.js``, so the android sidecar captures it once
+# per page lifetime onto ``window.__comixApi`` (XHR breakpoint + evaluateOnCallFrame)
+# and this template calls it. ``r.data`` is the ``{items, meta}`` envelope
+# ``_result_items`` already parses — incl. ``altTitles``/``hasChapters``.
 #
 # The ``__COMIX_SEARCH_KEYWORD__`` / ``__COMIX_SEARCH_LIMIT__`` placeholders are
 # filled at the call site (:meth:`_search_series`) via ``json.dumps`` — the keyword
@@ -164,88 +164,65 @@ _MAX_FEED_LIMIT = 100
 # data and never code (SEC T-14-06: it cannot break out of the JS string). The JS
 # template itself is gateway-authored. raw-string literal (single-backslash regex).
 _SEARCH_LIST_API_EXTRACT_JS = r"""(async () => {
-  // (1) Discover the API-client module (env-*.js) at RUNTIME — hash rotates per
-  // deploy, so NEVER hardcode it; it is already in the Resource-Timing buffer.
-  const envUrl = performance.getEntriesByType('resource')
-    .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
-  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
+  // (1) comix's module-private signed axios, stashed by the sidecar (261101-ryv).
+  // Fail closed — a missing client must never look like a genuine empty search.
+  const ax = window.__comixApi;
+  if (!ax || typeof ax.get !== 'function') {
+    throw new Error('comix: signed API client not captured');
+  }
 
-  // (2) import() returns the LIVE cached singleton whose axios instance already
-  // has comix's request-SIGN + response-DECRYPT interceptors wired. Prefer the
-  // proven `c` export; fall back to scanning exports (minified names rotate).
-  const mod = await import(envUrl);
-  const findApi = (m) => {
-    if (!m) return null;
-    if (m.c && typeof m.c.list === 'function') return m.c;
-    for (const v of Object.values(m)) {
-      if (v && typeof v === 'object' && typeof v.list === 'function') return v;
-    }
-    return null;
-  };
-  const api = findApi(mod) || findApi(mod.default);
-  if (!api) throw new Error('comix: list() API not found in env module');
-
-  // (3) c.list signs the _= token over the EXACT query string and returns the
-  // decrypted search envelope (spike 021 U3: no keyboard, no DOM event). The
-  // keyword + limit are JSON literals interpolated by the Python call site.
-  const res = await api.list({
-    keyword: __COMIX_SEARCH_KEYWORD__,
-    limit: __COMIX_SEARCH_LIMIT__,
+  // (2) The request interceptor signs the _= token over the EXACT query string and
+  // the response interceptor decrypts. keyword + limit are JSON literals
+  // interpolated by the Python call site.
+  const res = await ax.get('/manga', {
+    params: { keyword: __COMIX_SEARCH_KEYWORD__, limit: __COMIX_SEARCH_LIMIT__ },
   });
-  // Axios responses carry the body on `.data`; the decrypt interceptor may also
-  // return the body directly — unwrap to the SAME envelope `_result_items` reads.
+  // Axios responses carry the body on `.data` — unwrap to the SAME envelope
+  // `_result_items` reads.
   return (res && res.data !== undefined) ? res.data : res;
 })()
 """
-# Seconds budget for the in-WebView search eval (env-*.js hydration + one signed
-# c.list call). Name retained for call-site continuity (the typed path is gone).
+# Seconds budget for the in-WebView search eval (hydration + the sidecar's one-off
+# signed-client capture + one signed /manga call, 261101-ryv). Name retained for
+# call-site continuity (the typed path is gone).
 _SEARCH_TYPED_TIMEOUT = 60.0
 
-# ── Recent feed token gate (Phase 14 / spike 021 — env-module ``c.list({order})``) ─
+# ── Recent feed token gate (Phase 14 / 261101-ryv — the sidecar-captured client) ─
 # Comix also moved the recent feed ``GET /api/v1/manga?order[chapter_updated_at]=desc``
 # behind the same ``_=`` signature-over-query-string token. The PRIOR fix navigated
 # ``/browse`` and scraped the tokenized URL the SPA's default view fired — that
 # desktop-Patchright path is DEAD for the same reason as search. The ``/browse``
 # default view's exact query was ``order[chapter_updated_at]=desc&page=1&limit=28&
 # content_rating=suggestive&_=<token>``; this extractor reproduces that query via
-# the env-module's OWN ``c.list`` (axios serializes ``{order:{chapter_updated_at:
-# 'desc'}}`` → ``order[chapter_updated_at]=desc`` and the interceptor signs it),
-# returning the decrypted newest-first envelope directly — NO httpx replay. The
-# ``/api/v1/manga`` ``result.items`` shape is unchanged, so the deferred-composite
-# synthesis in :meth:`recent` is untouched. The ordering is the one piece NOT
-# spike-validated; Plan 04 live-verifies newest-first. raw-string literal.
+# comix's OWN signed axios — the sidecar-captured signed client (``window.__comixApi``,
+# 261101-ryv) — (axios serializes ``{order:{chapter_updated_at:'desc'}}`` →
+# ``order[chapter_updated_at]=desc`` and the interceptor signs it), returning the
+# decrypted newest-first envelope directly — NO httpx replay. The ``{items, meta}``
+# shape is unchanged, so the deferred-composite synthesis in :meth:`recent` is
+# untouched. raw-string literal.
 _RECENT_LIST_API_EXTRACT_JS = r"""(async () => {
-  // (1) Discover the API-client module (env-*.js) at RUNTIME (hash rotates).
-  const envUrl = performance.getEntriesByType('resource')
-    .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
-  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
+  // (1) comix's module-private signed axios, stashed by the sidecar (261101-ryv).
+  // Fail closed — a missing client must never look like a genuine empty feed.
+  const ax = window.__comixApi;
+  if (!ax || typeof ax.get !== 'function') {
+    throw new Error('comix: signed API client not captured');
+  }
 
-  // (2) Resolve the LIVE signed-axios manga API (same discovery as search).
-  const mod = await import(envUrl);
-  const findApi = (m) => {
-    if (!m) return null;
-    if (m.c && typeof m.c.list === 'function') return m.c;
-    for (const v of Object.values(m)) {
-      if (v && typeof v === 'object' && typeof v.list === 'function') return v;
-    }
-    return null;
-  };
-  const api = findApi(mod) || findApi(mod.default);
-  if (!api) throw new Error('comix: list() API not found in env module');
-
-  // (3) Reproduce the /browse default-view recent query (source-of-truth params
+  // (2) Reproduce the /browse default-view recent query (source-of-truth params
   // from the prior token-capture path), signed + decrypted in one call.
-  const res = await api.list({
-    order: { chapter_updated_at: 'desc' },
-    page: 1,
-    limit: 28,
-    content_rating: 'suggestive',
+  const res = await ax.get('/manga', {
+    params: {
+      order: { chapter_updated_at: 'desc' },
+      page: 1,
+      limit: 28,
+      content_rating: 'suggestive',
+    },
   });
   return (res && res.data !== undefined) ? res.data : res;
 })()
 """
-# Seconds budget for the in-WebView recent eval (env-*.js hydration + one signed
-# c.list call). Name retained for call-site continuity (the /browse nav is gone).
+# Seconds budget for the in-WebView recent eval (hydration + one signed /manga
+# call, 261101-ryv). Name retained for call-site continuity (the /browse nav is gone).
 _RECENT_NAV_TIMEOUT = 60.0
 
 # Composite chapter-id separator. ``chapter_id`` for Comix is the composite
@@ -653,7 +630,10 @@ def _unscramble_image(
 # ``Origin`` is the discriminator — ``Referer``/UA alone do not flip it). Sending these
 # on the image fetch makes the gateway receive the same plaintext bytes the in-browser
 # reader does, so no descramble is needed for the vast majority of pages.
-_IMAGE_FETCH_HEADERS = {"Origin": "https://comix.to", "Referer": "https://comix.to/"}
+# 261101-ryv: the rotated ``<label>.<words>.site`` CDN answers **403 to any request
+# carrying ``Referer: https://comix.to/``** (bare and Origin-only GETs are 200, same
+# bytes — live-verified from the deploy egress), so ONLY ``Origin`` is sent now.
+_IMAGE_FETCH_HEADERS = {"Origin": "https://comix.to"}
 
 
 def _make_deferred_composite(hid: str, slug: str, chapter_number: str) -> str:
@@ -821,7 +801,21 @@ def _resolve_deferred(
 # real security anchor stays the ``*.wowpic{N}.store`` HOST pin + the
 # token/filename shape; the segment carries no trust. HTTPS-only, anchored
 # ``^…$`` (no path traversal), image extensions only.
-_COMIX_CDN_HOST_RE = re.compile(r"^[a-z0-9-]+\.wowpic\d+\.store$", re.IGNORECASE)
+#
+# 261101-ryv (2026-11): comix rotated page images to
+# ``https://<label>.<words>.site/hi/<token>`` — ``<label>`` a short alnum run
+# (``lov``/``pq4``/``447``) and ``<words>`` one of DOZENS of rotating made-up
+# ``.site`` domains. A domain list would re-break on every rotation, so the pin is
+# now SHAPE-based: exactly three labels ending ``.site`` (1-8 char label, 3-40 char
+# word), HTTPS-only, plus the unchanged anchored token path. Residual: any
+# registrant's 3-label ``.site`` host passes — accepted because the URLs come only
+# from comix's own signed API via gateway-internal manifest resolution (R6/PKG-01),
+# never from Mangarr. ``pages.alt2`` (``kkplayer.wtf``) is not used by the extractor
+# and stays rejected.
+_COMIX_CDN_HOST_RE = re.compile(
+    r"^(?:[a-z0-9-]+\.wowpic\d+\.store|[a-z0-9]{1,8}\.[a-z0-9-]{3,40}\.site)$",
+    re.IGNORECASE,
+)
 _COMIX_CDN_PATH_RE = re.compile(
     # Two observed shapes: the historical ``/{seg}/{token}/{NN}.{ext}`` and the
     # 2026-06 scheme ``/{seg}/{per-page-token}`` (NO filename / extension — each
@@ -842,7 +836,8 @@ def _is_allowed_image_url(url: str) -> bool:
     match the expected ``/{seg}/{token}/{NN}.{ext}`` shape (``{seg}`` is a
     rotating short path segment, e.g. ``si``/``i3``). Called on every URL
     returned by the browser-DOM page-list extractor before the framework
-    fetches it.
+    fetches it. Hosts: the legacy ``*.wowpic{N}.store`` and, since the 2026-11
+    rotation, the shape-pinned ``<label>.<words>.site`` (261101-ryv).
     """
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -941,10 +936,11 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 
 # JS extractor that resolves a chapter's ordered page-image URLs from comix's OWN
 # internal API (spike 019), replacing the lazy-reader-DOM scrape. The chapter
-# reader fetches ``GET /api/v1/chapters/{id}`` and the env module's axios instance
-# (its ``ro(ri)`` interceptors) signs the ``_=`` token + decrypts the ``{"e":...}``
-# envelope, returning the chapter object with ``pages:{baseUrl, items:[{width,
-# height, url}]}`` — EVERY page in order, in ONE call.
+# reader fetches ``GET /api/v1/chapters/{id}`` and comix's signed axios instance
+# — the sidecar-captured signed client (``window.__comixApi``, 261101-ryv) — signs
+# the ``_=`` token + decrypts the ``{"e":...}`` envelope, returning the chapter
+# object with ``pages:{baseUrl, items:[{width, height, url}]}`` — EVERY page in
+# order, in ONE call.
 #
 # Why this replaced the DOM scrape (debug comix-cdn-scheme-rotation, 2026-06):
 # comix changed the page-image CDN URL scheme from ``/{seg}/{token}/{NN}.{ext}``
@@ -956,31 +952,16 @@ def _parse_relative_time(raw: str | None, *, now: datetime | None = None) -> str
 # scraping every page meant scrolling N times (the #32/comix-manifest-60s-timeout
 # pain). The internal-API read sidesteps all of it: it returns the full decrypted
 # page list regardless of the CDN URL shape, so it is robust to the next rotation.
-# The env-*.js URL hash + the axios instance are discovered at RUNTIME (never
-# hardcoded). The image BYTES are still fetched via httpx (CLAUDE.md), and the
+# The signed client is captured at RUNTIME by the sidecar (never hardcoded,
+# 261101-ryv). The image BYTES are still fetched via httpx (CLAUDE.md), and the
 # per-page byte/tile decryption in ``fetch_image`` is unchanged. raw-string literal.
 _CHAPTER_PAGES_API_EXTRACT_JS = r"""(async () => {
-  // (1) Discover the API-client module (env-*.js) at RUNTIME — hash rotates per
-  // deploy, so NEVER hardcode it; it is already in the Resource-Timing buffer.
-  const envUrl = performance.getEntriesByType('resource')
-    .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
-  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
-
-  // (2) import() returns the LIVE cached singleton whose axios instance already
-  // has comix's request-SIGN + response-DECRYPT interceptors wired (ro(ri)).
-  const mod = await import(envUrl);
-  const isAxios = (v) => v && (typeof v === 'object' || typeof v === 'function')
-    && typeof v.get === 'function' && v.interceptors && v.interceptors.request;
-  // spike 019: m.x is the axios instance (ri); fall back to scanning exports
-  // (minified export names can rotate per deploy).
-  const findAxios = (m) => {
-    if (!m) return null;
-    if (isAxios(m.x)) return m.x;
-    for (const v of Object.values(m)) if (isAxios(v)) return v;
-    return null;
-  };
-  const ax = findAxios(mod) || findAxios(mod.default);
-  if (!ax) throw new Error('comix: axios instance not found in env module');
+  // (1-2) comix's module-private signed axios (request-SIGN + response-DECRYPT
+  // interceptors), stashed by the sidecar (261101-ryv). Fail closed when missing.
+  const ax = window.__comixApi;
+  if (!ax || typeof ax.get !== 'function') {
+    throw new Error('comix: signed API client not captured');
+  }
 
   // (3) Chapter numeric id — interpolated by the Python call site as a JSON string
   // literal (json.dumps; data never code, SEC T-14-06), NOT read from
@@ -988,8 +969,8 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""(async () => {
   // fast-path runs the eval on whatever warm comix page is already loaded (e.g. the
   // homepage a prior search/chapter-list eval left us on), which is NOT the
   // chapter-reader page, so reading the id from the path would throw there. The
-  // env-module axios is a page-independent cached singleton, so /chapters/{id} signs
-  // + decrypts regardless of which comix page is loaded (spike 019/021).
+  // captured signed client is page-independent, so /chapters/{id} signs + decrypts
+  // regardless of which comix page is loaded (spike 019/021, 261101-ryv).
   const chapterId = __COMIX_CHAPTER_ID__;
   if (!chapterId) throw new Error('comix: empty chapter id');
 
@@ -1047,10 +1028,11 @@ _CHAPTER_PAGES_API_EXTRACT_JS = r"""(async () => {
 # which renders ONLY on a navigated chapter-reader page. The in-page fast-path runs
 # the eval on whatever warm comix page is already loaded (NOT the reader page), so
 # that predicate never went truthy there and ``_wait_for_hydration`` burned the full
-# ~20s budget. The extract is API-based (it ``import()``s the env module and calls
-# ``ax.get('/chapters/{id}')`` directly — it never touches the reader DOM), so the
-# DOM readiness gate was vestigial. The sidecar's built-in env-*.js hydration signal
-# (satisfied instantly on a warm page) is the real readiness gate.
+# ~20s budget. The extract is API-based (it calls ``ax.get('/chapters/{id}')`` on
+# the sidecar-captured signed client (``window.__comixApi``, 261101-ryv) directly —
+# it never touches the reader DOM), so the DOM readiness gate was vestigial. The
+# sidecar's built-in env-/apicore-*.js hydration signal (satisfied instantly on a
+# warm page) is the real readiness gate.
 
 # Issue #171: how many times fetch_manifest navigates the chapter page before
 # giving up on an EMPTY capture. A cold Patchright context (right after a restart
@@ -1066,21 +1048,18 @@ _MANIFEST_COLD_RACE_ATTEMPTS = 2
 # signature (binds page+limit since #232) AND returns an encrypted ``{"e":...}``
 # envelope decrypted only in-page by the VM-obfuscated ``secure-*.js`` — judged
 # un-crackable statically (spikes 010/012/015). Spike 019's bypass: don't crack the
-# VM, call comix's own loader. The API-client ES module (``env-*.js``) wires the
-# request-SIGN + response-DECRYPT interceptors onto its axios instance (``ro(ri)``);
-# ES modules are cached singletons, so ``await import('<env-*.js url>')`` returns the
-# LIVE warm instance and ``<api>.chapters(hid, {limit:100})`` signs limit=100 AND
-# returns DECRYPTED rows (proven live: 100 rows in ~511ms). Dynamic same-origin
-# import is NOT CSP-blocked from page.evaluate (unlike the init scripts Patchright
-# suppresses). limit=100 cuts One Piece from ~236 pages (limit=20 DOM walk) to ~47,
-# each a ~500ms in-page API call fanned out (bounded) in ONE warm tab.
+# VM, call comix's own loader. comix's signed axios carries the request-SIGN +
+# response-DECRYPT interceptors; ``ax.get('/manga/{hid}/chapters', {limit:100})``
+# signs limit=100 AND returns DECRYPTED rows (proven live: 100 rows in ~511ms).
+# 261101-ryv: the 2026-11 build made that axios module-private (no importable
+# ``env-*.js``), so it is the sidecar-captured signed client (``window.__comixApi``).
+# limit=100 cuts One Piece from ~236 pages (limit=20 DOM walk) to ~47, each a ~500ms
+# in-page API call fanned out (bounded) in ONE warm tab.
 #
 # Emits the SAME ``{id, chapter, lang, groups, publishedAtRelative, likes, volume}``
 # row shape the prior DOM extractor produced, so the ``_to_release`` consumer and the
 # newest-first sort / enum-cache wrapping in ``_fetch_series_chapters_raw`` are
-# unchanged. The env-*.js URL hash and minified export names can rotate per deploy,
-# so both are discovered at RUNTIME (Resource-Timing buffer + export scan), never
-# hardcoded. raw-string literal — the JS regexes use single-backslash escapes.
+# unchanged. raw-string literal — the JS regexes use single-backslash escapes.
 _CHAPTER_LIST_API_EXTRACT_JS = r"""(async () => {
   // Bounded parallel page-fetch tuning. limit=100 (comix signs the token for any
   // limit); CONCURRENCY caps simultaneous in-page API calls; MAX_PAGES is a
@@ -1089,41 +1068,21 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""(async () => {
   const CONCURRENCY = 8;
   const MAX_PAGES = 200;
 
-  // (1) Discover the API-client module (env-*.js) URL at RUNTIME — the hash
-  // changes per deploy, so NEVER hardcode it. It is in the Resource-Timing buffer
-  // because the SPA already loaded it on boot.
-  const envUrl = performance.getEntriesByType('resource')
-    .map(e => e.name)
-    .find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
-  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
-
-  // (2) import() returns the LIVE cached singleton — its axios instance already
-  // has comix's own request-SIGN + response-DECRYPT interceptors wired (ro(ri)),
-  // so chapters() signs the _= token for limit=100 AND decrypts the {"e":...}
-  // envelope for free. Dynamic same-origin import is NOT CSP-blocked here.
-  const mod = await import(envUrl);
-
-  // (3) Find the manga API object (exposes chapters(hid, params)). Prefer the
-  // proven `c` export; fall back to scanning exports (minified names can rotate).
-  const findApi = (m) => {
-    if (!m) return null;
-    if (m.c && typeof m.c.chapters === 'function') return m.c;
-    for (const v of Object.values(m)) {
-      if (v && typeof v === 'object' && typeof v.chapters === 'function') return v;
-    }
-    return null;
-  };
-  const api = findApi(mod) || findApi(mod.default);
-  if (!api) throw new Error('comix: chapters() API not found in env module');
+  // (1-3) comix's module-private signed axios (request-SIGN + response-DECRYPT
+  // interceptors), stashed by the sidecar (261101-ryv). Fail closed when missing.
+  const ax = window.__comixApi;
+  if (!ax || typeof ax.get !== 'function') {
+    throw new Error('comix: signed API client not captured');
+  }
 
   // (4) Series hid — interpolated by the Python call site as a JSON string literal
   // (json.dumps; data never code, SEC T-14-06), NOT read from location.pathname.
   // Bug 5b: this makes the extract PAGE-AGNOSTIC — the in-page fast-path runs the
   // eval on whatever warm comix page is already loaded (the homepage after the
   // search eval), which is NOT the /title/{hid} page, so reading the hid from the
-  // path would throw there. The env-module axios is a page-independent cached
-  // singleton, so chapters(hid) signs + decrypts regardless of the loaded page
-  // (spike 019/021).
+  // path would throw there. The captured signed client is page-independent, so
+  // /manga/{hid}/chapters signs + decrypts regardless of the loaded page
+  // (spike 019/021, 261101-ryv).
   const hid = __COMIX_SERIES_HID__;
   if (!hid) throw new Error('comix: empty series hid');
 
@@ -1153,9 +1112,13 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""(async () => {
     }
   };
 
+  // Unwrap axios `.data` HERE: it is the {items, meta} envelope rowsOf() and the
+  // first.meta pagination below expect (261101-ryv).
   const getPage = (p) =>
     withTimeoutRetry(() =>
-      api.chapters(hid, { page: p, limit: LIMIT, order: { number: 'desc' } }));
+      ax.get('/manga/' + hid + '/chapters', {
+        params: { page: p, limit: LIMIT, order: { number: 'desc' } },
+      })).then((res) => (res && res.data !== undefined) ? res.data : res);
   const rowsOf = (res) => {
     if (!res) return [];
     if (Array.isArray(res)) return res;
@@ -1246,10 +1209,11 @@ _CHAPTER_LIST_API_EXTRACT_JS = r"""(async () => {
 # render ONLY on a navigated /title/{hid} page. The in-page fast-path runs the eval
 # on whatever warm comix page is already loaded (the homepage after the search eval),
 # so that predicate never went truthy there and ``_wait_for_hydration`` burned the
-# full ~20s budget (live 2026-06-22 01:01Z). The extract is API-based (it
-# ``import()``s the env module and calls ``chapters(hid)`` directly — it never reads
-# the series DOM), so the DOM readiness gate was vestigial. The sidecar's built-in
-# env-*.js hydration signal (satisfied instantly on a warm page — proven: the
+# full ~20s budget (live 2026-06-22 01:01Z). The extract is API-based (it calls
+# ``/manga/{hid}/chapters`` on the sidecar-captured signed client
+# (``window.__comixApi``, 261101-ryv) directly — it never reads the series DOM), so
+# the DOM readiness gate was vestigial. The sidecar's built-in env-/apicore-*.js
+# hydration signal (satisfied instantly on a warm page — proven: the
 # ``_search_series`` eval with ``wait_for=None`` hydrates in 0.0s) is the real gate.
 
 
@@ -1608,8 +1572,9 @@ class ComixSource(Source):
         from the ``/api/v1/manga?order[chapter_updated_at]=desc`` feed. #232: that
         feed is ``_=``-token-gated (a plain httpx call 403s "Missing token."). Phase
         14 (spike 021): rather than navigating ``/browse`` and scraping the tokenized
-        URL (the dead desktop-Patchright path), we run the env-module's OWN signed
-        ``c.list({order:{chapter_updated_at:'desc'}, …})`` INSIDE the cleared redroid
+        URL (the dead desktop-Patchright path), we run comix's OWN signed
+        ``/manga?order[chapter_updated_at]=desc`` call on the sidecar-captured signed
+        client (``window.__comixApi``, 261101-ryv) INSIDE the cleared redroid
         WebView via ``eval_in_webview`` (see ``_RECENT_LIST_API_EXTRACT_JS``) — it
         reproduces the ``/browse`` default-view recent query, signs the token, and
         returns the decrypted newest-first envelope directly (NO httpx replay). The
@@ -1636,10 +1601,11 @@ class ComixSource(Source):
         requires ``format: date-time``).
         """
         _ = (languages, since, limit)  # see docstring — all deliberately unused
-        # Phase 14 (spike 021): run the env-module's OWN signed ``c.list`` with the
-        # recent-order params INSIDE the cleared redroid WebView — it mints the ``_=``
-        # token + decrypts in one device round-trip; the unchanged ``result.items``
-        # parse follows. NEVER mint/rewrite the token outside the env-module axios.
+        # Phase 14 (spike 021): run comix's OWN signed ``/manga`` call with the
+        # recent-order params INSIDE the cleared redroid WebView on the sidecar-captured
+        # signed client (``window.__comixApi``, 261101-ryv) — it mints the ``_=`` token
+        # + decrypts in one device round-trip; the unchanged ``items`` parse follows.
+        # NEVER mint/rewrite the token outside comix's own signed axios.
         solver = self._solver_from_ctx(ctx)
         data = await solver.eval_in_webview(
             f"{self.base_url}/",
@@ -1819,9 +1785,10 @@ class ComixSource(Source):
             # so a path read would fail there. wait_for is None: the prior
             # ``.rpage-page[data-page]`` reader-scaffold predicate is a reader-page-
             # only DOM signal that never renders on a non-reader warm page and would
-            # burn the ~20s hydration budget; the extract calls the env-module API
-            # directly and never touches the reader DOM. The sidecar's built-in
-            # env-*.js hydration signal is the real readiness gate.
+            # burn the ~20s hydration budget; the extract calls the sidecar-captured
+            # signed client (``window.__comixApi``, 261101-ryv) directly and never
+            # touches the reader DOM. The sidecar's built-in env-/apicore-*.js
+            # hydration signal is the real readiness gate.
             chapter_pages_js = _CHAPTER_PAGES_API_EXTRACT_JS.replace(
                 "__COMIX_CHAPTER_ID__", json.dumps(str(numeric_id))
             )
@@ -2201,8 +2168,9 @@ class ComixSource(Source):
         ``GET /api/v1/manga`` requires a JS-minted ``_=`` request token (a signature
         bound to the EXACT query string). Phase 14 (spike 021): rather than typing the
         keyword into the SPA's search box (the dead desktop-Patchright path — comix.to
-        now 403s that fingerprint even WITH a cf_clearance), we run the env-module's
-        OWN signed ``c.list({keyword, limit})`` INSIDE the Turnstile-cleared redroid
+        now 403s that fingerprint even WITH a cf_clearance), we run comix's OWN signed
+        ``/manga?keyword&limit`` call on the sidecar-captured signed client
+        (``window.__comixApi``, 261101-ryv) INSIDE the Turnstile-cleared redroid
         WebView via ``eval_in_webview`` — it mints the token with NO keyboard and
         returns the decrypted (plaintext) search envelope directly. The ``keyword`` is
         interpolated as a JSON string literal (``json.dumps`` — data, never code; SEC
@@ -2296,7 +2264,7 @@ class ComixSource(Source):
         enumerate every chapter. Bug 5b: the hid is interpolated into the extract
         (not read from ``location.pathname``), so the eval is PAGE-AGNOSTIC and takes
         the in-page fast-path on whatever warm comix page is loaded — no DOM
-        ``wait_for``; the sidecar's built-in env-*.js hydration signal is the
+        ``wait_for``; the sidecar's built-in env-/apicore-*.js hydration signal is the
         readiness gate. It normalizes the rows to the dict shape ``_to_release``
         consumes, and sorts newest-first by chapter number. It applies NEITHER the
         ``chapter_matches`` floor filter NOR the offset/limit slice — those live one
@@ -2311,18 +2279,18 @@ class ComixSource(Source):
         (One Piece ~236 pages, ~20-30s, blew the 30s budget on the longest series).
         Spike 019 replaced it: the chapter-list endpoint's ``_=`` request signature
         (binds page+limit) and encrypted ``{"e":...}`` response are un-crackable
-        statically, so rather than crack them we call comix's OWN axios loader. The
-        API-client ES module (``env-*.js``, discovered at runtime — the hash rotates
-        per deploy) is a cached singleton whose request-SIGN + response-DECRYPT
-        interceptors are already wired; ``await import()``-ing it and calling
-        ``<api>.chapters(hid, {page, limit:100, order})`` signs limit=100 AND returns
-        DECRYPTED rows. The extract (``_CHAPTER_LIST_API_EXTRACT_JS``) fans the pages
-        out (bounded ``Promise.all``) in ONE warm tab and merges deduped by ``id``.
+        statically, so rather than crack them we call comix's OWN signed axios —
+        the sidecar-captured signed client (``window.__comixApi``, 261101-ryv) whose
+        request-SIGN + response-DECRYPT interceptors are already wired; calling
+        ``ax.get('/manga/{hid}/chapters', {params: {page, limit:100, order}})`` signs
+        limit=100 AND returns DECRYPTED rows. The extract
+        (``_CHAPTER_LIST_API_EXTRACT_JS``) fans the pages out (bounded
+        ``Promise.all``) in ONE warm tab and merges deduped by ``id``.
         limit=100 cuts One Piece to ~47 pages, each a ~500ms in-page API call. A page
         fetch that throws FAILS CLOSED (rejects ``Promise.all`` → the extract throws →
         ``SourceError`` below) — a partial list is never returned. All comix-side
-        literals (the ``/env-*.js`` discovery, the ``chapters()`` call, ``limit=100``)
-        live in the extract JS, never in the framework.
+        literals (the ``window.__comixApi`` client, the ``/chapters`` call,
+        ``limit=100``) live in the extract JS, never in the framework.
 
         PERF (spike 019, live): the in-page API fan-out replaces the per-page DOM
         Next-walk — One Piece drops from ~236 sequential limit=20 pages (timeout) to
@@ -2342,8 +2310,9 @@ class ComixSource(Source):
         # for the same reason: the prior ``a.mchap-row__primary`` predicate is a
         # series-page-only DOM signal that never renders on the warm homepage and
         # burned the full ~20s hydration budget (live 2026-06-22 01:01Z). The extract
-        # calls the env-module API directly and never touches the DOM; the sidecar's
-        # built-in env-*.js hydration signal is the real readiness gate.
+        # calls the sidecar-captured signed client (``window.__comixApi``,
+        # 261101-ryv) directly and never touches the DOM; the sidecar's built-in
+        # env-/apicore-*.js hydration signal is the real readiness gate.
         chapter_list_js = _CHAPTER_LIST_API_EXTRACT_JS.replace(
             "__COMIX_SERIES_HID__", json.dumps(series_hid)
         )

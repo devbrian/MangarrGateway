@@ -13,6 +13,7 @@ from android_solver.cdp import (
     cdp_call_collecting,
     effective_user_agent,
     extract_clearance,
+    wait_for_event,
     webview_user_agent,
 )
 
@@ -207,3 +208,21 @@ def test_effective_user_agent_rewrites_redroid_model() -> None:
     assert effective_user_agent(phone) == phone  # identity for a real device
     assert effective_user_agent(None) is None
     assert effective_user_agent("") == ""
+
+
+def test_wait_for_event_skips_responses_and_other_events() -> None:
+    """261101-ryv: returns the matching event's params, skipping id frames/events."""
+    ws = _FrameListWs(
+        [
+            {"method": "Debugger.scriptParsed", "params": {"scriptId": "1"}},
+            {"id": 9, "result": {}},
+            {"method": "Debugger.paused", "params": {"callFrames": [1]}},
+        ]
+    )
+    assert wait_for_event(ws, "Debugger.paused", timeout_s=5.0) == {"callFrames": [1]}
+
+
+def test_wait_for_event_zero_timeout_returns_none_without_reading() -> None:
+    ws = _FrameListWs([{"method": "Debugger.paused", "params": {}}])
+    assert wait_for_event(ws, "Debugger.paused", timeout_s=0.0) is None
+    assert len(ws.frames) == 1

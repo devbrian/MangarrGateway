@@ -36,8 +36,8 @@ from manga_gateway.sources.comix import (
 # from the production ``_IMAGE_FETCH_HEADERS``) so a bad change to either value fails a
 # test instead of silently tracking the implementation.
 _EXPECTED_IMAGE_FETCH_HEADERS = {
+    # 261101-ryv: Origin ONLY — the rotated .site CDN 403s a comix Referer.
     "Origin": "https://comix.to",
-    "Referer": "https://comix.to/",
 }
 
 # Spike-012 offline regression vector (page 04 — x-enc-seed header + raw bytes;
@@ -616,8 +616,8 @@ def _scramble_to_vp8x_exif(
 
 
 @pytest.mark.asyncio
-async def test_fetch_image_sends_origin_referer_headers() -> None:
-    """Comix must send ``Origin``/``Referer: https://comix.to`` on the image fetch — the
+async def test_fetch_image_sends_origin_header_only() -> None:
+    """Comix must send ``Origin: https://comix.to`` (and NO Referer, 261101-ryv) — the
     live-proven discriminator that makes the CDN return the plaintext original."""
     payload = b"RIFF\x10\x00\x00\x00WEBPVP8 "  # plaintext page
     ctx = _FakeCtx(payload, {})

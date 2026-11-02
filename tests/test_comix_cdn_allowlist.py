@@ -12,6 +12,8 @@ The fix WILDCARDS the leading path segment to a short alphanumeric run
 ``*.wowpic{N}.store`` HOST pin, the token/filename shape, HTTPS-only, anchored
 path (no traversal), and image-only extensions. These tests pin that contract so
 a future tightening that re-breaks ``/i3/`` (or loosens a guard) fails loudly.
+261101-ryv: comix then rotated to ``https://<label>.<words>.site/hi/<token>`` across
+dozens of made-up ``.site`` domains, so the host pin also accepts that 3-label shape.
 """
 
 from __future__ import annotations
@@ -21,9 +23,18 @@ import pytest
 from manga_gateway.sources.comix import _is_allowed_image_url
 
 _TOKEN = "bEqPbYfoMT0GmyXlE2KfoBZAzoUdauw"  # 31 chars, live-observed
+_SITE_TOKEN = "bEqPbYfoMT0GmxHlRkqfoDpswqEVYv6i3R0VvpbI6y4AjS5FIHyE"  # 261101-ryv
 
 # (url, expected, reason)
 _ACCEPT_CASES: list[tuple[str, str]] = [
+    (
+        f"https://lov.softstylemarket.site/hi/{_SITE_TOKEN}",
+        "2026-11 rotated .site CDN (261101-ryv)",
+    ),
+    (
+        f"https://447.puregoodsmarket.site/hi/{_SITE_TOKEN}",
+        "2026-11 .site CDN with a numeric label (261101-ryv)",
+    ),
     (
         f"https://jloo.wowpic5.store/i3/{_TOKEN}/01.webp",
         "live 2026-06-02 /i3/ segment — THE regression",
@@ -49,6 +60,22 @@ _ACCEPT_CASES: list[tuple[str, str]] = [
 ]
 
 _REJECT_CASES: list[tuple[str, str]] = [
+    (
+        f"http://lov.softstylemarket.site/hi/{_SITE_TOKEN}",
+        ".site CDN over plain http — HTTPS-only holds",
+    ),
+    (
+        f"https://203.0.113.9/hi/{_SITE_TOKEN}",
+        "IP literal host — never a CDN",
+    ),
+    (
+        f"https://evil.site/hi/{_SITE_TOKEN}",
+        "two-label .site (no label) — 3-label shape pin holds",
+    ),
+    (
+        f"https://kkplayer.wtf/hi/{_SITE_TOKEN}",
+        "pages.alt2 kkplayer.wtf host — not used, stays rejected",
+    ),
     (
         f"https://evil.example.com/i3/{_TOKEN}/01.webp",
         "off-host (not *.wowpic{N}.store) — SSRF anchor holds",

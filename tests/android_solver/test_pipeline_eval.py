@@ -109,10 +109,12 @@ class FakeCdp:
     """Configurable CDP fake: scripts the eval-path probes + records navigations.
 
     ``location_host`` answers the fast-path ``location.host`` probe; ``env_ready`` the
-    ``env-*.js`` SPA-readiness probe; ``cf_present`` whether ``Page.getFrameTree`` shows
-    the ``challenges.cloudflare.com`` OOPIF (a CF interstitial). ``egress_body`` answers
-    the proxied egress read. Every ``Page.navigate`` URL is recorded so a test can
-    assert the fast path issues NONE.
+    ``env-/apicore-*.js`` SPA-readiness probe; ``cf_present`` whether
+    ``Page.getFrameTree`` shows the ``challenges.cloudflare.com`` OOPIF (a CF
+    interstitial). ``egress_body`` answers the proxied egress read. Every
+    ``Page.navigate`` URL is recorded so a test can assert the fast path issues
+    NONE. ``api_captured`` / ``apicore_present`` answer the
+    261101-ryv signed-client probes; ``calls`` records every ``(method, command_id)``.
     """
 
     def __init__(
@@ -124,6 +126,8 @@ class FakeCdp:
         egress_body: object = None,
         eval_value: object = "RESULT",
         eval_exception: dict[str, object] | None = None,
+        api_captured: bool = False,
+        apicore_present: bool = False,
     ) -> None:
         self.location_host = location_host
         self.env_ready = env_ready
@@ -136,8 +140,14 @@ class FakeCdp:
         # ``awaitPromise:true``.
         self.eval_exception = eval_exception
         self.navigations: list[str] = []
+        self.api_captured = api_captured
+        self.apicore_present = apicore_present
+        self.calls: list[tuple[str, int]] = []
 
     def __call__(self, ws, method, params=None, *, command_id):  # type: ignore[no-untyped-def]
+        self.calls.append((method, command_id))
+        if method == "Debugger.evaluateOnCallFrame":
+            return {"result": {"value": params["callFrameId"] == "f2"}}
         if method == "Page.navigate":
             self.navigations.append(params["url"])
             return {}
@@ -164,6 +174,10 @@ class FakeCdp:
                 return {"result": {"value": self.env_ready}}
             if command_id == service._EVAL_WAIT_FOR_CMD_ID:
                 return {"result": {"value": True}}
+            if command_id == service._EVAL_API_PROBE_CMD_ID:
+                return {"result": {"value": self.api_captured}}
+            if command_id == service._EVAL_APICORE_CMD_ID:
+                return {"result": {"value": self.apicore_present}}
             if command_id == service._EVAL_CMD_ID:
                 if self.eval_exception is not None:
                     # A rejected in-page promise: CDP returns exceptionDetails and the
@@ -241,9 +255,9 @@ def test_already_hydrated_eval_skips_nav_and_tap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The /solve before this eval left the WebView on the cleared, hydrated comix page
-    # (location host matches, env-*.js present, NOT a CF interstitial). The eval runs
-    # DIRECTLY — no Page.navigate (which would reload and re-trigger the challenge) and
-    # no tap.
+    # (location host matches, env-/apicore-*.js present, NOT a CF interstitial). The
+    # eval runs DIRECTLY — no Page.navigate (which would reload and re-trigger the
+    # challenge) and no tap.
     device = FakeDevice()
     fake = FakeCdp(
         location_host="comix.to",
@@ -258,6 +272,66 @@ def test_already_hydrated_eval_skips_nav_and_tap(
     assert value == {"chapters": [1, 2, 3]}
     assert fake.navigations == []  # bug 3 fast path: NO needless re-navigation
     assert device.taps == []  # already cleared: NO tap
+
+
+# ── 261101-ryv: capture comix's private signed axios client onto window.__comixApi ─
+
+_THREE_FRAMES = {"callFrames": [{"callFrameId": f"f{i}"} for i in range(3)]}
+
+
+@pytest.mark.parametrize("paused", [_THREE_FRAMES, None], ids=["paused", "never"])
+def test_eval_captures_signed_api_client_and_always_resumes(
+    monkeypatch: pytest.MonkeyPatch, paused: dict[str, object] | None
+) -> None:
+    device = FakeDevice()
+    fake = FakeCdp(
+        location_host="comix.to",
+        env_ready=True,
+        cf_present=False,
+        apicore_present=True,
+        eval_value="RESULT",
+    )
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=FakeClock(), fake=fake)
+    monkeypatch.setattr(service, "wait_for_event", lambda ws, method, **k: paused)
+
+    value = pipeline.eval_in_webview("https://comix.to/", "comix.to", "extract()")
+
+    assert value == "RESULT"
+    methods = [m for m, _ in fake.calls]
+    assert "Debugger.enable" in methods
+    assert "DOMDebugger.setXHRBreakpoint" in methods
+    assert methods.count("Debugger.evaluateOnCallFrame") == (3 if paused else 0)
+    eval_idx = fake.calls.index(("Runtime.evaluate", service._EVAL_CMD_ID))
+    for cleanup in (
+        "Debugger.resume",
+        "DOMDebugger.removeXHRBreakpoint",
+        "Debugger.disable",
+    ):
+        assert cleanup in methods
+        assert methods.index(cleanup) < eval_idx
+
+
+def test_eval_skips_capture_when_client_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = FakeDevice()
+    fake = FakeCdp(
+        location_host="comix.to",
+        env_ready=True,
+        cf_present=False,
+        api_captured=True,
+        apicore_present=True,
+    )
+    pipeline = _eval_pipeline(monkeypatch, device=device, clock=FakeClock(), fake=fake)
+    waited: list[str] = []
+    monkeypatch.setattr(
+        service, "wait_for_event", lambda ws, method, **k: waited.append(method)
+    )
+
+    pipeline.eval_in_webview("https://comix.to/", "comix.to", "extract()")
+
+    assert not [m for m, _ in fake.calls if m.startswith(("Debugger.", "DOMDebugger."))]
+    assert waited == []
 
 
 # ── Mode-E: a REJECTED in-page promise must RAISE, not marshal to a swallowed empty ─
@@ -286,7 +360,7 @@ def test_eval_raises_when_inpage_promise_rejects(
             "exception": {
                 "className": "Error",
                 "description": (
-                    "Error: comix: env-*.js module URL not found\n"
+                    "Error: comix: signed API client not captured\n"
                     "    at <anonymous>:5:11"
                 ),
             },
@@ -299,7 +373,7 @@ def test_eval_raises_when_inpage_promise_rejects(
 
     message = str(excinfo.value)
     # First-line-only summary surfaces the cause for field diagnosis …
-    assert "comix: env-*.js module URL not found" in message
+    assert "comix: signed API client not captured" in message
     # … but never the second stack line, the evaluated js, or a marshalled value.
     assert "at <anonymous>" not in message
     assert "c.list" not in message
