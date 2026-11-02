@@ -1,4 +1,4 @@
-"""Unit tests for ``KaganeSource.search`` — search/series → series-detail fan-out.
+"""Unit tests for ``KaganeSource.search`` — search/series → ``/books`` feed fan-out.
 
 The LIVE flow is TWO calls (live recon 2026-06-09):
 
@@ -6,9 +6,10 @@ The LIVE flow is TWO calls (live recon 2026-06-09):
    ``{"title": q, "content_rating": ["Safe","Suggestive"]}``) → a TITLE-ONLY
    ``{content:[{series_id, title, alternate_titles, translated_language, ...}]}``
    envelope. ``search`` prunes to ``_DEFAULT_TITLE_CANDIDATES`` candidates.
-2. ``GET /api/v2/series/{series_id}`` per candidate → the COMPLETE
-   ``{series_books:[{book_id, chapter_no, sort_no, page_count, groups}]}`` feed (one
-   Release each).
+2. ``GET /api/v2/series/{series_id}/books?limit=500`` per candidate → a cursor-paginated
+   ``{items:[{book_id, chapter_no, sort_no, page_count, groups}], next_cursor}`` feed,
+   walked via ``before=<next_cursor>`` until ``next_cursor`` is null (kagane.moe,
+   261101-plw) — one Release per book.
 
 Each Release carries the guid ``kagane:{series_id}:ch-{chapter_no}:{book_id}`` (D-08),
 an opaque minted ``downloadHandle`` whose ``ResolutionRecord.chapter_id`` is the bare
@@ -32,8 +33,12 @@ from manga_gateway.models.search import SearchRequest
 from manga_gateway.sources.kagane import KaganeSource
 
 _GUID_RE = re.compile(r"^kagane:[\w-]+:ch-[\d.?]+:[\w-]+$")
-_SEARCH = "https://kagane.to/api/v2/search/series"
-_SERIES = "https://kagane.to/api/v2/series"
+_SEARCH = "https://kagane.moe/api/v2/search/series"
+_SERIES = "https://kagane.moe/api/v2/series"
+
+# 261101-plw: per-series cursor pages — ``before`` cursor (None = first page) →
+# ``(items, next_cursor)``.
+_Pages = dict[str | None, tuple[list[dict[str, Any]], str | None]]
 
 
 class _FakeCtxForSearch:
@@ -44,10 +49,12 @@ class _FakeCtxForSearch:
         *,
         content: list[dict[str, Any]],
         details: dict[str, list[dict[str, Any]]],
+        pages: dict[str, _Pages] | None = None,
     ) -> None:
         self.handle_store = HandleStore()
         self._content = content
         self._details = details
+        self._pages = pages or {}
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.candidates_enumerated: int | None = None
 
@@ -83,9 +90,12 @@ class _FakeCtxForSearch:
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         self.calls.append((url, params))
         prefix = f"{_SERIES}/"
-        if url.startswith(prefix):
-            series_id = url[len(prefix) :]
-            return {"series_books": self._details.get(series_id, [])}
+        if url.startswith(prefix) and url.endswith("/books"):
+            series_id = url[len(prefix) : -len("/books")]
+            if series_id in self._pages:
+                items, next_cursor = self._pages[series_id][params.get("before")]
+                return {"items": items, "next_cursor": next_cursor}
+            return {"items": self._details.get(series_id, []), "next_cursor": None}
         raise AssertionError(f"unexpected get_json url: {url}")
 
 
@@ -93,8 +103,9 @@ def _ctx(
     *,
     content: list[dict[str, Any]],
     details: dict[str, list[dict[str, Any]]] | None = None,
+    pages: dict[str, _Pages] | None = None,
 ) -> Any:
-    return _FakeCtxForSearch(content=content, details=details or {})
+    return _FakeCtxForSearch(content=content, details=details or {}, pages=pages)
 
 
 def _series(
@@ -285,3 +296,56 @@ async def test_search_non_matching_language_filtered_out() -> None:
     )
     assert releases == []
     assert len(_series_url_calls(ctx)) == 0  # filtered before the detail fan-out
+
+
+@pytest.mark.asyncio
+async def test_search_single_books_page_sends_only_limit() -> None:
+    """261101-plw: a series that fits one page → ONE /books GET, no ``before`` key."""
+    ctx = _ctx(content=[_series(series_id="s1")], details={"s1": [_book(book_id="b1")]})
+    releases = await KaganeSource().search(SearchRequest(type="manga", query="x"), ctx)
+    calls = _series_url_calls(ctx)
+    assert calls == [(f"{_SERIES}/s1/books", {"limit": 500})]
+    assert releases[0].guid == "kagane:s1:ch-200:b1"
+    assert releases[0].page_count == 12
+    assert releases[0].votes == 856
+
+
+@pytest.mark.asyncio
+async def test_search_walks_books_cursor_via_before() -> None:
+    """261101-plw: follow ``next_cursor`` through ``before`` until it is null."""
+    b1 = _book(book_id="b1", chapter_no=1, sort_no=1.0)
+    b2 = _book(book_id="b2", chapter_no=2, sort_no=2.0)
+    b3 = _book(book_id="b3", chapter_no=3, sort_no=3.0)
+    ctx = _ctx(
+        content=[_series(series_id="s1")],
+        pages={"s1": {None: ([b1, b2], "c1"), "c1": ([b3], None)}},
+    )
+    releases = await KaganeSource().search(SearchRequest(type="manga", query="x"), ctx)
+    assert [p for _u, p in _series_url_calls(ctx)] == [
+        {"limit": 500},
+        {"limit": 500, "before": "c1"},
+    ]
+    assert [r.guid.rsplit(":", 1)[1] for r in releases] == ["b3", "b2", "b1"]
+
+
+@pytest.mark.asyncio
+async def test_search_books_cursor_loop_guard() -> None:
+    """261101-plw: a repeated cursor (or an empty page) stops the walk — no hang."""
+    repeat = _ctx(
+        content=[_series(series_id="s1")],
+        pages={"s1": {None: ([_book(book_id="b1")], "c1"), "c1": ([], "c1")}},
+    )
+    await KaganeSource().search(SearchRequest(type="manga", query="x"), repeat)
+    assert len(_series_url_calls(repeat)) == 2
+    same = _ctx(
+        content=[_series(series_id="s1")],
+        pages={
+            "s1": {
+                None: ([_book(book_id="b1")], "c1"),
+                "c1": ([_book(book_id="b2", sort_no=201.0)], "c1"),
+            }
+        },
+    )
+    releases = await KaganeSource().search(SearchRequest(type="manga", query="x"), same)
+    assert len(_series_url_calls(same)) == 2
+    assert len(releases) == 2

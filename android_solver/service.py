@@ -57,6 +57,7 @@ from android_solver.cdp import (
     WebSocketLike,
     cdp_call,
     cdp_call_collecting,
+    effective_user_agent,
     extract_clearance,
     webview_user_agent,
 )
@@ -180,6 +181,10 @@ _VERIFY_PROBE_JS = (
 _EGRESS_ECHO_URL = "https://api.ipify.org"
 _EGRESS_NAV_CMD_ID = 40
 _EGRESS_READ_CMD_ID = 41
+# 261101-plw: ``Emulation.setUserAgentOverride`` issued right after ``Page.enable`` on
+# every CDP session (solve / eval / fetch-images) so no navigation ever leaves the
+# device under the WAF-blocked ``redroid11_x86_64`` UA (``cdp.effective_user_agent``).
+_UA_OVERRIDE_CMD_ID = 12
 _CHALLENGE_RENAV_CMD_ID = 42
 _EGRESS_READ_TIMEOUT_S = 15.0
 _EGRESS_READ_JS = "document.body.innerText"
@@ -823,6 +828,7 @@ class AndroidSolvePipeline:
             try:
                 cdp_call(ws, "Page.enable", command_id=10)
                 cdp_call(ws, "DOM.enable", command_id=11)
+                self._override_user_agent(ws, port, command_id=_UA_OVERRIDE_CMD_ID)
                 navigated_away = False
                 if expected_egress_ip:
                     # Req 3 / T-11-01 parity: prove the WebView egresses through the
@@ -953,6 +959,7 @@ class AndroidSolvePipeline:
             ws = self._ws_factory(ws_url, timeout=_WS_TIMEOUT_S)
             try:
                 cdp_call(ws, "Page.enable", command_id=_FETCH_PAGE_ENABLE_CMD_ID)
+                self._override_user_agent(ws, port, command_id=_UA_OVERRIDE_CMD_ID)
                 cdp_call(ws, "Network.enable", command_id=_FETCH_NETWORK_ENABLE_CMD_ID)
                 # A repeat URL must hit the network so it emits Network.* events.
                 cdp_call(
@@ -1094,9 +1101,11 @@ class AndroidSolvePipeline:
             return None
         try:
             user_agent = (
-                webview_user_agent(
-                    f"http://localhost:{port}/json/version",
-                    http_get=self._http_get,
+                effective_user_agent(
+                    webview_user_agent(
+                        f"http://localhost:{port}/json/version",
+                        http_get=self._http_get,
+                    )
                 )
                 or ""
             )
@@ -1405,6 +1414,7 @@ class AndroidSolvePipeline:
             try:
                 cdp_call(ws, "Page.enable", command_id=10)
                 cdp_call(ws, "DOM.enable", command_id=11)
+                self._override_user_agent(ws, port, command_id=_UA_OVERRIDE_CMD_ID)
                 if expected_egress_ip:
                     # Req 3 / T-11-01: prove the WebView egresses through the verified
                     # proxy IP BEFORE tapping — a silently-bypassed proxy must NOT mint
@@ -1461,9 +1471,11 @@ class AndroidSolvePipeline:
             # forward is still alive here (its teardown is the outer finally below).
             try:
                 user_agent = (
-                    webview_user_agent(
-                        f"http://localhost:{port}/json/version",
-                        http_get=self._http_get,
+                    effective_user_agent(
+                        webview_user_agent(
+                            f"http://localhost:{port}/json/version",
+                            http_get=self._http_get,
+                        )
                     )
                     or ""
                 )
@@ -1822,6 +1834,34 @@ class AndroidSolvePipeline:
             )
             return (1.0, 1.0)
         return (screen_w / view_w, screen_h / view_h)
+
+    def _override_user_agent(
+        self, ws: WebSocketLike, port: int, *, command_id: int
+    ) -> None:
+        """Navigate under the emulator-model-rewritten UA (261101-plw).
+
+        Reads the device UA from ``/json/version`` and, when
+        :func:`effective_user_agent` changes it, issues
+        ``Emulation.setUserAgentOverride`` on ``ws`` BEFORE any ``Page.navigate``.
+        Best-effort: a UA read/override hiccup logs and proceeds under the device UA
+        rather than failing the op (the minted-UA readers apply the same rewrite, so
+        the D-40 binding stays consistent either way).
+        """
+        try:
+            raw = webview_user_agent(
+                f"http://localhost:{port}/json/version", http_get=self._http_get
+            )
+            ua = effective_user_agent(raw)
+            if not ua or ua == raw:
+                return
+            cdp_call(
+                ws,
+                "Emulation.setUserAgentOverride",
+                {"userAgent": ua},
+                command_id=command_id,
+            )
+        except Exception:  # noqa: BLE001 — never fail a solve over the UA override
+            _log.warning("webview UA override skipped", exc_info=True)
 
     def _discover_page_ws(self, port: int) -> str:
         payload = self._http_get(

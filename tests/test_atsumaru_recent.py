@@ -1,6 +1,6 @@
 """Unit tests for ``AtsumaruSource.recent`` — title feed → newest-chapter mint.
 
-The recent feed (``GET /api/infinite/recentlyUpdated``) is TITLE-ONLY (no embedded
+The recent feed (``GET /api/home2/recentlyUpdated``) is TITLE-ONLY (no embedded
 chapter), so ``recent`` fans out exactly ONE ``GET /api/manga/page?id=`` per title —
 that detail endpoint returns the newest-first chapter WINDOW *and* the scanlators map
 together, so recent needs no separate ``allChapters`` and no separate scanlators call
@@ -27,7 +27,7 @@ from manga_gateway.sources.atsumaru import (
     _ms_to_iso,
 )
 
-_RECENT = "https://atsu.moe/api/infinite/recentlyUpdated"
+_RECENT = "https://atsu.moe/api/home2/recentlyUpdated"
 _MANGAPAGE = "https://atsu.moe/api/manga/page"
 _DEFAULT_SCANLATORS = [{"id": "sg", "name": "Alpha"}]
 
@@ -110,6 +110,17 @@ async def test_recent_mints_newest_chapter_per_title() -> None:
         languages=None, limit=10, since=None, ctx=ctx
     )
     assert len(releases) == 2
+    # 261101-plw: the home2 feed params mirror the live SPA exactly.
+    feed_params = [p for u, p in ctx.calls if u == _RECENT]
+    assert feed_params == [
+        {
+            "offset": 0,
+            "limit": _RECENT_TITLE_CAP,
+            "types": "Manga,Manwha,Manhua",
+            "mediums": "Comic",
+            "contentRatings": "Safe,Suggestive,Erotica",
+        }
+    ]
     by_title = {r.manga_title: r for r in releases}
     assert by_title["One Piece"].guid == "atsumaru:m1:ch-1184:op2"  # newest, not op1
     assert by_title["Naruto"].guid == "atsumaru:m2:ch-700:nr1"

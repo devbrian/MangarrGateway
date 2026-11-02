@@ -11,6 +11,7 @@ import json
 from android_solver.cdp import (
     ClearanceCookie,
     cdp_call_collecting,
+    effective_user_agent,
     extract_clearance,
     webview_user_agent,
 )
@@ -191,3 +192,18 @@ def test_cdp_call_collecting_returns_events_before_matching_response() -> None:
         {"id": 7, "method": "Runtime.evaluate", "params": {"expression": "1"}}
     ]
     assert ws.frames == [json.dumps(after)]  # frames after the match are not consumed
+
+
+def test_effective_user_agent_rewrites_redroid_model() -> None:
+    """261101-plw: mangadot's WAF blocks the literal emulator model; a phone model in
+    the SAME UA gets the solvable challenge. Only the model token changes."""
+    raw = (
+        "Mozilla/5.0 (Linux; Android 11; redroid11_x86_64 Build/RD2A.211001.002; wv) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/125.0.6422.113 "
+        "Mobile Safari/537.36"
+    )
+    assert effective_user_agent(raw) == raw.replace("redroid11_x86_64", "Pixel 4")
+    phone = raw.replace("redroid11_x86_64", "Pixel 4")
+    assert effective_user_agent(phone) == phone  # identity for a real device
+    assert effective_user_agent(None) is None
+    assert effective_user_agent("") == ""

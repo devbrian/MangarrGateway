@@ -231,9 +231,40 @@ def compute_output_path(
     return Path(output_root) / folder / f"{name}{suffix}"
 
 
-def _entry_name(index: int, original: str, width: int) -> str:
-    """Zero-padded reading-order entry name preserving the extension (Pitfall 5)."""
-    ext = Path(original).suffix or _DEFAULT_EXT
+# Magic-byte → archive extension. The URL suffix is only a HINT: kagane's manifest
+# declares ``.jxl`` but its CDN transcodes to JPEG on the wire (261101-plw), so an
+# entry named from the URL would carry the wrong extension and readers choke.
+_MAGIC_EXT: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF8", ".gif"),
+)
+
+
+def _sniff_ext(content: bytes) -> str | None:
+    """Extension implied by ``content``'s magic bytes, or ``None`` if unknown."""
+    if not isinstance(content, bytes):  # let the writer raise on a bad payload (D-26)
+        return None
+    for magic, ext in _MAGIC_EXT:
+        if content.startswith(magic):
+            return ext
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return ".webp"
+    if content[4:12] in (b"ftypavif", b"ftypavis"):
+        return ".avif"
+    if content.startswith((b"\xff\x0a", b"\x00\x00\x00\x0cJXL ")):
+        return ".jxl"
+    return None
+
+
+def _entry_name(index: int, original: str, width: int, content: bytes = b"") -> str:
+    """Zero-padded reading-order entry name (Pitfall 5).
+
+    The extension is the one the BYTES carry (:func:`_sniff_ext`) so the archive entry
+    matches what readers will decode; the ``original`` URL suffix is the fallback for
+    an unrecognised magic (261101-plw).
+    """
+    ext = _sniff_ext(content) or Path(original).suffix or _DEFAULT_EXT
     return f"{index:0{width}d}{ext}"
 
 
@@ -265,7 +296,7 @@ def write_cbz(pages: list[tuple[str, bytes]], final_path: Path, *, job_id: str) 
     try:
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
             for i, (original, content) in enumerate(pages, start=1):
-                zf.writestr(_entry_name(i, original, width), content)
+                zf.writestr(_entry_name(i, original, width, content), content)
         os.replace(tmp, final_path)  # atomic publish (D-26)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)  # no partial CBZ (D-29)
@@ -291,7 +322,7 @@ def write_cbt(pages: list[tuple[str, bytes]], final_path: Path, *, job_id: str) 
     try:
         with tarfile.open(tmp, "w") as tf:
             for i, (original, content) in enumerate(pages, start=1):
-                info = tarfile.TarInfo(name=_entry_name(i, original, width))
+                info = tarfile.TarInfo(name=_entry_name(i, original, width, content))
                 info.size = len(content)
                 tf.addfile(info, io.BytesIO(content))
         os.replace(tmp, final_path)
@@ -324,7 +355,7 @@ def write_folder(
     )
     try:
         for i, (original, content) in enumerate(pages, start=1):
-            (staging / _entry_name(i, original, width)).write_bytes(content)
+            (staging / _entry_name(i, original, width, content)).write_bytes(content)
         # Clear any existing folder so the swap does not fail on a populated dir
         # (re-grab path, WR-04); CBZ/CBT publish over their target via os.replace.
         shutil.rmtree(final_dir, ignore_errors=True)

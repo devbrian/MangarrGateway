@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.request
 from typing import Any, NamedTuple, Protocol, cast
 
@@ -219,6 +220,27 @@ def _cookie_expires(cookie: dict[str, Any]) -> float | None:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
     return float(raw) if raw > 0 else None
+
+
+# 261101-plw: mangadot.net's Cloudflare WAF BLOCKS the WebView's literal emulator
+# model (``redroid11_x86_64``) outright — "Sorry, you have been blocked", no challenge
+# rendered — while the SAME UA with any phone model gets the solvable managed
+# challenge (verified with curl through the residential pool, direct and proxied).
+# Every navigation therefore runs under the rewritten UA
+# (``Emulation.setUserAgentOverride``) and the minted clearance is bound to that same
+# string (D-40: a cf_clearance replays only under its issuing UA).
+_UA_MODEL_REWRITE = re.compile(r"redroid\d+_x86(?:_64)?")
+_UA_MODEL_REPLACEMENT = "Pixel 4"
+
+
+def effective_user_agent(raw: str | None) -> str | None:
+    """``raw`` with the redroid emulator model rewritten to a phone model (261101-plw).
+
+    Identity for a UA that carries no emulator model (and for ``None``/empty).
+    """
+    if not raw:
+        return raw
+    return _UA_MODEL_REWRITE.sub(_UA_MODEL_REPLACEMENT, raw)
 
 
 def webview_user_agent(
