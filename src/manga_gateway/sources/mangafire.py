@@ -110,6 +110,10 @@ _MANGAFIRE_ZONE_RE = re.compile(r"\.mfcdn(\d+)\.", re.IGNORECASE)
 # never cross-contaminates concurrent jobs — unlike source-instance state (the source
 # object is a shared registry singleton).
 _PREFERRED_ZONE_ATTR = "_mangafire_preferred_cdn_zone"
+# 261101-r4c: the page CDN (now ``*.mfcdnN.xyz``) answers 403 to a bare GET — from the
+# datacenter egress AND through the residential pool alike — and 200 with the site's
+# Referer (curl-verified per header). Mirrors mangaball/comix ``_IMAGE_FETCH_HEADERS``.
+_IMAGE_FETCH_HEADERS = {"Referer": "https://mangafire.to/"}
 
 # ── control-flow constants (mirror atsumaru/weebcentral) ───────────────────────
 # search() requests at most this many title results from /api/titles before pruning.
@@ -552,7 +556,10 @@ class MangaFireSource(Source):
         # gets a single plain fetch with no rewrite.
         current_zone = _zone_of(clean_url)
         if current_zone is None:
-            return await ctx.get_bytes(clean_url)
+            content, _ = await ctx.get_bytes_plain_with_headers(
+                clean_url, extra_headers=_IMAGE_FETCH_HEADERS
+            )
+            return content
 
         preferred = getattr(ctx, _PREFERRED_ZONE_ATTR, None)
         order: list[int] = []
@@ -572,7 +579,9 @@ class MangaFireSource(Source):
                 continue
             attempted.append(f"mfcdn{zone}")
             try:
-                content = await ctx.get_bytes(candidate)
+                content, _ = await ctx.get_bytes_plain_with_headers(
+                    candidate, extra_headers=_IMAGE_FETCH_HEADERS
+                )
             except SourceError as exc:
                 if exc.status == 403:
                     last_403 = exc

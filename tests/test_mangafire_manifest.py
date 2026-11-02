@@ -172,6 +172,13 @@ class _ZoneCtx:
             return b"zone-bytes"
         raise _ZONE403
 
+    async def get_bytes_plain_with_headers(
+        self, url: str, *, extra_headers: dict[str, str] | None = None
+    ) -> tuple[bytes, dict[str, str]]:
+        # 261101-r4c: image fetch now carries the site Referer; delegate.
+        assert extra_headers == {"Referer": "https://mangafire.to/"}
+        return await self.get_bytes(url), {}
+
 
 @pytest.mark.asyncio
 async def test_fetch_image_returns_clean_bytes_no_descramble() -> None:
@@ -183,6 +190,13 @@ async def test_fetch_image_returns_clean_bytes_no_descramble() -> None:
         async def get_bytes(self, url: str) -> bytes:
             captured.append(url)
             return b"rawbytes"
+
+        async def get_bytes_plain_with_headers(
+            self, url: str, *, extra_headers: dict[str, str] | None = None
+        ) -> tuple[bytes, dict[str, str]]:
+            # 261101-r4c: image fetch now carries the site Referer; delegate.
+            assert extra_headers == {"Referer": "https://mangafire.to/"}
+            return await self.get_bytes(url), {}
 
     src = MangaFireSource()
     ctx = _ImgCtx()
@@ -243,6 +257,13 @@ async def test_fetch_image_non_403_error_propagates_without_zone_retry() -> None
         async def get_bytes(self, url: str) -> bytes:
             self.calls.append(url)
             raise SourceError("source_unavailable", "upstream 500", status=500)
+
+        async def get_bytes_plain_with_headers(
+            self, url: str, *, extra_headers: dict[str, str] | None = None
+        ) -> tuple[bytes, dict[str, str]]:
+            # 261101-r4c: image fetch now carries the site Referer; delegate.
+            assert extra_headers == {"Referer": "https://mangafire.to/"}
+            return await self.get_bytes(url), {}
 
     src = MangaFireSource()
     ctx = _Ctx()
