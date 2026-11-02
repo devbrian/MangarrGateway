@@ -3,28 +3,35 @@
 MangaFire (``https://mangafire.to``) rewrote its whole frontend (260706-hgu): it
 dropped the PHP/jQuery server-rendered HTML + AJAX surface (the ``/filter`` HTML, the
 ``/ajax/manga/{slug}/chapter/{lang}`` HTML-in-JSON, the build-hash-tied ``vrf`` token,
-and the per-image piece-shuffle descramble) for a React SPA backed by a **plain,
-unsigned ``GET /api/*`` JSON REST API**. There is no token, header, or query signature —
-every outbound call is a bare ``ctx.get_json`` / ``ctx.get_bytes`` (SRC-01/SRC-02), so
-the source needs **no browser and no vrf**.
+and the per-image piece-shuffle descramble) for a React SPA backed by a **plain
+``GET /api/*`` JSON REST API**. The protected endpoints (``/api/titles``,
+``/api/titles/{hid}/chapters``, ``/api/chapters/{id}``) again require a ``vrf`` query
+token (261101-r4c), minted by the site's own obfuscator-VM signer chunk run in QuickJS
+(``mangafire_vrf.py``), discovered from the homepage at runtime and rebuilt once on a
+403 so a build rotation self-heals. Still **no browser**: every outbound call is a bare
+``ctx.get_json`` / ``ctx.get_bytes`` (SRC-01/SRC-02), all API calls routed through
+``_signed_get_json``.
 
 Structurally it is now a MangaDex/atsumaru-class source: a title-only search that
 deep-enumerates each candidate's chapter list, DIRECT newest-chapter mint on recent, and
 a manifest that reads server-minted page URLs verbatim. The four ``Source`` hooks:
 
-* **search** — ``GET /api/titles?keyword=&limit=&page=`` → ``{items:[{id,hid,slug,title,
-  …}],meta}`` (TITLE-ONLY) → prune candidates → per-candidate chapter-list fan-out →
-  ``chapter_matches`` filter → slice → GAP-2 mint-after-slice.
-* **recent** — ``GET /api/titles?order[chapter_updated_at]=desc&limit=`` (the bracket
-  param is required; built via ``urlencode``) → per-title newest-chapter DIRECT mint.
-* **chapter list** — ``GET /api/titles/{hid}/chapters?language=&limit=200&page=`` →
-  ``{items:[{id,number,name,createdAt}],meta:{lastPage}}``. Max ``limit`` is 200, so a
+* **search** — ``GET /api/titles?keyword=&limit=&page=&vrf=`` →
+  ``{items:[{id,hid,slug,title,…}],meta}`` (TITLE-ONLY) → prune candidates →
+  per-candidate chapter-list fan-out → ``chapter_matches`` filter → slice → GAP-2
+  mint-after-slice.
+* **recent** — ``GET /api/titles?order[chapter_updated_at]=desc&limit=&vrf=`` (the
+  bracket param is required; sent as a params dict) → per-title newest-chapter DIRECT
+  mint.
+* **chapter list** — ``GET /api/titles/{hid}/chapters?language=&limit=200&page=&vrf=``
+  → ``{items:[{id,number,name,createdAt}],meta:{lastPage}}``. Max ``limit`` is 200, so a
   long series PAGINATES page=1..meta.lastPage (the extra pages fanned out concurrently)
   for the COMPLETE list (source-onboarding completeness rule). The chapter numeric
   ``id`` is the resolve unit; ``createdAt`` is a unix-epoch (seconds).
-* **fetch_manifest** — ``GET /api/chapters/{chapterId}`` → ``{data:{pages:[{url,width,
-  height}]}}`` — direct ``mfcdnN.xyz`` CDN URLs, NO scramble offset. Each URL is
-  SSRF-allowlisted (SEC-01) and returned clean (no URL fragment).
+* **fetch_manifest** — ``GET /api/chapters/{chapterId}?vrf=`` →
+  ``{data:{pages:[{url,width,height}]}}`` — direct ``mfcdnN.xyz`` CDN URLs, NO
+  scramble offset. Each URL is SSRF-allowlisted (SEC-01) and returned clean (no URL
+  fragment).
 * **fetch_image** — ``ctx.get_bytes`` of the clean URL with adaptive CDN zone-retry
   (the ``mfcdnN`` WAF-block self-heal); NO descramble anymore.
 
@@ -48,7 +55,7 @@ from collections.abc import Coroutine
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urldefrag, urlencode, urlparse
+from urllib.parse import urldefrag, urlparse
 
 from ..framework.base import Source
 from ..framework.enum_cache import Enumeration
@@ -207,9 +214,10 @@ class MangaFireSource(Source):
     A MangaDex/atsumaru-class source since the site's React-SPA rewrite: a title-only
     ``/api/titles`` search deep-enumerates each candidate's
     ``/api/titles/{hid}/chapters`` feed (paginating past the 200-cap), recent the newest
-    chapter DIRECT, and ``/api/chapters/{id}`` yields server-minted CDN page URLs. Zero
-    networking glue — every outbound call is ``ctx.get_json`` / ``ctx.get_bytes``
-    (SRC-01/SRC-02). See the module docstring for the per-hook map.
+    chapter DIRECT, and ``/api/chapters/{id}`` yields server-minted CDN page URLs. Every
+    API call is vrf-signed via ``_signed_get_json`` (261101-r4c). Zero networking glue —
+    every outbound call is ``ctx.get_json`` / ``ctx.get_bytes`` (SRC-01/SRC-02). See
+    the module docstring for the per-hook map.
     """
 
     key = "mangafire"
@@ -413,9 +421,9 @@ class MangaFireSource(Source):
         """Newest-updated titles → DIRECT newest-chapter releases (RCNT-01/02).
 
         GETs ``/api/titles?order[chapter_updated_at]=desc&limit=`` (the bracket param is
-        required — a plain ``sort=`` is silently ignored — so the URL is built via
-        ``urlencode``), then fans out PER TITLE under a bounded semaphore and mints the
-        NEWEST chapter DIRECT (the chapter id is always present, no ``:DEFERRED``).
+        required — a plain ``sort=`` is silently ignored; sent vrf-signed as a params
+        dict, 261101-r4c), then fans out PER TITLE under a bounded semaphore and mints
+        the NEWEST chapter DIRECT (the chapter id is always present, no ``:DEFERRED``).
 
         Recent fetches ONLY page 1 of each title's chapter list
         (``_chapters_page(hid, lang, 1)``): the newest chapter is page-1 row 0 in the
@@ -641,8 +649,8 @@ class MangaFireSource(Source):
         TITLE-ONLY (each item is a series ``{id,hid,slug,title,…}``, not a chapter); the
         chapter-list key is ``hid``. Returns ``[]`` for a missing/malformed ``items``.
         """
-        body = await ctx.get_json(
-            f"{self.base_url}/api/titles", keyword=query, limit=limit, page=1
+        body = await self._signed_get_json(
+            "/titles", {"keyword": query, "limit": limit, "page": 1}, ctx
         )
         items = body.get("items")
         return (
@@ -656,12 +664,14 @@ class MangaFireSource(Source):
     ) -> list[dict[str, Any]]:
         """GET ``/api/titles?order[chapter_updated_at]=desc&limit=`` → newest titles.
 
-        The ``order[...]`` bracket param is REQUIRED (a plain ``sort=`` is silently
-        ignored) and can't be a Python kwarg, so the URL is built via ``urlencode`` and
-        passed whole to ``ctx.get_json``. Returns ``[]`` for a malformed body.
+        The ``order[...]`` bracket param is still REQUIRED (a plain ``sort=`` is
+        silently ignored); it now travels as a params dict that both the vrf signer and
+        httpx consume (261101-r4c) — httpx percent-encodes the brackets exactly as
+        ``urlencode`` did. Returns ``[]`` for a malformed body.
         """
-        qs = urlencode({"order[chapter_updated_at]": "desc", "limit": limit})
-        body = await ctx.get_json(f"{self.base_url}/api/titles?{qs}")
+        body = await self._signed_get_json(
+            "/titles", {"order[chapter_updated_at]": "desc", "limit": limit}, ctx
+        )
         items = body.get("items")
         return (
             [it for it in items if isinstance(it, dict)]
@@ -700,11 +710,10 @@ class MangaFireSource(Source):
         self, hid: str, lang: str, page: int, ctx: SourceContext
     ) -> tuple[list[dict[str, Any]], int]:
         """One chapters page → ``(items, meta.lastPage)`` (``lastPage`` floors to 1)."""
-        body = await ctx.get_json(
-            f"{self.base_url}/api/titles/{hid}/chapters",
-            language=lang,
-            limit=_CHAPTER_PAGE_LIMIT,
-            page=page,
+        body = await self._signed_get_json(
+            f"/titles/{hid}/chapters",
+            {"language": lang, "limit": _CHAPTER_PAGE_LIMIT, "page": page},
+            ctx,
         )
         raw_items = body.get("items")
         items = (

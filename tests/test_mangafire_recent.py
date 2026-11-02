@@ -19,6 +19,7 @@ import pytest
 
 from manga_gateway.handles.store import HandleStore
 from manga_gateway.sources.mangafire import MangaFireSource
+from tests.test_mangafire_vrf import stub_bootstrap_bytes
 
 _GUID_RE = re.compile(r"^mangafire:[\w.-]+:ch-[\d.?]+:[a-z-]+:[\w.-]+$")
 
@@ -58,6 +59,7 @@ class _FakeCtx:
         self._chapter_pages = chapter_pages
         self._chapters_body = chapters_body or {}
         self.get_json_calls: list[str] = []
+        self.get_json_params: list[dict[str, Any]] = []
         # (hid, page) for every /api/titles/{hid}/chapters GET — lets tests assert
         # recent never paginates past page 1 per title.
         self.chapter_page_gets: list[tuple[str, int]] = []
@@ -80,8 +82,13 @@ class _FakeCtx:
     ) -> tuple[Any, ...]:
         return ("mangafire", hid, tuple(sorted(languages)))
 
+    async def get_bytes(self, url: str, *, limited: bool = False) -> bytes:
+        # The vrf signer's homepage + chunk bootstrap (261101-r4c).
+        return stub_bootstrap_bytes(url)
+
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         self.get_json_calls.append(url)
+        self.get_json_params.append(params)
         m = re.search(r"/api/titles/([^/]+)/chapters", url)
         if m:
             hid = m.group(1)
@@ -135,8 +142,12 @@ async def test_recent_mints_direct_newest_chapter_per_title() -> None:
         # The chapter_id is the numeric chapter id (the resolve unit).
         assert record.chapter_id.isdigit()
         assert rel.language == "en"
-    # The recent feed used the required order[...] bracket param.
-    assert any("order%5Bchapter_updated_at%5D=desc" in u for u in ctx.get_json_calls)
+    # The recent feed used the required order[...] bracket param, vrf-signed
+    # (261101-r4c) — it travels in the params dict, not the URL string.
+    assert any(
+        p.get("order[chapter_updated_at]") == "desc" and p.get("vrf")
+        for p in ctx.get_json_params
+    )
 
 
 @pytest.mark.asyncio
