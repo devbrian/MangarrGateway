@@ -56,6 +56,7 @@ from ..framework.errors import SourceError
 from ..framework.relevance import _normalize, prune_candidates
 from ..handles.store import ResolutionRecord
 from ..models.search import Release
+from .mangafire_vrf import VrfSigner, find_chunk_url
 
 if TYPE_CHECKING:
     from ..framework.context import SourceContext
@@ -262,6 +263,14 @@ class MangaFireSource(Source):
     # The framework rotates the proxy ONLY when the entire zone-retry fails. Search is
     # never given a pool (unchanged).
     image_fetch_via_proxy_pool = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        # 261101-r4c: the source is a registry singleton, so the vrf signer is
+        # process-wide and built once; the lock makes the lazy build single-flight
+        # under the search/chapter fan-out.
+        self._signer: VrfSigner | None = None
+        self._signer_lock = asyncio.Lock()
 
     # ─────────────────────────────── search ──────────────────────────────────
 
@@ -577,6 +586,53 @@ class MangaFireSource(Source):
 
     # ─────────────────────────── data access (plain JSON) ─────────────────────
 
+    async def _get_signer(
+        self, ctx: SourceContext, stale: VrfSigner | None = None
+    ) -> VrfSigner:
+        """The shared vrf signer, (re)built from the homepage's chunk (261101-r4c).
+
+        Rebuilds only when unset or still the ``stale`` instance a caller saw 403, so a
+        burst of concurrent 403s rebuilds exactly once.
+        """
+        async with self._signer_lock:
+            if self._signer is None or self._signer is stale:
+                # Same host as the API → counts against its limiter.
+                html = await ctx.get_bytes(f"{self.base_url}/", limited=True)
+                url = find_chunk_url(html.decode("utf-8", "replace"))
+                if url is None:
+                    raise SourceError(
+                        "source_unavailable",
+                        "mangafire vrf signer chunk not found on homepage",
+                    )
+                js = await ctx.get_bytes(url)
+                self._signer = await asyncio.to_thread(
+                    VrfSigner, js.decode("utf-8", "replace")
+                )
+            return self._signer
+
+    async def _signed_get_json(
+        self, path: str, params: dict[str, Any], ctx: SourceContext
+    ) -> dict[str, Any]:
+        """Every protected API call: GET ``/api{path}`` + ``vrf`` (261101-r4c).
+
+        ``path`` is relative to ``/api``; ``params`` is the exact query dict — the
+        signer and httpx consume the same dict. A 403 (WR-07: branch on status, never
+        the message) drops the signer and rebuilds it ONCE, then retries ONCE — covers
+        a chunk build rotation / token-scheme refresh; a second failure propagates.
+        """
+        signer = await self._get_signer(ctx)
+
+        async def _call(s: VrfSigner) -> dict[str, Any]:
+            vrf = await asyncio.to_thread(s.sign, path, params)
+            return await ctx.get_json(f"{self.base_url}/api{path}", **params, vrf=vrf)
+
+        try:
+            return await _call(signer)
+        except SourceError as exc:
+            if exc.status != 403:
+                raise
+        return await _call(await self._get_signer(ctx, stale=signer))
+
     async def _search_titles(
         self, query: str, limit: int, ctx: SourceContext
     ) -> list[dict[str, Any]]:
@@ -667,7 +723,7 @@ class MangaFireSource(Source):
 
         Raises ``source_unavailable`` when ``data``/``pages`` is missing or empty.
         """
-        body = await ctx.get_json(f"{self.base_url}/api/chapters/{chapter_id}")
+        body = await self._signed_get_json(f"/chapters/{chapter_id}", {}, ctx)
         data = body.get("data")
         pages = data.get("pages") if isinstance(data, dict) else None
         if not isinstance(pages, list) or not pages:
