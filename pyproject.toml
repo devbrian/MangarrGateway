@@ -17,6 +17,7 @@ dependencies = [
     "pydantic==2.13.4",
     "pydantic-settings==2.14.1",
     "pyvirtualdisplay==3.0",
+    "quickjs==1.19.4",
     "tenacity==9.1.4",
     "tomli-w==1.2.0",
     "uvicorn[standard]==0.48.0",
@@ -87,6 +88,13 @@ ignore_missing_imports = true
 # snapshot (metrics/store.py, metrics/snapshot.py) are the only consumers (OBS-08
 # p95 sketch). Treat the import as untyped rather than pulling a stubs package in.
 module = ["hdrh.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# quickjs (1.19.4) ships no type stubs / py.typed marker; the MangaFire vrf signer
+# (sources/mangafire_vrf.py) is the only consumer (261101-r4c). Treat the import as
+# untyped rather than pulling a stubs package into the tree.
+module = ["quickjs"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

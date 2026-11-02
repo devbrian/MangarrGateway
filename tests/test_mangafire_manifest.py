@@ -1,6 +1,7 @@
 """Unit tests for ``MangaFireSource.fetch_manifest`` / ``fetch_image`` — JSON API.
 
-The manifest is a single plain httpx GET (260706-hgu, no browser, no vrf):
+The manifest is a single plain httpx GET (260706-hgu, no browser; vrf-signed since
+261101-r4c):
 ``GET /api/chapters/{chapterId}`` → ``{"data":{"pages":[{"url","width","height"}, …]}}``
 — server-minted ``mfcdnN.xyz`` CDN URLs with NO scramble offset. ``fetch_manifest``:
 
@@ -27,21 +28,28 @@ from manga_gateway.sources.mangafire import (
     _rewrite_zone,
     _zone_of,
 )
+from tests.test_mangafire_vrf import stub_bootstrap_bytes
 
 _CHAPTER_ID = "4736538"
 _CDN = "https://o48.mfcdn1.xyz/mf/abcdef0123/h"
 
 
 class _FakeCtx:
-    """Answers ``get_json`` for ``/api/chapters/{id}`` from a canned body."""
+    """Answers ``get_json`` for ``/api/chapters/{id}`` from a canned body; the vrf
+    signer's homepage + chunk bootstrap via ``get_bytes`` (261101-r4c)."""
 
     def __init__(self, *, body: Any, expected_pages: int | None = None) -> None:
         self._body = body
         self.expected_pages = expected_pages
         self.calls: list[str] = []
+        self.params: list[dict[str, Any]] = []
+
+    async def get_bytes(self, url: str, *, limited: bool = False) -> bytes:
+        return stub_bootstrap_bytes(url)
 
     async def get_json(self, url: str, **params: Any) -> dict[str, Any]:
         self.calls.append(url)
+        self.params.append(params)
         if isinstance(self._body, Exception):
             raise self._body
         return self._body
@@ -66,6 +74,8 @@ async def test_fetch_manifest_returns_clean_allowlisted_urls() -> None:
     # The manifest is a single GET at /api/chapters/{id}.
     assert len(ctx.calls) == 1
     assert ctx.calls[0].endswith(f"/api/chapters/{_CHAPTER_ID}")
+    # 261101-r4c: the protected call carries the signer's vrf as a query param.
+    assert ctx.params[0]["vrf"]
 
 
 @pytest.mark.asyncio
@@ -162,6 +172,13 @@ class _ZoneCtx:
             return b"zone-bytes"
         raise _ZONE403
 
+    async def get_bytes_plain_with_headers(
+        self, url: str, *, extra_headers: dict[str, str] | None = None
+    ) -> tuple[bytes, dict[str, str]]:
+        # 261101-r4c: image fetch now carries the site Referer; delegate.
+        assert extra_headers == {"Referer": "https://mangafire.to/"}
+        return await self.get_bytes(url), {}
+
 
 @pytest.mark.asyncio
 async def test_fetch_image_returns_clean_bytes_no_descramble() -> None:
@@ -173,6 +190,13 @@ async def test_fetch_image_returns_clean_bytes_no_descramble() -> None:
         async def get_bytes(self, url: str) -> bytes:
             captured.append(url)
             return b"rawbytes"
+
+        async def get_bytes_plain_with_headers(
+            self, url: str, *, extra_headers: dict[str, str] | None = None
+        ) -> tuple[bytes, dict[str, str]]:
+            # 261101-r4c: image fetch now carries the site Referer; delegate.
+            assert extra_headers == {"Referer": "https://mangafire.to/"}
+            return await self.get_bytes(url), {}
 
     src = MangaFireSource()
     ctx = _ImgCtx()
@@ -233,6 +257,13 @@ async def test_fetch_image_non_403_error_propagates_without_zone_retry() -> None
         async def get_bytes(self, url: str) -> bytes:
             self.calls.append(url)
             raise SourceError("source_unavailable", "upstream 500", status=500)
+
+        async def get_bytes_plain_with_headers(
+            self, url: str, *, extra_headers: dict[str, str] | None = None
+        ) -> tuple[bytes, dict[str, str]]:
+            # 261101-r4c: image fetch now carries the site Referer; delegate.
+            assert extra_headers == {"Referer": "https://mangafire.to/"}
+            return await self.get_bytes(url), {}
 
     src = MangaFireSource()
     ctx = _Ctx()
