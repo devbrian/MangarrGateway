@@ -630,7 +630,10 @@ def _unscramble_image(
 # ``Origin`` is the discriminator — ``Referer``/UA alone do not flip it). Sending these
 # on the image fetch makes the gateway receive the same plaintext bytes the in-browser
 # reader does, so no descramble is needed for the vast majority of pages.
-_IMAGE_FETCH_HEADERS = {"Origin": "https://comix.to", "Referer": "https://comix.to/"}
+# 261101-ryv: the rotated ``<label>.<words>.site`` CDN answers **403 to any request
+# carrying ``Referer: https://comix.to/``** (bare and Origin-only GETs are 200, same
+# bytes — live-verified from the deploy egress), so ONLY ``Origin`` is sent now.
+_IMAGE_FETCH_HEADERS = {"Origin": "https://comix.to"}
 
 
 def _make_deferred_composite(hid: str, slug: str, chapter_number: str) -> str:
