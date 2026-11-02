@@ -141,22 +141,21 @@ _DEFAULT_SERIES_CANDIDATES = 5
 # Comix chapter-feed page-size ceiling (live recon: server default limit=20).
 _MAX_FEED_LIMIT = 100
 
-# ── Search token gate (Phase 14 / spike 021 — env-module ``c.list({keyword})``) ─
+# ── Search token gate (Phase 14 / 261101-ryv — the sidecar-captured signed client) ─
 # Comix moved the plaintext search API ``GET /api/v1/manga`` behind a JS-minted
 # ``_=`` request token — exactly as it did to the chapter-list / chapter-pages
 # endpoints. A plain httpx call carrying a valid cf_clearance 403s
 # ``{"message":"Missing token."}``; the token is a SIGNATURE bound to the EXACT
 # query string minted by the VM-obfuscated ``secure-*.js`` (so it can be neither
-# minted statically NOR replayed with different params). The PRIOR fix typed the
-# keyword into the SPA's real search box (a desktop real-keyboard primitive) and
-# scraped the tokenized URL off Resource-Timing — that desktop-Patchright path is DEAD:
-# comix.to now 403s the Patchright-Linux fingerprint even WITH a cf_clearance
-# (debug ``comix-search-fails-on-server``). Spike 021 proved the env-module's OWN
-# signed axios mints the token for arbitrary params with NO keyboard and NO DOM
-# event: ``c.list({keyword, limit})`` returns the decrypted (plaintext) search
-# envelope directly. So search now runs ENTIRELY in-page via ``eval_in_webview``
-# inside the Turnstile-cleared redroid WebView. The envelope shape
-# ``_result_items`` parses — incl. ``altTitles``/``hasChapters`` — is unchanged.
+# minted statically NOR replayed with different params). Spike 021 proved comix's
+# OWN signed axios mints the token for arbitrary params with NO keyboard and NO DOM
+# event, so search runs ENTIRELY in-page via ``eval_in_webview`` inside the
+# Turnstile-cleared redroid WebView. 261101-ryv: comix's 2026-11 build dropped the
+# importable ``env-*.js`` module — the signed axios (sign + decrypt interceptors) is
+# now module-private inside ``apicore-*.js``, so the android sidecar captures it once
+# per page lifetime onto ``window.__comixApi`` (XHR breakpoint + evaluateOnCallFrame)
+# and this template calls it. ``r.data`` is the ``{items, meta}`` envelope
+# ``_result_items`` already parses — incl. ``altTitles``/``hasChapters``.
 #
 # The ``__COMIX_SEARCH_KEYWORD__`` / ``__COMIX_SEARCH_LIMIT__`` placeholders are
 # filled at the call site (:meth:`_search_series`) via ``json.dumps`` — the keyword
@@ -164,41 +163,27 @@ _MAX_FEED_LIMIT = 100
 # data and never code (SEC T-14-06: it cannot break out of the JS string). The JS
 # template itself is gateway-authored. raw-string literal (single-backslash regex).
 _SEARCH_LIST_API_EXTRACT_JS = r"""(async () => {
-  // (1) Discover the API-client module (env-*.js) at RUNTIME — hash rotates per
-  // deploy, so NEVER hardcode it; it is already in the Resource-Timing buffer.
-  const envUrl = performance.getEntriesByType('resource')
-    .map(e => e.name).find(n => /\/env-[\w-]+\.js(?:\?|$)/.test(n));
-  if (!envUrl) throw new Error('comix: env-*.js module URL not found');
+  // (1) comix's module-private signed axios, stashed by the sidecar (261101-ryv).
+  // Fail closed — a missing client must never look like a genuine empty search.
+  const ax = window.__comixApi;
+  if (!ax || typeof ax.get !== 'function') {
+    throw new Error('comix: signed API client not captured');
+  }
 
-  // (2) import() returns the LIVE cached singleton whose axios instance already
-  // has comix's request-SIGN + response-DECRYPT interceptors wired. Prefer the
-  // proven `c` export; fall back to scanning exports (minified names rotate).
-  const mod = await import(envUrl);
-  const findApi = (m) => {
-    if (!m) return null;
-    if (m.c && typeof m.c.list === 'function') return m.c;
-    for (const v of Object.values(m)) {
-      if (v && typeof v === 'object' && typeof v.list === 'function') return v;
-    }
-    return null;
-  };
-  const api = findApi(mod) || findApi(mod.default);
-  if (!api) throw new Error('comix: list() API not found in env module');
-
-  // (3) c.list signs the _= token over the EXACT query string and returns the
-  // decrypted search envelope (spike 021 U3: no keyboard, no DOM event). The
-  // keyword + limit are JSON literals interpolated by the Python call site.
-  const res = await api.list({
-    keyword: __COMIX_SEARCH_KEYWORD__,
-    limit: __COMIX_SEARCH_LIMIT__,
+  // (2) The request interceptor signs the _= token over the EXACT query string and
+  // the response interceptor decrypts. keyword + limit are JSON literals
+  // interpolated by the Python call site.
+  const res = await ax.get('/manga', {
+    params: { keyword: __COMIX_SEARCH_KEYWORD__, limit: __COMIX_SEARCH_LIMIT__ },
   });
-  // Axios responses carry the body on `.data`; the decrypt interceptor may also
-  // return the body directly — unwrap to the SAME envelope `_result_items` reads.
+  // Axios responses carry the body on `.data` — unwrap to the SAME envelope
+  // `_result_items` reads.
   return (res && res.data !== undefined) ? res.data : res;
 })()
 """
-# Seconds budget for the in-WebView search eval (env-*.js hydration + one signed
-# c.list call). Name retained for call-site continuity (the typed path is gone).
+# Seconds budget for the in-WebView search eval (hydration + the sidecar's one-off
+# signed-client capture + one signed /manga call, 261101-ryv). Name retained for
+# call-site continuity (the typed path is gone).
 _SEARCH_TYPED_TIMEOUT = 60.0
 
 # ── Recent feed token gate (Phase 14 / spike 021 — env-module ``c.list({order})``) ─

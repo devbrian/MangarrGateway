@@ -35,6 +35,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import random
 import select
 import socket
 import subprocess
@@ -59,6 +60,7 @@ from android_solver.cdp import (
     cdp_call_collecting,
     effective_user_agent,
     extract_clearance,
+    wait_for_event,
     webview_user_agent,
 )
 from android_solver.config import SidecarConfig
@@ -262,7 +264,7 @@ _EGRESS_IN_PAGE_JS = (
 # eval's Runtime.evaluate response never aliases an in-flight solve frame.
 _EVAL_CMD_ID = 400
 _EVAL_NAV_CMD_ID = 401  # Page.navigate to the challenge_url before the eval runs
-_EVAL_HYDRATION_CMD_ID = 402  # env-*.js Resource-Timing SPA-readiness probe
+_EVAL_HYDRATION_CMD_ID = 402  # env-/apicore-*.js Resource-Timing SPA-readiness probe
 _EVAL_WAIT_FOR_CMD_ID = 403  # the optional caller-supplied wait_for JS predicate
 _EVAL_LOCATION_CMD_ID = 404  # location.host probe for the already-hydrated fast path
 _EVAL_FRAME_TREE_CMD_ID = 405  # Page.getFrameTree CF-interstitial probe (bug 3)
@@ -271,14 +273,46 @@ _EVAL_FRAME_TREE_CMD_ID = 405  # Page.getFrameTree CF-interstitial probe (bug 3)
 # marshalled value (T-14-04); the cap keeps a hostile/verbose stack from bloating a
 # log line.
 _EVAL_EXC_SUMMARY_MAX = 300
-# SPA-ready signal (spike 021 A1): comix's ``env-*.js`` module appears in the
-# Resource-Timing buffer once the SPA has hydrated enough to run the in-page
-# extractors. Polled (bounded by the eval deadline) before running the gateway js.
+# SPA-ready signal (spike 021 A1): comix's ``env-*.js`` (old build) or
+# ``apicore-*.js`` (2026-11 build, 261101-ryv) module appears in the Resource-Timing
+# buffer once the SPA has hydrated enough to run the in-page extractors. Polled
+# (bounded by the eval deadline) before running the gateway js.
 _EVAL_HYDRATION_JS = (
     "performance.getEntriesByType('resource')"
-    ".some(function(e){return /env-.*\\.js/.test(e.name);})"
+    ".some(function(e){return /\\/(?:env|apicore)-[\\w-]+\\.js/.test(e.name);})"
 )
-# Settle floor before the env-*.js readiness poll, mirroring the solve path's
+# 261101-ryv: comix's 2026-11 build keeps its signed axios client (sign + decrypt
+# interceptors) module-private inside ``apicore-*.js`` — no export reaches it. The
+# sidecar captures it ONCE per page lifetime onto ``window.__comixApi``: an XHR
+# breakpoint on the ``_=`` signed-request token, a soft /browse route change to fire a
+# request, then ``Debugger.evaluateOnCallFrame`` finds the axios instance as ``this``
+# on a paused frame. Fresh cmd ids per step; the nav id is fire-and-forget and never
+# reused so its late response cannot alias another call.
+_API_CLIENT_GLOBAL = "__comixApi"
+_API_CAPTURE_XHR_SUBSTR = "_="
+_API_CAPTURE_TIMEOUT_S = 10.0
+_EVAL_API_PROBE_CMD_ID = 406
+_EVAL_APICORE_CMD_ID = 407
+_EVAL_DBG_ENABLE_CMD_ID = 408
+_EVAL_XHR_BP_CMD_ID = 409
+_EVAL_API_NAV_CMD_ID = 410
+_EVAL_FRAME_EVAL_CMD_ID = 411
+_EVAL_DBG_RESUME_CMD_ID = 412
+_EVAL_XHR_BP_REMOVE_CMD_ID = 413
+_EVAL_DBG_DISABLE_CMD_ID = 414
+_API_PROBE_JS = (
+    f"(function(){{var a=window.{_API_CLIENT_GLOBAL};"
+    "return !!(a&&a.interceptors&&typeof a.get==='function');})()"
+)
+_APICORE_PRESENT_JS = (
+    "performance.getEntriesByType('resource')"
+    ".some(function(e){return /\\/apicore-[\\w-]+\\.js/.test(e.name);})"
+)
+_API_FRAME_EXPR = (
+    "(this&&this.interceptors&&this.defaults&&typeof this.request==='function')"
+    f"?(window.{_API_CLIENT_GLOBAL}=this,true):false"
+)
+# Settle floor before the env-/apicore-*.js readiness poll, mirroring the solve path's
 # launch-settle before the devtools socket is driven.
 _EVAL_HYDRATION_TIMEOUT_S = 20.0
 
@@ -881,6 +915,9 @@ class AndroidSolvePipeline:
                     )
                     self._clear_challenge_if_present(ws, ws_url, host, cancel, deadline)
                     self._wait_for_hydration(ws, wait_for, cancel, deadline)
+                # 261101-ryv: one site for both branches — make sure comix's signed
+                # client is stashed on window.__comixApi before the gateway js runs.
+                self._ensure_api_client(ws, cancel, deadline)
                 _raise_if_cancelled(cancel)
                 # awaitPromise:true is the ONLY new option over the existing eval
                 # sites — comix's extractors wrap an async ``import()`` IIFE.
@@ -1127,8 +1164,9 @@ class AndroidSolvePipeline:
         """True when the warm WebView is ALREADY on a cleared, hydrated ``host`` page.
 
         The spike-021 fast path: the prior ``/solve`` leaves the WebView alive on the
-        cleared comix page (``env-*.js`` in Resource-Timing, NO CF interstitial). When
-        ALL three hold — current ``location.host`` == ``host`` AND ``env-*.js`` present
+        cleared comix page (``env-/apicore-*.js`` in Resource-Timing, NO CF
+        interstitial). When ALL three hold — current ``location.host`` == ``host`` AND
+        ``env-/apicore-*.js`` present
         AND NOT a CF interstitial — the eval runs with NO ``Page.navigate`` and NO tap,
         avoiding the reload that re-triggers comix's managed challenge (bug 3). Any
         probe failure ⇒ ``False`` (take the safe re-nav + clear-if-challenged path).
@@ -1269,13 +1307,13 @@ class AndroidSolvePipeline:
     ) -> None:
         """Poll until the comix SPA has hydrated, bounded by ``deadline``.
 
-        Readiness = ``env-*.js`` present in the Resource-Timing buffer (the SPA-ready
-        signal, spike 021 A1) AND, when ``wait_for`` is supplied, that JS boolean
-        predicate is truthy. Returns anyway on the deadline (does NOT hard-fail) —
-        comix routes by hid and the slug is cosmetic, so a cosmetic-readiness miss
-        must not abort an otherwise-runnable eval (spike 021). The wait is also
-        bounded by ``_EVAL_HYDRATION_TIMEOUT_S`` so it never consumes the whole eval
-        budget waiting on a signal that will not appear.
+        Readiness = ``env-/apicore-*.js`` present in the Resource-Timing buffer (the
+        SPA-ready signal, spike 021 A1) AND, when ``wait_for`` is supplied, that JS
+        boolean predicate is truthy. Returns anyway on the deadline (does NOT
+        hard-fail) — comix routes by hid and the slug is cosmetic, so a
+        cosmetic-readiness miss must not abort an otherwise-runnable eval (spike 021).
+        The wait is also bounded by ``_EVAL_HYDRATION_TIMEOUT_S`` so it never
+        consumes the whole eval budget waiting on a signal that will not appear.
         """
         hydration_deadline = min(deadline, time.monotonic() + _EVAL_HYDRATION_TIMEOUT_S)
         while time.monotonic() < hydration_deadline:
@@ -1290,6 +1328,95 @@ class AndroidSolvePipeline:
             "comix SPA hydration signal not seen before eval deadline; "
             "running the eval anyway"
         )
+
+    def _ensure_api_client(
+        self, ws: WebSocketLike, cancel: Event | None, deadline: float
+    ) -> None:
+        """Stash comix's private signed axios on ``window.__comixApi`` (261101-ryv).
+
+        A warm page that already holds it costs one probe. Otherwise (new ``apicore``
+        build only) it is captured via an XHR breakpoint on ``_=`` + a soft /browse
+        route change + ``Debugger.evaluateOnCallFrame``. The debugger is ALWAYS
+        resumed / un-breakpointed / disabled in a finally — a page left paused would
+        hang every later eval (T-ryv-01). A miss is logged and the gateway js fails
+        closed by itself. Never logs URLs, the ``_=`` token or frame contents (T-14-04).
+        """
+        if self._eval_bool(ws, _API_PROBE_JS, _EVAL_API_PROBE_CMD_ID):
+            return
+        if not self._eval_bool(ws, _APICORE_PRESENT_JS, _EVAL_APICORE_CMD_ID):
+            return  # not the apicore build — skip the debugger dance
+        capture_deadline = min(deadline, time.monotonic() + _API_CAPTURE_TIMEOUT_S)
+        captured = False
+        try:
+            cdp_call(ws, "Debugger.enable", command_id=_EVAL_DBG_ENABLE_CMD_ID)
+            cdp_call(
+                ws,
+                "DOMDebugger.setXHRBreakpoint",
+                {"url": _API_CAPTURE_XHR_SUBSTR},
+                command_id=_EVAL_XHR_BP_CMD_ID,
+            )
+            _raise_if_cancelled(cancel)
+            # Raw send, NOT cdp_call: if the XHR fires synchronously the page pauses
+            # before this evaluate returns, and _recv_result would drop the paused
+            # event and block. The home route fires no request, so /browse?page=2..9.
+            page = random.randint(2, 9)  # noqa: S311 — a route nonce, not crypto
+            nav_js = (
+                f"history.pushState({{}}, '', '/browse?page={page}');"
+                "window.dispatchEvent(new PopStateEvent('popstate', {state: {}})); 1"
+            )
+            ws.send(
+                json.dumps(
+                    {
+                        "id": _EVAL_API_NAV_CMD_ID,
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": nav_js, "returnByValue": True},
+                    }
+                )
+            )
+            paused = wait_for_event(
+                ws,
+                "Debugger.paused",
+                timeout_s=max(0.0, capture_deadline - time.monotonic()),
+            )
+            # ponytail: one pause is inspected; if a non-axios pause ever shows up
+            # first, loop resume-and-wait until capture_deadline.
+            for frame in (paused or {}).get("callFrames", []):
+                _raise_if_cancelled(cancel)
+                result = cdp_call(
+                    ws,
+                    "Debugger.evaluateOnCallFrame",
+                    {
+                        "callFrameId": frame.get("callFrameId"),
+                        "expression": _API_FRAME_EXPR,
+                        "returnByValue": True,
+                    },
+                    command_id=_EVAL_FRAME_EVAL_CMD_ID,
+                )
+                if result.get("result", {}).get("value") is True:
+                    captured = True
+                    break
+        except SolveCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a capture miss fails closed in-page
+            _log.warning("comix API client capture errored: %s", type(exc).__name__)
+        finally:
+            for method, params, cmd_id in (
+                ("Debugger.resume", None, _EVAL_DBG_RESUME_CMD_ID),
+                (
+                    "DOMDebugger.removeXHRBreakpoint",
+                    {"url": _API_CAPTURE_XHR_SUBSTR},
+                    _EVAL_XHR_BP_REMOVE_CMD_ID,
+                ),
+                ("Debugger.disable", None, _EVAL_DBG_DISABLE_CMD_ID),
+            ):
+                with contextlib.suppress(Exception):
+                    cdp_call(ws, method, params, command_id=cmd_id)
+        if captured:
+            _log.info("captured comix signed API client")
+        else:
+            _log.warning(
+                "comix signed API client not captured; the eval will fail closed"
+            )
 
     def _eval_bool(self, ws: WebSocketLike, expression: str, command_id: int) -> bool:
         """Evaluate a JS boolean predicate; any CDP/eval error is treated as False.
